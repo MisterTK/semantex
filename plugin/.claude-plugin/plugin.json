@@ -1,0 +1,13 @@
+{
+  "name": "sage",
+  "version": "0.1.0",
+  "description": "Semantic code search with hybrid dense+sparse retrieval. Finds code by meaning, not just keywords. Understands 20+ languages.",
+  "author": {
+    "name": "sage contributors"
+  },
+  "repository": "https://github.com/tk/sage",
+  "license": "Apache-2.0",
+  "keywords": ["search", "semantic", "code", "grep", "retrieval"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

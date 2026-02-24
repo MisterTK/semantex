@@ -1,0 +1,66 @@
+# sage Configuration Examples
+# Copy one of these configurations to ~/.config/sage/config.yaml
+# Or create .sagerc.yaml in your project root for project-specific settings
+
+# ============================================================
+# DEFAULT CONFIGURATION (Balanced)
+# ============================================================
+# Good balance between speed and quality
+# Recommended for most projects
+
+max_count: 10
+content: false
+context_lines: 0
+rerank: false
+max_file_size: 1048576          # 1MB
+max_file_count: 50000
+chunk_size: 512
+chunk_overlap: 128
+
+# ============================================================
+# HIGH QUALITY (Accuracy Priority)
+# ============================================================
+# Optimized for maximum search quality
+# Use for critical searches or research
+
+# max_count: 20
+# content: true
+# context_lines: 3
+# rerank: true                  # Enable cross-encoder reranking
+# rerank_candidates: 100        # Rerank more candidates
+# chunk_size: 512
+# chunk_overlap: 128
+
+# ============================================================
+# INTERACTIVE (Development)
+# ============================================================
+# Optimized for interactive development sessions
+# Fast feedback, always show content
+
+# max_count: 15
+# content: true                 # Always show code
+# context_lines: 2              # Some context
+# rerank: false                 # Fast results
+
+# ============================================================
+# BATCH PROCESSING (Automation)
+# ============================================================
+# Optimized for automated/scripted searches
+# JSON output, no reranking
+
+# max_count: 100                # Many results
+# content: true                 # Include content
+# rerank: false                 # Speed for batches
+
+# ============================================================
+# USAGE
+# ============================================================
+
+# To use one of these configs:
+# 1. Copy the desired section to ~/.config/sage/config.yaml
+# 2. Keep only the configuration values (uncommented)
+
+# Or use environment variables to override:
+# export SAGE_MAX_COUNT=20
+# export SAGE_CONTENT=true
+# export SAGE_RERANK=false

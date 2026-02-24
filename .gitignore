@@ -1,0 +1,33 @@
+# Build
+/target
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Secrets
+.env
+
+# Runtime index data
+.sage/
+
+# Model cache
+.fastembed_cache/
+
+# Claude Code local config
+.claude/settings.local.json
+
+# Internal dev docs
+/docs
+/CLAUDE.md
+/FASTEMBED_INTEGRATION.md
+
+# Benchmarks (contain hardcoded local paths and dev-only scripts)
+/benchmarks
+/benches
+/bench_results
+/scripts

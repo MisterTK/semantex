@@ -1,0 +1,108 @@
+pub mod adaptive;
+pub mod code_tokenizer;
+pub mod fastembed_reranker;
+pub mod graph_propagation;
+pub mod hybrid;
+pub mod plaid_search;
+pub mod query_classifier;
+pub mod query_expander;
+pub mod regex_semantic;
+pub mod ripgrep_fallback;
+pub mod sparse_search;
+pub mod triple_fusion;
+
+use crate::types::{FileFilter, SearchResult};
+use anyhow::Result;
+
+/// Search configuration for a single query
+#[derive(Debug, Clone)]
+pub struct SearchQuery {
+    pub text: String,
+    pub max_results: usize,
+    pub use_dense: bool,
+    pub use_sparse: bool,
+    pub use_rerank: bool,
+    pub file_filter: Option<FileFilter>,
+    /// Grep parity mode: exact+sparse only, no dense, no rerank, permissive threshold
+    pub grep_mode: bool,
+    /// Optional regex pattern for hybrid regex+semantic mode (-e flag).
+    pub regex_pattern: Option<String>,
+}
+
+impl SearchQuery {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            max_results: 10,
+            use_dense: true,
+            use_sparse: true,
+            use_rerank: true,
+            file_filter: None,
+            grep_mode: false,
+            regex_pattern: None,
+        }
+    }
+
+    pub fn max_results(mut self, n: usize) -> Self {
+        self.max_results = n;
+        self
+    }
+
+    pub fn dense_only(mut self) -> Self {
+        self.use_sparse = false;
+        self.use_rerank = false;
+        self
+    }
+
+    pub fn sparse_only(mut self) -> Self {
+        self.use_dense = false;
+        self.use_rerank = false;
+        self
+    }
+
+    pub fn no_rerank(mut self) -> Self {
+        self.use_rerank = false;
+        self
+    }
+
+    /// Enable grep parity mode: exact+sparse only, exhaustive, no reranking.
+    pub fn grep_mode(mut self) -> Self {
+        self.grep_mode = true;
+        self.use_dense = false;
+        self.use_sparse = true;
+        self.use_rerank = false;
+        self.max_results = 50;
+        self
+    }
+
+    pub fn regex_pattern(mut self, pattern: Option<String>) -> Self {
+        self.regex_pattern = pattern;
+        self
+    }
+
+    pub fn include_types(mut self, extensions: Vec<String>) -> Self {
+        let filter = self.file_filter.get_or_insert_with(FileFilter::default);
+        filter.include_extensions = extensions;
+        self
+    }
+
+    pub fn exclude_types(mut self, extensions: Vec<String>) -> Self {
+        let filter = self.file_filter.get_or_insert_with(FileFilter::default);
+        filter.exclude_extensions = extensions;
+        self
+    }
+
+    pub fn code_only(self) -> Self {
+        self.exclude_types(
+            FileFilter::NON_CODE_EXTENSIONS
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        )
+    }
+}
+
+/// Trait for search backends
+pub trait Searcher: Send + Sync {
+    fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>>;
+}

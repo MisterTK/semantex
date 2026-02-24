@@ -1,0 +1,46 @@
+[workspace]
+members = ["crates/sage-cli", "crates/sage-core", "crates/sage-mcp"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.91"
+repository = "https://github.com/tk/sage"
+homepage = "https://github.com/tk/sage"
+description = "Semantic code search — hybrid ColBERT + BM25 retrieval engine"
+
+[workspace.dependencies]
+sage-core = { path = "crates/sage-core" }
+sage-mcp = { path = "crates/sage-mcp" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bincode = { version = "2", features = ["serde"] }
+regex = "1"
+next-plaid = "1.0"
+next-plaid-onnx = { version = "1.0", features = ["coreml"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
