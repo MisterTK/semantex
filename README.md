@@ -61,34 +61,53 @@ sage uses a multi-stage search pipeline:
 
 ## Getting Started
 
-### Recommended: Claude Code Plugin
+### Claude Code (Recommended)
 
-The fastest way to use sage is as a Claude Code plugin. This gives Claude semantic search as a built-in skill — it automatically uses sage instead of grep/glob for code exploration.
+sage integrates with Claude Code via hooks that automatically make sage the default search tool. No manual configuration needed.
 
 ```bash
 # 1. Install the sage binary
 cargo install --path crates/sage-cli
 
-# 2. Install the plugin into Claude Code
-claude plugin install ./plugin
+# 2. Install hooks into Claude Code (fully automated)
+sage install-claude-code
 
-# 3. Index your project
-sage index /path/to/your/project
-
-# 4. Start using Claude Code — sage is now the default search tool
+# 3. Restart Claude Code — sage is now active
 ```
 
-Once installed, Claude will automatically prefer `sage "query"` over Grep/Glob for conceptual searches, and `sage --grep "token"` for exact matches. The plugin also includes hooks that nudge Claude to use sage when it reaches for grep or glob.
+That's it. sage auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer sage over Grep/Glob. No manual indexing step required.
 
-### Manual CLI Usage
+### Other AI Coding Tools
 
-sage works as a standalone CLI tool without Claude Code:
+sage exposes an MCP server with 4 tools (`sage_search`, `sage_index`, `sage_status`, `sage_health`). Add to your editor's MCP config:
+
+```json
+{
+  "mcpServers": {
+    "sage": {
+      "command": "sage",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Setup helpers for specific tools:
+
+```bash
+sage install-codex       # OpenAI Codex CLI
+sage install-open-code   # OpenCode
+```
+
+### Standalone CLI
+
+sage works as a standalone CLI tool without any AI editor:
 
 ```bash
 # Install from source
 cargo install --path crates/sage-cli
 
-# Index your project
+# Index your project (or let sage auto-index on first search)
 sage index /path/to/your/project
 
 # Search semantically
@@ -190,28 +209,16 @@ sage stop /path/to/project
 sage watch /path/to/project
 ```
 
-### MCP Integration
+### MCP Server
 
-```bash
-# Run as MCP server (stdio transport)
-sage mcp
+sage exposes 4 MCP tools over stdio transport (`sage mcp`):
 
-# Install Claude Code integration
-sage install-claude-code
-```
+- **`sage_search`** — semantic or keyword search with auto-fallback to ripgrep
+- **`sage_index`** — trigger background indexing for a project
+- **`sage_status`** — check index metadata (file count, chunk count, freshness)
+- **`sage_health`** — full system health check (model status, cache stats)
 
-Add to your Claude Desktop config:
-
-```json
-{
-  "mcpServers": {
-    "sage": {
-      "command": "sage",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+See [Getting Started](#other-ai-coding-tools) for editor configuration.
 
 ## Architecture
 
