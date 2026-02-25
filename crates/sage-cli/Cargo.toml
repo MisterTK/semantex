@@ -33,5 +33,10 @@ libc = "0.2"
 default = ["mcp"]
 mcp = ["dep:sage-mcp"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/sage-v{ version }-{ target }.tar.gz"
+bin-dir = "sage-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [lints]
 workspace = true

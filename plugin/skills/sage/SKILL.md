@@ -1,12 +1,12 @@
 ---
 name: sage
-description: "ALWAYS use sage instead of Grep, Glob, and find for code search. sage finds code by meaning \u2014 queries like \"authentication flow\" or \"error handling\" work even when exact words aren't in the code. Run via Bash: `sage \"query\" .` for semantic search, `sage --grep \"token\"` for exact match, `sage -e \"regex\" \"query\"` for hybrid. Auto-indexes on first use; falls back to keyword search while building. 25+ languages supported."
+description: "Semantic code search \u2014 finds code by meaning. Use instead of Grep/Glob for conceptual queries. sage \"query\" for semantic, sage --grep \"token\" for exact. 25+ languages."
 compatibility: Requires sage binary in PATH. Primary support for Claude Code.
 license: Apache-2.0
 allowed-tools: Bash
 ---
 
-# sage — Semantic Code Search
+# sage \u2014 Semantic Code Search
 
 Hybrid dense+sparse retrieval engine. Finds code by meaning, not just keywords.
 
@@ -20,14 +20,14 @@ Hybrid dense+sparse retrieval engine. Finds code by meaning, not just keywords.
 6. Only fall back to Glob for finding files by name/path pattern
 7. Always run sage via the Bash tool
 8. Use `-c` for code snippets, `--json` for structured output
-9. **Sub-agents should also use sage** — prefer it over Grep/Glob in all agent contexts
+9. **Sub-agents should also use sage** \u2014 prefer it over Grep/Glob in all agent contexts
 
 ## Availability
 
 sage auto-indexes on first use. If you see "index building" or keyword-only results:
-1. Results are still useful — they come from ripgrep keyword matching
+1. Results are still useful \u2014 they come from ripgrep keyword matching
 2. Semantic search becomes available within 10-30 seconds
-3. Do NOT manually run `sage index .` — it happens automatically
+3. Do NOT manually run `sage index .` \u2014 it happens automatically
 
 ## When to Use What
 
@@ -43,7 +43,7 @@ sage auto-indexes on first use. If you see "index building" or keyword-only resu
 ## Search Commands
 
 ```bash
-# Semantic search (natural language → hybrid dense+sparse)
+# Semantic search (natural language \u2192 hybrid dense+sparse)
 sage "authentication and session management" src/
 
 # Hybrid: regex filter + semantic ranking
@@ -70,13 +70,13 @@ sage --code-only "configuration loading" .
 # JSON output for processing
 sage --json "error recovery patterns" src/
 
-# Reranking (experimental — may not improve results for code)
+# Reranking (experimental \u2014 may not improve results for code)
 sage --rerank "complex multi-concept query" src/
 ```
 
 ## Index Management
 
-Index is built automatically on first search — you usually don't need these commands.
+Index is built automatically on first search \u2014 you usually don't need these commands.
 
 ```bash
 sage index .              # force rebuild index for current directory
@@ -87,9 +87,9 @@ sage watch .              # daemon: auto-reindex on file changes
 
 ## Search Strategy
 
-1. **Broad semantic first**: `sage "concept" .` — find related chunks by meaning
-2. **Narrow with regex**: `sage -e "pattern" "concept"` — regex filter + semantic re-ranking
-3. **Exact when known**: `sage --grep "exactToken"` — fast BM25/literal, no model loading
+1. **Broad semantic first**: `sage "concept" .` \u2014 find related chunks by meaning
+2. **Narrow with regex**: `sage -e "pattern" "concept"` \u2014 regex filter + semantic re-ranking
+3. **Exact when known**: `sage --grep "exactToken"` \u2014 fast BM25/literal, no model loading
 
 ## Output Format
 

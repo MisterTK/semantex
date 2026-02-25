@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Determine archive name
+        id: archive
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          name="sage-${version}-${{ matrix.target }}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          archive="${{ steps.archive.outputs.name }}"
+          mkdir -p "${archive}"
+          cp "target/${{ matrix.target }}/release/sage" "${archive}/"
+          # Bundle ONNX Runtime dylib if present alongside binary
+          for lib in target/${{ matrix.target }}/release/libonnxruntime*.{dylib,so}; do
+            [ -f "$lib" ] && cp "$lib" "${archive}/"
+          done
+          cp LICENSE README.md "${archive}/" 2>/dev/null || true
+          tar czf "${archive}.tar.gz" "${archive}"
+          shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+
+      - name: Fix macOS rpath
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          archive="${{ steps.archive.outputs.name }}"
+          binary="${archive}/sage"
+          # Point to ONNX Runtime dylib co-located with the binary
+          for lib in "${archive}"/libonnxruntime*.dylib; do
+            [ -f "$lib" ] && install_name_tool -add_rpath @executable_path "$binary" 2>/dev/null || true
+          done
+
+      - name: Fix Linux rpath
+        if: runner.os == 'Linux' && !matrix.cross
+        shell: bash
+        run: |
+          archive="${{ steps.archive.outputs.name }}"
+          binary="${archive}/sage"
+          if [ -f "$binary" ]; then
+            patchelf --set-rpath '$ORIGIN' "$binary" 2>/dev/null || true
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "${{ steps.archive.outputs.name }}"
+          New-Item -ItemType Directory -Force -Path $archive
+          Copy-Item "target/${{ matrix.target }}/release/sage.exe" "$archive/"
+          # Bundle ONNX Runtime DLL if present
+          Get-ChildItem "target/${{ matrix.target }}/release/onnxruntime*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "$archive/"
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$archive/" }
+          if (Test-Path "README.md") { Copy-Item "README.md" "$archive/" }
+          Compress-Archive -Path "$archive/*" -DestinationPath "$archive.zip"
+          Get-FileHash "$archive.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $archive.zip" } | Out-File -Encoding ascii "$archive.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.name }}
+          path: |
+            ${{ steps.archive.outputs.name }}.tar.gz
+            ${{ steps.archive.outputs.name }}.tar.gz.sha256
+            ${{ steps.archive.outputs.name }}.zip
+            ${{ steps.archive.outputs.name }}.zip.sha256
+          if-no-files-found: ignore
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release/ \;
+          echo "## SHA-256 Checksums" > release/checksums.txt
+          echo '```' >> release/checksums.txt
+          cat release/*.sha256 >> release/checksums.txt
+          echo '```' >> release/checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body_path: release/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
