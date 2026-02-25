@@ -854,7 +854,8 @@ fn test_semantic_search_accuracy() -> Result<()> {
 
     for (query, expected_keyword) in test_queries {
         let search_query = SearchQuery::new(query).max_results(5).dense_only();
-        let results = searcher.search(&search_query)?;
+        let output = searcher.search(&search_query)?;
+        let results = &output.results;
 
         assert!(!results.is_empty(), "Query '{query}' returned no results");
 
@@ -900,7 +901,8 @@ fn test_keyword_search_accuracy() -> Result<()> {
 
     for (query, expected) in keyword_tests {
         let search_query = SearchQuery::new(query).max_results(5).sparse_only();
-        let results = searcher.search(&search_query)?;
+        let output = searcher.search(&search_query)?;
+        let results = &output.results;
 
         assert!(!results.is_empty(), "Keyword '{query}' returned no results");
 
@@ -932,15 +934,15 @@ fn test_hybrid_search_beats_single_mode() -> Result<()> {
 
     // Dense-only search
     let dense_query = SearchQuery::new(query).max_results(10).dense_only();
-    let dense_results = searcher.search(&dense_query)?;
+    let dense_results = searcher.search(&dense_query)?.results;
 
     // Sparse-only search
     let sparse_query = SearchQuery::new(query).max_results(10).sparse_only();
-    let sparse_results = searcher.search(&sparse_query)?;
+    let sparse_results = searcher.search(&sparse_query)?.results;
 
     // Hybrid search
     let hybrid_query = SearchQuery::new(query).max_results(10).no_rerank();
-    let hybrid_results = searcher.search(&hybrid_query)?;
+    let hybrid_results = searcher.search(&hybrid_query)?.results;
 
     println!("Dense results: {}", dense_results.len());
     println!("Sparse results: {}", sparse_results.len());
@@ -983,11 +985,11 @@ fn test_reranking_improves_results() -> Result<()> {
 
     // Without reranking
     let no_rerank_query = SearchQuery::new(query).max_results(5).no_rerank();
-    let no_rerank_results = searcher.search(&no_rerank_query)?;
+    let no_rerank_results = searcher.search(&no_rerank_query)?.results;
 
     // With reranking
     let rerank_query = SearchQuery::new(query).max_results(5);
-    let rerank_results = searcher.search(&rerank_query)?;
+    let rerank_results = searcher.search(&rerank_query)?.results;
 
     assert!(!no_rerank_results.is_empty());
     assert!(!rerank_results.is_empty());
@@ -1066,7 +1068,7 @@ fn test_edge_case_empty_query() -> Result<()> {
 
     // Should either return empty results or error gracefully
     match results {
-        Ok(res) => assert!(res.is_empty(), "Empty query should return no results"),
+        Ok(out) => assert!(out.results.is_empty(), "Empty query should return no results"),
         Err(_) => println!("Empty query errored (acceptable)"),
     }
 
@@ -1075,8 +1077,8 @@ fn test_edge_case_empty_query() -> Result<()> {
     let results = searcher.search(&whitespace_query);
 
     match results {
-        Ok(res) => assert!(
-            res.is_empty() || res.len() < 5,
+        Ok(out) => assert!(
+            out.results.is_empty() || out.results.len() < 5,
             "Whitespace query should return few or no results"
         ),
         Err(_) => println!("Whitespace query errored (acceptable)"),

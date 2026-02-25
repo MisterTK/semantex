@@ -1,3 +1,4 @@
+use crate::search::SearchMetrics;
 use serde::{Deserialize, Serialize};
 
 /// Magic byte prefix to distinguish binary (bincode) from JSON protocol.
@@ -69,6 +70,8 @@ pub struct SearchResponse {
     pub dense_count: usize,
     pub sparse_count: usize,
     pub fused_count: usize,
+    #[serde(default)]
+    pub metrics: Option<SearchMetrics>,
 }
 
 /// A single result item in the response

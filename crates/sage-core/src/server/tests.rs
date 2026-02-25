@@ -106,6 +106,7 @@ mod tests {
             dense_count: 20,
             sparse_count: 20,
             fused_count: 28,
+            metrics: None,
         });
 
         let json = serde_json::to_string(&response).unwrap();
@@ -212,6 +213,7 @@ mod tests {
             dense_count: 0,
             sparse_count: 0,
             fused_count: 0,
+            metrics: None,
         });
         let response_line = format!("{}\n", serde_json::to_string(&response).unwrap());
 
@@ -317,6 +319,7 @@ mod tests {
             dense_count: 20,
             sparse_count: 15,
             fused_count: 28,
+            metrics: None,
         });
 
         let encoded = encode_binary_response(&resp);
@@ -427,6 +430,7 @@ mod tests {
             dense_count: 0,
             sparse_count: 0,
             fused_count: 0,
+            metrics: None,
         });
         let bin: BinaryResponse = resp.into();
         assert!(matches!(bin, BinaryResponse::Search(_)));
@@ -495,6 +499,7 @@ mod tests {
             dense_count: 10,
             sparse_count: 5,
             fused_count: 12,
+            metrics: None,
         });
 
         let encoded = encode_binary_response(&resp);
@@ -556,6 +561,7 @@ mod tests {
             dense_count: 5,
             sparse_count: 5,
             fused_count: 8,
+            metrics: None,
         });
         let wire_response = encode_binary_response(&server_resp);
 

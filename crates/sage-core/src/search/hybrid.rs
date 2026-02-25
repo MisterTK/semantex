@@ -156,7 +156,7 @@ impl HybridSearcher {
         use_rerank = query.use_rerank,
         grep_mode = query.grep_mode,
     ))]
-    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+    pub fn search(&self, query: &SearchQuery) -> Result<super::SearchOutput> {
         let search_start = std::time::Instant::now();
 
         // Grep-mode: fast path with simplified exact+sparse fusion
@@ -214,90 +214,97 @@ impl HybridSearcher {
         let symbol_exact_hits: Vec<ScoredChunkId> = Vec::new();
 
         // Stage 1: Candidate retrieval — run dense, sparse, and exact in parallel
-        let (dense_results, sparse_results, exact_ids) = std::thread::scope(|s| {
-            let dense_handle = s.spawn(|| -> Vec<ScoredChunkId> {
-                if !query.use_dense {
-                    return Vec::new();
-                }
-                let dense_start = std::time::Instant::now();
-                if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
-                    match plaid.search(colbert, &effective_text, retrieval_candidates) {
-                        Ok(results) => {
-                            tracing::debug!(
-                                results_count = results.len(),
-                                duration_ms = dense_start.elapsed().as_millis() as u64,
-                                "PLAID (ColBERT) search complete"
-                            );
-                            results
-                        }
-                        Err(e) => {
-                            tracing::warn!("PLAID search failed: {}", e);
-                            Vec::new()
-                        }
+        let (dense_results, sparse_results, exact_ids, dense_ms, sparse_ms, exact_ms) =
+            std::thread::scope(|s| {
+                let dense_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
+                    if !query.use_dense {
+                        return (Vec::new(), 0);
                     }
-                } else {
-                    Vec::new()
-                }
-            });
+                    let dense_start = std::time::Instant::now();
+                    let results =
+                        if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                            match plaid.search(colbert, &effective_text, retrieval_candidates) {
+                                Ok(results) => {
+                                    tracing::debug!(
+                                        results_count = results.len(),
+                                        duration_ms = dense_start.elapsed().as_millis() as u64,
+                                        "PLAID (ColBERT) search complete"
+                                    );
+                                    results
+                                }
+                                Err(e) => {
+                                    tracing::warn!("PLAID search failed: {}", e);
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                    (results, dense_start.elapsed().as_millis() as u64)
+                });
 
-            let sparse_handle = s.spawn(|| -> Vec<ScoredChunkId> {
-                if !query.use_sparse {
-                    return Vec::new();
-                }
-                let sparse_start = std::time::Instant::now();
-                if let Some(ref sparse) = self.sparse {
-                    let safe_query = sanitize_tantivy_query(&effective_text);
-                    let mut results = sparse
-                        .search(&safe_query, retrieval_candidates)
-                        .unwrap_or_default();
-                    tracing::debug!(
-                        results_count = results.len(),
-                        duration_ms = sparse_start.elapsed().as_millis() as u64,
-                        "Sparse search complete"
-                    );
+                let sparse_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
+                    if !query.use_sparse {
+                        return (Vec::new(), 0);
+                    }
+                    let sparse_start = std::time::Instant::now();
+                    let results = if let Some(ref sparse) = self.sparse {
+                        let safe_query = sanitize_tantivy_query(&effective_text);
+                        let mut results = sparse
+                            .search(&safe_query, retrieval_candidates)
+                            .unwrap_or_default();
+                        tracing::debug!(
+                            results_count = results.len(),
+                            duration_ms = sparse_start.elapsed().as_millis() as u64,
+                            "Sparse search complete"
+                        );
 
-                    #[allow(clippy::collapsible_if)]
-                    if matches!(query_type, QueryType::Semantic | QueryType::Mixed) {
-                        if let Some(expanded) = query_expander::expand_query(&effective_text) {
-                            let safe_expanded = sanitize_tantivy_query(&expanded);
-                            if let Ok(expanded_results) =
-                                sparse.search(&safe_expanded, retrieval_candidates)
-                            {
-                                tracing::debug!(
-                                    expanded_count = expanded_results.len(),
-                                    "Dual-route BM25 expansion"
-                                );
-                                results = dual_route_fuse(&results, &expanded_results, 1.0, 0.5);
+                        #[allow(clippy::collapsible_if)]
+                        if matches!(query_type, QueryType::Semantic | QueryType::Mixed) {
+                            if let Some(expanded) = query_expander::expand_query(&effective_text) {
+                                let safe_expanded = sanitize_tantivy_query(&expanded);
+                                if let Ok(expanded_results) =
+                                    sparse.search(&safe_expanded, retrieval_candidates)
+                                {
+                                    tracing::debug!(
+                                        expanded_count = expanded_results.len(),
+                                        "Dual-route BM25 expansion"
+                                    );
+                                    results =
+                                        dual_route_fuse(&results, &expanded_results, 1.0, 0.5);
+                                }
                             }
                         }
-                    }
 
-                    results
-                } else {
-                    Vec::new()
-                }
+                        results
+                    } else {
+                        Vec::new()
+                    };
+                    (results, sparse_start.elapsed().as_millis() as u64)
+                });
+
+                let exact_handle = s.spawn(|| -> (Vec<u64>, u64) {
+                    let exact_start = std::time::Instant::now();
+                    let store = self.store.lock();
+                    let ids = store
+                        .search_exact(&effective_text, retrieval_candidates)
+                        .unwrap_or_default();
+                    tracing::debug!(
+                        results_count = ids.len(),
+                        duration_ms = exact_start.elapsed().as_millis() as u64,
+                        "Exact substring search complete (SQLite)"
+                    );
+                    (ids, exact_start.elapsed().as_millis() as u64)
+                });
+
+                let (dense_results, d_ms) =
+                    dense_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+                let (sparse_results, s_ms) =
+                    sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+                let (exact_ids, e_ms) = exact_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+
+                (dense_results, sparse_results, exact_ids, d_ms, s_ms, e_ms)
             });
-
-            let exact_handle = s.spawn(|| -> Vec<u64> {
-                let exact_start = std::time::Instant::now();
-                let store = self.store.lock();
-                let ids = store
-                    .search_exact(&effective_text, retrieval_candidates)
-                    .unwrap_or_default();
-                tracing::debug!(
-                    results_count = ids.len(),
-                    duration_ms = exact_start.elapsed().as_millis() as u64,
-                    "Exact substring search complete (SQLite)"
-                );
-                ids
-            });
-
-            let dense_results = dense_handle.join().unwrap_or_else(|_| Vec::new());
-            let sparse_results = sparse_handle.join().unwrap_or_else(|_| Vec::new());
-            let exact_ids = exact_handle.join().unwrap_or_else(|_| Vec::new());
-
-            (dense_results, sparse_results, exact_ids)
-        });
 
         // Stage 2: Query-adaptive weighted Triple CC Fusion
         let fusion_start = std::time::Instant::now();
@@ -307,6 +314,10 @@ impl HybridSearcher {
             ?triple_weights,
             "Query classified (triple fusion)"
         );
+
+        let dense_count = dense_results.len();
+        let sparse_count = sparse_results.len();
+        let exact_count = exact_ids.len();
 
         let has_any_results =
             !dense_results.is_empty() || !sparse_results.is_empty() || !exact_ids.is_empty();
@@ -328,6 +339,7 @@ impl HybridSearcher {
         } else {
             Vec::new()
         };
+        let fusion_ms = fusion_start.elapsed().as_millis() as u64;
 
         if fused.is_empty() && symbol_exact_hits.is_empty() {
             tracing::info!(
@@ -335,7 +347,24 @@ impl HybridSearcher {
                 duration_ms = search_start.elapsed().as_millis() as u64,
                 "Search completed with no results"
             );
-            return Ok(Vec::new());
+            return Ok(super::SearchOutput {
+                results: Vec::new(),
+                metrics: super::SearchMetrics {
+                    total_ms: search_start.elapsed().as_millis() as u64,
+                    dense_ms: if query.use_dense { Some(dense_ms) } else { None },
+                    sparse_ms: if query.use_sparse { Some(sparse_ms) } else { None },
+                    exact_ms: Some(exact_ms),
+                    fusion_ms: Some(fusion_ms),
+                    rerank_ms: None,
+                    dense_count,
+                    sparse_count,
+                    exact_count,
+                    fused_count: 0,
+                    result_count: 0,
+                    query_type: format!("{query_type:?}"),
+                    response_bytes: None,
+                },
+            });
         }
 
         // Merge symbol exact hits (Phase 6) into fused results.
@@ -659,6 +688,7 @@ impl HybridSearcher {
         }
 
         // Stage 3: Cross-encoder reranking with fastembed (lazy-loaded on first use)
+        let mut rerank_ms: Option<u64> = None;
         if query.use_rerank && self.config.rerank {
             let rerank_start = std::time::Instant::now();
             let mut reranker_guard = self.reranker.lock();
@@ -700,6 +730,7 @@ impl HybridSearcher {
                         .collect();
                 }
             }
+            rerank_ms = Some(rerank_start.elapsed().as_millis() as u64);
         }
 
         // Stage 4: Adaptive result sizing, confidence threshold, and deduplication
@@ -720,6 +751,7 @@ impl HybridSearcher {
             );
         }
 
+        let fused_count = fused.len();
         let total_duration = search_start.elapsed();
         tracing::info!(
             query = %query.text,
@@ -728,7 +760,24 @@ impl HybridSearcher {
             "Search completed successfully"
         );
 
-        Ok(results)
+        Ok(super::SearchOutput {
+            metrics: super::SearchMetrics {
+                total_ms: total_duration.as_millis() as u64,
+                dense_ms: if query.use_dense { Some(dense_ms) } else { None },
+                sparse_ms: if query.use_sparse { Some(sparse_ms) } else { None },
+                exact_ms: Some(exact_ms),
+                fusion_ms: Some(fusion_ms),
+                rerank_ms,
+                dense_count,
+                sparse_count,
+                exact_count,
+                fused_count,
+                result_count: results.len(),
+                query_type: format!("{query_type:?}"),
+                response_bytes: None,
+            },
+            results,
+        })
     }
 
     /// Grep-mode search: exact + sparse only, no dense, no rerank, no adaptive filtering.
@@ -737,13 +786,13 @@ impl HybridSearcher {
         &self,
         query: &SearchQuery,
         search_start: std::time::Instant,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<super::SearchOutput> {
         // Fetch more candidates in grep mode for exhaustive results
         let fetch_limit = query.max_results * 3;
 
         // Run sparse and exact in parallel
-        let (sparse_results, exact_ids) = std::thread::scope(|s| {
-            let sparse_handle = s.spawn(|| -> Vec<ScoredChunkId> {
+        let (sparse_results, exact_ids, sparse_ms, exact_ms) = std::thread::scope(|s| {
+            let sparse_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
                 if let Some(ref sparse) = self.sparse {
                     let safe_query = sanitize_tantivy_query(&query.text);
                     let sparse_start = std::time::Instant::now();
@@ -753,13 +802,13 @@ impl HybridSearcher {
                         duration_ms = sparse_start.elapsed().as_millis() as u64,
                         "Grep-mode sparse search complete"
                     );
-                    results
+                    (results, sparse_start.elapsed().as_millis() as u64)
                 } else {
-                    Vec::new()
+                    (Vec::new(), 0)
                 }
             });
 
-            let exact_handle = s.spawn(|| -> Vec<u64> {
+            let exact_handle = s.spawn(|| -> (Vec<u64>, u64) {
                 let exact_start = std::time::Instant::now();
                 let store = self.store.lock();
                 let ids = store
@@ -770,23 +819,28 @@ impl HybridSearcher {
                     duration_ms = exact_start.elapsed().as_millis() as u64,
                     "Grep-mode exact search complete (SQLite)"
                 );
-                ids
+                (ids, exact_start.elapsed().as_millis() as u64)
             });
 
-            let sparse_results = sparse_handle.join().unwrap_or_else(|_| Vec::new());
-            let exact_ids = exact_handle.join().unwrap_or_else(|_| Vec::new());
+            let (sparse_results, s_ms) =
+                sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+            let (exact_ids, e_ms) = exact_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
 
-            (sparse_results, exact_ids)
+            (sparse_results, exact_ids, s_ms, e_ms)
         });
+
+        let sparse_count = sparse_results.len();
+        let exact_count = exact_ids.len();
 
         // Grep-mode fusion: exact first, then sparse, deduplicated
         let fusion_start = std::time::Instant::now();
         let fused = grep_mode_fuse(&sparse_results, &exact_ids);
+        let fusion_ms = fusion_start.elapsed().as_millis() as u64;
         tracing::debug!(
             fused_count = fused.len(),
             exact_count = exact_ids.len(),
             sparse_count = sparse_results.len(),
-            duration_ms = fusion_start.elapsed().as_millis() as u64,
+            duration_ms = fusion_ms,
             "Grep-mode fusion complete"
         );
 
@@ -796,7 +850,24 @@ impl HybridSearcher {
                 duration_ms = search_start.elapsed().as_millis() as u64,
                 "Grep-mode search completed with no results"
             );
-            return Ok(Vec::new());
+            return Ok(super::SearchOutput {
+                results: Vec::new(),
+                metrics: super::SearchMetrics {
+                    total_ms: search_start.elapsed().as_millis() as u64,
+                    dense_ms: None,
+                    sparse_ms: Some(sparse_ms),
+                    exact_ms: Some(exact_ms),
+                    fusion_ms: Some(fusion_ms),
+                    rerank_ms: None,
+                    dense_count: 0,
+                    sparse_count,
+                    exact_count,
+                    fused_count: 0,
+                    result_count: 0,
+                    query_type: "GrepMode".to_string(),
+                    response_bytes: None,
+                },
+            });
         }
 
         // Fetch chunks from storage
@@ -841,6 +912,7 @@ impl HybridSearcher {
         // Grep mode: exhaustive matching — just truncate to max_results, no adaptive filtering
         results.truncate(query.max_results);
 
+        let fused_count = fused.len();
         let total_duration = search_start.elapsed();
         tracing::info!(
             query = %query.text,
@@ -849,7 +921,24 @@ impl HybridSearcher {
             "Grep-mode search completed"
         );
 
-        Ok(results)
+        Ok(super::SearchOutput {
+            metrics: super::SearchMetrics {
+                total_ms: total_duration.as_millis() as u64,
+                dense_ms: None,
+                sparse_ms: Some(sparse_ms),
+                exact_ms: Some(exact_ms),
+                fusion_ms: Some(fusion_ms),
+                rerank_ms: None,
+                dense_count: 0,
+                sparse_count,
+                exact_count,
+                fused_count,
+                result_count: results.len(),
+                query_type: "GrepMode".to_string(),
+                response_bytes: None,
+            },
+            results,
+        })
     }
 }
 

@@ -222,6 +222,9 @@ pub fn daemon_search(
             .get("fused_count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize,
+        metrics: response
+            .get("metrics")
+            .and_then(|m| serde_json::from_value(m.clone()).ok()),
     })
 }
 

@@ -64,11 +64,13 @@ impl<'a> Handler<'a> {
         }
 
         match self.searcher.search(&query) {
-            Ok(results) => {
+            Ok(output) => {
                 self.search_count.fetch_add(1, Ordering::Relaxed);
                 let duration_ms = start.elapsed().as_millis() as u64;
+                let metrics = output.metrics;
 
-                let items: Vec<SearchResultItem> = results
+                let items: Vec<SearchResultItem> = output
+                    .results
                     .iter()
                     .map(|r| {
                         let (chunk_type_str, name, language) = match &r.chunk.chunk_type {
@@ -113,9 +115,10 @@ impl<'a> Handler<'a> {
                 Response::Search(SearchResponse {
                     results: items,
                     duration_ms,
-                    dense_count: 0,
-                    sparse_count: 0,
-                    fused_count: 0,
+                    dense_count: metrics.dense_count,
+                    sparse_count: metrics.sparse_count,
+                    fused_count: metrics.fused_count,
+                    metrics: Some(metrics),
                 })
             }
             Err(e) => Response::Error(ErrorResponse {

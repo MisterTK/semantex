@@ -178,6 +178,10 @@ pub fn run_via_binary_daemon(opts: &SearchOpts, port: u16) -> Result<()> {
         print_results_daemon(&response.results, opts)?;
     }
 
+    if let Some(ref m) = response.metrics {
+        print_metrics_stderr(m);
+    }
+
     Ok(())
 }
 
@@ -224,6 +228,10 @@ fn run_via_daemon(opts: &SearchOpts, project_path: &std::path::Path) -> Result<(
         print_json_daemon(&response.results)?;
     } else {
         print_results_daemon(&response.results, opts)?;
+    }
+
+    if let Some(ref m) = response.metrics {
+        print_metrics_stderr(m);
     }
 
     Ok(())
@@ -290,7 +298,8 @@ fn run_with_searcher(
         query = query.regex_pattern(opts.pattern.clone());
     }
 
-    let results = searcher.search(&query)?;
+    let output = searcher.search(&query)?;
+    let results = output.results;
 
     if results.is_empty() {
         if opts.grep {
@@ -314,6 +323,8 @@ fn run_with_searcher(
     } else {
         print_results(&results, opts, project_path)?;
     }
+
+    print_metrics_stderr(&output.metrics);
 
     Ok(())
 }
@@ -534,6 +545,24 @@ fn print_grep(results: &[SearchResult]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// --- Metrics printer (shared by direct + daemon paths) ---
+
+fn print_metrics_stderr(m: &sage_core::search::SearchMetrics) {
+    let mut parts = vec![format!("{}ms total", m.total_ms)];
+    if let Some(ms) = m.dense_ms {
+        parts.push(format!("{ms}ms dense"));
+    }
+    if let Some(ms) = m.sparse_ms {
+        parts.push(format!("{ms}ms sparse"));
+    }
+    if let Some(ms) = m.rerank_ms {
+        parts.push(format!("{ms}ms rerank"));
+    }
+    parts.push(format!("{} results", m.result_count));
+    parts.push(format!("[{}]", m.query_type));
+    eprintln!("{}", parts.join(" | "));
 }
 
 // --- Daemon response printers ---

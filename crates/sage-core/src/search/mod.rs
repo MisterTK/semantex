@@ -13,6 +13,37 @@ pub mod triple_fusion;
 
 use crate::types::{FileFilter, SearchResult};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+/// Measured performance metrics from a single search invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMetrics {
+    pub total_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_ms: Option<u64>,
+    pub dense_count: usize,
+    pub sparse_count: usize,
+    pub exact_count: usize,
+    pub fused_count: usize,
+    pub result_count: usize,
+    pub query_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_bytes: Option<usize>,
+}
+
+/// Search results bundled with performance metrics.
+pub struct SearchOutput {
+    pub results: Vec<SearchResult>,
+    pub metrics: SearchMetrics,
+}
 
 /// Search configuration for a single query
 #[derive(Debug, Clone)]

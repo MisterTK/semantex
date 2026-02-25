@@ -400,7 +400,7 @@ impl McpServer {
     ) -> Result<String> {
         let index_dir = SageConfig::project_index_dir(path);
 
-        let results = if grep_mode {
+        let search_output = if grep_mode {
             let searcher = HybridSearcher::open_sparse_only(&index_dir, &self.config)?;
             let sq = SearchQuery::new(query).grep_mode();
             searcher.search(&sq)?
@@ -413,7 +413,8 @@ impl McpServer {
             cached.searcher.search(&sq)?
         };
 
-        let output: Vec<serde_json::Value> = results
+        let json_results: Vec<serde_json::Value> = search_output
+            .results
             .iter()
             .map(|r| {
                 serde_json::json!({
@@ -426,7 +427,11 @@ impl McpServer {
             })
             .collect();
 
-        Ok(serde_json::to_string_pretty(&output)?)
+        let json_text = serde_json::to_string_pretty(&json_results)?;
+        let response_bytes = json_text.len();
+        let metrics = search_output.metrics;
+        let footer = format_metrics_footer(&metrics, response_bytes);
+        Ok(format!("{json_text}\n\n{footer}"))
     }
 
     /// Fall back to ripgrep for keyword search while the index builds.
@@ -576,4 +581,30 @@ impl McpServer {
 
         Ok(status.join("\n"))
     }
+}
+
+/// Format a compact metrics footer for MCP responses.
+fn format_metrics_footer(metrics: &sage_core::search::SearchMetrics, response_bytes: usize) -> String {
+    let mut parts = vec![
+        format!("total_ms={}", metrics.total_ms),
+    ];
+    if let Some(ms) = metrics.dense_ms {
+        parts.push(format!("dense_ms={ms}"));
+    }
+    if let Some(ms) = metrics.sparse_ms {
+        parts.push(format!("sparse_ms={ms}"));
+    }
+    if let Some(ms) = metrics.exact_ms {
+        parts.push(format!("exact_ms={ms}"));
+    }
+    if let Some(ms) = metrics.fusion_ms {
+        parts.push(format!("fusion_ms={ms}"));
+    }
+    if let Some(ms) = metrics.rerank_ms {
+        parts.push(format!("rerank_ms={ms}"));
+    }
+    parts.push(format!("results={}", metrics.result_count));
+    parts.push(format!("query_type={}", metrics.query_type));
+    parts.push(format!("response_bytes={response_bytes}"));
+    format!("[sage_metrics: {}]", parts.join(" "))
 }
