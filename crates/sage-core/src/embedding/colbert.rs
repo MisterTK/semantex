@@ -37,6 +37,7 @@ impl ColbertEmbedder {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
 
+        #[allow(unused_mut)]
         let mut builder = Colbert::builder(model_dir)
             .with_quantized(true)
             .with_threads(threads);
