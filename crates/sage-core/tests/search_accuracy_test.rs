@@ -1068,7 +1068,10 @@ fn test_edge_case_empty_query() -> Result<()> {
 
     // Should either return empty results or error gracefully
     match results {
-        Ok(out) => assert!(out.results.is_empty(), "Empty query should return no results"),
+        Ok(out) => assert!(
+            out.results.is_empty(),
+            "Empty query should return no results"
+        ),
         Err(_) => println!("Empty query errored (acceptable)"),
     }
 

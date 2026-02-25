@@ -221,25 +221,25 @@ impl HybridSearcher {
                         return (Vec::new(), 0);
                     }
                     let dense_start = std::time::Instant::now();
-                    let results =
-                        if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
-                            match plaid.search(colbert, &effective_text, retrieval_candidates) {
-                                Ok(results) => {
-                                    tracing::debug!(
-                                        results_count = results.len(),
-                                        duration_ms = dense_start.elapsed().as_millis() as u64,
-                                        "PLAID (ColBERT) search complete"
-                                    );
-                                    results
-                                }
-                                Err(e) => {
-                                    tracing::warn!("PLAID search failed: {}", e);
-                                    Vec::new()
-                                }
+                    let results = if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert)
+                    {
+                        match plaid.search(colbert, &effective_text, retrieval_candidates) {
+                            Ok(results) => {
+                                tracing::debug!(
+                                    results_count = results.len(),
+                                    duration_ms = dense_start.elapsed().as_millis() as u64,
+                                    "PLAID (ColBERT) search complete"
+                                );
+                                results
                             }
-                        } else {
-                            Vec::new()
-                        };
+                            Err(e) => {
+                                tracing::warn!("PLAID search failed: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     (results, dense_start.elapsed().as_millis() as u64)
                 });
 
@@ -297,8 +297,7 @@ impl HybridSearcher {
                     (ids, exact_start.elapsed().as_millis() as u64)
                 });
 
-                let (dense_results, d_ms) =
-                    dense_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+                let (dense_results, d_ms) = dense_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
                 let (sparse_results, s_ms) =
                     sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
                 let (exact_ids, e_ms) = exact_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
@@ -351,8 +350,16 @@ impl HybridSearcher {
                 results: Vec::new(),
                 metrics: super::SearchMetrics {
                     total_ms: search_start.elapsed().as_millis() as u64,
-                    dense_ms: if query.use_dense { Some(dense_ms) } else { None },
-                    sparse_ms: if query.use_sparse { Some(sparse_ms) } else { None },
+                    dense_ms: if query.use_dense {
+                        Some(dense_ms)
+                    } else {
+                        None
+                    },
+                    sparse_ms: if query.use_sparse {
+                        Some(sparse_ms)
+                    } else {
+                        None
+                    },
                     exact_ms: Some(exact_ms),
                     fusion_ms: Some(fusion_ms),
                     rerank_ms: None,
@@ -763,8 +770,16 @@ impl HybridSearcher {
         Ok(super::SearchOutput {
             metrics: super::SearchMetrics {
                 total_ms: total_duration.as_millis() as u64,
-                dense_ms: if query.use_dense { Some(dense_ms) } else { None },
-                sparse_ms: if query.use_sparse { Some(sparse_ms) } else { None },
+                dense_ms: if query.use_dense {
+                    Some(dense_ms)
+                } else {
+                    None
+                },
+                sparse_ms: if query.use_sparse {
+                    Some(sparse_ms)
+                } else {
+                    None
+                },
                 exact_ms: Some(exact_ms),
                 fusion_ms: Some(fusion_ms),
                 rerank_ms,
@@ -822,8 +837,7 @@ impl HybridSearcher {
                 (ids, exact_start.elapsed().as_millis() as u64)
             });
 
-            let (sparse_results, s_ms) =
-                sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+            let (sparse_results, s_ms) = sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
             let (exact_ids, e_ms) = exact_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
 
             (sparse_results, exact_ids, s_ms, e_ms)

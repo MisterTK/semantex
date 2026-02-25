@@ -584,10 +584,11 @@ impl McpServer {
 }
 
 /// Format a compact metrics footer for MCP responses.
-fn format_metrics_footer(metrics: &sage_core::search::SearchMetrics, response_bytes: usize) -> String {
-    let mut parts = vec![
-        format!("total_ms={}", metrics.total_ms),
-    ];
+fn format_metrics_footer(
+    metrics: &sage_core::search::SearchMetrics,
+    response_bytes: usize,
+) -> String {
+    let mut parts = vec![format!("total_ms={}", metrics.total_ms)];
     if let Some(ms) = metrics.dense_ms {
         parts.push(format!("dense_ms={ms}"));
     }

@@ -1,4 +1,4 @@
-# sage — Semantic Code Search
+# sage — **S**emantic-**A**ware **G**rep **E**ngine
 
 **Hybrid dense+sparse code search with ColBERT late interaction and BM25**
 
@@ -280,7 +280,7 @@ On a 30-query benchmark (8 exact, 14 semantic, 8 architectural):
 ### Building from Source
 
 ```bash
-git clone https://github.com/tk/sage.git
+git clone https://github.com/MisterTK/sage.git
 cd sage
 cargo build --release
 ```
