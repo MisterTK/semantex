@@ -28,6 +28,7 @@ impl FastembedReranker {
     /// CoreML allocates ~10 GB of persistent ANE/compilation buffers on first
     /// inference, which OOMs machines when the daemon is running. CPU-only
     /// execution uses ~50–200 MB and is safe for always-on daemons.
+    #[allow(clippy::vec_init_then_push)] // conditional pushes based on platform/feature flags
     fn configure_execution_providers() -> Vec<ort::ep::ExecutionProviderDispatch> {
         let mut providers = Vec::new();
 
