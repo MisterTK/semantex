@@ -25,8 +25,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-            cross: true
+            os: ubuntu-24.04-arm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
 
@@ -42,16 +41,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Build (native)
-        if: "!matrix.cross"
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Determine archive name
@@ -70,7 +60,6 @@ jobs:
           archive="${{ steps.archive.outputs.name }}"
           mkdir -p "${archive}"
           cp "target/${{ matrix.target }}/release/sage" "${archive}/"
-          # Bundle ONNX Runtime dylib if present alongside binary
           for lib in target/${{ matrix.target }}/release/libonnxruntime*.{dylib,so}; do
             [ -f "$lib" ] && cp "$lib" "${archive}/"
           done
@@ -84,13 +73,12 @@ jobs:
         run: |
           archive="${{ steps.archive.outputs.name }}"
           binary="${archive}/sage"
-          # Point to ONNX Runtime dylib co-located with the binary
           for lib in "${archive}"/libonnxruntime*.dylib; do
             [ -f "$lib" ] && install_name_tool -add_rpath @executable_path "$binary" 2>/dev/null || true
           done
 
       - name: Fix Linux rpath
-        if: runner.os == 'Linux' && !matrix.cross
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           archive="${{ steps.archive.outputs.name }}"
@@ -106,7 +94,6 @@ jobs:
           $archive = "${{ steps.archive.outputs.name }}"
           New-Item -ItemType Directory -Force -Path $archive
           Copy-Item "target/${{ matrix.target }}/release/sage.exe" "$archive/"
-          # Bundle ONNX Runtime DLL if present
           Get-ChildItem "target/${{ matrix.target }}/release/onnxruntime*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "$archive/"
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$archive/" }
           if (Test-Path "README.md") { Copy-Item "README.md" "$archive/" }
