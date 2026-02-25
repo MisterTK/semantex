@@ -67,9 +67,10 @@ sage uses a multi-stage search pipeline:
 curl -fsSL https://raw.githubusercontent.com/MisterTK/sage/main/install.sh | sh
 ```
 
-**Cargo binstall** (prebuilt binary via cargo):
+**Cargo binstall** (prebuilt binary via cargo, requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)):
 
 ```bash
+cargo install cargo-binstall  # one-time setup
 cargo binstall sage-cli
 ```
 
