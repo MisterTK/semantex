@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.91"
-repository = "https://github.com/tk/sage"
-homepage = "https://github.com/tk/sage"
+repository = "https://github.com/MisterTK/sage"
+homepage = "https://github.com/MisterTK/sage"
 description = "Semantic code search — hybrid ColBERT + BM25 retrieval engine"
 
 [workspace.dependencies]

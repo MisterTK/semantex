@@ -59,6 +59,28 @@ sage uses a multi-stage search pipeline:
 - **Unix domain socket daemon**: Persistent server for low-latency repeated queries
 - **MCP server**: Model Context Protocol integration for AI coding assistants
 
+## Installation
+
+**Shell installer** (macOS / Linux — downloads prebuilt binary):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MisterTK/sage/main/install.sh | sh
+```
+
+**Cargo binstall** (prebuilt binary via cargo):
+
+```bash
+cargo binstall sage-cli
+```
+
+**Build from source** (requires Rust 1.91+):
+
+```bash
+git clone https://github.com/MisterTK/sage.git
+cd sage
+cargo install --path crates/sage-cli
+```
+
 ## Getting Started
 
 ### Claude Code (Recommended)
@@ -66,13 +88,10 @@ sage uses a multi-stage search pipeline:
 sage integrates with Claude Code via hooks that automatically make sage the default search tool. No manual configuration needed.
 
 ```bash
-# 1. Install the sage binary
-cargo install --path crates/sage-cli
-
-# 2. Install hooks into Claude Code (fully automated)
+# 1. Install hooks into Claude Code (fully automated)
 sage install-claude-code
 
-# 3. Restart Claude Code — sage is now active
+# 2. Restart Claude Code — sage is now active
 ```
 
 That's it. sage auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer sage over Grep/Glob. No manual indexing step required.
@@ -104,9 +123,6 @@ sage install-open-code   # OpenCode
 sage works as a standalone CLI tool without any AI editor:
 
 ```bash
-# Install from source
-cargo install --path crates/sage-cli
-
 # Index your project (or let sage auto-index on first search)
 sage index /path/to/your/project
 

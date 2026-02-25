@@ -1,9 +1,9 @@
 #!/bin/sh
 # sage installer — downloads pre-built binary from GitHub Releases
-# Usage: curl -fsSL https://raw.githubusercontent.com/tk/sage/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/MisterTK/sage/main/install.sh | sh
 set -eu
 
-REPO="tk/sage"
+REPO="MisterTK/sage"
 INSTALL_DIR="${SAGE_INSTALL_DIR:-$HOME/.sage/bin}"
 
 info() { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
