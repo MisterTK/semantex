@@ -22,10 +22,12 @@ tracing-subscriber.workspace = true
 
 clap = { version = "4", features = ["derive", "env"] }
 colored = "3"
-libc = "0.2"
 bincode = { workspace = true }
 dirs = "6"
 mimalloc = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["mcp"]

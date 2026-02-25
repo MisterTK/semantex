@@ -10,7 +10,7 @@ fn sage_binary_path() -> Result<String> {
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 /// Install sage hooks into Claude Code's settings.

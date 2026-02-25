@@ -1,30 +1,28 @@
 use anyhow::{Context, Result};
 use sage_core::server::protocol::{self, BINARY_MAGIC, BinaryRequest, BinaryResponse};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
-
-/// Directory under $HOME for persistent client state.
-const SAGE_DIR: &str = ".sage";
 
 /// PID file name for the persistent client process.
 const CLIENT_PID_FILE: &str = "client.pid";
 
-/// A persistent client that maintains a long-lived UDS connection to the
+/// A persistent client that maintains a long-lived TCP connection to the
 /// sage daemon. Eliminates per-query connection overhead and uses the
 /// binary (bincode) protocol for minimal serialization cost.
 pub struct PersistentClient {
-    stream: UnixStream,
+    stream: TcpStream,
     /// Pre-allocated read buffer
     read_buf: Vec<u8>,
 }
 
 impl PersistentClient {
-    /// Connect to the daemon at the given socket path.
-    pub fn connect(socket_path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path)
-            .with_context(|| format!("Failed to connect to daemon at {}", socket_path.display()))?;
+    /// Connect to the daemon at the given TCP port.
+    pub fn connect(port: u16) -> Result<Self> {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
 
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -71,10 +69,9 @@ impl PersistentClient {
 
 // --- PID file management ---
 
-/// Path to the sage state directory: ~/.sage/
+/// Path to the sage state directory: ~/.sage/ (cross-platform)
 pub fn sage_home() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(SAGE_DIR))
+    Ok(sage_core::config::SageConfig::sage_home())
 }
 
 /// Path to the persistent client PID file: ~/.sage/client.pid
@@ -90,16 +87,14 @@ pub fn write_client_pid() -> Result<()> {
     Ok(())
 }
 
-/// Check if a persistent client process is running. Returns the PID if alive.
+/// Check if a persistent client process is running. Returns the PID if the
+/// PID file exists and the process appears to be alive.
 pub fn client_alive() -> Option<u32> {
     let path = client_pid_path().ok()?;
     let pid_str = std::fs::read_to_string(&path).ok()?;
     let pid: u32 = pid_str.trim().parse().ok()?;
 
-    // SAFETY: libc::kill with signal 0 is a read-only check for process existence.
-    // The PID comes from our own PID file, not external input.
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-    if alive {
+    if process_exists(pid) {
         Some(pid)
     } else {
         // Stale PID file, clean up
@@ -108,19 +103,38 @@ pub fn client_alive() -> Option<u32> {
     }
 }
 
-/// Stop the persistent client by sending SIGTERM to the PID in the PID file.
+/// Check whether a process with the given PID exists (cross-platform).
+fn process_exists(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 is a read-only existence check.
+        // The PID comes from our own PID file, not external input.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        // Attempt to open the process with PROCESS_QUERY_LIMITED_INFORMATION
+        use std::process::Command;
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        // Cannot check process existence on this platform — assume alive
+        true
+    }
+}
+
+/// Stop the persistent client by cleaning up the PID file.
+/// The daemon itself is stopped via `sage stop`.
 pub fn stop_client() -> Result<bool> {
     let path = client_pid_path()?;
     if !path.exists() {
         return Ok(false);
     }
-
-    let pid_str = std::fs::read_to_string(&path)?;
-    let pid: u32 = pid_str.trim().parse().context("Invalid PID")?;
-
-    // SAFETY: Sends SIGTERM to a process we own (PID from our PID file).
-    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     let _ = std::fs::remove_file(&path);
-
-    Ok(result == 0)
+    Ok(true)
 }

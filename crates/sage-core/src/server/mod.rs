@@ -9,7 +9,7 @@ use crate::search::hybrid::HybridSearcher;
 use anyhow::{Context, Result};
 use listener::Listener;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -44,9 +44,9 @@ impl SageServer {
         self
     }
 
-    /// Get the socket path for this server
-    pub fn socket_path(&self) -> PathBuf {
-        self.index_dir.join("sage.sock")
+    /// Get the port file path for this server
+    pub fn port_file_path(&self) -> PathBuf {
+        self.index_dir.join("sage.port")
     }
 
     /// Get the PID file path
@@ -80,7 +80,7 @@ impl SageServer {
 
         // Start listening
         let listener = Listener::bind(
-            &self.socket_path(),
+            &self.port_file_path(),
             searcher,
             self.idle_timeout,
             self.shutdown.clone(),
@@ -100,38 +100,54 @@ impl SageServer {
     }
 }
 
-/// Install SIGINT/SIGTERM handler that sets the shutdown flag
-#[allow(clippy::needless_pass_by_value)] // Arc cloned inside for signal_hook::flag::register
+/// Install Ctrl-C / SIGTERM handler that sets the shutdown flag (cross-platform)
+#[allow(clippy::needless_pass_by_value)] // Arc cloned inside for ctrlc handler
 fn install_signal_handler(shutdown: Arc<AtomicBool>) -> Result<()> {
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    let flag = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    })
+    .context("Failed to install Ctrl-C handler")?;
     Ok(())
+}
+
+/// Read the daemon port from the port file for a given project.
+pub fn read_daemon_port(project_path: &Path) -> Result<u16> {
+    let index_dir = SageConfig::project_index_dir(project_path);
+    let port_file = index_dir.join("sage.port");
+    let content = std::fs::read_to_string(&port_file)
+        .with_context(|| format!("Failed to read port file: {}", port_file.display()))?;
+    content.trim().parse::<u16>().with_context(|| {
+        format!(
+            "Invalid port in {}: {}",
+            port_file.display(),
+            content.trim()
+        )
+    })
 }
 
 /// Check if a daemon is running and healthy for the given project
 pub fn daemon_healthy(project_path: &Path) -> bool {
-    let index_dir = SageConfig::project_index_dir(project_path);
-    let socket_path = index_dir.join("sage.sock");
-
-    if !socket_path.exists() {
+    let Ok(port) = read_daemon_port(project_path) else {
         return false;
-    }
+    };
 
-    // Try a health check
-    if let Ok(response) = send_request(&socket_path, r#"{"type":"health"}"#) {
+    if let Ok(response) = send_request_to_port(port, r#"{"type":"health"}"#) {
         response.contains("\"status\":\"ok\"")
     } else {
-        // Stale socket, clean up
-        let _ = std::fs::remove_file(&socket_path);
+        // Stale port file, clean up
+        let index_dir = SageConfig::project_index_dir(project_path);
+        let _ = std::fs::remove_file(index_dir.join("sage.port"));
         let _ = std::fs::remove_file(index_dir.join("sage.pid"));
         false
     }
 }
 
-/// Send a raw JSON request to the daemon and return the response
-pub fn send_request(socket_path: &Path, request_json: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("Failed to connect to daemon at {}", socket_path.display()))?;
+/// Send a raw JSON request to the daemon at the given port and return the response
+fn send_request_to_port(port: u16, request_json: &str) -> Result<String> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
 
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -154,8 +170,7 @@ pub fn daemon_search(
     project_path: &Path,
     request: &protocol::SearchRequest,
 ) -> Result<protocol::SearchResponse> {
-    let index_dir = SageConfig::project_index_dir(project_path);
-    let socket_path = index_dir.join("sage.sock");
+    let port = read_daemon_port(project_path)?;
 
     let request_json = serde_json::json!({
         "type": "search",
@@ -171,7 +186,7 @@ pub fn daemon_search(
         "snippet": request.snippet,
     });
 
-    let response_str = send_request(&socket_path, &request_json.to_string())?;
+    let response_str = send_request_to_port(port, &request_json.to_string())?;
     let response: serde_json::Value =
         serde_json::from_str(&response_str).context("Failed to parse daemon response")?;
 
@@ -210,10 +225,10 @@ pub fn daemon_search(
     })
 }
 
-/// Send a binary (bincode) search request to the daemon socket.
+/// Send a binary (bincode) search request to the daemon at the given port.
 /// Returns the SearchResponse or an error. Much faster than JSON.
 pub fn daemon_search_binary(
-    socket_path: &Path,
+    port: u16,
     request: protocol::SearchRequest,
 ) -> Result<protocol::SearchResponse> {
     use std::io::Read;
@@ -222,8 +237,9 @@ pub fn daemon_search_binary(
 
     let frame = protocol::encode_binary_request(&bin_req);
 
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("Failed to connect to daemon at {}", socket_path.display()))?;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
 
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -258,14 +274,15 @@ pub fn daemon_search_binary(
     }
 }
 
-/// Send a binary health check to the daemon socket.
-pub fn daemon_healthy_binary(socket_path: &Path) -> bool {
+/// Send a binary health check to the daemon at the given port.
+pub fn daemon_healthy_binary(port: u16) -> bool {
     use std::io::Read;
 
     let bin_req = protocol::BinaryRequest::Health;
     let frame = protocol::encode_binary_request(&bin_req);
 
-    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
         return false;
     };
 
@@ -307,21 +324,21 @@ pub fn daemon_healthy_binary(socket_path: &Path) -> bool {
 /// Stop a running daemon for the given project
 pub fn stop_daemon(project_path: &Path) -> Result<bool> {
     let index_dir = SageConfig::project_index_dir(project_path);
-    let socket_path = index_dir.join("sage.sock");
+    let port_file = index_dir.join("sage.port");
     let pid_path = index_dir.join("sage.pid");
 
-    if !socket_path.exists() {
+    let Ok(port) = read_daemon_port(project_path) else {
         return Ok(false);
-    }
+    };
 
     // Try graceful shutdown
-    if send_request(&socket_path, r#"{"type":"shutdown"}"#).is_ok() {
+    if send_request_to_port(port, r#"{"type":"shutdown"}"#).is_ok() {
         // Wait briefly for cleanup
         std::thread::sleep(Duration::from_millis(200));
     }
 
     // Clean up stale files
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&port_file);
     let _ = std::fs::remove_file(&pid_path);
 
     Ok(true)

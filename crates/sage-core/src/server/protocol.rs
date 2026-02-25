@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// A JSON message always starts with '{' (0x7b), so 0x00 is unambiguous.
 pub const BINARY_MAGIC: u8 = 0x00;
 
-/// Request sent from client to daemon over UDS
+/// Request sent from client to daemon over TCP
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {

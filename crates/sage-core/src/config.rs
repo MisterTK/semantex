@@ -131,9 +131,12 @@ impl SageConfig {
         Ok(config)
     }
 
-    /// Default sage home directory
+    /// Default sage home directory (cross-platform)
     pub fn sage_home() -> PathBuf {
-        dirs_or_default("SAGE_HOME", ".sage")
+        if let Ok(val) = std::env::var("SAGE_HOME") {
+            return PathBuf::from(val);
+        }
+        dirs::home_dir().map_or_else(|| std::env::temp_dir().join("sage"), |h| h.join(".sage"))
     }
 
     /// Models directory
@@ -161,22 +164,14 @@ impl SageConfig {
         }
     }
 
-    /// Global config file path
+    /// Global config file path (cross-platform)
     fn global_config_path() -> PathBuf {
-        let config_dir = std::env::var("XDG_CONFIG_HOME").map_or_else(
-            |_| dirs_or_default("HOME", "").join(".config"),
-            PathBuf::from,
-        );
-        config_dir.join("sage").join("config.yaml")
-    }
-}
-
-fn dirs_or_default(env_key: &str, suffix: &str) -> PathBuf {
-    if let Ok(val) = std::env::var(env_key) {
-        PathBuf::from(val)
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(suffix)
-    } else {
-        PathBuf::from("/tmp").join("sage")
+        if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {
+            return PathBuf::from(val).join("sage").join("config.yaml");
+        }
+        dirs::config_dir().map_or_else(
+            || Self::sage_home().join("config.yaml"),
+            |d| d.join("sage").join("config.yaml"),
+        )
     }
 }

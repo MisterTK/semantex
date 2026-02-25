@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uds_protocol_roundtrip() {
+    fn test_tcp_protocol_roundtrip() {
         // Simulate what happens over the wire: request → JSON line → parse → handle → response → JSON line
         let request = serde_json::json!({
             "type": "search",
@@ -511,8 +511,8 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_uds_protocol_simulation() {
-        // Simulate the full binary protocol flow as it would happen over UDS:
+    fn test_binary_tcp_protocol_simulation() {
+        // Simulate the full binary protocol flow as it would happen over TCP:
         // Client sends: [0x00][len:4 LE][bincode request]
         // Server reads, processes, responds: [0x00][len:4 LE][bincode response]
 

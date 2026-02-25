@@ -214,7 +214,41 @@ enum Commands {
     Disconnect,
 }
 
+/// Find ONNX Runtime shared library on platform-specific paths.
+fn find_ort_dylib() -> Option<&'static str> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/opt/homebrew/lib/libonnxruntime.dylib",
+            "/usr/local/lib/libonnxruntime.dylib",
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            r"C:\Program Files\onnxruntime\lib\onnxruntime.dll",
+            r"C:\Program Files\Microsoft\ONNX Runtime\onnxruntime.dll",
+        ]
+    } else {
+        // Linux (x86_64, aarch64, etc.)
+        &[
+            "/usr/lib/libonnxruntime.so",
+            "/usr/local/lib/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+            "/usr/lib/aarch64-linux-gnu/libonnxruntime.so",
+            "/usr/lib64/libonnxruntime.so",
+        ]
+    };
+    candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+}
+
 fn main() -> Result<()> {
+    // Enable ANSI escape codes on Windows Terminal / PowerShell
+    #[cfg(windows)]
+    {
+        let _ = colored::control::set_virtual_terminal(true);
+    }
+
     // ── Hard memory limits: must be set before ORT/OpenMP loads ───────────
     //
     // fastembed hardcodes intra_op_num_threads = available_parallelism() (all
@@ -290,16 +324,14 @@ fn main() -> Result<()> {
         return commands::install::install_codex();
     }
 
-    // Fast daemon path: skip config loading + ORT detection when daemon socket exists.
+    // Fast daemon path: skip config loading + ORT detection when daemon port file exists.
     // Saves ~5-7ms by avoiding YAML config I/O + ORT dylib stat() calls.
     #[allow(clippy::collapsible_if)]
     if cli.command.is_none() {
         if let Some(ref query) = cli.query {
             let path = cli.path.as_deref().unwrap_or(Path::new("."));
             if let Ok(project_path) = path.canonicalize() {
-                let socket_path =
-                    sage_core::SageConfig::project_index_dir(&project_path).join("sage.sock");
-                if socket_path.exists() {
+                if let Ok(port) = sage_core::server::read_daemon_port(&project_path) {
                     let search_opts = commands::search::SearchOpts {
                         query: query.clone(),
                         path: cli.path.clone().unwrap_or_else(|| PathBuf::from(".")),
@@ -320,7 +352,7 @@ fn main() -> Result<()> {
                         code_only: cli.code_only,
                         pattern: cli.pattern.clone(),
                     };
-                    if commands::search::run_via_binary_daemon(&search_opts, &socket_path).is_ok() {
+                    if commands::search::run_via_binary_daemon(&search_opts, port).is_ok() {
                         return Ok(());
                     }
                     // Fall through to normal path if daemon connection fails
@@ -331,20 +363,11 @@ fn main() -> Result<()> {
 
     // Auto-detect ONNX Runtime library if not explicitly set.
     // Deferred to after the daemon fast-path: daemon queries never load ORT in-process.
-    if std::env::var("ORT_DYLIB_PATH").is_err() {
-        for candidate in &[
-            "/opt/homebrew/lib/libonnxruntime.dylib", // macOS ARM Homebrew
-            "/usr/local/lib/libonnxruntime.dylib",    // macOS Intel Homebrew
-            "/usr/lib/libonnxruntime.so",             // Linux system
-            "/usr/local/lib/libonnxruntime.so",       // Linux local
-            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so", // Debian/Ubuntu
-        ] {
-            if std::path::Path::new(candidate).exists() {
-                // SAFETY: Called at program startup before any threads are spawned.
-                unsafe { std::env::set_var("ORT_DYLIB_PATH", candidate) };
-                break;
-            }
-        }
+    if std::env::var("ORT_DYLIB_PATH").is_err()
+        && let Some(path) = find_ort_dylib()
+    {
+        // SAFETY: Called at program startup before any threads are spawned.
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", path) };
     }
 
     // Build config with CLI overrides

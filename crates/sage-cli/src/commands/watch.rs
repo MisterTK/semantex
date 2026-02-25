@@ -40,22 +40,27 @@ pub fn run(path: &Path, config: &SageConfig) -> Result<()> {
 
     // Start the search daemon in a background thread
     let index_dir = SageConfig::project_index_dir(&project_path);
-    let socket_path = index_dir.join("sage.sock");
+    let port_file = index_dir.join("sage.port");
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Open searcher for daemon
     match HybridSearcher::open(&index_dir, config) {
         Ok(searcher) => {
             let shutdown_clone = shutdown.clone();
-            let socket_path_clone = socket_path.clone();
+            let port_file_clone = port_file.clone();
             std::thread::spawn(move || {
                 match Listener::bind(
-                    &socket_path_clone,
+                    &port_file_clone,
                     searcher,
                     Duration::from_secs(86400), // 24h timeout (watch keeps it alive)
                     shutdown_clone,
                 ) {
                     Ok(listener) => {
+                        println!(
+                            "  {} Search daemon started on 127.0.0.1:{}",
+                            "OK".green(),
+                            listener.port()
+                        );
                         if let Err(e) = listener.run() {
                             tracing::error!("Daemon listener error: {}", e);
                         }
@@ -65,12 +70,6 @@ pub fn run(path: &Path, config: &SageConfig) -> Result<()> {
                     }
                 }
             });
-
-            println!(
-                "  {} Search daemon started on {}",
-                "OK".green(),
-                socket_path.display()
-            );
         }
         Err(e) => {
             eprintln!(
@@ -122,7 +121,7 @@ pub fn run(path: &Path, config: &SageConfig) -> Result<()> {
 
     // Clean up daemon
     shutdown.store(true, Ordering::Relaxed);
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&port_file);
 
     Ok(())
 }

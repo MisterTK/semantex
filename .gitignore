@@ -18,12 +18,12 @@
 # Model cache
 .fastembed_cache/
 
-# Claude Code local config
-.claude/settings.local.json
+# Claude Code
+.claude/
+CLAUDE.md
 
 # Internal dev docs
 /docs
-/CLAUDE.md
 /FASTEMBED_INTEGRATION.md
 
 # Benchmarks (contain hardcoded local paths and dev-only scripts)

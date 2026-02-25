@@ -55,9 +55,8 @@ pub fn run(opts: &SearchOpts, config: &SageConfig) -> Result<()> {
     }
 
     // Try binary protocol to daemon first (fastest path)
-    let socket_path = index_dir.join("sage.sock");
-    if socket_path.exists()
-        && let Ok(result) = run_via_binary_daemon(opts, &socket_path)
+    if let Ok(port) = sage_core::server::read_daemon_port(&project_path)
+        && let Ok(result) = run_via_binary_daemon(opts, port)
     {
         return Ok(result);
     }
@@ -134,7 +133,7 @@ fn run_ripgrep_fallback(opts: &SearchOpts, project_path: &std::path::Path) -> Re
     Ok(())
 }
 
-pub fn run_via_binary_daemon(opts: &SearchOpts, socket_path: &std::path::Path) -> Result<()> {
+pub fn run_via_binary_daemon(opts: &SearchOpts, port: u16) -> Result<()> {
     let request = SearchRequest {
         query: opts.query.clone(),
         max_results: if opts.grep_mode || opts.grep {
@@ -158,7 +157,7 @@ pub fn run_via_binary_daemon(opts: &SearchOpts, socket_path: &std::path::Path) -
         regex_pattern: opts.pattern.clone(),
     };
 
-    let response = sage_core::server::daemon_search_binary(socket_path, request)?;
+    let response = sage_core::server::daemon_search_binary(port, request)?;
 
     if response.results.is_empty() {
         if opts.grep {
@@ -328,10 +327,8 @@ fn run_with_searcher(
 fn auto_start_and_search(
     opts: &SearchOpts,
     project_path: &std::path::Path,
-    index_dir: &std::path::Path,
+    _index_dir: &std::path::Path,
 ) -> Result<()> {
-    let socket_path = index_dir.join("sage.sock");
-
     let current_exe = std::env::current_exe().context("cannot determine sage executable path")?;
 
     eprintln!(
@@ -357,7 +354,9 @@ fn auto_start_and_search(
         if attempt == 15 {
             eprintln!("  (loading embedding model — first run takes ~30 s) …");
         }
-        if socket_path.exists() && run_via_binary_daemon(opts, &socket_path).is_ok() {
+        if let Ok(port) = sage_core::server::read_daemon_port(project_path)
+            && run_via_binary_daemon(opts, port).is_ok()
+        {
             return Ok(());
         }
     }

@@ -3,17 +3,17 @@ use super::protocol::{self, BINARY_MAGIC, BinaryResponse, ErrorResponse, Request
 use crate::search::hybrid::HybridSearcher;
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Unix domain socket listener for the sage daemon
+/// TCP localhost listener for the sage daemon
 #[allow(clippy::struct_field_names)]
 pub struct Listener {
-    socket_path: PathBuf,
-    listener: UnixListener,
+    port_file: PathBuf,
+    listener: TcpListener,
     searcher: HybridSearcher,
     search_count: AtomicU64,
     start_time: Instant,
@@ -22,45 +22,34 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Create a new UDS listener bound to the given socket path
+    /// Create a new TCP listener bound to an OS-assigned ephemeral port.
+    /// Writes the assigned port number to `port_file`.
     pub fn bind(
-        socket_path: &Path,
+        port_file: &std::path::Path,
         searcher: HybridSearcher,
         idle_timeout: Duration,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        // Remove stale socket file if it exists
-        if socket_path.exists() {
-            std::fs::remove_file(socket_path).with_context(|| {
-                format!("Failed to remove stale socket: {}", socket_path.display())
-            })?;
-        }
+        // Bind to localhost with an OS-assigned ephemeral port
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("Failed to bind TCP listener on 127.0.0.1")?;
 
-        let listener = UnixListener::bind(socket_path)
-            .with_context(|| format!("Failed to bind UDS at {}", socket_path.display()))?;
+        let port = listener
+            .local_addr()
+            .context("Failed to get local address")?
+            .port();
 
-        // Blocking mode with 500ms SO_RCVTIMEO for periodic shutdown/idle checks.
-        // This replaces the 50ms non-blocking poll loop, reducing avg latency from 25ms to ~0ms.
-        {
-            use std::os::unix::io::AsRawFd;
-            let timeout = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 500_000, // 500ms
-            };
-            // SAFETY: Setting socket option on a valid file descriptor before any concurrent access.
-            unsafe {
-                libc::setsockopt(
-                    listener.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVTIMEO,
-                    (&raw const timeout).cast::<libc::c_void>(),
-                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-                );
-            }
-        }
+        // Write port to file for client discovery
+        std::fs::write(port_file, format!("{port}\n"))
+            .with_context(|| format!("Failed to write port file: {}", port_file.display()))?;
+
+        // Use non-blocking mode with sleep for periodic shutdown/idle checks
+        listener
+            .set_nonblocking(true)
+            .context("Failed to set non-blocking mode")?;
 
         Ok(Self {
-            socket_path: socket_path.to_path_buf(),
+            port_file: port_file.to_path_buf(),
             listener,
             searcher,
             search_count: AtomicU64::new(0),
@@ -70,12 +59,18 @@ impl Listener {
         })
     }
 
+    /// Get the port this listener is bound to.
+    pub fn port(&self) -> u16 {
+        self.listener.local_addr().map(|a| a.port()).unwrap_or(0)
+    }
+
     /// Run the accept loop until shutdown or idle timeout
     pub fn run(&self) -> Result<()> {
         tracing::info!(
-            socket = %self.socket_path.display(),
+            port = self.port(),
             idle_timeout_s = self.idle_timeout.as_secs(),
-            "Daemon listening"
+            "Daemon listening on 127.0.0.1:{}",
+            self.port()
         );
 
         let mut last_activity = Instant::now();
@@ -96,19 +91,22 @@ impl Listener {
                 break;
             }
 
-            // Accept a connection (blocks up to 500ms per SO_RCVTIMEO)
+            // Accept a connection (non-blocking + 500ms sleep on WouldBlock)
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
+                    // Switch to blocking mode for connection handling
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        tracing::warn!("Failed to set blocking mode: {}", e);
+                        continue;
+                    }
                     last_activity = Instant::now();
                     if let Err(e) = self.handle_connection(stream) {
                         tracing::warn!("Connection error: {}", e);
                     }
                 }
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // SO_RCVTIMEO expired — loop back to check shutdown/idle
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No pending connection — sleep briefly and retry
+                    std::thread::sleep(Duration::from_millis(500));
                 }
                 Err(e) => {
                     tracing::error!("Accept error: {}", e);
@@ -121,8 +119,8 @@ impl Listener {
         Ok(())
     }
 
-    #[allow(clippy::needless_pass_by_value)] // UnixStream ownership needed for set_read/write_timeout
-    fn handle_connection(&self, stream: std::os::unix::net::UnixStream) -> Result<()> {
+    #[allow(clippy::needless_pass_by_value)] // TcpStream ownership needed for set_read/write_timeout
+    fn handle_connection(&self, stream: TcpStream) -> Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
@@ -141,8 +139,8 @@ impl Listener {
     /// Handle a binary (bincode) framed connection.
     fn handle_binary_connection(
         &self,
-        reader: &mut BufReader<&std::os::unix::net::UnixStream>,
-        stream: &std::os::unix::net::UnixStream,
+        reader: &mut BufReader<&TcpStream>,
+        stream: &TcpStream,
     ) -> Result<()> {
         // Read 4-byte LE length
         let mut len_buf = [0u8; 4];
@@ -191,8 +189,8 @@ impl Listener {
     fn handle_json_connection(
         &self,
         first_byte: u8,
-        reader: &mut BufReader<&std::os::unix::net::UnixStream>,
-        stream: &std::os::unix::net::UnixStream,
+        reader: &mut BufReader<&TcpStream>,
+        stream: &TcpStream,
     ) -> Result<()> {
         let mut line = String::new();
         line.push(first_byte as char);
@@ -247,8 +245,8 @@ impl Listener {
     }
 
     fn cleanup(&self) {
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        if self.port_file.exists() {
+            let _ = std::fs::remove_file(&self.port_file);
         }
         tracing::info!(
             searches = self.search_count.load(Ordering::Relaxed),
@@ -260,8 +258,8 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
+        if self.port_file.exists() {
+            let _ = std::fs::remove_file(&self.port_file);
         }
     }
 }

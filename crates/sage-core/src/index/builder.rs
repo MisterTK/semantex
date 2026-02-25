@@ -228,7 +228,7 @@ impl IndexBuilder {
                 pb.inc(1);
                 continue;
             } else if let Ok(c) = std::fs::read_to_string(file_path) {
-                c
+                c.replace("\r\n", "\n") // Normalize CRLF for consistent line counting
             } else {
                 files_skipped += 1;
                 pb.inc(1);

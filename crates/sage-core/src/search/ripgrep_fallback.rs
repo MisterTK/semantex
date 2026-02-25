@@ -57,12 +57,12 @@ pub fn search(query: &str, path: &Path, max_results: usize) -> Result<Vec<RgResu
 
     // rg exits with 1 on "no matches" — that's not an error for us
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_rg_json(&stdout, path, max_results)
+    Ok(parse_rg_json(&stdout, path, max_results))
 }
 
 /// Parse ripgrep's JSON-lines output, filtering for `type: "match"` entries.
 /// File paths are made relative to `base_path`.
-fn parse_rg_json(output: &str, base_path: &Path, max_results: usize) -> Result<Vec<RgResult>> {
+fn parse_rg_json(output: &str, base_path: &Path, max_results: usize) -> Vec<RgResult> {
     let mut results = Vec::new();
 
     for line in output.lines() {
@@ -79,9 +79,8 @@ fn parse_rg_json(output: &str, base_path: &Path, max_results: usize) -> Result<V
             continue;
         }
 
-        let data = match value.get("data") {
-            Some(d) => d,
-            None => continue,
+        let Some(data) = value.get("data") else {
+            continue;
         };
 
         let raw_file = data
@@ -118,7 +117,7 @@ fn parse_rg_json(output: &str, base_path: &Path, max_results: usize) -> Result<V
         }
     }
 
-    Ok(results)
+    results
 }
 
 /// Format ripgrep results as a bare JSON array, matching sage's normal `--json` output format.
@@ -147,14 +146,14 @@ mod tests {
 
     #[test]
     fn test_parse_rg_json_empty() {
-        let results = parse_rg_json("", Path::new("."), 10).unwrap();
+        let results = parse_rg_json("", Path::new("."), 10);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_parse_rg_json_match() {
         let json_line = r#"{"type":"match","data":{"path":{"text":"src/main.rs"},"lines":{"text":"fn main() {\n"},"line_number":1}}"#;
-        let results = parse_rg_json(json_line, Path::new("."), 10).unwrap();
+        let results = parse_rg_json(json_line, Path::new("."), 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file, PathBuf::from("src/main.rs"));
         assert_eq!(results[0].line_number, 1);
@@ -164,7 +163,7 @@ mod tests {
     #[test]
     fn test_parse_rg_json_strips_prefix() {
         let json_line = r#"{"type":"match","data":{"path":{"text":"/abs/project/src/main.rs"},"lines":{"text":"fn main()"},"line_number":1}}"#;
-        let results = parse_rg_json(json_line, Path::new("/abs/project"), 10).unwrap();
+        let results = parse_rg_json(json_line, Path::new("/abs/project"), 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file, PathBuf::from("src/main.rs"));
     }
@@ -179,7 +178,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let results = parse_rg_json(&json_lines, Path::new("."), 5).unwrap();
+        let results = parse_rg_json(&json_lines, Path::new("."), 5);
         assert_eq!(results.len(), 5);
     }
 

@@ -26,7 +26,7 @@ pub fn run(path: &Path, config: &SageConfig) -> Result<()> {
         "Starting".green().bold(),
         project_path.display()
     );
-    eprintln!("  Socket: {}", server.socket_path().display());
+    eprintln!("  Port file: {}", server.port_file_path().display());
     eprintln!("  PID:    {}", std::process::id());
     eprintln!("Press Ctrl+C to stop.");
     eprintln!();

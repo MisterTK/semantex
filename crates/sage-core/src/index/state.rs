@@ -51,9 +51,8 @@ pub fn detect(project_path: &Path) -> IndexState {
 
 /// Check if the index has an outdated schema version.
 fn is_stale(meta_path: &Path) -> bool {
-    let content = match std::fs::read_to_string(meta_path) {
-        Ok(c) => c,
-        Err(_) => return true, // unreadable meta.json → treat as stale
+    let Ok(content) = std::fs::read_to_string(meta_path) else {
+        return true; // unreadable meta.json → treat as stale
     };
     let meta: IndexMeta = match serde_json::from_str(&content) {
         Ok(m) => m,
@@ -64,36 +63,21 @@ fn is_stale(meta_path: &Path) -> bool {
 
 /// Try to acquire a non-blocking exclusive lock on the file.
 /// Returns `true` if the file is currently locked by another process.
-#[cfg(unix)]
+/// Uses `File::try_lock()` (stabilized in Rust 1.84) for cross-platform support.
 fn is_locked(lock_path: &Path) -> bool {
-    use std::os::unix::io::AsRawFd;
-
-    let file = match std::fs::File::open(lock_path) {
-        Ok(f) => f,
-        Err(_) => return false,
+    let Ok(file) = std::fs::File::open(lock_path) else {
+        return false;
     };
 
-    let fd = file.as_raw_fd();
-
-    // SAFETY: fd is a valid file descriptor from an open File.
-    // flock with LOCK_EX | LOCK_NB is a safe, non-destructive probe.
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-
-    if ret == 0 {
-        // We acquired the lock — nobody else holds it. File drop releases it.
-        false
-    } else {
-        // Check errno: only EWOULDBLOCK means "locked by another process".
-        // Other errors (ENOTSUP on NFS/FUSE, EINTR, etc.) → assume not locked.
-        let err = std::io::Error::last_os_error();
-        matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK))
+    match file.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // Another process holds the lock.
+            true
+        }
+        // Ok: we acquired the lock — nobody else holds it (released on drop).
+        // Error: other error (NFS, unsupported FS) — assume not locked.
+        Ok(()) | Err(std::fs::TryLockError::Error(_)) => false,
     }
-}
-
-/// Non-unix fallback — cannot probe locks, so assume not locked.
-#[cfg(not(unix))]
-fn is_locked(_lock_path: &Path) -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -155,27 +139,19 @@ mod tests {
         assert_eq!(detect(tmp.path()), IndexState::Stale);
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_building_with_lock() {
-        use std::os::unix::io::AsRawFd;
-
         let tmp = TempDir::new().unwrap();
         let sage_dir = tmp.path().join(".sage");
         std::fs::create_dir_all(&sage_dir).unwrap();
         let lock_path = sage_dir.join(".sage.lock");
         let lock_file = std::fs::File::create(&lock_path).unwrap();
 
-        // Hold an exclusive lock
-        let fd = lock_file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(ret, 0, "Failed to acquire test lock");
+        // Hold an exclusive lock (cross-platform)
+        lock_file.lock().expect("Failed to acquire test lock");
 
         assert_eq!(detect(tmp.path()), IndexState::Building);
 
-        // Release lock
-        unsafe {
-            libc::flock(fd, libc::LOCK_UN);
-        }
+        // Lock released when lock_file drops
     }
 }

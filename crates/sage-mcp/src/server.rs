@@ -157,8 +157,16 @@ impl McpServer {
         // Auto-index cwd if no index exists and it looks like a project directory
         if let Ok(cwd) = std::env::current_dir() {
             let looks_like_project = [
-                ".git", "Cargo.toml", "package.json", "go.mod", "pyproject.toml",
-                "setup.py", "Makefile", "CMakeLists.txt", "pom.xml", "build.gradle",
+                ".git",
+                "Cargo.toml",
+                "package.json",
+                "go.mod",
+                "pyproject.toml",
+                "setup.py",
+                "Makefile",
+                "CMakeLists.txt",
+                "pom.xml",
+                "build.gradle",
             ]
             .iter()
             .any(|marker| cwd.join(marker).exists());
@@ -375,9 +383,9 @@ impl McpServer {
             IndexState::Ready => self.do_sage_search(query, &path, max_results, rerank, grep_mode),
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
-                self.do_ripgrep_fallback(query, &path, max_results)
+                Self::do_ripgrep_fallback(query, &path, max_results)
             }
-            IndexState::Building => self.do_ripgrep_fallback(query, &path, max_results),
+            IndexState::Building => Self::do_ripgrep_fallback(query, &path, max_results),
         }
     }
 
@@ -423,7 +431,6 @@ impl McpServer {
 
     /// Fall back to ripgrep for keyword search while the index builds.
     fn do_ripgrep_fallback(
-        &self,
         query: &str,
         path: &std::path::Path,
         max_results: usize,

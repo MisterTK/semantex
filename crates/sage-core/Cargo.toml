@@ -87,12 +87,12 @@ pdf-extract = "0.10"
 # Config
 serde_yml = "0.0.12"
 
-# Misc
-libc = "0.2"
+# Cross-platform
+dirs = "6"
+ctrlc = { version = "3", features = ["termination"] }
 tempfile = "3"
 walkdir = "2"
 bincode = { workspace = true }
-signal-hook = "0.3"
 parking_lot = "0.12"
 regex = { workspace = true }
 rust-stemmers = "1.2"

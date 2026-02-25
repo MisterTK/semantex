@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
-use sage_core::config::SageConfig;
 use std::path::Path;
 
 use crate::client;
 
 /// Start a persistent client connected to the daemon for the given project.
 ///
-/// The persistent client maintains a long-lived UDS connection using the
+/// The persistent client maintains a long-lived TCP connection using the
 /// binary protocol, eliminating per-query connection and serialization overhead.
 ///
 /// If a client is already running, this prints its PID and exits.
@@ -21,20 +20,15 @@ pub fn run(project_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let index_dir = SageConfig::project_index_dir(&project_path);
-    let socket_path = index_dir.join("sage.sock");
-
-    if !socket_path.exists() {
-        anyhow::bail!(
-            "No daemon running for {}. Start one with 'sage serve {}'.",
-            project_path.display(),
-            project_path.display()
-        );
-    }
+    let port = sage_core::server::read_daemon_port(&project_path).context(format!(
+        "No daemon running for {}. Start one with 'sage serve {}'.",
+        project_path.display(),
+        project_path.display()
+    ))?;
 
     // Verify the daemon is reachable via binary protocol
     let mut client_conn =
-        client::PersistentClient::connect(&socket_path).context("Failed to connect to daemon")?;
+        client::PersistentClient::connect(port).context("Failed to connect to daemon")?;
 
     match client_conn.health() {
         Ok(true) => {}
@@ -46,9 +40,9 @@ pub fn run(project_path: &Path) -> Result<()> {
     client::write_client_pid()?;
 
     eprintln!(
-        "Persistent client connected (PID {}, socket: {})",
+        "Persistent client connected (PID {}, port: {})",
         std::process::id(),
-        socket_path.display()
+        port
     );
     eprintln!("Binary protocol active. Searches will use fast path.");
     eprintln!("Use 'sage disconnect' to stop.");
