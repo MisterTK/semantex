@@ -173,12 +173,8 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
     }
 
     // --- 2. Install skill ---
-    // Skills go into the same claude_dir as the hooks for user/project scope.
-    // For local scope the skill is personal so it goes to ~/.claude/skills (user level).
-    let skill_dir = match scope {
-        InstallScope::User | InstallScope::Project => claude_dir.join("skills").join("semantex"),
-        InstallScope::Local => dirs_home().join(".claude").join("skills").join("semantex"),
-    };
+    // Skill always goes into the same claude_dir as the hooks so each scope is self-contained.
+    let skill_dir = claude_dir.join("skills").join("semantex");
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(skill_dir.join("SKILL.md"), SKILL_MD)?;
 

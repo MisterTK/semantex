@@ -32,3 +32,4 @@ CLAUDE.md
 /bench_results
 /scripts
 .semantex/
+settings.local.json
