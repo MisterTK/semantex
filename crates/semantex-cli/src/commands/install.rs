@@ -13,12 +13,18 @@ fn dirs_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
-/// Install semantex hooks into Claude Code's settings.
-/// Writes to ~/.claude/settings.json
+/// Embedded SKILL.md — single source of truth lives in plugin/skills/semantex/SKILL.md.
+const SKILL_MD: &str = include_str!("../../../../plugin/skills/semantex/SKILL.md");
+
+/// Install semantex hooks + skill into Claude Code.
+/// Writes hooks to ~/.claude/settings.json and skill to ~/.claude/skills/semantex/SKILL.md.
 pub fn install_claude_code() -> Result<()> {
     let binary = semantex_binary_path()?;
-    let settings_path = dirs_home().join(".claude").join("settings.json");
+    let home = dirs_home();
+    let claude_dir = home.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
 
+    // --- 1. Install hooks into settings.json ---
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = std::fs::read_to_string(&settings_path)?;
         serde_json::from_str(&content)?
@@ -26,7 +32,6 @@ pub fn install_claude_code() -> Result<()> {
         serde_json::json!({})
     };
 
-    // Add hooks configuration
     let hooks = settings
         .as_object_mut()
         .context("settings.json is not an object")?
@@ -87,33 +92,59 @@ pub fn install_claude_code() -> Result<()> {
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
 
     eprintln!(
-        "{} Installed semantex hooks into {}",
-        "Done!".green().bold(),
+        "  {} hooks → {}",
+        "✓".green().bold(),
         settings_path.display()
     );
-    eprintln!("Restart Claude Code to activate.");
+
+    // --- 2. Install skill to ~/.claude/skills/semantex/SKILL.md ---
+    let skill_dir = claude_dir.join("skills").join("semantex");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(skill_dir.join("SKILL.md"), SKILL_MD)?;
+
+    eprintln!(
+        "  {} skill → {}",
+        "✓".green().bold(),
+        skill_dir.join("SKILL.md").display()
+    );
+
+    eprintln!(
+        "\n{} semantex installed for Claude Code. Restart Claude Code to activate.",
+        "Done!".green().bold(),
+    );
     Ok(())
 }
 
-/// Uninstall semantex hooks from Claude Code's settings.
+/// Uninstall semantex hooks and skill from Claude Code.
 pub fn uninstall_claude_code() -> Result<()> {
-    let settings_path = dirs_home().join(".claude").join("settings.json");
-    if !settings_path.exists() {
+    let home = dirs_home();
+    let claude_dir = home.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+
+    // Remove hooks from settings.json
+    if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path)?;
+        let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+
+        if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+            hooks.remove("SessionStart");
+            hooks.remove("PreToolUse");
+            hooks.remove("SessionEnd");
+        }
+
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+        eprintln!("Removed semantex hooks from {}", settings_path.display());
+    } else {
         eprintln!("No Claude Code settings found.");
-        return Ok(());
     }
 
-    let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
-
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        hooks.remove("SessionStart");
-        hooks.remove("PreToolUse");
-        hooks.remove("SessionEnd");
+    // Remove skill directory
+    let skill_dir = claude_dir.join("skills").join("semantex");
+    if skill_dir.exists() {
+        std::fs::remove_dir_all(&skill_dir)?;
+        eprintln!("Removed semantex skill from {}", skill_dir.display());
     }
 
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    eprintln!("Removed semantex hooks from {}", settings_path.display());
     Ok(())
 }
 
