@@ -18,7 +18,7 @@ use std::time::Duration;
 /// Default idle timeout before the daemon auto-exits (30 minutes)
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 
-/// The sage search daemon
+/// The semantex search daemon
 pub struct SemantexServer {
     index_dir: PathBuf,
     config: SemantexConfig,

@@ -2,7 +2,7 @@
 
 ## Test Suite Overview
 
-Comprehensive integration tests for sage semantic code search accuracy, covering:
+Comprehensive integration tests for semantex semantic code search accuracy, covering:
 
 - ✅ **Language Parser Coverage**: All 12 supported languages tested
 - ✅ **Semantic Search**: Dense embedding-based search
@@ -151,7 +151,7 @@ The following tests are marked as `#[ignore]` because they require:
 To run these tests:
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test -- --ignored --test-threads=1
+cargo test --package semantex-core --test search_accuracy_test -- --ignored --test-threads=1
 ```
 
 ### test_semantic_search_accuracy
@@ -253,20 +253,20 @@ Query: "implement fibonacci calculation"
 
 ```bash
 # Run all non-ignored tests (~13 seconds)
-cargo test --package sage-core --test search_accuracy_test
+cargo test --package semantex-core --test search_accuracy_test
 
 # Run specific test
-cargo test --package sage-core --test search_accuracy_test test_ast_chunking_all_languages
+cargo test --package semantex-core --test search_accuracy_test test_ast_chunking_all_languages
 ```
 
 ### Full Tests (Requires Index Build)
 
 ```bash
 # Run ALL tests including ignored ones (~2-5 minutes)
-cargo test --package sage-core --test search_accuracy_test -- --ignored --test-threads=1
+cargo test --package semantex-core --test search_accuracy_test -- --ignored --test-threads=1
 
 # Run specific ignored test
-cargo test --package sage-core --test search_accuracy_test test_semantic_search_accuracy -- --ignored
+cargo test --package semantex-core --test search_accuracy_test test_semantic_search_accuracy -- --ignored
 ```
 
 ---

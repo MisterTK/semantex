@@ -1,6 +1,6 @@
-//! Ripgrep fallback — shell out to system `rg` when the sage index is unavailable.
+//! Ripgrep fallback — shell out to system `rg` when the semantex index is unavailable.
 //!
-//! Provides keyword-level search results in a sage-compatible format so users
+//! Provides keyword-level search results in a semantex-compatible format so users
 //! get useful results immediately while the index builds in the background.
 
 use anyhow::{Context, Result};
@@ -120,7 +120,7 @@ fn parse_rg_json(output: &str, base_path: &Path, max_results: usize) -> Vec<RgRe
     results
 }
 
-/// Format ripgrep results as a bare JSON array, matching sage's normal `--json` output format.
+/// Format ripgrep results as a bare JSON array, matching semantex's normal `--json` output format.
 pub fn format_as_json(results: &[RgResult]) -> String {
     let items: Vec<serde_json::Value> = results
         .iter()

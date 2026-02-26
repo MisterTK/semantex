@@ -11,7 +11,7 @@ pub mod status;
 pub mod stop;
 pub mod watch;
 
-/// Spawn `sage index <dir>` in a background process (fire-and-forget).
+/// Spawn `semantex index <dir>` in a background process (fire-and-forget).
 /// Shared by hooks and search commands.
 pub(crate) fn spawn_background_index(project_path: &std::path::Path) {
     match std::env::current_exe() {
@@ -24,9 +24,9 @@ pub(crate) fn spawn_background_index(project_path: &std::path::Path) {
                 .stderr(std::process::Stdio::null())
                 .spawn()
             {
-                eprintln!("sage: failed to spawn background indexer: {e}");
+                eprintln!("semantex: failed to spawn background indexer: {e}");
             }
         }
-        Err(e) => eprintln!("sage: cannot determine executable path: {e}"),
+        Err(e) => eprintln!("semantex: cannot determine executable path: {e}"),
     }
 }

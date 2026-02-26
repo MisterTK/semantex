@@ -2,7 +2,7 @@
 //!
 //! This module wraps the `next-plaid` crate to provide ColBERT late-interaction
 //! search over a pre-built PLAID index. Each document in the PLAID index is
-//! mapped back to an sage `chunk_id` via a bincode-encoded `Vec<u64>` mapping file.
+//! mapped back to a semantex `chunk_id` via a bincode-encoded `Vec<u64>` mapping file.
 
 use crate::embedding::colbert::ColbertEmbedder;
 use crate::types::ScoredChunkId;
@@ -13,11 +13,11 @@ use std::path::Path;
 /// PLAID-based ColBERT searcher using memory-mapped index.
 ///
 /// Wraps `next_plaid::MmapIndex` and a doc-to-chunk ID mapping so that
-/// PLAID passage IDs can be translated back to sage's internal `chunk_id`.
+/// PLAID passage IDs can be translated back to semantex's internal `chunk_id`.
 pub struct PlaidSearcher {
     /// Memory-mapped PLAID index.
     index: MmapIndex,
-    /// Maps PLAID doc_id (positional index) to sage chunk_id (SQLite row ID).
+    /// Maps PLAID doc_id (positional index) to semantex chunk_id (SQLite row ID).
     doc_to_chunk: Vec<u64>,
 }
 
@@ -50,7 +50,7 @@ impl PlaidSearcher {
     /// Search using ColBERT MaxSim scoring.
     ///
     /// Encodes `query` via the provided `ColbertEmbedder`, searches the PLAID
-    /// index, then maps passage IDs back to sage chunk IDs.
+    /// index, then maps passage IDs back to semantex chunk IDs.
     ///
     /// Returns `ScoredChunkId` items sorted by descending score.
     ///

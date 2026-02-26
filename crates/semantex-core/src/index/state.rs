@@ -1,10 +1,10 @@
-//! Index state detection — determines whether a project's sage index is ready,
+//! Index state detection — determines whether a project's semantex index is ready,
 //! currently being built, stale (schema mismatch), or absent.
 
 use crate::types::IndexMeta;
 use std::path::Path;
 
-/// The current state of a project's sage index.
+/// The current state of a project's semantex index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
     /// No index exists for this project.
@@ -23,12 +23,12 @@ pub enum IndexState {
 /// then probes the lock file with a non-blocking `flock` to distinguish
 /// `Building` from `Ready`.
 pub fn detect(project_path: &Path) -> IndexState {
-    let sage_dir = project_path.join(".semantex");
-    let meta_path = sage_dir.join("meta.json");
+    let semantex_dir = project_path.join(".semantex");
+    let meta_path = semantex_dir.join("meta.json");
 
     if !meta_path.exists() {
         // No meta.json — check if a build is in progress via lock file
-        let lock_path = sage_dir.join(".sage.lock");
+        let lock_path = semantex_dir.join(".semantex.lock");
         if is_locked(&lock_path) {
             return IndexState::Building;
         }
@@ -41,7 +41,7 @@ pub fn detect(project_path: &Path) -> IndexState {
     }
 
     // Check if a rebuild is in progress
-    let lock_path = sage_dir.join(".sage.lock");
+    let lock_path = semantex_dir.join(".semantex.lock");
     if is_locked(&lock_path) {
         return IndexState::Building;
     }
@@ -94,8 +94,8 @@ mod tests {
     #[test]
     fn test_ready() {
         let tmp = TempDir::new().unwrap();
-        let sage_dir = tmp.path().join(".semantex");
-        std::fs::create_dir_all(&sage_dir).unwrap();
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
         let meta = serde_json::json!({
             "schema_version": IndexMeta::CURRENT_SCHEMA_VERSION,
             "project_path": tmp.path(),
@@ -106,15 +106,15 @@ mod tests {
             "embedding_model": "test",
             "embedding_dim": 48
         });
-        std::fs::write(sage_dir.join("meta.json"), meta.to_string()).unwrap();
+        std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
         assert_eq!(detect(tmp.path()), IndexState::Ready);
     }
 
     #[test]
     fn test_stale_schema() {
         let tmp = TempDir::new().unwrap();
-        let sage_dir = tmp.path().join(".semantex");
-        std::fs::create_dir_all(&sage_dir).unwrap();
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
         let meta = serde_json::json!({
             "schema_version": 1,
             "project_path": tmp.path(),
@@ -125,26 +125,26 @@ mod tests {
             "embedding_model": "test",
             "embedding_dim": 48
         });
-        std::fs::write(sage_dir.join("meta.json"), meta.to_string()).unwrap();
+        std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
         assert_eq!(detect(tmp.path()), IndexState::Stale);
     }
 
     #[test]
     fn test_unreadable_meta_treated_as_stale() {
         let tmp = TempDir::new().unwrap();
-        let sage_dir = tmp.path().join(".semantex");
-        std::fs::create_dir_all(&sage_dir).unwrap();
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
         // Write invalid JSON to meta.json
-        std::fs::write(sage_dir.join("meta.json"), "not valid json").unwrap();
+        std::fs::write(semantex_dir.join("meta.json"), "not valid json").unwrap();
         assert_eq!(detect(tmp.path()), IndexState::Stale);
     }
 
     #[test]
     fn test_building_with_lock() {
         let tmp = TempDir::new().unwrap();
-        let sage_dir = tmp.path().join(".semantex");
-        std::fs::create_dir_all(&sage_dir).unwrap();
-        let lock_path = sage_dir.join(".sage.lock");
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let lock_path = semantex_dir.join(".semantex.lock");
         let lock_file = std::fs::File::create(&lock_path).unwrap();
 
         // Hold an exclusive lock (cross-platform)

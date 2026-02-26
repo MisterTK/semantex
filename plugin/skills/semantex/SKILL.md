@@ -1,18 +1,18 @@
 ---
 name: semantex
-description: "Semantic code search \u2014 finds code by meaning. Use instead of Grep/Glob for conceptual queries. sage \"query\" for semantic, semantex --grep \"token\" for exact. 25+ languages."
-compatibility: Requires sage binary in PATH. Primary support for Claude Code.
+description: "Semantic code search \u2014 finds code by meaning. Use instead of Grep/Glob for conceptual queries. semantex \"query\" for semantic, semantex --grep \"token\" for exact. 25+ languages."
+compatibility: Requires semantex binary in PATH. Primary support for Claude Code.
 license: Apache-2.0
 allowed-tools: Bash
 ---
 
-# sage \u2014 Semantic Code Search
+# semantex \u2014 Semantic Code Search
 
 Hybrid dense+sparse retrieval engine. Finds code by meaning, not just keywords.
 
 ## Rules
 
-1. Use sage as your **PRIMARY** search tool for all code exploration
+1. Use semantex as your **PRIMARY** search tool for all code exploration
 2. Prefer `semantex "query"` over Grep/Glob for any conceptual or multi-word search
 3. Use `semantex --grep "literal"` for exact string matching (replaces grep)
 4. Use `semantex -e "regex" "query"` for hybrid regex + semantic search
@@ -44,10 +44,10 @@ semantex auto-indexes on first use. If you see "index building" or keyword-only 
 
 ```bash
 # Semantic search (natural language \u2192 hybrid dense+sparse)
-sage "authentication and session management" src/
+semantex "authentication and session management" src/
 
 # Hybrid: regex filter + semantic ranking
-sage -e "login|auth" "authentication flow" src/
+semantex -e "login|auth" "authentication flow" src/
 
 # Exact / BM25 keyword (fast, no embedding)
 semantex --grep "functionName" src/
@@ -56,13 +56,13 @@ semantex --grep "functionName" src/
 semantex --sparse-only "error handling" src/
 
 # Show code snippets in results
-sage -c "database connection pooling" src/
+semantex -c "database connection pooling" src/
 
 # Increase result count
-sage -m 20 "API endpoint handlers" src/
+semantex -m 20 "API endpoint handlers" src/
 
 # Filter to specific file types (-t / --type)
-sage -t rs "async task spawning" src/
+semantex -t rs "async task spawning" src/
 
 # Exclude tests, docs, config
 semantex --code-only "configuration loading" .
@@ -111,4 +111,4 @@ With `--json`:
 | Semantic (cold start) | 30-90s (model loading) |
 | With `--rerank` | +200ms |
 
-The sage daemon starts automatically on the first query and stays resident. Subsequent queries in the same session are fast.
+The semantex daemon starts automatically on the first query and stays resident. Subsequent queries in the same session are fast.

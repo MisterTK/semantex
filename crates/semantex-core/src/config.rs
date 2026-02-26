@@ -11,7 +11,7 @@ pub enum ColbertModelChoice {
     LateOnCodeEdge,
 }
 
-/// Global sage configuration
+/// Global semantex configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SemantexConfig {
@@ -131,7 +131,7 @@ impl SemantexConfig {
         Ok(config)
     }
 
-    /// Default sage home directory (cross-platform)
+    /// Default semantex home directory (cross-platform)
     pub fn semantex_home() -> PathBuf {
         if let Ok(val) = std::env::var("SEMANTEX_HOME") {
             return PathBuf::from(val);

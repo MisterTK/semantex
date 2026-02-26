@@ -9,7 +9,7 @@ use std::time::Duration;
 const CLIENT_PID_FILE: &str = "client.pid";
 
 /// A persistent client that maintains a long-lived TCP connection to the
-/// sage daemon. Eliminates per-query connection overhead and uses the
+/// semantex daemon. Eliminates per-query connection overhead and uses the
 /// binary (bincode) protocol for minimal serialization cost.
 pub struct PersistentClient {
     stream: TcpStream,
@@ -69,7 +69,7 @@ impl PersistentClient {
 
 // --- PID file management ---
 
-/// Path to the sage state directory: ~/.semantex/ (cross-platform)
+/// Path to the semantex state directory: ~/.semantex/ (cross-platform)
 pub fn semantex_home() -> Result<PathBuf> {
     Ok(semantex_core::config::SemantexConfig::semantex_home())
 }
@@ -129,7 +129,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 /// Stop the persistent client by cleaning up the PID file.
-/// The daemon itself is stopped via `sage stop`.
+/// The daemon itself is stopped via `semantex stop`.
 pub fn stop_client() -> Result<bool> {
     let path = client_pid_path()?;
     if !path.exists() {

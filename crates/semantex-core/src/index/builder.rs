@@ -60,7 +60,7 @@ impl IndexBuilder {
         std::fs::create_dir_all(&index_dir)?;
 
         // Prevent concurrent index builds from corrupting the index
-        let lock_file = std::fs::File::create(index_dir.join(".sage.lock"))?;
+        let lock_file = std::fs::File::create(index_dir.join(".semantex.lock"))?;
         lock_file.lock()?;
 
         // Auto-append .semantex/ to .gitignore if inside a git repo

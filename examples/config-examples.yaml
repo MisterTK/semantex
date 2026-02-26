@@ -1,6 +1,6 @@
-# sage Configuration Examples
-# Copy one of these configurations to ~/.config/sage/config.yaml
-# Or create .sagerc.yaml in your project root for project-specific settings
+# semantex Configuration Examples
+# Copy one of these configurations to ~/.config/semantex/config.yaml
+# Or create .semantexrc.yaml in your project root for project-specific settings
 
 # ============================================================
 # DEFAULT CONFIGURATION (Balanced)
@@ -57,10 +57,10 @@ chunk_overlap: 128
 # ============================================================
 
 # To use one of these configs:
-# 1. Copy the desired section to ~/.config/sage/config.yaml
+# 1. Copy the desired section to ~/.config/semantex/config.yaml
 # 2. Keep only the configuration values (uncommented)
 
 # Or use environment variables to override:
-# export SAGE_MAX_COUNT=20
-# export SAGE_CONTENT=true
-# export SAGE_RERANK=false
+# export SEMANTEX_MAX_COUNT=20
+# export SEMANTEX_CONTENT=true
+# export SEMANTEX_RERANK=false

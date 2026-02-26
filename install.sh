@@ -65,7 +65,7 @@ fi
 
 # Extract binary
 tar xzf "${tmpdir}/${archive}" -C "$tmpdir"
-bin_src="${tmpdir}/semantex-${version}-${target}/sage"
+bin_src="${tmpdir}/semantex-${version}-${target}/semantex"
 
 # Copy ONNX Runtime dylib alongside binary (needed for model inference)
 dylib_src=""

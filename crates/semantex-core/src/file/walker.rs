@@ -29,7 +29,7 @@ impl FileWalker {
         }
     }
 
-    /// Walk directory, respecting .gitignore and .sageignore, returning discovered file paths.
+    /// Walk directory, respecting .gitignore and .semantexignore, returning discovered file paths.
     pub fn walk(&self, root: &Path) -> Result<Vec<PathBuf>> {
         if !root.is_dir() {
             bail!("Root path is not a directory: {}", root.display());
@@ -44,8 +44,8 @@ impl FileWalker {
             .require_git(false) // walk even if not a git repo
             .max_filesize(Some(self.max_file_size));
 
-        // Add .sageignore support
-        builder.add_custom_ignore_filename(".sageignore");
+        // Add .semantexignore support
+        builder.add_custom_ignore_filename(".semantexignore");
 
         let walker = builder.build();
 

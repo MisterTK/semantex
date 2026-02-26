@@ -2,15 +2,15 @@
 
 ## Overview
 
-Comprehensive integration tests for sage semantic code search, covering search accuracy, language parsers, chunking algorithms, and edge cases.
+Comprehensive integration tests for semantex semantic code search, covering search accuracy, language parsers, chunking algorithms, and edge cases.
 
 ## Quick Start
 
 ### Run All Auto Tests (No Index Required)
 
 ```bash
-cd sage
-cargo test --package sage-core --test search_accuracy_test
+cd semantex
+cargo test --package semantex-core --test search_accuracy_test
 ```
 
 **Expected**: 10 tests pass in ~13 seconds
@@ -18,8 +18,8 @@ cargo test --package sage-core --test search_accuracy_test
 ### Run Full Test Suite (Including Ignored Tests)
 
 ```bash
-cd sage
-cargo test --package sage-core --test search_accuracy_test -- --ignored --test-threads=1
+cd semantex
+cargo test --package semantex-core --test search_accuracy_test -- --ignored --test-threads=1
 ```
 
 **Note**: Requires downloading embedding models and building a full index (~2-5 minutes first run)
@@ -36,7 +36,7 @@ Validates that all 12 language parsers correctly extract AST nodes:
 - Markdown, JSON, TOML (text-based fallback)
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test test_ast_chunking_all_languages
+cargo test --package semantex-core --test search_accuracy_test test_ast_chunking_all_languages
 ```
 
 ### 2. Chunking Tests
@@ -47,8 +47,8 @@ cargo test --package sage-core --test search_accuracy_test test_ast_chunking_all
 - `test_unicode_and_multibyte_handling` - International character support
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test test_text_chunking
-cargo test --package sage-core --test search_accuracy_test test_unicode
+cargo test --package semantex-core --test search_accuracy_test test_text_chunking
+cargo test --package semantex-core --test search_accuracy_test test_unicode
 ```
 
 ### 3. Search Algorithm Tests
@@ -60,8 +60,8 @@ cargo test --package sage-core --test search_accuracy_test test_unicode
 - `test_large_batch_embedding` - 100-item batch processing
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test test_rrf
-cargo test --package sage-core --test search_accuracy_test test_embedding
+cargo test --package semantex-core --test search_accuracy_test test_rrf
+cargo test --package semantex-core --test search_accuracy_test test_embedding
 ```
 
 ### 4. Edge Case Tests
@@ -71,8 +71,8 @@ cargo test --package sage-core --test search_accuracy_test test_embedding
 - `test_special_characters_in_query` - SQL, regex, HTML in queries
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test test_edge_case
-cargo test --package sage-core --test search_accuracy_test test_special
+cargo test --package semantex-core --test search_accuracy_test test_edge_case
+cargo test --package semantex-core --test search_accuracy_test test_special
 ```
 
 ### 5. End-to-End Search Tests (Ignored)
@@ -88,16 +88,16 @@ These tests require a full index build and are marked with `#[ignore]`:
 Run with:
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test test_semantic_search_accuracy -- --ignored
-cargo test --package sage-core --test search_accuracy_test test_keyword_search_accuracy -- --ignored
-cargo test --package sage-core --test search_accuracy_test test_hybrid_search_beats_single_mode -- --ignored
-cargo test --package sage-core --test search_accuracy_test test_reranking_improves_results -- --ignored
+cargo test --package semantex-core --test search_accuracy_test test_semantic_search_accuracy -- --ignored
+cargo test --package semantex-core --test search_accuracy_test test_keyword_search_accuracy -- --ignored
+cargo test --package semantex-core --test search_accuracy_test test_hybrid_search_beats_single_mode -- --ignored
+cargo test --package semantex-core --test search_accuracy_test test_reranking_improves_results -- --ignored
 ```
 
 Or all at once:
 
 ```bash
-cargo test --package sage-core --test search_accuracy_test -- --ignored --test-threads=1
+cargo test --package semantex-core --test search_accuracy_test -- --ignored --test-threads=1
 ```
 
 ## Test Data
@@ -210,9 +210,9 @@ jobs:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
       - name: Run quick tests
-        run: cargo test --package sage-core --test search_accuracy_test
+        run: cargo test --package semantex-core --test search_accuracy_test
       - name: Run full tests
-        run: cargo test --package sage-core --test search_accuracy_test -- --ignored --test-threads=1
+        run: cargo test --package semantex-core --test search_accuracy_test -- --ignored --test-threads=1
 ```
 
 ## Contributing

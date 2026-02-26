@@ -1,12 +1,12 @@
-# Contributing to sage
+# Contributing to semantex
 
-Thanks for your interest in contributing to sage!
+Thanks for your interest in contributing to semantex!
 
 ## Getting Started
 
 ```bash
 git clone https://github.com/MisterTK/semantex.git
-cd sage
+cd semantex
 cargo build --release
 cargo test --all
 ```
@@ -39,7 +39,7 @@ cargo test --all
 
 ### OSS Quality Rules
 
-sage is used across thousands of diverse codebases. All code in `crates/` must be **repo-agnostic**:
+semantex is used across thousands of diverse codebases. All code in `crates/` must be **repo-agnostic**:
 
 - **No hardcoded paths** — never embed absolute paths in production code
 - **No test-repo metadata** — don't add synonyms, heuristics, or boosting rules tailored to specific repositories

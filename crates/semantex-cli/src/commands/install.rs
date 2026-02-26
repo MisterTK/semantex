@@ -2,21 +2,21 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::PathBuf;
 
-/// Get the sage binary path for hook configuration.
-fn sage_binary_path() -> Result<String> {
+/// Get the semantex binary path for hook configuration.
+fn semantex_binary_path() -> Result<String> {
     std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
-        .context("Failed to determine sage binary path")
+        .context("Failed to determine semantex binary path")
 }
 
 fn dirs_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
-/// Install sage hooks into Claude Code's settings.
+/// Install semantex hooks into Claude Code's settings.
 /// Writes to ~/.claude/settings.json
 pub fn install_claude_code() -> Result<()> {
-    let binary = sage_binary_path()?;
+    let binary = semantex_binary_path()?;
     let settings_path = dirs_home().join(".claude").join("settings.json");
 
     let mut settings: serde_json::Value = if settings_path.exists() {
@@ -35,7 +35,7 @@ pub fn install_claude_code() -> Result<()> {
 
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
 
-    // SessionStart hook — injects sage context + pre-warms daemon
+    // SessionStart hook — injects semantex context + pre-warms daemon
     hooks_obj.insert(
         "SessionStart".to_string(),
         serde_json::json!([{
@@ -87,7 +87,7 @@ pub fn install_claude_code() -> Result<()> {
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
 
     eprintln!(
-        "{} Installed sage hooks into {}",
+        "{} Installed semantex hooks into {}",
         "Done!".green().bold(),
         settings_path.display()
     );
@@ -95,7 +95,7 @@ pub fn install_claude_code() -> Result<()> {
     Ok(())
 }
 
-/// Uninstall sage hooks from Claude Code's settings.
+/// Uninstall semantex hooks from Claude Code's settings.
 pub fn uninstall_claude_code() -> Result<()> {
     let settings_path = dirs_home().join(".claude").join("settings.json");
     if !settings_path.exists() {
@@ -113,7 +113,7 @@ pub fn uninstall_claude_code() -> Result<()> {
     }
 
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    eprintln!("Removed sage hooks from {}", settings_path.display());
+    eprintln!("Removed semantex hooks from {}", settings_path.display());
     Ok(())
 }
 
@@ -121,17 +121,17 @@ pub fn uninstall_claude_code() -> Result<()> {
 pub fn install_opencode() -> Result<()> {
     println!("{}", "Installing OpenCode integration...".green().bold());
 
-    let sage_path = std::env::current_exe()?;
-    let sage_path_str = sage_path.display();
+    let semantex_path = std::env::current_exe()?;
+    let semantex_path_str = semantex_path.display();
 
     println!();
     println!("Add to your OpenCode configuration:");
     println!();
-    println!("  sage_command: \"{sage_path_str}\"");
+    println!("  semantex_command: \"{semantex_path_str}\"");
     println!();
     println!(
         "{}",
-        "See sage documentation for full OpenCode integration details.".dimmed()
+        "See semantex documentation for full OpenCode integration details.".dimmed()
     );
 
     Ok(())
@@ -141,25 +141,25 @@ pub fn install_opencode() -> Result<()> {
 pub fn install_codex() -> Result<()> {
     println!("{}", "Installing Codex integration...".green().bold());
 
-    let sage_path = std::env::current_exe()?;
-    let sage_path_str = sage_path.display();
+    let semantex_path = std::env::current_exe()?;
+    let semantex_path_str = semantex_path.display();
 
     println!();
     println!("Add to your Codex configuration:");
     println!();
-    println!("  sage_command: \"{sage_path_str}\"");
+    println!("  semantex_command: \"{semantex_path_str}\"");
     println!();
     println!(
         "{}",
-        "See sage documentation for full Codex integration details.".dimmed()
+        "See semantex documentation for full Codex integration details.".dimmed()
     );
 
     Ok(())
 }
 
-/// Remove all sage hook registrations.
+/// Remove all semantex hook registrations.
 pub fn uninstall_all() -> Result<()> {
     let _ = uninstall_claude_code();
-    eprintln!("Removed all sage hook registrations.");
+    eprintln!("Removed all semantex hook registrations.");
     Ok(())
 }

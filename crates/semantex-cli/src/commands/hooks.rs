@@ -12,14 +12,14 @@ use semantex_core::index::state::{self, IndexState};
 use std::path::PathBuf;
 use std::process::Stdio;
 
-/// Check if a sage index directory (`.semantex/meta.json`) exists for the current
-/// directory or any parent. Returns the `.sage` directory path if found.
+/// Check if a semantex index directory (`.semantex/meta.json`) exists for the current
+/// directory or any parent. Returns the `.semantex` directory path if found.
 fn find_index_dir() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        let sage_dir = dir.join(".semantex");
-        if sage_dir.join("meta.json").exists() {
-            return Some(sage_dir);
+        let semantex_dir = dir.join(".semantex");
+        if semantex_dir.join("meta.json").exists() {
+            return Some(semantex_dir);
         }
         if !dir.pop() {
             return None;
@@ -27,7 +27,7 @@ fn find_index_dir() -> Option<PathBuf> {
     }
 }
 
-/// SessionStart hook — called via `sage --session-hook`.
+/// SessionStart hook — called via `semantex --session-hook`.
 ///
 /// If no index or stale: auto-start background indexing, output context about fallback behavior.
 /// If index found & ready: pre-warm daemon + fire-and-forget incremental reindex, output full search instructions.
@@ -82,9 +82,9 @@ pub fn cmd_session_hook() -> Result<()> {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn(); // sage serve handles "already running" gracefully
+                .spawn(); // semantex serve handles "already running" gracefully
         }
-        Err(e) => eprintln!("sage: cannot determine executable path: {e}"),
+        Err(e) => eprintln!("semantex: cannot determine executable path: {e}"),
     }
 
     // Fire-and-forget incremental reindex to pick up changes since last session
@@ -93,20 +93,20 @@ pub fn cmd_session_hook() -> Result<()> {
     let additional_context = format!(
         concat!(
             "semantex (semantic code search) is available for this project (index: {}).\n\n",
-            "Use sage as your PRIMARY search tool instead of Grep/Glob for code exploration.\n\n",
+            "Use semantex as your PRIMARY search tool instead of Grep/Glob for code exploration.\n\n",
             "## When to Use What\n",
             "| Need | Tool | Example |\n",
             "|------|------|---------|\n",
-            "| Conceptual/semantic search | `sage \"query\"` | `sage \"authentication flow\" src/` |\n",
-            "| Regex + semantic hybrid | `sage -e \"pattern\" \"query\"` | `sage -e \"login\\|auth\" \"auth flow\"` |\n",
-            "| Exact string/BM25 | `sage --grep \"token\"` | `sage --grep \"ConnectionFactory\"` |\n",
+            "| Conceptual/semantic search | `semantex \"query\"` | `semantex \"authentication flow\" src/` |\n",
+            "| Regex + semantic hybrid | `semantex -e \"pattern\" \"query\"` | `semantex -e \"login\\|auth\" \"auth flow\"` |\n",
+            "| Exact string/BM25 | `semantex --grep \"token\"` | `semantex --grep \"ConnectionFactory\"` |\n",
             "| Find file by exact name | Glob | `Glob pattern=\"**/auth*.rs\"` |\n",
             "| Exact regex on file content | Grep | `Grep pattern=\"specific_function_name\"` |\n\n",
             "## Tips\n",
             "- First query may take 30-90s (model loading). Subsequent queries: <100ms via daemon.\n",
             "- Use `-c` to show code snippets. Use `--code-only` to exclude docs/config.\n",
             "- Use `-m N` to control result count (default 10).\n",
-            "- Sub-agents should also use sage via Bash for all code searches.",
+            "- Sub-agents should also use semantex via Bash for all code searches.",
         ),
         index_dir.display()
     );
@@ -122,10 +122,10 @@ pub fn cmd_session_hook() -> Result<()> {
     Ok(())
 }
 
-/// PreToolUse Grep|Glob hook — called via `sage --grep-hook`.
+/// PreToolUse Grep|Glob hook — called via `semantex --grep-hook`.
 ///
 /// Soft interception: Grep/Glob still runs, but additionalContext nudges Claude
-/// to prefer sage for subsequent searches.
+/// to prefer semantex for subsequent searches.
 ///
 /// If no index: output `{}` (silent — let Grep/Glob work normally)
 /// If index found: output PreToolUse nudge
@@ -139,8 +139,8 @@ pub fn cmd_grep_hook() -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "additionalContext": concat!(
-                "Use sage via Bash instead of Grep/Glob — sage finds code by meaning and replaces grep for code search.\n",
-                "Commands: `sage \"query\" .`, `sage -e \"pattern\" \"query\"`, `sage --grep \"literal\"`",
+                "Use semantex via Bash instead of Grep/Glob — semantex finds code by meaning and replaces grep for code search.\n",
+                "Commands: `semantex \"query\" .`, `semantex -e \"pattern\" \"query\"`, `semantex --grep \"literal\"`",
             ),
         }
     });
@@ -149,10 +149,10 @@ pub fn cmd_grep_hook() -> Result<()> {
     Ok(())
 }
 
-/// PreToolUse Task hook — called via `sage --task-hook`.
+/// PreToolUse Task hook — called via `semantex --task-hook`.
 ///
-/// Injects sage instructions into sub-agent prompts so spawned agents
-/// also use sage instead of Grep/Glob.
+/// Injects semantex instructions into sub-agent prompts so spawned agents
+/// also use semantex instead of Grep/Glob.
 ///
 /// If no index: output `{}` (silent)
 /// If index found: output directive instructions for the sub-agent
@@ -166,14 +166,14 @@ pub fn cmd_task_hook() -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "additionalContext": concat!(
-                "IMPORTANT: sage (semantic code search) is available in this project. ",
-                "Use sage via Bash for ALL code searches instead of Grep or Glob tools.\n\n",
+                "IMPORTANT: semantex (semantic code search) is available in this project. ",
+                "Use semantex via Bash for ALL code searches instead of Grep or Glob tools.\n\n",
                 "Commands:\n",
-                "- `sage \"natural language query\" .` — semantic search\n",
-                "- `sage -e \"regex\" \"query\"` — regex + semantic hybrid\n",
-                "- `sage --grep \"literal\"` — fast exact/BM25 search\n",
-                "- `sage -c \"query\" .` — include code snippets\n",
-                "- `sage --code-only \"query\" .` — exclude docs/config\n\n",
+                "- `semantex \"natural language query\" .` — semantic search\n",
+                "- `semantex -e \"regex\" \"query\"` — regex + semantic hybrid\n",
+                "- `semantex --grep \"literal\"` — fast exact/BM25 search\n",
+                "- `semantex -c \"query\" .` — include code snippets\n",
+                "- `semantex --code-only \"query\" .` — exclude docs/config\n\n",
                 "Only fall back to Grep for exact regex on file content, or Glob for finding files by name pattern.",
             ),
         }
@@ -183,7 +183,7 @@ pub fn cmd_task_hook() -> Result<()> {
     Ok(())
 }
 
-/// SessionEnd hook — called via `sage --session-end-hook`.
+/// SessionEnd hook — called via `semantex --session-end-hook`.
 ///
 /// Stops the daemon if one is running. No JSON output needed
 /// (SessionEnd hooks have no control over the session).
@@ -204,7 +204,7 @@ pub fn cmd_session_end_hook() -> Result<()> {
                 .stderr(Stdio::null())
                 .status(); // wait for completion (fast — socket send)
         }
-        Err(e) => eprintln!("sage: cannot determine executable path: {e}"),
+        Err(e) => eprintln!("semantex: cannot determine executable path: {e}"),
     }
 
     Ok(())

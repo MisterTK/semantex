@@ -37,18 +37,18 @@ static WEIGHT_OVERRIDES: LazyLock<CachedWeightOverrides> = LazyLock::new(|| {
     }
 
     CachedWeightOverrides {
-        identifier: parse_weights("SAGE_WEIGHTS_IDENTIFIER"),
-        keyword: parse_weights("SAGE_WEIGHTS_KEYWORD"),
-        semantic: parse_weights("SAGE_WEIGHTS_SEMANTIC"),
-        mixed: parse_weights("SAGE_WEIGHTS_MIXED"),
+        identifier: parse_weights("SEMANTEX_WEIGHTS_IDENTIFIER"),
+        keyword: parse_weights("SEMANTEX_WEIGHTS_KEYWORD"),
+        semantic: parse_weights("SEMANTEX_WEIGHTS_SEMANTIC"),
+        mixed: parse_weights("SEMANTEX_WEIGHTS_MIXED"),
     }
 });
 
 impl QueryType {
     /// Return recommended weights for triple CC fusion (dense + sparse + exact).
     ///
-    /// Supports env var overrides for tuning: `SAGE_WEIGHTS_{TYPE}=dense,sparse,exact`
-    /// e.g. `SAGE_WEIGHTS_SEMANTIC=0.4,0.5,1.5`
+    /// Supports env var overrides for tuning: `SEMANTEX_WEIGHTS_{TYPE}=dense,sparse,exact`
+    /// e.g. `SEMANTEX_WEIGHTS_SEMANTIC=0.4,0.5,1.5`
     ///
     /// Overrides are cached via LazyLock — read once at first access.
     pub fn triple_fusion_weights(self) -> TripleFusionWeights {

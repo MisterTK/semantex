@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
     name = "semantex",
     about = "Semantic grep — fully local code search with dense+sparse hybrid retrieval",
     version,
-    after_help = "Examples:\n  sage \"function that handles authentication\" .\n  sage index .\n  sage --content --max-count 10 \"database connection pool\"\n  sage --json --rerank \"error handling\"\n  sage -G --grep \"ConnectionFactory\" .  # grep-like exhaustive search"
+    after_help = "Examples:\n  semantex \"function that handles authentication\" .\n  semantex index .\n  semantex --content --max-count 10 \"database connection pool\"\n  semantex --json --rerank \"error handling\"\n  semantex -G --grep \"ConnectionFactory\" .  # grep-like exhaustive search"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -136,28 +136,28 @@ struct Cli {
     #[arg(long, hide = true)]
     session_end_hook: bool,
 
-    /// Uninstall sage hooks from Claude Code
+    /// Uninstall semantex hooks from Claude Code
     #[arg(long)]
     uninstall_claude_code: bool,
 
-    /// Remove all sage hook registrations
+    /// Remove all semantex hook registrations
     #[arg(long)]
     uninstall: bool,
 
-    /// Install sage hooks into Claude Code's settings.json
+    /// Install semantex hooks into Claude Code's settings.json
     #[arg(long)]
     install_claude_code: bool,
 
-    /// Install sage hooks into OpenCode
+    /// Install semantex hooks into OpenCode
     #[arg(long)]
     install_opencode: bool,
 
-    /// Install sage hooks into Codex
+    /// Install semantex hooks into Codex
     #[arg(long)]
     install_codex: bool,
 
     /// Regex pattern to combine with semantic search (hybrid mode).
-    /// Example: sage -e "async fn" "database pool"
+    /// Example: semantex -e "async fn" "database pool"
     #[arg(short = 'e', long = "pattern")]
     pattern: Option<String>,
 }

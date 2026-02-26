@@ -70,7 +70,7 @@ impl HybridSearcher {
         {
             tracing::warn!(
                 "Index schema version mismatch (found v{}, expected v{}). \
-                 Re-index with `sage index` for best results.",
+                 Re-index with `semantex index` for best results.",
                 existing_meta.schema_version,
                 crate::types::IndexMeta::CURRENT_SCHEMA_VERSION
             );

@@ -8,7 +8,7 @@ Status: **Planned** (Phase 1 complete)
 
 Replace the three separate functions (`install_claude_code`, `install_opencode`, `install_codex`) with a unified system.
 
-**File:** `crates/sage-cli/src/commands/install.rs`
+**File:** `crates/semantex-cli/src/commands/install.rs`
 
 ```rust
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ impl AgentKind {
 }
 
 pub fn install_agent(kind: AgentKind) -> anyhow::Result<()> {
-    let binary = sage_binary_path()?;
+    let binary = semantex_binary_path()?;
     register_mcp(kind, &binary)?;
     install_skill(kind)?;
     if kind.supports_hooks() {
@@ -84,13 +84,13 @@ pub fn uninstall_agent(kind: AgentKind) -> anyhow::Result<()> {
 
 | Agent | Config File | Format |
 |-------|-----------|--------|
-| Claude Code | `~/.claude/settings.json` | JSON: `{ "mcpServers": { "sage": { "command": "sage", "args": ["mcp"] } } }` |
-| Codex | `~/.codex/config.toml` | TOML: `[mcp.sage]\ncommand = "sage"\nargs = ["mcp"]` |
+| Claude Code | `~/.claude/settings.json` | JSON: `{ "mcpServers": { "semantex": { "command": "semantex", "args": ["mcp"] } } }` |
+| Codex | `~/.codex/config.toml` | TOML: `[mcp.semantex]\ncommand = "semantex"\nargs = ["mcp"]` |
 | Cursor | `~/.cursor/mcp.json` | JSON: same structure as Claude Code |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON: same structure as Claude Code |
-| OpenCode | `~/.config/opencode/opencode.json` | JSON: `{ "mcp": { "sage": { "command": "sage", "args": ["mcp"] } } }` |
+| OpenCode | `~/.config/opencode/opencode.json` | JSON: `{ "mcp": { "semantex": { "command": "semantex", "args": ["mcp"] } } }` |
 | VS Code | `.vscode/mcp.json` (workspace) | JSON: same structure as Claude Code |
-| Gemini | `~/.gemini/settings.json` | JSON: `{ "mcpServers": { "sage": { "command": "sage", "args": ["mcp"] } } }` |
+| Gemini | `~/.gemini/settings.json` | JSON: `{ "mcpServers": { "semantex": { "command": "semantex", "args": ["mcp"] } } }` |
 
 ### 2.3 SKILL.md Installation
 
@@ -98,31 +98,31 @@ Copy the bundled SKILL.md to each agent's skills directory:
 
 | Agent | Skills Directory |
 |-------|-----------------|
-| Claude Code | `~/.claude/skills/sage/SKILL.md` |
-| Codex | `~/.agents/skills/sage/SKILL.md` |
-| Cursor | `~/.cursor/skills/sage/SKILL.md` |
-| Windsurf | `~/.codeium/windsurf/skills/sage/SKILL.md` |
-| OpenCode | `~/.config/opencode/skills/sage/SKILL.md` |
-| Gemini | `~/.gemini/skills/sage/SKILL.md` |
+| Claude Code | `~/.claude/skills/semantex/SKILL.md` |
+| Codex | `~/.agents/skills/semantex/SKILL.md` |
+| Cursor | `~/.cursor/skills/semantex/SKILL.md` |
+| Windsurf | `~/.codeium/windsurf/skills/semantex/SKILL.md` |
+| OpenCode | `~/.config/opencode/skills/semantex/SKILL.md` |
+| Gemini | `~/.gemini/skills/semantex/SKILL.md` |
 
 The SKILL.md content is embedded in the binary at compile time via `include_str!`.
 
 ### 2.4 Hook Registration (Claude Code + Gemini)
 
 Only Claude Code and Gemini CLI support hooks. The hooks intercept:
-- **SessionStart**: Start sage daemon, report index status
-- **PreToolUse (Grep|Glob)**: Suggest sage alternative for semantic queries
-- **PreToolUse (Task)**: Inject sage awareness into sub-agents
+- **SessionStart**: Start semantex daemon, report index status
+- **PreToolUse (Grep|Glob)**: Suggest semantex alternative for semantic queries
+- **PreToolUse (Task)**: Inject semantex awareness into sub-agents
 - **SessionEnd**: Clean up daemon if idle
 
 Hook registration merges into the agent's existing hook config, avoiding duplicates.
 
 ### 2.5 Auto-Detect + Interactive Install
 
-When `sage install` is run without arguments:
+When `semantex install` is run without arguments:
 
 ```
-sage install
+semantex install
 
 Detected agents:
   [x] Claude Code (~/.claude/)
@@ -138,7 +138,7 @@ Uses `dialoguer` crate for the interactive checklist (already a common Rust TUI 
 
 ### 2.6 CLI Subcommand Changes
 
-**File:** `crates/sage-cli/src/main.rs`
+**File:** `crates/semantex-cli/src/main.rs`
 
 Replace:
 ```rust
@@ -151,7 +151,7 @@ InstallOpenCode,
 
 With:
 ```rust
-/// Install sage integration for coding agents
+/// Install semantex integration for coding agents
 Install {
     /// Agent to install for (auto-detects if omitted)
     #[arg(value_enum)]
@@ -160,7 +160,7 @@ Install {
     #[arg(long)]
     all: bool,
 },
-/// Uninstall sage integration
+/// Uninstall semantex integration
 Uninstall {
     #[arg(value_enum)]
     agent: Option<AgentKind>,
@@ -172,7 +172,7 @@ Uninstall {
 
 ### 2.7 New Dependency
 
-Add to `crates/sage-cli/Cargo.toml`:
+Add to `crates/semantex-cli/Cargo.toml`:
 ```toml
 toml_edit = "0.22"    # For Codex TOML config manipulation
 dialoguer = "0.11"    # Interactive agent selection
@@ -191,71 +191,71 @@ cd plugin && claude plugin validate .
 
 Users install via:
 ```bash
-claude plugin install tk/sage
+claude plugin install tk/semantex
 ```
 
-The plugin manifest (`plugin.json`) already includes skills, hooks, and MCP references. The marketplace handles distribution — no binary bundling needed since the plugin assumes `sage` is on PATH.
+The plugin manifest (`plugin.json`) already includes skills, hooks, and MCP references. The marketplace handles distribution — no binary bundling needed since the plugin assumes `semantex` is on PATH.
 
 ### 3.2 Homebrew Tap
 
-Create new repo `tk/homebrew-sage` with formula:
+Create new repo `tk/homebrew-semantex` with formula:
 
-**File:** `Formula/sage.rb`
+**File:** `Formula/semantex.rb`
 ```ruby
-class Sage < Formula
+class Semantex < Formula
   desc "Semantic code search — hybrid ColBERT + BM25 retrieval engine"
-  homepage "https://github.com/tk/sage"
+  homepage "https://github.com/tk/semantex"
   version "0.1.0"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/tk/sage/releases/download/v#{version}/sage-v#{version}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/tk/semantex/releases/download/v#{version}/semantex-v#{version}-aarch64-apple-darwin.tar.gz"
       # sha256 "..." — fill from release checksums
     end
     on_intel do
-      url "https://github.com/tk/sage/releases/download/v#{version}/sage-v#{version}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/tk/semantex/releases/download/v#{version}/semantex-v#{version}-x86_64-apple-darwin.tar.gz"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/tk/sage/releases/download/v#{version}/sage-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/tk/semantex/releases/download/v#{version}/semantex-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
     end
     on_intel do
-      url "https://github.com/tk/sage/releases/download/v#{version}/sage-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/tk/semantex/releases/download/v#{version}/semantex-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
     end
   end
 
   def install
-    bin.install "sage"
+    bin.install "semantex"
     # Install ONNX Runtime dylib alongside binary
     lib.install Dir["libonnxruntime*"]
   end
 
   test do
-    system "#{bin}/sage", "--version"
+    system "#{bin}/semantex", "--version"
   end
 end
 ```
 
-Install: `brew install tk/sage/sage`
+Install: `brew install tk/semantex/semantex`
 
 ### 3.3 npm Wrapper (Optional)
 
 For agents that configure MCP via npm (Cursor, some VS Code setups):
 
-**Package:** `sage-search` on npm
+**Package:** `semantex-search` on npm
 
 Structure using platform-specific `optionalDependencies`:
 ```
-sage-search/
+semantex-search/
   package.json
-  bin/sage-search.js       # Thin wrapper that finds + execs native binary
-@sage-search/
+  bin/semantex-search.js       # Thin wrapper that finds + execs native binary
+@semantex-search/
   darwin-arm64/
     package.json
-    bin/sage               # Native binary
+    bin/semantex               # Native binary
   darwin-x64/
   linux-x64/
   linux-arm64/
@@ -265,34 +265,34 @@ sage-search/
 **`package.json`:**
 ```json
 {
-  "name": "sage-search",
+  "name": "semantex-search",
   "version": "0.1.0",
   "description": "Semantic code search — hybrid ColBER + BM25",
-  "bin": { "sage-search": "bin/sage-search.js" },
+  "bin": { "semantex-search": "bin/semantex-search.js" },
   "optionalDependencies": {
-    "@sage-search/darwin-arm64": "0.1.0",
-    "@sage-search/darwin-x64": "0.1.0",
-    "@sage-search/linux-x64": "0.1.0",
-    "@sage-search/linux-arm64": "0.1.0",
-    "@sage-search/win32-x64": "0.1.0"
+    "@semantex-search/darwin-arm64": "0.1.0",
+    "@semantex-search/darwin-x64": "0.1.0",
+    "@semantex-search/linux-x64": "0.1.0",
+    "@semantex-search/linux-arm64": "0.1.0",
+    "@semantex-search/win32-x64": "0.1.0"
   }
 }
 ```
 
-Usage: `npx sage-search mcp` for MCP server, `npx sage-search "query"` for search.
+Usage: `npx semantex-search mcp` for MCP server, `npx semantex-search "query"` for search.
 
 This approach follows the esbuild/turbo pattern and works well with npm-based tool registries.
 
 ### 3.4 Cursor Marketplace (MCP Registry)
 
-Cursor sources MCP servers from a registry. Submit `sage` to the Cursor MCP directory once the npm wrapper is available, enabling one-click install from Cursor settings.
+Cursor sources MCP servers from a registry. Submit `semantex` to the Cursor MCP directory once the npm wrapper is available, enabling one-click install from Cursor settings.
 
 ### 3.5 VS Code Extension (Future)
 
 A minimal VS Code extension that:
-1. Installs the sage binary (or uses one on PATH)
+1. Installs the semantex binary (or uses one on PATH)
 2. Registers as MCP provider
-3. Adds "Search with sage" command to command palette
+3. Adds "Search with semantex" command to command palette
 
 Lower priority — VS Code users can use the MCP config directly.
 

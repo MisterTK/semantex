@@ -70,11 +70,11 @@ pub fn run(opts: &SearchOpts, config: &SemantexConfig) -> Result<()> {
     run_direct(opts, config, &project_path, &index_dir)
 }
 
-/// Use ripgrep as a keyword-level fallback when the sage index is unavailable.
+/// Use ripgrep as a keyword-level fallback when the semantex index is unavailable.
 fn run_ripgrep_fallback(opts: &SearchOpts, project_path: &std::path::Path) -> Result<()> {
     if !ripgrep_fallback::is_rg_available() {
         anyhow::bail!(
-            "No sage index and ripgrep (rg) not found.\n\
+            "No semantex index and ripgrep (rg) not found.\n\
              Either wait for the index to finish building, or install ripgrep: https://github.com/BurntSushi/ripgrep"
         );
     }
@@ -329,7 +329,7 @@ fn run_with_searcher(
     Ok(())
 }
 
-/// Auto-start a sage daemon for `project_path` and route the search through it.
+/// Auto-start a semantex daemon for `project_path` and route the search through it.
 ///
 /// This ensures the ONNX embedding model (~13 GB peak RAM) lives in exactly one
 /// dedicated daemon process rather than being loaded inside every CLI invocation.
@@ -340,10 +340,10 @@ fn auto_start_and_search(
     project_path: &std::path::Path,
     _index_dir: &std::path::Path,
 ) -> Result<()> {
-    let current_exe = std::env::current_exe().context("cannot determine sage executable path")?;
+    let current_exe = std::env::current_exe().context("cannot determine semantex executable path")?;
 
     eprintln!(
-        "sage: no daemon found — auto-starting for {} …",
+        "semantex: no daemon found — auto-starting for {} …",
         project_path.display()
     );
     eprintln!(
@@ -358,7 +358,7 @@ fn auto_start_and_search(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .context("failed to auto-start sage daemon")?;
+        .context("failed to auto-start semantex daemon")?;
 
     for attempt in 0_u32..120 {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -374,7 +374,7 @@ fn auto_start_and_search(
 
     anyhow::bail!(
         "semantex daemon did not become ready within 120 s.\n\
-         Try starting it manually: sage serve {}",
+         Try starting it manually: semantex serve {}",
         project_path.display()
     )
 }

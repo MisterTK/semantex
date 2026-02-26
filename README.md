@@ -4,26 +4,26 @@
 
 semantex is a fully local, production-grade semantic code search engine. It combines per-token neural embeddings (ColBERT/PLAID) with stemmed BM25 keyword search and intelligent fusion to find code by meaning, not just pattern matching.
 
-## Why sage?
+## Why semantex?
 
-Traditional grep tools match exact patterns. sage understands **meaning**:
+Traditional grep tools match exact patterns. semantex understands **meaning**:
 
 ```bash
 # Find authentication code, even if it doesn't contain "auth"
-sage "verify user credentials" ./src
+semantex "verify user credentials" ./src
 
 # Understand intent, not just keywords
-sage "database connection pool initialization" .
+semantex "database connection pool initialization" .
 
 # Search in natural language
-sage "function that handles file uploads with progress tracking" .
+semantex "function that handles file uploads with progress tracking" .
 ```
 
 ## Key Features
 
 ### Hybrid Retrieval Architecture
 
-sage uses a multi-stage search pipeline:
+semantex uses a multi-stage search pipeline:
 
 1. **Dense search** (ColBERT/PLAID) — per-token late interaction with MaxSim scoring (48d embeddings)
 2. **Sparse search** (BM25 via Tantivy) — stemmed keyword matching with code-aware tokenization
@@ -67,7 +67,7 @@ sage uses a multi-stage search pipeline:
 curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
 ```
 
-Installs to `/usr/local/bin` (or `~/.local/bin` as fallback). `sage` is ready immediately — no shell restart required.
+Installs to `/usr/local/bin` (or `~/.local/bin` as fallback). `semantex` is ready immediately — no shell restart required.
 
 **Windows** — download the `.zip` from [GitHub Releases](https://github.com/MisterTK/semantex/releases/latest) and add the binary to your PATH.
 
@@ -75,7 +75,7 @@ Installs to `/usr/local/bin` (or `~/.local/bin` as fallback). `sage` is ready im
 
 ```bash
 git clone https://github.com/MisterTK/semantex.git
-cd sage
+cd semantex
 cargo install --path crates/semantex-cli
 ```
 
@@ -83,7 +83,7 @@ cargo install --path crates/semantex-cli
 
 ### Claude Code (Recommended)
 
-semantex integrates with Claude Code via hooks that automatically make sage the default search tool. No manual configuration needed.
+semantex integrates with Claude Code via hooks that automatically make semantex the default search tool. No manual configuration needed.
 
 ```bash
 # 1. Install hooks into Claude Code (fully automated)
@@ -92,11 +92,11 @@ semantex install-claude-code
 # 2. Restart Claude Code — semantex is now active
 ```
 
-That's it. semantex auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer sage over Grep/Glob. No manual indexing step required.
+That's it. semantex auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer semantex over Grep/Glob. No manual indexing step required.
 
 ### Other AI Coding Tools
 
-semantex exposes an MCP server with 4 tools (`sage_search`, `sage_index`, `sage_status`, `sage_health`). Add to your editor's MCP config:
+semantex exposes an MCP server with 4 tools (`semantex_search`, `semantex_index`, `semantex_status`, `semantex_health`). Add to your editor's MCP config:
 
 ```json
 {
@@ -121,11 +121,11 @@ semantex install-open-code   # OpenCode
 semantex works as a standalone CLI tool without any AI editor:
 
 ```bash
-# Index your project (or let sage auto-index on first search)
+# Index your project (or let semantex auto-index on first search)
 semantex index /path/to/your/project
 
 # Search semantically
-sage "authentication logic" /path/to/your/project
+semantex "authentication logic" /path/to/your/project
 ```
 
 ### System Requirements
@@ -137,12 +137,12 @@ sage "authentication logic" /path/to/your/project
 
 ### Model Downloads
 
-On first index, sage automatically downloads the ColBERT model to `~/.semantex/models/`:
+On first index, semantex automatically downloads the ColBERT model to `~/.semantex/models/`:
 
 - **ColBERT model**: LateOn-Code-edge (~200MB, 48d per-token embeddings)
 - **Reranker model**: JINA Reranker v1 Turbo (~80MB, optional via `--rerank`)
 
-Models are cached and shared across all sage instances.
+Models are cached and shared across all semantex instances.
 
 ## Usage
 
@@ -150,10 +150,10 @@ Models are cached and shared across all sage instances.
 
 ```bash
 # Search current directory
-sage "handle user authentication"
+semantex "handle user authentication"
 
 # Search specific path
-sage "database migration logic" ./backend/db
+semantex "database migration logic" ./backend/db
 
 # Limit results
 semantex --max-count 5 "error handling"
@@ -166,13 +166,13 @@ semantex --content "API endpoint for users"
 
 ```bash
 # Search only Rust files
-sage -t rs "error handling"
+semantex -t rs "error handling"
 
 # Search TypeScript and JavaScript
-sage -t ts -t js "API endpoint"
+semantex -t ts -t js "API endpoint"
 
 # Multiple types
-sage -t rs -t py -t go "factory pattern"
+semantex -t rs -t py -t go "factory pattern"
 ```
 
 ### Compact Output Modes
@@ -192,7 +192,7 @@ semantex --json --no-content "error handling"
 
 ```bash
 # Default: Hybrid search (dense + sparse + fusion)
-sage "authentication middleware"
+semantex "authentication middleware"
 
 # Dense-only (semantic search only)
 semantex --dense-only "user verification"
@@ -201,10 +201,10 @@ semantex --dense-only "user verification"
 semantex --sparse-only "authenticate"
 
 # Grep mode (exact + BM25, no dense, exhaustive)
-sage -G "authenticate"
+semantex -G "authenticate"
 
 # Regex + semantic hybrid
-sage -e "Promise\.allSettled" "parallel failure handling"
+semantex -e "Promise\.allSettled" "parallel failure handling"
 ```
 
 ### Daemon Server
@@ -214,7 +214,7 @@ sage -e "Promise\.allSettled" "parallel failure handling"
 semantex serve /path/to/project
 
 # Search via daemon (auto-detected)
-sage "authentication" /path/to/project
+semantex "authentication" /path/to/project
 
 # Stop daemon
 semantex stop /path/to/project
@@ -227,10 +227,10 @@ semantex watch /path/to/project
 
 semantex exposes 4 MCP tools over stdio transport (`semantex mcp`):
 
-- **`sage_search`** — semantic or keyword search with auto-fallback to ripgrep
-- **`sage_index`** — trigger background indexing for a project
-- **`sage_status`** — check index metadata (file count, chunk count, freshness)
-- **`sage_health`** — full system health check (model status, cache stats)
+- **`semantex_search`** — semantic or keyword search with auto-fallback to ripgrep
+- **`semantex_index`** — trigger background indexing for a project
+- **`semantex_status`** — check index metadata (file count, chunk count, freshness)
+- **`semantex_health`** — full system health check (model status, cache stats)
 
 See [Getting Started](#other-ai-coding-tools) for editor configuration.
 
@@ -261,11 +261,11 @@ Query -> Exact string match -------------------+
 ### Project Structure
 
 ```
-sage/
+semantex/
 ├── crates/
-│   ├── sage-core/      # Core search engine (indexing, search, embeddings)
-│   ├── sage-cli/       # Command-line interface
-│   └── sage-mcp/       # MCP server
+│   ├── semantex-core/      # Core search engine (indexing, search, embeddings)
+│   ├── semantex-cli/       # Command-line interface
+│   └── semantex-mcp/       # MCP server
 ├── plugin/              # Claude Code plugin (skills, hooks)
 │   ├── .claude-plugin/  #   Plugin manifest
 │   ├── skills/          #   Agent skill definitions
@@ -287,7 +287,7 @@ Plus fallback text chunking for any other file type.
 
 On a 30-query benchmark (8 exact, 14 semantic, 8 architectural):
 
-| Metric | grep | sage |
+| Metric | grep | semantex |
 |--------|------|-------|
 | **Overall F1** | 0.454 | **0.610** |
 | **Speed (warm)** | 64ms | **17ms** |
@@ -302,7 +302,7 @@ On a 30-query benchmark (8 exact, 14 semantic, 8 architectural):
 
 ```bash
 git clone https://github.com/MisterTK/semantex.git
-cd sage
+cd semantex
 cargo build --release
 ```
 
@@ -316,8 +316,8 @@ cargo clippy --all
 ### Environment Variables
 
 ```bash
-SAGE_ORT_THREADS=4     # ONNX Runtime thread count (default: 4)
-SAGE_COREML=1          # Enable CoreML acceleration on macOS
+SEMANTEX_ORT_THREADS=4     # ONNX Runtime thread count (default: 4)
+SEMANTEX_COREML=1          # Enable CoreML acceleration on macOS
 RUST_LOG=info            # Logging level (error, warn, info, debug, trace)
 ```
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// TCP localhost listener for the sage daemon
+/// TCP localhost listener for the semantex daemon
 #[allow(clippy::struct_field_names)]
 pub struct Listener {
     port_file: PathBuf,

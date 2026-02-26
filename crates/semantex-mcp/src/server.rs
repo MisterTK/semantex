@@ -187,7 +187,7 @@ impl McpServer {
                 },
             },
             server_info: ServerInfo {
-                name: "sage".into(),
+                name: "semantex".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
         };
@@ -263,7 +263,7 @@ impl McpServer {
             Tool {
                 name: "semantex_index".into(),
                 description: concat!(
-                    "Build or update the sage search index. Usually NOT needed — sage auto-indexes on first search. ",
+                    "Build or update the semantex search index. Usually NOT needed — semantex auto-indexes on first search. ",
                     "Call only to force a rebuild after major changes."
                 ).into(),
                 input_schema: serde_json::json!({
@@ -276,7 +276,7 @@ impl McpServer {
             },
             Tool {
                 name: "semantex_status".into(),
-                description: "Check sage index status: whether it exists, file count, chunk count, freshness. Use to verify indexing is complete.".into(),
+                description: "Check semantex index status: whether it exists, file count, chunk count, freshness. Use to verify indexing is complete.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -286,7 +286,7 @@ impl McpServer {
             },
             Tool {
                 name: "semantex_health".into(),
-                description: "Health check for the sage system, including model availability and configuration.".into(),
+                description: "Health check for the semantex system, including model availability and configuration.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {}
@@ -389,7 +389,7 @@ impl McpServer {
         }
     }
 
-    /// Perform a full sage search using the index.
+    /// Perform a full semantex search using the index.
     fn do_semantex_search(
         &self,
         query: &str,
@@ -506,7 +506,7 @@ impl McpServer {
         use semantex_core::embedding::model_manager;
 
         let mut status = Vec::new();
-        status.push(format!("Sage Health Check v{}", env!("CARGO_PKG_VERSION")));
+        status.push(format!("Semantex Health Check v{}", env!("CARGO_PKG_VERSION")));
         status.push("=".repeat(50));
 
         // Check models directory
@@ -607,5 +607,5 @@ fn format_metrics_footer(
     parts.push(format!("results={}", metrics.result_count));
     parts.push(format!("query_type={}", metrics.query_type));
     parts.push(format!("response_bytes={response_bytes}"));
-    format!("[sage_metrics: {}]", parts.join(" "))
+    format!("[semantex_metrics: {}]", parts.join(" "))
 }

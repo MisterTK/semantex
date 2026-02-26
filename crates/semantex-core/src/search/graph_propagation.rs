@@ -85,27 +85,27 @@ impl GraphPropagationConfig {
     #[must_use]
     #[allow(clippy::collapsible_if)]
     pub fn with_env_overrides(mut self) -> Self {
-        if let Ok(v) = std::env::var("SAGE_GRAPH_CALL_DECAY") {
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_CALL_DECAY") {
             if let Ok(f) = v.parse() {
                 self.call_decay = f;
             }
         }
-        if let Ok(v) = std::env::var("SAGE_GRAPH_CALLER_DECAY") {
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_CALLER_DECAY") {
             if let Ok(f) = v.parse() {
                 self.caller_decay = f;
             }
         }
-        if let Ok(v) = std::env::var("SAGE_GRAPH_TYPE_DECAY") {
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_TYPE_DECAY") {
             if let Ok(f) = v.parse() {
                 self.type_ref_decay = f;
             }
         }
-        if let Ok(v) = std::env::var("SAGE_GRAPH_HIERARCHY_DECAY") {
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_HIERARCHY_DECAY") {
             if let Ok(f) = v.parse() {
                 self.hierarchy_decay = f;
             }
         }
-        if let Ok(v) = std::env::var("SAGE_GRAPH_TRANSITIVE_DECAY") {
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_TRANSITIVE_DECAY") {
             if let Ok(f) = v.parse() {
                 self.transitive_decay = f;
             }
