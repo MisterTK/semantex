@@ -61,18 +61,15 @@ sage uses a multi-stage search pipeline:
 
 ## Installation
 
-**Shell installer** (macOS / Linux — downloads prebuilt binary):
+**macOS / Linux** — one command, no PATH changes needed:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MisterTK/sage/main/install.sh | sh
 ```
 
-**Cargo binstall** (prebuilt binary via cargo, requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)):
+Installs to `/usr/local/bin` (or `~/.local/bin` as fallback). `sage` is ready immediately — no shell restart required.
 
-```bash
-cargo install cargo-binstall  # one-time setup
-cargo binstall sage-cli
-```
+**Windows** — download the `.zip` from [GitHub Releases](https://github.com/MisterTK/sage/releases/latest) and add the binary to your PATH.
 
 **Build from source** (requires Rust 1.91+):
 
