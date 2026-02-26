@@ -5,7 +5,7 @@ Thanks for your interest in contributing to sage!
 ## Getting Started
 
 ```bash
-git clone https://github.com/tk/sage.git
+git clone https://github.com/MisterTK/semantex.git
 cd sage
 cargo build --release
 cargo test --all
@@ -14,7 +14,7 @@ cargo test --all
 ### Requirements
 
 - Rust 1.91+ (edition 2024)
-- ~200MB disk for ColBERT model (downloaded on first `sage index`)
+- ~200MB disk for ColBERT model (downloaded on first `semantex index`)
 
 ## Development Workflow
 

@@ -1,5 +1,5 @@
 {
-  "description": "sage semantic code search hooks for Claude Code",
+  "description": "semantex semantic code search hooks for Claude Code",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sage --session-hook",
+            "command": "semantex --session-hook",
             "timeout": 15
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sage --grep-hook",
+            "command": "semantex --grep-hook",
             "timeout": 5
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sage --task-hook",
+            "command": "semantex --task-hook",
             "timeout": 5
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sage --session-end-hook",
+            "command": "semantex --session-end-hook",
             "timeout": 10
           }
         ]

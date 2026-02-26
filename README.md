@@ -1,8 +1,8 @@
-# sage — **S**emantic-**A**ware **G**rep **E**ngine
+# semantex — **S**emantic-**A**ware **G**rep **E**ngine
 
 **Hybrid dense+sparse code search with ColBERT late interaction and BM25**
 
-sage is a fully local, production-grade semantic code search engine. It combines per-token neural embeddings (ColBERT/PLAID) with stemmed BM25 keyword search and intelligent fusion to find code by meaning, not just pattern matching.
+semantex is a fully local, production-grade semantic code search engine. It combines per-token neural embeddings (ColBERT/PLAID) with stemmed BM25 keyword search and intelligent fusion to find code by meaning, not just pattern matching.
 
 ## Why sage?
 
@@ -64,45 +64,45 @@ sage uses a multi-stage search pipeline:
 **macOS / Linux** — one command, no PATH changes needed:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MisterTK/sage/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
 ```
 
 Installs to `/usr/local/bin` (or `~/.local/bin` as fallback). `sage` is ready immediately — no shell restart required.
 
-**Windows** — download the `.zip` from [GitHub Releases](https://github.com/MisterTK/sage/releases/latest) and add the binary to your PATH.
+**Windows** — download the `.zip` from [GitHub Releases](https://github.com/MisterTK/semantex/releases/latest) and add the binary to your PATH.
 
 **Build from source** (requires Rust 1.91+):
 
 ```bash
-git clone https://github.com/MisterTK/sage.git
+git clone https://github.com/MisterTK/semantex.git
 cd sage
-cargo install --path crates/sage-cli
+cargo install --path crates/semantex-cli
 ```
 
 ## Getting Started
 
 ### Claude Code (Recommended)
 
-sage integrates with Claude Code via hooks that automatically make sage the default search tool. No manual configuration needed.
+semantex integrates with Claude Code via hooks that automatically make sage the default search tool. No manual configuration needed.
 
 ```bash
 # 1. Install hooks into Claude Code (fully automated)
-sage install-claude-code
+semantex install-claude-code
 
-# 2. Restart Claude Code — sage is now active
+# 2. Restart Claude Code — semantex is now active
 ```
 
-That's it. sage auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer sage over Grep/Glob. No manual indexing step required.
+That's it. semantex auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer sage over Grep/Glob. No manual indexing step required.
 
 ### Other AI Coding Tools
 
-sage exposes an MCP server with 4 tools (`sage_search`, `sage_index`, `sage_status`, `sage_health`). Add to your editor's MCP config:
+semantex exposes an MCP server with 4 tools (`sage_search`, `sage_index`, `sage_status`, `sage_health`). Add to your editor's MCP config:
 
 ```json
 {
   "mcpServers": {
-    "sage": {
-      "command": "sage",
+    "semantex": {
+      "command": "semantex",
       "args": ["mcp"]
     }
   }
@@ -112,17 +112,17 @@ sage exposes an MCP server with 4 tools (`sage_search`, `sage_index`, `sage_stat
 Setup helpers for specific tools:
 
 ```bash
-sage install-codex       # OpenAI Codex CLI
-sage install-open-code   # OpenCode
+semantex install-codex       # OpenAI Codex CLI
+semantex install-open-code   # OpenCode
 ```
 
 ### Standalone CLI
 
-sage works as a standalone CLI tool without any AI editor:
+semantex works as a standalone CLI tool without any AI editor:
 
 ```bash
 # Index your project (or let sage auto-index on first search)
-sage index /path/to/your/project
+semantex index /path/to/your/project
 
 # Search semantically
 sage "authentication logic" /path/to/your/project
@@ -137,7 +137,7 @@ sage "authentication logic" /path/to/your/project
 
 ### Model Downloads
 
-On first index, sage automatically downloads the ColBERT model to `~/.sage/models/`:
+On first index, sage automatically downloads the ColBERT model to `~/.semantex/models/`:
 
 - **ColBERT model**: LateOn-Code-edge (~200MB, 48d per-token embeddings)
 - **Reranker model**: JINA Reranker v1 Turbo (~80MB, optional via `--rerank`)
@@ -156,10 +156,10 @@ sage "handle user authentication"
 sage "database migration logic" ./backend/db
 
 # Limit results
-sage --max-count 5 "error handling"
+semantex --max-count 5 "error handling"
 
 # Show code snippets in results
-sage --content "API endpoint for users"
+semantex --content "API endpoint for users"
 ```
 
 ### File-Type Filtering
@@ -179,13 +179,13 @@ sage -t rs -t py -t go "factory pattern"
 
 ```bash
 # Grep-like one-line format (222x token reduction vs grep multi-iteration)
-sage --grep "authentication"
+semantex --grep "authentication"
 
 # JSON output for programmatic use
-sage --json "database"
+semantex --json "database"
 
 # JSON without content (compact)
-sage --json --no-content "error handling"
+semantex --json --no-content "error handling"
 ```
 
 ### Search Modes
@@ -195,10 +195,10 @@ sage --json --no-content "error handling"
 sage "authentication middleware"
 
 # Dense-only (semantic search only)
-sage --dense-only "user verification"
+semantex --dense-only "user verification"
 
 # Sparse-only (keyword search only)
-sage --sparse-only "authenticate"
+semantex --sparse-only "authenticate"
 
 # Grep mode (exact + BM25, no dense, exhaustive)
 sage -G "authenticate"
@@ -211,21 +211,21 @@ sage -e "Promise\.allSettled" "parallel failure handling"
 
 ```bash
 # Start daemon server (16ms warm search)
-sage serve /path/to/project
+semantex serve /path/to/project
 
 # Search via daemon (auto-detected)
 sage "authentication" /path/to/project
 
 # Stop daemon
-sage stop /path/to/project
+semantex stop /path/to/project
 
 # Auto-reindex on file changes
-sage watch /path/to/project
+semantex watch /path/to/project
 ```
 
 ### MCP Server
 
-sage exposes 4 MCP tools over stdio transport (`sage mcp`):
+semantex exposes 4 MCP tools over stdio transport (`semantex mcp`):
 
 - **`sage_search`** — semantic or keyword search with auto-fallback to ripgrep
 - **`sage_index`** — trigger background indexing for a project
@@ -276,7 +276,7 @@ sage/
 
 ## Supported Languages
 
-sage indexes 27 file types, including 23 with tree-sitter AST-aware chunking:
+semantex indexes 27 file types, including 23 with tree-sitter AST-aware chunking:
 
 - **AST-parsed (23):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte
 - **Text-chunked (4):** Markdown, JSON, TOML, YAML
@@ -301,7 +301,7 @@ On a 30-query benchmark (8 exact, 14 semantic, 8 architectural):
 ### Building from Source
 
 ```bash
-git clone https://github.com/MisterTK/sage.git
+git clone https://github.com/MisterTK/semantex.git
 cd sage
 cargo build --release
 ```

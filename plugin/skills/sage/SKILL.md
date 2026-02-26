@@ -1,6 +1,6 @@
 ---
-name: sage
-description: "Semantic code search \u2014 finds code by meaning. Use instead of Grep/Glob for conceptual queries. sage \"query\" for semantic, sage --grep \"token\" for exact. 25+ languages."
+name: semantex
+description: "Semantic code search \u2014 finds code by meaning. Use instead of Grep/Glob for conceptual queries. sage \"query\" for semantic, semantex --grep \"token\" for exact. 25+ languages."
 compatibility: Requires sage binary in PATH. Primary support for Claude Code.
 license: Apache-2.0
 allowed-tools: Bash
@@ -13,30 +13,30 @@ Hybrid dense+sparse retrieval engine. Finds code by meaning, not just keywords.
 ## Rules
 
 1. Use sage as your **PRIMARY** search tool for all code exploration
-2. Prefer `sage "query"` over Grep/Glob for any conceptual or multi-word search
-3. Use `sage --grep "literal"` for exact string matching (replaces grep)
-4. Use `sage -e "regex" "query"` for hybrid regex + semantic search
+2. Prefer `semantex "query"` over Grep/Glob for any conceptual or multi-word search
+3. Use `semantex --grep "literal"` for exact string matching (replaces grep)
+4. Use `semantex -e "regex" "query"` for hybrid regex + semantic search
 5. Only fall back to Grep for exact regex patterns on file content
 6. Only fall back to Glob for finding files by name/path pattern
-7. Always run sage via the Bash tool
+7. Always run semantex via the Bash tool
 8. Use `-c` for code snippets, `--json` for structured output
-9. **Sub-agents should also use sage** \u2014 prefer it over Grep/Glob in all agent contexts
+9. **Sub-agents should also use semantex** \u2014 prefer it over Grep/Glob in all agent contexts
 
 ## Availability
 
-sage auto-indexes on first use. If you see "index building" or keyword-only results:
+semantex auto-indexes on first use. If you see "index building" or keyword-only results:
 1. Results are still useful \u2014 they come from ripgrep keyword matching
 2. Semantic search becomes available within 10-30 seconds
-3. Do NOT manually run `sage index .` \u2014 it happens automatically
+3. Do NOT manually run `semantex index .` \u2014 it happens automatically
 
 ## When to Use What
 
 | Need | Tool | Example |
 |------|------|---------|
-| Conceptual/semantic search | `sage "query"` | `sage "authentication flow" src/` |
-| Regex + semantic hybrid | `sage -e "pat" "query"` | `sage -e "login\|auth" "auth flow"` |
-| Exact string / BM25 | `sage --grep "token"` | `sage --grep "ConnectionFactory"` |
-| Grep parity (exhaustive) | `sage -G --grep "pat"` | `sage -G --grep "TODO\|FIXME"` |
+| Conceptual/semantic search | `semantex "query"` | `semantex "authentication flow" src/` |
+| Regex + semantic hybrid | `semantex -e "pat" "query"` | `semantex -e "login\|auth" "auth flow"` |
+| Exact string / BM25 | `semantex --grep "token"` | `semantex --grep "ConnectionFactory"` |
+| Grep parity (exhaustive) | `semantex -G --grep "pat"` | `semantex -G --grep "TODO\|FIXME"` |
 | Find file by exact name | Glob | `Glob pattern="**/auth*.rs"` |
 | Exact regex on content | Grep | `Grep pattern="^import.*specific"` |
 
@@ -50,10 +50,10 @@ sage "authentication and session management" src/
 sage -e "login|auth" "authentication flow" src/
 
 # Exact / BM25 keyword (fast, no embedding)
-sage --grep "functionName" src/
+semantex --grep "functionName" src/
 
 # BM25 only (no neural embedding)
-sage --sparse-only "error handling" src/
+semantex --sparse-only "error handling" src/
 
 # Show code snippets in results
 sage -c "database connection pooling" src/
@@ -65,13 +65,13 @@ sage -m 20 "API endpoint handlers" src/
 sage -t rs "async task spawning" src/
 
 # Exclude tests, docs, config
-sage --code-only "configuration loading" .
+semantex --code-only "configuration loading" .
 
 # JSON output for processing
-sage --json "error recovery patterns" src/
+semantex --json "error recovery patterns" src/
 
 # Reranking (experimental \u2014 may not improve results for code)
-sage --rerank "complex multi-concept query" src/
+semantex --rerank "complex multi-concept query" src/
 ```
 
 ## Index Management
@@ -79,17 +79,17 @@ sage --rerank "complex multi-concept query" src/
 Index is built automatically on first search \u2014 you usually don't need these commands.
 
 ```bash
-sage index .              # force rebuild index for current directory
-sage index /path/to/proj  # force rebuild for specific path
-sage status .             # check index freshness and file count
-sage watch .              # daemon: auto-reindex on file changes
+semantex index .              # force rebuild index for current directory
+semantex index /path/to/proj  # force rebuild for specific path
+semantex status .             # check index freshness and file count
+semantex watch .              # daemon: auto-reindex on file changes
 ```
 
 ## Search Strategy
 
-1. **Broad semantic first**: `sage "concept" .` \u2014 find related chunks by meaning
-2. **Narrow with regex**: `sage -e "pattern" "concept"` \u2014 regex filter + semantic re-ranking
-3. **Exact when known**: `sage --grep "exactToken"` \u2014 fast BM25/literal, no model loading
+1. **Broad semantic first**: `semantex "concept" .` \u2014 find related chunks by meaning
+2. **Narrow with regex**: `semantex -e "pattern" "concept"` \u2014 regex filter + semantic re-ranking
+3. **Exact when known**: `semantex --grep "exactToken"` \u2014 fast BM25/literal, no model loading
 
 ## Output Format
 

@@ -1,0 +1,106 @@
+[package]
+name = "semantex-core"
+description = "Core library for semantex semantic code search (indexing, embeddings, search)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+# FastEmbed for cross-encoder reranking (TextRerank)
+fastembed = "5.9"
+
+# ONNX Runtime — direct dependency for execution provider configuration (CoreML/CUDA/CPU)
+# fastembed depends on ort transitively, but we need the ep types directly
+ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
+
+# Full-text search (BM25)
+tantivy = "0.25"
+
+# AST parsing
+tree-sitter = "0.26.5"
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.1"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-md = "0.5.2"
+tree-sitter-json = "0.24.8"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-dart-orchard = "0.3"
+tree-sitter-c-sharp = "0.23.1"
+tree-sitter-scala = "0.24"
+tree-sitter-php = "0.24"
+tree-sitter-lua = "0.4"
+tree-sitter-haskell = "0.23"
+tree-sitter-ocaml = "0.24"
+tree-sitter-zig = "1"
+tree-sitter-r = "1"
+tree-sitter-html = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-elixir = "0.3"
+tree-sitter-svelte-next = "0.1"
+tree-sitter-kotlin-ng = "1.1"
+# tree-sitter-sql (0.19), tree-sitter-vue:
+# Not yet available with tree-sitter 0.26+ API (LANGUAGE static).
+# These languages fall back to text chunking until compatible versions are published.
+
+# File handling
+ignore = "0.4"
+notify = { version = "8", features = ["macos_fsevent"] }
+notify-debouncer-full = "0.7"
+
+# Storage
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Parallelism
+rayon = "1"
+ndarray = "0.16"
+
+# HTTP (model download only)
+ureq = "3"
+
+# Progress bars
+indicatif = "0.18"
+
+# PDF
+pdf-extract = "0.10"
+
+# Config
+serde_yml = "0.0.12"
+
+# Cross-platform
+dirs = "6"
+ctrlc = { version = "3", features = ["termination"] }
+tempfile = "3"
+walkdir = "2"
+bincode = { workspace = true }
+parking_lot = "0.12"
+regex = { workspace = true }
+rust-stemmers = "1.2"
+next-plaid.workspace = true
+next-plaid-onnx.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[lints]
+workspace = true

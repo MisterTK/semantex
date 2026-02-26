@@ -76,11 +76,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v4
         with:
-          path: ~/.sage/models
-          key: sage-models-v1-${{ runner.os }}
+          path: ~/.semantex/models
+          key: semantex-models-v1-${{ runner.os }}
       - run: cargo build --release
       - name: Smoke test
         shell: bash
         run: |
-          ./target/release/sage index . || ./target/release/sage.exe index .
-          ./target/release/sage status . || ./target/release/sage.exe status .
+          ./target/release/semantex index . || ./target/release/semantex.exe index .
+          ./target/release/semantex status . || ./target/release/semantex.exe status .
+

@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME}"
-          name="sage-${version}-${{ matrix.target }}"
+          name="semantex-${version}-${{ matrix.target }}"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
@@ -59,7 +59,7 @@ jobs:
         run: |
           archive="${{ steps.archive.outputs.name }}"
           mkdir -p "${archive}"
-          cp "target/${{ matrix.target }}/release/sage" "${archive}/"
+          cp "target/${{ matrix.target }}/release/semantex" "${archive}/"
           for lib in target/${{ matrix.target }}/release/libonnxruntime*.{dylib,so}; do
             [ -f "$lib" ] && cp "$lib" "${archive}/"
           done
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           archive="${{ steps.archive.outputs.name }}"
-          binary="${archive}/sage"
+          binary="${archive}/semantex"
           for lib in "${archive}"/libonnxruntime*.dylib; do
             [ -f "$lib" ] && install_name_tool -add_rpath @executable_path "$binary" 2>/dev/null || true
           done
@@ -82,7 +82,7 @@ jobs:
         shell: bash
         run: |
           archive="${{ steps.archive.outputs.name }}"
-          binary="${archive}/sage"
+          binary="${archive}/semantex"
           if [ -f "$binary" ]; then
             patchelf --set-rpath '$ORIGIN' "$binary" 2>/dev/null || true
           fi
@@ -93,7 +93,7 @@ jobs:
         run: |
           $archive = "${{ steps.archive.outputs.name }}"
           New-Item -ItemType Directory -Force -Path $archive
-          Copy-Item "target/${{ matrix.target }}/release/sage.exe" "$archive/"
+          Copy-Item "target/${{ matrix.target }}/release/semantex.exe" "$archive/"
           Get-ChildItem "target/${{ matrix.target }}/release/onnxruntime*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination "$archive/"
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$archive/" }
           if (Test-Path "README.md") { Copy-Item "README.md" "$archive/" }
@@ -141,3 +141,4 @@ jobs:
           body_path: release/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

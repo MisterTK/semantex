@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "sage": {
-      "command": "sage",
+    "semantex": {
+      "command": "semantex",
       "args": ["mcp"]
     }
   }

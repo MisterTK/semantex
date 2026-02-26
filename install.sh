@@ -1,9 +1,9 @@
 #!/bin/sh
-# sage installer — downloads pre-built binary from GitHub Releases
-# Usage: curl -fsSL https://raw.githubusercontent.com/MisterTK/sage/main/install.sh | sh
+# semantex installer — downloads pre-built binary from GitHub Releases
+# Usage: curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
 set -eu
 
-REPO="MisterTK/sage"
+REPO="MisterTK/semantex"
 
 info() { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
 err()  { printf '  \033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
@@ -26,18 +26,18 @@ target="${arch}-${os}"
 info "Platform" "${target}"
 
 # Determine latest version
-if [ -n "${SAGE_VERSION:-}" ]; then
-  version="$SAGE_VERSION"
+if [ -n "${SEMANTEX_VERSION:-}" ]; then
+  version="$SEMANTEX_VERSION"
 else
   info "Fetching" "latest release..."
   version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-  [ -z "$version" ] && err "Could not determine latest version. Set SAGE_VERSION=v0.1.0 manually."
+  [ -z "$version" ] && err "Could not determine latest version. Set SEMANTEX_VERSION=v0.1.0 manually."
 fi
 info "Version" "${version}"
 
 # Download
-archive="sage-${version}-${target}.tar.gz"
+archive="semantex-${version}-${target}.tar.gz"
 url="https://github.com/${REPO}/releases/download/${version}/${archive}"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
@@ -65,11 +65,11 @@ fi
 
 # Extract binary
 tar xzf "${tmpdir}/${archive}" -C "$tmpdir"
-bin_src="${tmpdir}/sage-${version}-${target}/sage"
+bin_src="${tmpdir}/semantex-${version}-${target}/sage"
 
 # Copy ONNX Runtime dylib alongside binary (needed for model inference)
 dylib_src=""
-for lib in "${tmpdir}/sage-${version}-${target}"/libonnxruntime*; do
+for lib in "${tmpdir}/semantex-${version}-${target}"/libonnxruntime*; do
   [ -f "$lib" ] && dylib_src="$lib" && break
 done
 
@@ -83,10 +83,10 @@ else
   USE_SUDO=""
 fi
 
-info "Installing" "${INSTALL_DIR}/sage"
+info "Installing" "${INSTALL_DIR}/semantex"
 ${USE_SUDO} mkdir -p "$INSTALL_DIR"
-${USE_SUDO} cp "$bin_src" "${INSTALL_DIR}/sage"
-${USE_SUDO} chmod +x "${INSTALL_DIR}/sage"
+${USE_SUDO} cp "$bin_src" "${INSTALL_DIR}/semantex"
+${USE_SUDO} chmod +x "${INSTALL_DIR}/semantex"
 
 # Copy dylib next to binary if present
 if [ -n "$dylib_src" ]; then
@@ -113,12 +113,12 @@ if [ "$INSTALL_DIR" != "/usr/local/bin" ]; then
 fi
 
 echo ""
-info "Done!" "sage ${version} is ready"
+info "Done!" "semantex ${version} is ready"
 echo ""
-sage --version
+semantex --version
 echo ""
 echo "  Next: install into your AI coding tool:"
-echo "    sage install-claude-code   # Claude Code"
-echo "    sage install-codex         # Codex CLI"
-echo "    sage install-open-code     # OpenCode"
+echo "    semantex install-claude-code   # Claude Code"
+echo "    semantex install-codex         # Codex CLI"
+echo "    semantex install-open-code     # OpenCode"
 echo ""
