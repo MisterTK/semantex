@@ -419,17 +419,26 @@ impl McpServer {
             .results
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let snippet = make_snippet_mcp(&r.chunk.content, &r.chunk.chunk_type);
+                let score = (r.score * 100.0_f32).round() / 100.0_f32;
+                let mut val = serde_json::json!({
                     "file": r.chunk.file_path.display().to_string(),
-                    "start_line": r.chunk.start_line,
-                    "end_line": r.chunk.end_line,
-                    "score": r.score,
-                    "content": r.chunk.content,
-                })
+                    "lines": format!("{}-{}", r.chunk.start_line, r.chunk.end_line),
+                    "score": score,
+                    "snippet": snippet,
+                });
+                match &r.chunk.chunk_type {
+                    semantex_core::types::ChunkType::AstNode { name, language, .. } => {
+                        val["name"] = serde_json::Value::String(name.clone());
+                        val["lang"] = serde_json::Value::String(language.clone());
+                    }
+                    _ => {}
+                }
+                val
             })
             .collect();
 
-        let json_text = serde_json::to_string_pretty(&json_results)?;
+        let json_text = serde_json::to_string(&json_results)?;
         let response_bytes = json_text.len();
         let metrics = search_output.metrics;
         let footer = format_metrics_footer(&metrics, response_bytes);
@@ -613,4 +622,27 @@ fn format_metrics_footer(
     parts.push(format!("query_type={}", metrics.query_type));
     parts.push(format!("response_bytes={response_bytes}"));
     format!("[semantex_metrics: {}]", parts.join(" "))
+}
+
+fn make_snippet_mcp(content: &str, chunk_type: &semantex_core::types::ChunkType) -> String {
+    match chunk_type {
+        semantex_core::types::ChunkType::AstNode { .. } => truncate_lines_mcp(content, 3),
+        semantex_core::types::ChunkType::TextWindow { .. } => truncate_lines_mcp(content, 2),
+        semantex_core::types::ChunkType::PdfPage { .. } => {
+            if content.len() > 100 {
+                format!("{}...", &content[..content.floor_char_boundary(100)])
+            } else {
+                content.to_string()
+            }
+        }
+    }
+}
+
+fn truncate_lines_mcp(content: &str, n: usize) -> String {
+    let lines: Vec<&str> = content.lines().take(n + 1).collect();
+    if lines.len() > n {
+        format!("{}...", lines[..n].join("\n"))
+    } else {
+        lines.join("\n")
+    }
 }

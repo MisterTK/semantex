@@ -3518,6 +3518,7 @@ dependencies = [
  "fastembed",
  "ignore",
  "indicatif 0.18.4",
+ "libc",
  "ndarray 0.16.1",
  "next-plaid",
  "next-plaid-onnx",

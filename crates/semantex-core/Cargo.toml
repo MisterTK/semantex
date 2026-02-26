@@ -99,6 +99,9 @@ rust-stemmers = "1.2"
 next-plaid.workspace = true
 next-plaid-onnx.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 

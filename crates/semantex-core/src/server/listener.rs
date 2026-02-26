@@ -9,6 +9,41 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// ─── RSS helpers ────────────────────────────────────────────────────────────
+
+/// Returns the process RSS in bytes, or `None` if unavailable.
+/// On macOS, returns peak RSS (monotonically increasing but good enough for a hard cap).
+/// On Linux, returns current VmRSS from /proc/self/status.
+#[cfg(target_os = "macos")]
+fn current_rss_bytes() -> Option<u64> {
+    // SAFETY: getrusage is a standard POSIX call; zeroing the struct is valid.
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            Some(usage.ru_maxrss as u64) // bytes on macOS
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn current_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// TCP localhost listener for the semantex daemon
 #[allow(clippy::struct_field_names)]
 pub struct Listener {
@@ -64,16 +99,28 @@ impl Listener {
         self.listener.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
-    /// Run the accept loop until shutdown or idle timeout
+    /// Run the accept loop until shutdown, idle timeout, or RSS limit exceeded.
+    ///
+    /// The RSS limit defaults to 2 048 MB and can be overridden with the
+    /// `SEMANTEX_MAX_RSS_MB` environment variable (set to `0` to disable).
+    /// When the limit is hit the daemon exits cleanly; the next `semantex`
+    /// invocation will start a fresh daemon with a clean memory footprint.
     pub fn run(&self) -> Result<()> {
+        let rss_limit_mb: u64 = std::env::var("SEMANTEX_MAX_RSS_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+
         tracing::info!(
             port = self.port(),
             idle_timeout_s = self.idle_timeout.as_secs(),
+            rss_limit_mb,
             "Daemon listening on 127.0.0.1:{}",
             self.port()
         );
 
         let mut last_activity = Instant::now();
+        let mut loop_count: u32 = 0;
 
         loop {
             // Check shutdown flag
@@ -91,6 +138,25 @@ impl Listener {
                 break;
             }
 
+            // RSS guard — checked every 500 iterations (~5 s at 10 ms/iteration)
+            loop_count += 1;
+            if rss_limit_mb > 0 && loop_count % 500 == 0 {
+                if let Some(rss_bytes) = current_rss_bytes() {
+                    let rss_mb = rss_bytes / (1024 * 1024);
+                    if rss_mb > rss_limit_mb {
+                        tracing::warn!(
+                            rss_mb,
+                            rss_limit_mb,
+                            "RSS limit exceeded ({} MB > {} MB) — daemon exiting to free memory. \
+                             Next search will restart it.",
+                            rss_mb,
+                            rss_limit_mb
+                        );
+                        break;
+                    }
+                }
+            }
+
             // Accept a connection (non-blocking + 500ms sleep on WouldBlock)
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
@@ -100,13 +166,14 @@ impl Listener {
                         continue;
                     }
                     last_activity = Instant::now();
+                    loop_count = 0; // reset so we don't exit right after heavy search
                     if let Err(e) = self.handle_connection(stream) {
                         tracing::warn!("Connection error: {}", e);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // No pending connection — sleep briefly and retry
-                    std::thread::sleep(Duration::from_millis(500));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => {
                     tracing::error!("Accept error: {}", e);

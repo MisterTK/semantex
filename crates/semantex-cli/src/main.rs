@@ -40,9 +40,13 @@ struct Cli {
     #[arg(short = 'm', long, default_value = "10", env = "SEMANTEX_MAX_COUNT")]
     max_count: usize,
 
-    /// Show matching content snippets
+    /// Show matching content snippets (alias for --verbose)
     #[arg(short = 'c', long, env = "SEMANTEX_CONTENT")]
     content: bool,
+
+    /// Verbose output: show full content with colors (default: compact 3-line snippets)
+    #[arg(short = 'v', long)]
+    verbose: bool,
 
     /// Lines of context around match
     #[arg(short = 'C', long, default_value = "0")]
@@ -199,7 +203,11 @@ enum Commands {
     /// Run as MCP server (stdio transport)
     Mcp,
     /// Install Claude Code integration
-    InstallClaudeCode,
+    InstallClaudeCode {
+        /// Installation scope: user (all projects), project (shared via git), or local (this repo, gitignored)
+        #[arg(long, value_enum)]
+        scope: Option<commands::install::InstallScope>,
+    },
     /// Install Codex integration
     InstallCodex,
     /// Install OpenCode integration
@@ -315,7 +323,7 @@ fn main() -> Result<()> {
         return commands::install::uninstall_all();
     }
     if cli.install_claude_code {
-        return commands::install::install_claude_code();
+        return commands::install::install_claude_code(None);
     }
     if cli.install_opencode {
         return commands::install::install_opencode();
@@ -336,7 +344,7 @@ fn main() -> Result<()> {
                         query: query.clone(),
                         path: cli.path.clone().unwrap_or_else(|| PathBuf::from(".")),
                         max_count: cli.max_count,
-                        content: cli.content,
+                        verbose: cli.content || cli.verbose,
                         context: cli.context,
                         line_number: !cli.no_line_number,
                         rerank: cli.rerank,
@@ -395,7 +403,9 @@ fn main() -> Result<()> {
         Some(Commands::DownloadModels) => commands::download::run(&config),
         Some(Commands::Status { path }) => commands::status::run(&path, &config),
         Some(Commands::Mcp) => commands::mcp::run(&config),
-        Some(Commands::InstallClaudeCode) => commands::install::install_claude_code(),
+        Some(Commands::InstallClaudeCode { scope }) => {
+            commands::install::install_claude_code(scope)
+        }
         Some(Commands::InstallCodex) => commands::install::install_codex(),
         Some(Commands::InstallOpenCode) => commands::install::install_opencode(),
         Some(Commands::Connect { path }) => commands::connect::run(&path),
@@ -407,7 +417,7 @@ fn main() -> Result<()> {
                     query,
                     path: cli.path.unwrap_or_else(|| PathBuf::from(".")),
                     max_count: cli.max_count,
-                    content: cli.content,
+                    verbose: cli.content || cli.verbose,
                     context: cli.context,
                     line_number: !cli.no_line_number,
                     rerank: cli.rerank,

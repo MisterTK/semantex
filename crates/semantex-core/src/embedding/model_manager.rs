@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 const LATEON_CODE_EDGE_BASE_URL: &str =
     "https://huggingface.co/lightonai/LateOn-Code-edge/resolve/main";
-const LATEON_CODE_EDGE_FILES: &[&str] = &["model_int8.onnx", "tokenizer.json"];
+const LATEON_CODE_EDGE_FILES: &[&str] = &["model_int8.onnx", "tokenizer.json", "onnx_config.json"];
 const LATEON_CODE_EDGE_DIR: &str = "LateOn-Code-edge";
 
 /// Download LateOn-Code-edge ColBERT model if not already cached.

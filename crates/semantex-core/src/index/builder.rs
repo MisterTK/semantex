@@ -139,6 +139,7 @@ impl IndexBuilder {
         let mut files_skipped = 0u64;
         let mut files_deleted = 0u64;
         let mut removed_chunk_ids: Vec<u64> = Vec::new();
+        let mut new_chunk_ids: Vec<u64> = Vec::new();
 
         store.begin_transaction()?;
 
@@ -282,6 +283,7 @@ impl IndexBuilder {
             // Process each chunk: insert into SQLite + BM25
             for chunk in chunks {
                 let chunk_id = store.insert_chunk(&chunk, file_hash, mtime)?;
+                new_chunk_ids.push(chunk_id);
 
                 // Prepend structured NL summary for BM25 enrichment
                 let base_bm25 = if let ChunkType::AstNode {
@@ -415,7 +417,9 @@ impl IndexBuilder {
 
         let total_removals = removed_chunk_ids.len();
 
-        if total_chunks == 0 && total_removals == 0 {
+        let plaid_missing = !index_dir.join("plaid").exists();
+
+        if total_chunks == 0 && total_removals == 0 && !plaid_missing {
             tracing::info!(
                 files_scanned,
                 files_indexed,
@@ -437,49 +441,132 @@ impl IndexBuilder {
             });
         }
 
-        // Build PLAID index (ColBERT late-interaction)
+        // Build or incrementally update PLAID index (ColBERT late-interaction).
+        //
+        // Memory strategy: never load all chunks at once.
+        // - Full rebuild (plaid_missing): batch 512 chunks at a time from SQLite.
+        // - Incremental: encode only new_chunk_ids; delete only removed_chunk_ids from PLAID.
+        if plaid_missing {
+            tracing::info!("PLAID index missing — rebuilding dense embeddings");
+        }
         let colbert_model_dir = model_manager::ensure_colbert_model(&self.config.models_dir())?;
         match (|| -> Result<()> {
             use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
+            const PLAID_BATCH: usize = 512;
 
             let embedder = ColbertEmbedder::new(&colbert_model_dir)?;
-
-            // Collect all chunk contents from store for ColBERT encoding
-            let mut chunk_ids_all: Vec<u64> = Vec::new();
-            let mut chunk_contents: Vec<String> = Vec::new();
-            store.for_each_chunk_content(|id, content| {
-                chunk_ids_all.push(id);
-                chunk_contents.push(content.to_string());
-            })?;
-
-            if chunk_contents.is_empty() {
-                tracing::info!("No chunks to encode for PLAID index");
-                return Ok(());
-            }
-
-            let doc_embeddings = embedder.encode_documents(&chunk_contents)?;
-
             let plaid_dir = index_dir.join("plaid");
-            std::fs::create_dir_all(&plaid_dir)?;
-
-            // Build PLAID index via next-plaid
+            let mapping_path = index_dir.join("plaid_mapping.bin");
+            let plaid_dir_str = plaid_dir.to_string_lossy().into_owned();
             let plaid_config = IndexConfig {
                 nbits: self.config.plaid_nbits,
                 ..Default::default()
             };
-            let (_index, _doc_ids) = MmapIndex::update_or_create(
-                &doc_embeddings,
-                &plaid_dir.to_string_lossy(),
-                &plaid_config,
-                &UpdateConfig::default(),
-            )?;
 
-            // Save doc_id -> chunk_id mapping
-            let mapping =
-                bincode::serde::encode_to_vec(&chunk_ids_all, bincode::config::standard())?;
-            std::fs::write(index_dir.join("plaid_mapping.bin"), mapping)?;
+            if plaid_missing {
+                // Full rebuild — stream chunks from SQLite in batches to bound peak RAM.
+                if plaid_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&plaid_dir);
+                }
+                std::fs::create_dir_all(&plaid_dir)?;
 
-            tracing::info!("PLAID index built successfully");
+                let all_ids = store.get_all_chunk_ids()?;
+                if all_ids.is_empty() {
+                    tracing::info!("No chunks to encode for PLAID index");
+                    return Ok(());
+                }
+
+                let mut full_mapping: Vec<u64> = Vec::with_capacity(all_ids.len());
+                for batch in all_ids.chunks(PLAID_BATCH) {
+                    let chunks = store.get_chunks(batch)?;
+                    if chunks.is_empty() {
+                        continue;
+                    }
+                    let contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+                    let embeddings = embedder.encode_documents(&contents)?;
+                    MmapIndex::update_or_create(
+                        &embeddings,
+                        &plaid_dir_str,
+                        &plaid_config,
+                        &UpdateConfig::default(),
+                    )?;
+                    full_mapping.extend(chunks.iter().map(|c| c.id));
+                }
+
+                let mapping_bytes =
+                    bincode::serde::encode_to_vec(&full_mapping, bincode::config::standard())?;
+                std::fs::write(&mapping_path, mapping_bytes)?;
+                tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
+            } else {
+                // Incremental update — only touch new/removed chunks.
+                let mut mapping: Vec<u64> = if mapping_path.exists() {
+                    let bytes = std::fs::read(&mapping_path)?;
+                    bincode::serde::decode_from_slice::<Vec<u64>, _>(
+                        &bytes,
+                        bincode::config::standard(),
+                    )?
+                    .0
+                } else {
+                    Vec::new()
+                };
+
+                // Soft-delete removed chunks from PLAID.
+                if !removed_chunk_ids.is_empty() {
+                    let removed_set: std::collections::HashSet<u64> =
+                        removed_chunk_ids.iter().copied().collect();
+                    let plaid_delete_ids: Vec<i64> = mapping
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(plaid_id, &chunk_id)| {
+                            if removed_set.contains(&chunk_id) {
+                                Some(plaid_id as i64)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !plaid_delete_ids.is_empty() {
+                        match MmapIndex::load(&plaid_dir_str) {
+                            Ok(mut index) => {
+                                if let Err(e) = index.delete(&plaid_delete_ids) {
+                                    tracing::warn!("PLAID delete failed: {e}");
+                                }
+                            }
+                            Err(e) => tracing::warn!("PLAID load for delete failed: {e}"),
+                        }
+                    }
+                }
+
+                // Encode only new chunks and add them to the existing PLAID index.
+                if !new_chunk_ids.is_empty() {
+                    for batch in new_chunk_ids.chunks(PLAID_BATCH) {
+                        let chunks = store.get_chunks(batch)?;
+                        if chunks.is_empty() {
+                            continue;
+                        }
+                        let contents: Vec<String> =
+                            chunks.iter().map(|c| c.content.clone()).collect();
+                        let embeddings = embedder.encode_documents(&contents)?;
+                        MmapIndex::update_or_create(
+                            &embeddings,
+                            &plaid_dir_str,
+                            &plaid_config,
+                            &UpdateConfig::default(),
+                        )?;
+                        mapping.extend(chunks.iter().map(|c| c.id));
+                    }
+                }
+
+                let mapping_bytes =
+                    bincode::serde::encode_to_vec(&mapping, bincode::config::standard())?;
+                std::fs::write(&mapping_path, mapping_bytes)?;
+                tracing::info!(
+                    added = new_chunk_ids.len(),
+                    removed = removed_chunk_ids.len(),
+                    "PLAID index updated incrementally"
+                );
+            }
+
             Ok(())
         })() {
             Ok(()) => {}

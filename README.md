@@ -1,4 +1,4 @@
-# semantex — **S**emantic-**A**ware **G**rep **E**ngine
+# semantex — Semantic Code Search
 
 **Hybrid dense+sparse code search with ColBERT late interaction and BM25**
 
@@ -56,7 +56,7 @@ semantex uses a multi-stage search pipeline:
 
 - **File-type filtering**: Scope searches with `-t/--type` flags (e.g., `-t rs`, `-t py`)
 - **Compact output modes**: Token-efficient formats (`--grep`, `--no-content`, `--snippet`)
-- **Unix domain socket daemon**: Persistent server for low-latency repeated queries
+- **TCP localhost daemon**: Persistent server for low-latency repeated queries
 - **MCP server**: Model Context Protocol integration for AI coding assistants
 
 ## Installation
@@ -133,13 +133,13 @@ semantex "authentication logic" /path/to/your/project
 - **Rust**: 1.91 or later (edition 2024)
 - **Platform**: macOS (ARM/Intel), Linux, Windows
 - **Memory**: 2GB+ RAM recommended
-- **Disk**: ~200MB for ColBERT model + index storage
+- **Disk**: ~100MB for models (ColBERT ~17MB + optional reranker ~80MB) + index storage
 
 ### Model Downloads
 
 On first index, semantex automatically downloads the ColBERT model to `~/.semantex/models/`:
 
-- **ColBERT model**: LateOn-Code-edge (~200MB, 48d per-token embeddings)
+- **ColBERT model**: LateOn-Code-edge (~17MB int8 ONNX, 48d per-token embeddings)
 - **Reranker model**: JINA Reranker v1 Turbo (~80MB, optional via `--rerank`)
 
 Models are cached and shared across all semantex instances.
@@ -318,7 +318,8 @@ cargo clippy --all
 ```bash
 SEMANTEX_ORT_THREADS=4     # ONNX Runtime thread count (default: 4)
 SEMANTEX_COREML=1          # Enable CoreML acceleration on macOS
-RUST_LOG=info            # Logging level (error, warn, info, debug, trace)
+SEMANTEX_MAX_RSS_MB=2048   # Daemon RSS hard limit in MB (default: 2048, 0=disabled)
+RUST_LOG=info              # Logging level (error, warn, info, debug, trace)
 ```
 
 ## Contributing

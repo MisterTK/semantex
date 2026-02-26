@@ -395,6 +395,15 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Return all chunk IDs ordered by ID, for batched PLAID rebuilds.
+    pub fn get_all_chunk_ids(&self) -> Result<Vec<u64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM chunks ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids.into_iter().map(|id| id as u64).collect())
+    }
+
     /// Begin a transaction for batch operations
     pub fn begin_transaction(&self) -> Result<()> {
         self.conn.execute_batch("BEGIN TRANSACTION")?;

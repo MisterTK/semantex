@@ -91,23 +91,9 @@ pub fn cmd_session_hook() -> Result<()> {
     super::spawn_background_index(project_dir);
 
     let additional_context = format!(
-        concat!(
-            "semantex (semantic code search) is available for this project (index: {}).\n\n",
-            "Use semantex as your PRIMARY search tool instead of Grep/Glob for code exploration.\n\n",
-            "## When to Use What\n",
-            "| Need | Tool | Example |\n",
-            "|------|------|---------|\n",
-            "| Conceptual/semantic search | `semantex \"query\"` | `semantex \"authentication flow\" src/` |\n",
-            "| Regex + semantic hybrid | `semantex -e \"pattern\" \"query\"` | `semantex -e \"login\\|auth\" \"auth flow\"` |\n",
-            "| Exact string/BM25 | `semantex --grep \"token\"` | `semantex --grep \"ConnectionFactory\"` |\n",
-            "| Find file by exact name | Glob | `Glob pattern=\"**/auth*.rs\"` |\n",
-            "| Exact regex on file content | Grep | `Grep pattern=\"specific_function_name\"` |\n\n",
-            "## Tips\n",
-            "- First query may take 30-90s (model loading). Subsequent queries: <100ms via daemon.\n",
-            "- Use `-c` to show code snippets. Use `--code-only` to exclude docs/config.\n",
-            "- Use `-m N` to control result count (default 10).\n",
-            "- Sub-agents should also use semantex via Bash for all code searches.",
-        ),
+        "semantex semantic code search is available (index: {}).\n\
+         Use `semantex \"query\"` for all code search. Use `semantex --grep \"literal\"` for exact match.\n\
+         Fallback: Grep for regex patterns, Glob for file names.",
         index_dir.display()
     );
 

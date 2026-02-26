@@ -16,18 +16,24 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Measured performance metrics from a single search invocation.
+///
+/// NOTE: `skip_serializing_if` is intentionally omitted from Optional fields.
+/// This struct is serialized via bincode v2 (positional encoding) for the binary
+/// daemon protocol. Skipping fields in positional encoding causes field misalignment
+/// during deserialization. `#[serde(default)]` is kept for JSON compatibility
+/// (fills in `null` fields when deserializing older responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMetrics {
     pub total_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub dense_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub sparse_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub exact_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub fusion_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub rerank_ms: Option<u64>,
     pub dense_count: usize,
     pub sparse_count: usize,
@@ -35,7 +41,7 @@ pub struct SearchMetrics {
     pub fused_count: usize,
     pub result_count: usize,
     pub query_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub response_bytes: Option<usize>,
 }
 

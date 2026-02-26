@@ -9,11 +9,21 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("Invalid path: {}", path.display()))?;
 
-    // Check if daemon is already running
-    if semantex_core::server::daemon_healthy(&project_path) {
+    // Prevent redundant daemons: check if one is fully up or still starting.
+    // Multiple subagents/sessions racing to start a daemon will each call
+    // `semantex serve`; the second+ arrivals should exit immediately.
+    let already_healthy = semantex_core::server::daemon_healthy(&project_path);
+    let already_starting =
+        !already_healthy && semantex_core::server::daemon_starting(&project_path);
+    if already_healthy || already_starting {
         eprintln!(
-            "{} Daemon already running for {}",
+            "{} Daemon already {} for {}",
             "Note:".yellow(),
+            if already_starting {
+                "starting"
+            } else {
+                "running"
+            },
             project_path.display()
         );
         return Ok(());

@@ -324,6 +324,56 @@ pub fn daemon_healthy_binary(port: u16) -> bool {
     )
 }
 
+/// Check if a daemon has been spawned and is loading models (PID file exists,
+/// process alive, but port file not yet written).
+///
+/// Used to prevent N concurrent processes from each spawning a daemon when
+/// the first one is still initialising — without this guard, a cluster of
+/// subagents waking up simultaneously would race to each call `semantex serve`,
+/// causing N redundant heavy daemon processes.
+pub fn daemon_starting(project_path: &Path) -> bool {
+    let index_dir = SemantexConfig::project_index_dir(project_path);
+    let port_path = index_dir.join("semantex.port");
+    let pid_path = index_dir.join("semantex.pid");
+
+    // If the port file exists the daemon is already fully ready — not "starting".
+    if port_path.exists() {
+        return false;
+    }
+
+    let Ok(pid_str) = std::fs::read_to_string(&pid_path) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
+        // Malformed PID file from a previous crash — remove it.
+        let _ = std::fs::remove_file(&pid_path);
+        return false;
+    };
+
+    if is_process_alive(pid) {
+        true
+    } else {
+        // Stale PID file left by a crashed/OOM-killed daemon.
+        let _ = std::fs::remove_file(&pid_path);
+        false
+    }
+}
+
+/// Check if a process is alive using POSIX signal 0 (existence check, no signal sent).
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) is a read-only probe — it sends no signal and only
+    // checks whether the process exists and we have permission to signal it.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// On non-Unix platforms return `true` as a conservative fallback to avoid
+/// spurious double-spawns (if the daemon didn't start, search falls back to sparse).
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Stop a running daemon for the given project
 pub fn stop_daemon(project_path: &Path) -> Result<bool> {
     let index_dir = SemantexConfig::project_index_dir(project_path);

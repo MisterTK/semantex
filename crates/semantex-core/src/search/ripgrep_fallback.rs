@@ -31,7 +31,8 @@ pub fn is_rg_available() -> bool {
 
 /// Run ripgrep on `path` with the given `query` and return up to `max_results` matches.
 ///
-/// Uses `--fixed-strings` so the query is treated as a literal string, not a regex.
+/// For multi-word queries, splits into keywords joined with `|` so ripgrep matches
+/// any keyword (OR semantics). Single-word queries use `--fixed-strings`.
 /// Returns file paths relative to `path`.
 pub fn search(query: &str, path: &Path, max_results: usize) -> Result<Vec<RgResult>> {
     if !is_rg_available() {
@@ -40,15 +41,29 @@ pub fn search(query: &str, path: &Path, max_results: usize) -> Result<Vec<RgResu
         );
     }
 
-    // --max-count is per-file, not global. We cap total results in parse_rg_json.
-    let output = std::process::Command::new("rg")
-        .arg("--json")
-        .arg("--fixed-strings") // treat query as literal, not regex
+    let words: Vec<&str> = query.split_whitespace().collect();
+
+    let mut cmd = std::process::Command::new("rg");
+    cmd.arg("--json")
         .arg("--max-count")
-        .arg(max_results.to_string())
-        .arg("-S") // smart-case: case-insensitive unless query has uppercase
-        .arg("--")
-        .arg(query)
+        .arg(max_results.to_string());
+
+    if words.len() <= 1 {
+        // Single word or empty: literal match, smart-case
+        cmd.arg("--fixed-strings").arg("-S").arg("--").arg(query);
+    } else {
+        // Multi-word: escape each keyword for regex safety, join with |
+        // Use case-insensitive since semantic queries are typically NL
+        let pattern = words
+            .iter()
+            .map(|w| regex::escape(w))
+            .collect::<Vec<_>>()
+            .join("|");
+        cmd.arg("-i").arg("--").arg(&pattern);
+    }
+
+    // --max-count is per-file, not global. We cap total results in parse_rg_json.
+    let output = cmd
         .arg(path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
