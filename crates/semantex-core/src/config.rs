@@ -136,7 +136,10 @@ impl SemantexConfig {
         if let Ok(val) = std::env::var("SEMANTEX_HOME") {
             return PathBuf::from(val);
         }
-        dirs::home_dir().map_or_else(|| std::env::temp_dir().join("semantex"), |h| h.join(".semantex"))
+        dirs::home_dir().map_or_else(
+            || std::env::temp_dir().join("semantex"),
+            |h| h.join(".semantex"),
+        )
     }
 
     /// Models directory

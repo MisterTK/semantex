@@ -340,7 +340,8 @@ fn auto_start_and_search(
     project_path: &std::path::Path,
     _index_dir: &std::path::Path,
 ) -> Result<()> {
-    let current_exe = std::env::current_exe().context("cannot determine semantex executable path")?;
+    let current_exe =
+        std::env::current_exe().context("cannot determine semantex executable path")?;
 
     eprintln!(
         "semantex: no daemon found — auto-starting for {} …",

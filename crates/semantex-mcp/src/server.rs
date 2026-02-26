@@ -380,7 +380,9 @@ impl McpServer {
         // Check index state — fall back to ripgrep if index not ready
         let idx_state = state::detect(&path);
         match idx_state {
-            IndexState::Ready => self.do_semantex_search(query, &path, max_results, rerank, grep_mode),
+            IndexState::Ready => {
+                self.do_semantex_search(query, &path, max_results, rerank, grep_mode)
+            }
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
                 Self::do_ripgrep_fallback(query, &path, max_results)
@@ -506,7 +508,10 @@ impl McpServer {
         use semantex_core::embedding::model_manager;
 
         let mut status = Vec::new();
-        status.push(format!("Semantex Health Check v{}", env!("CARGO_PKG_VERSION")));
+        status.push(format!(
+            "Semantex Health Check v{}",
+            env!("CARGO_PKG_VERSION")
+        ));
         status.push("=".repeat(50));
 
         // Check models directory
