@@ -52,12 +52,17 @@ semantex uses a multi-stage search pipeline:
 - **No telemetry**: Your code never leaves your device
 - **Offline-first**: Works without internet after initial model download
 
-### Agent & LLM Friendly
+### Progressive Disclosure for AI Agents
 
-- **File-type filtering**: Scope searches with `-t/--type` flags (e.g., `-t rs`, `-t py`)
-- **Compact output modes**: Token-efficient formats (`--grep`, `--no-content`, `--snippet`)
-- **TCP localhost daemon**: Persistent server for low-latency repeated queries
-- **MCP server**: Model Context Protocol integration for AI coding assistants
+semantex implements a layered retrieval architecture that minimizes token usage:
+
+- **`--refs`** (default): Compact references — `file:line [kind] "summary"` (~200 tokens/10 results)
+- **`--peek`**: Refs + first 5 lines of code per result (~740 tokens/10 results)
+- **`--around <symbol>`**: Call graph walk — callers, callees, type refs for a named symbol
+- **`--deep`**: Internal search→read→summarize pipeline — returns a curated prose answer
+- **Batch queries**: `semantex --refs "q1" "q2" "q3"` runs multiple queries in one call
+- **MCP server**: 5 tools (`semantex_search`, `semantex_deep`, `semantex_index`, `semantex_status`, `semantex_health`)
+- **TCP daemon**: Persistent server for 10ms warm searches
 
 ## Installation
 
@@ -81,22 +86,21 @@ cargo install --path crates/semantex-cli
 
 ## Getting Started
 
-### Claude Code (Recommended)
+semantex has three integration modes. **Pick one** — they are independent and should not be combined.
 
-semantex integrates with Claude Code via hooks that automatically make semantex the default search tool. No manual configuration needed.
+| Mode | Best for | Setup |
+|------|----------|-------|
+| [MCP Server](#mcp-server-cursor-windsurf-cline-and-others) | Cursor, Windsurf, Cline, any MCP client | Add to editor MCP config |
+| [Claude Code Skill](#claude-code-skill) | Claude Code | One command install |
+| [Standalone CLI](#standalone-cli) | Terminal, scripts, CI | Just run `semantex` |
 
-```bash
-# 1. Install hooks into Claude Code (fully automated)
-semantex install-claude-code
+---
 
-# 2. Restart Claude Code — semantex is now active
-```
+### MCP Server (Cursor, Windsurf, Cline, and others)
 
-That's it. semantex auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer semantex over Grep/Glob. No manual indexing step required.
+semantex implements the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP 2025-03-26) over stdio. Any MCP-compatible editor or agent can use it.
 
-### Other AI Coding Tools
-
-semantex exposes an MCP server with 4 tools (`semantex_search`, `semantex_index`, `semantex_status`, `semantex_health`). Add to your editor's MCP config:
+**Setup** — add to your editor's MCP configuration:
 
 ```json
 {
@@ -109,12 +113,66 @@ semantex exposes an MCP server with 4 tools (`semantex_search`, `semantex_index`
 }
 ```
 
+Where to put this depends on your editor:
+
+| Editor | Config file |
+|--------|-------------|
+| **Cursor** | `.cursor/mcp.json` in project root |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
+| **Cline** | VS Code settings → Cline MCP Servers |
+| **Continue** | `~/.continue/config.json` under `mcpServers` |
+| **Generic** | Wherever your client reads MCP server config |
+
 Setup helpers for specific tools:
 
 ```bash
 semantex install-codex       # OpenAI Codex CLI
 semantex install-open-code   # OpenCode
 ```
+
+**What the client gets** — 5 tools, automatically discovered at startup:
+
+| Tool | Purpose | Auto-approve |
+|------|---------|:------------:|
+| `semantex_search` | Semantic + keyword search with progressive disclosure | Yes |
+| `semantex_deep` | Search, triage, graph-expand, read, and summarize into a prose answer | Yes |
+| `semantex_index` | Trigger background indexing for a project | No |
+| `semantex_status` | Index metadata (file count, chunk count, freshness) | Yes |
+| `semantex_health` | Full system health check (model status, cache stats) | Yes |
+
+Read-only tools are annotated with `readOnlyHint: true` so clients that support MCP tool annotations can auto-approve them without user confirmation.
+
+**MCP features:**
+
+- **Structured output** — `semantex_search` and `semantex_deep` return machine-readable JSON in `structuredContent` alongside the text fallback, so clients can render results natively
+- **Progress notifications** — `semantex_deep` sends phase-by-phase progress (searching, triaging, graph-expanding, reading, summarizing) so the client can show a progress indicator
+- **Logging** — tool events are emitted as MCP log notifications; clients can set the log level via `logging/setLevel`
+- **Server instructions** — at initialization, semantex sends the LLM usage guidance for progressive disclosure (`search` first, then `deep` or `around` for complex questions)
+- **Auto-indexing** — first search auto-indexes the project; no manual `index` call needed
+
+---
+
+### Claude Code Skill
+
+For Claude Code specifically, semantex installs as a **skill + hooks** — not via MCP. This gives deeper integration: hooks nudge Claude and all sub-agents to prefer semantex over built-in Grep/Glob.
+
+> **Do not combine with MCP mode.** If you use `install-claude-code`, do not also add semantex to an MCP config. Pick one.
+
+```bash
+# Install skill + hooks (fully automated)
+semantex install-claude-code
+
+# Restart Claude Code — semantex is now active
+```
+
+That's it. semantex auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer semantex over Grep/Glob. No manual indexing step required.
+
+**What gets installed:**
+
+- **Skill** (SKILL.md) — teaches Claude the progressive disclosure workflow: `--refs` → `--around` → `--deep` → `--peek` → Read
+- **Hooks** — intercept session start (pre-warm daemon) and tool calls (redirect to semantex when appropriate)
+
+---
 
 ### Standalone CLI
 
@@ -127,6 +185,10 @@ semantex index /path/to/your/project
 # Search semantically
 semantex "authentication logic" /path/to/your/project
 ```
+
+See [Usage](#usage) for the full CLI reference.
+
+---
 
 ### System Requirements
 
@@ -207,6 +269,27 @@ semantex -G "authenticate"
 semantex -e "Promise\.allSettled" "parallel failure handling"
 ```
 
+### Progressive Disclosure (Agent Workflow)
+
+```bash
+# Level 0: Compact refs — cheapest, ~200 tokens for 10 results
+semantex --refs "authentication flow"
+
+# Level 1: Peek — refs + 5-line code preview per result
+semantex --peek "authentication flow"
+
+# Level 1: Graph walk — callers, callees, type refs for a symbol
+semantex --around authenticate_user
+
+# Level 2: Deep — search, read, and summarize into a prose answer
+semantex --deep "how does the authentication flow work end-to-end"
+
+# Batch: multiple queries in one invocation
+semantex --refs "auth flow" "token validation" "session management"
+```
+
+Most agent tasks complete at `--refs`. Use `--deep` for complex architectural questions.
+
 ### Daemon Server
 
 ```bash
@@ -225,14 +308,7 @@ semantex watch /path/to/project
 
 ### MCP Server
 
-semantex exposes 4 MCP tools over stdio transport (`semantex mcp`):
-
-- **`semantex_search`** — semantic or keyword search with auto-fallback to ripgrep
-- **`semantex_index`** — trigger background indexing for a project
-- **`semantex_status`** — check index metadata (file count, chunk count, freshness)
-- **`semantex_health`** — full system health check (model status, cache stats)
-
-See [Getting Started](#other-ai-coding-tools) for editor configuration.
+Run `semantex mcp` to start the MCP server over stdio. See [MCP Server setup](#mcp-server-cursor-windsurf-cline-and-others) for editor configuration and the full list of tools.
 
 ## Architecture
 
@@ -248,6 +324,20 @@ Query -> Stemmed CodeTokenizer -> BM25 --------+
                                                |
 Query -> Exact string match -------------------+
 ```
+
+### Deep Search Pipeline
+
+```
+Agent → semantex --deep "query"
+          │
+          ├─ Phase 1: Hybrid search (top-20 candidates)
+          ├─ Phase 2: Triage (dedup, per-file cap, kind preference → top-8)
+          ├─ Phase 3: Graph expansion (callers/callees/types, 1 hop → up to 12 total)
+          ├─ Phase 4: Read full content from SQLite
+          └─ Phase 5: Extractive summarize → prose answer + source refs
+```
+
+Output: `<answer>...</answer>` with `Sources:` listing. Typically <50ms.
 
 ### Components
 

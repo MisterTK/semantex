@@ -64,6 +64,22 @@ impl AstNodeKind {
     }
 }
 
+impl std::fmt::Display for AstNodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Function => "fn",
+            Self::Method => "method",
+            Self::Class => "class",
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::Interface => "interface",
+            Self::Module => "module",
+            Self::Other(s) => s.as_str(),
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// A search result with score and provenance
 #[derive(Debug, Clone)]
 pub struct SearchResult {

@@ -28,12 +28,12 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Search query (when no subcommand is given)
+    /// Search queries (multiple allowed with --refs for batch mode)
     #[arg(value_name = "QUERY")]
-    query: Option<String>,
+    queries: Vec<String>,
 
     /// Path to search/index (defaults to current directory)
-    #[arg(value_name = "PATH")]
+    #[arg(short = 'p', long, value_name = "PATH")]
     path: Option<PathBuf>,
 
     /// Maximum number of results
@@ -160,10 +160,30 @@ struct Cli {
     #[arg(long)]
     install_codex: bool,
 
+    /// Compact references only: file:start-end name (no snippets, no scores).
+    /// Ideal for agent consumption — minimises tokens, agent uses Read for content.
+    #[arg(long, conflicts_with_all = ["json", "grep", "content", "verbose"])]
+    refs: bool,
+
+    /// Peek mode: refs + first 5 lines of code per result.
+    /// More detail than --refs, less than full content.
+    #[arg(long, conflicts_with_all = ["json", "grep", "content", "verbose", "refs"])]
+    peek: bool,
+
+    /// Show callers, callees, and type references for a named symbol.
+    /// Standalone mode — skips normal search. Example: semantex --around my_function
+    #[arg(long, value_name = "SYMBOL")]
+    around: Option<String>,
+
     /// Regex pattern to combine with semantic search (hybrid mode).
     /// Example: semantex -e "async fn" "database pool"
     #[arg(short = 'e', long = "pattern")]
     pattern: Option<String>,
+
+    /// Deep mode: search, read, and summarize internally.
+    /// Returns a curated prose answer instead of raw results.
+    #[arg(long, conflicts_with_all = ["json", "grep", "refs", "peek", "around", "content"])]
+    deep: bool,
 }
 
 #[derive(Subcommand)]
@@ -336,34 +356,88 @@ fn main() -> Result<()> {
     // Saves ~5-7ms by avoiding YAML config I/O + ORT dylib stat() calls.
     #[allow(clippy::collapsible_if)]
     if cli.command.is_none() {
-        if let Some(ref query) = cli.query {
+        // Fast path for --around: graph walk via daemon
+        if let Some(ref symbol) = cli.around {
             let path = cli.path.as_deref().unwrap_or(Path::new("."));
             if let Ok(project_path) = path.canonicalize() {
                 if let Ok(port) = semantex_core::server::read_daemon_port(&project_path) {
-                    let search_opts = commands::search::SearchOpts {
-                        query: query.clone(),
-                        path: cli.path.clone().unwrap_or_else(|| PathBuf::from(".")),
-                        max_count: cli.max_count,
-                        verbose: cli.content || cli.verbose,
-                        context: cli.context,
-                        line_number: !cli.no_line_number,
-                        rerank: cli.rerank,
-                        dense_only: cli.dense_only,
-                        sparse_only: cli.sparse_only,
-                        json: cli.json,
-                        no_content: cli.no_content,
-                        snippet: cli.snippet,
-                        grep: cli.grep,
-                        grep_mode: cli.grep_mode,
-                        include_type: cli.include_type.clone(),
-                        exclude_type: cli.exclude_type.clone(),
-                        code_only: cli.code_only,
-                        pattern: cli.pattern.clone(),
-                    };
-                    if commands::search::run_via_binary_daemon(&search_opts, port).is_ok() {
+                    if commands::search::run_around_daemon(symbol, port).is_ok() {
                         return Ok(());
                     }
-                    // Fall through to normal path if daemon connection fails
+                }
+            }
+        }
+
+        // Fast path for --deep: deep search via daemon
+        if cli.deep && !cli.queries.is_empty() {
+            let path = cli.path.as_deref().unwrap_or(Path::new("."));
+            if let Ok(project_path) = path.canonicalize() {
+                if let Ok(port) = semantex_core::server::read_daemon_port(&project_path) {
+                    if commands::search::run_deep_via_binary_daemon(
+                        cli.queries.first().map_or("", String::as_str),
+                        port,
+                        cli.verbose,
+                    )
+                    .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if !cli.queries.is_empty() {
+            let path = cli.path.as_deref().unwrap_or(Path::new("."));
+            if let Ok(project_path) = path.canonicalize() {
+                if let Ok(port) = semantex_core::server::read_daemon_port(&project_path) {
+                    // Batch mode: multiple queries with --refs
+                    if cli.queries.len() > 1 && !cli.refs {
+                        eprintln!(
+                            "[warning] multiple queries require --refs for batch mode; using first query only"
+                        );
+                    }
+                    if cli.queries.len() > 1 && cli.refs {
+                        if commands::search::run_batch_via_binary_daemon(
+                            &cli.queries,
+                            cli.max_count,
+                            cli.code_only,
+                            &cli.include_type,
+                            &cli.exclude_type,
+                            port,
+                        )
+                        .is_ok()
+                        {
+                            return Ok(());
+                        }
+                    } else {
+                        let search_opts = commands::search::SearchOpts {
+                            queries: cli.queries.clone(),
+                            path: cli.path.clone().unwrap_or_else(|| PathBuf::from(".")),
+                            max_count: cli.max_count,
+                            verbose: cli.content || cli.verbose,
+                            context: cli.context,
+                            line_number: !cli.no_line_number,
+                            rerank: cli.rerank,
+                            dense_only: cli.dense_only,
+                            sparse_only: cli.sparse_only,
+                            json: cli.json,
+                            no_content: cli.no_content,
+                            snippet: cli.snippet,
+                            grep: cli.grep,
+                            grep_mode: cli.grep_mode,
+                            include_type: cli.include_type.clone(),
+                            exclude_type: cli.exclude_type.clone(),
+                            code_only: cli.code_only,
+                            refs: cli.refs,
+                            peek: cli.peek,
+                            pattern: cli.pattern.clone(),
+                            deep: cli.deep,
+                        };
+                        if commands::search::run_via_binary_daemon(&search_opts, port).is_ok() {
+                            return Ok(());
+                        }
+                        // Fall through to normal path if daemon connection fails
+                    }
                 }
             }
         }
@@ -412,9 +486,20 @@ fn main() -> Result<()> {
         Some(Commands::Disconnect) => commands::disconnect::run(),
         None => {
             // Default: search
-            if let Some(query) = cli.query {
+            if let Some(ref symbol) = cli.around {
+                let path = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
+                return commands::search::run_around(symbol, &path, &config);
+            }
+
+            if cli.queries.is_empty() {
+                // No query, no subcommand — print help
+                use clap::CommandFactory;
+                Cli::command().print_help()?;
+                println!();
+                Ok(())
+            } else {
                 let search_opts = commands::search::SearchOpts {
-                    query,
+                    queries: cli.queries,
                     path: cli.path.unwrap_or_else(|| PathBuf::from(".")),
                     max_count: cli.max_count,
                     verbose: cli.content || cli.verbose,
@@ -431,15 +516,12 @@ fn main() -> Result<()> {
                     include_type: cli.include_type,
                     exclude_type: cli.exclude_type,
                     code_only: cli.code_only,
+                    refs: cli.refs,
+                    peek: cli.peek,
                     pattern: cli.pattern,
+                    deep: cli.deep,
                 };
                 commands::search::run(&search_opts, &config)
-            } else {
-                // No query, no subcommand — print help
-                use clap::CommandFactory;
-                Cli::command().print_help()?;
-                println!();
-                Ok(())
             }
         }
     }

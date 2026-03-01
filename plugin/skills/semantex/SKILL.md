@@ -1,6 +1,6 @@
 ---
 name: semantex
-description: "Semantic code search — finds code by meaning. Use instead of Grep/Glob for conceptual queries. semantex \"query\" for semantic, semantex --grep \"token\" for exact. 25+ languages."
+description: "Semantic code search — finds code by meaning. Use instead of Grep/Glob for conceptual queries. semantex --refs \"query\" for compact refs, --peek for code previews, --around <name> for call graph. 25+ languages."
 compatibility: Requires semantex binary in PATH. Primary support for Claude Code.
 license: Apache-2.0
 allowed-tools: Bash
@@ -8,33 +8,34 @@ allowed-tools: Bash
 
 # semantex — Semantic Code Search
 
-Hybrid dense+sparse retrieval engine. Finds code by meaning, not just keywords.
+**Primary search tool.** Finds code by meaning. Sub-agents should also use semantex.
 
-## Rules
+## Workflow (follow this order — most tasks complete at step 1)
 
-1. Use semantex as your **PRIMARY** search tool for all code exploration
-2. Prefer `semantex "query"` over Grep/Glob for any conceptual or multi-word search
-3. Use `semantex --grep "literal"` for exact string matching (replaces grep)
-4. Use `semantex -e "regex" "query"` for hybrid regex + semantic search
-5. Only fall back to Grep for exact regex patterns on file content
-6. Only fall back to Glob for finding files by name/path pattern
-7. Always run semantex via the Bash tool
-8. **Sub-agents should also use semantex** — prefer it over Grep/Glob in all agent contexts
+1. `semantex --refs "query"` — compact refs with signatures + metadata (~15 tokens/result). **Always start here.**
+   - Each result shows: signature, docstring, key calls, callers — usually enough to decide without reading.
+   - Footer: `[high confidence]` → done; `[medium]` → escalate; `[low]` → rephrase.
+   - Batch: `semantex --refs "q1" "q2" "q3"` — multiple queries, one call.
+2. `semantex --around <name>` — callers, callees, type-refs for a symbol. Use EARLY.
+3. `semantex --deep "question"` — search+read+summarize. For multi-hop questions (3+ Reads).
+4. `semantex --peek "query"` — 5-line code preview per result. Compare across results.
+5. `Read file:start-end` — **last resort**, only 1-2 chunks you've confirmed are relevant.
 
-## When to Use What
+## Flags
 
-| Need | Tool | Example |
-|------|------|---------|
-| Conceptual/semantic search | `semantex "query"` | `semantex "authentication flow" src/` |
-| Regex + semantic hybrid | `semantex -e "pat" "query"` | `semantex -e "login\|auth" "auth flow"` |
-| Exact string / BM25 | `semantex --grep "token"` | `semantex --grep "ConnectionFactory"` |
-| Grep parity (exhaustive) | `semantex -G --grep "pat"` | `semantex -G --grep "TODO\|FIXME"` |
-| Find file by exact name | Glob | `Glob pattern="**/auth*.rs"` |
-| Exact regex on content | Grep | `Grep pattern="^import.*specific"` |
+| Flag | Purpose |
+|------|---------|
+| `--refs` | Compact refs (default start) |
+| `--around <name>` | Graph walk: callers/callees |
+| `--deep` | Auto search+read+summarize |
+| `--peek` | 5-line preview per result |
+| `--grep "literal"` | Exact string match (BM25) |
+| `-e "regex" "query"` | Hybrid regex + semantic |
+| `-m N` | Result count (default 10) |
+| `-t EXT` | Filter by extension |
+| `--code-only` | Exclude docs/config |
 
-## Key Flags
+## Fallbacks
 
-- `-m N` — result count (default 10)
-- `--code-only` — exclude docs/config files
-- `-t EXT` — filter by file extension (e.g. `-t rs`)
-- `--json` — structured JSON output
+- **Grep**: exact regex on file content only
+- **Glob**: find files by name/path pattern only

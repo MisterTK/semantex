@@ -1,5 +1,6 @@
 pub mod adaptive;
 pub mod code_tokenizer;
+pub mod deep;
 pub mod fastembed_reranker;
 pub mod graph_propagation;
 pub mod hybrid;
@@ -9,6 +10,7 @@ pub mod query_expander;
 pub mod regex_semantic;
 pub mod ripgrep_fallback;
 pub mod sparse_search;
+pub mod summarize;
 pub mod triple_fusion;
 
 use crate::types::{FileFilter, SearchResult};

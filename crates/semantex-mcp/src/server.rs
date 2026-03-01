@@ -1,6 +1,7 @@
 use crate::protocol::{
-    InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo, Tool,
-    ToolCallResult, ToolContent, ToolsCapability,
+    InitializeResult, JsonRpcRequest, JsonRpcResponse, LogLevel, PROTOCOL_VERSION,
+    ServerCapabilities, ServerInfo, Tool, ToolAnnotations, ToolCallResult, ToolContent,
+    ToolsCapability,
 };
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -8,13 +9,77 @@ use semantex_core::config::SemantexConfig;
 use semantex_core::index::builder::IndexBuilder;
 use semantex_core::index::state::{self, IndexState};
 use semantex_core::search::SearchQuery;
+use semantex_core::search::deep as deep_search;
 use semantex_core::search::hybrid::HybridSearcher;
 use semantex_core::search::ripgrep_fallback;
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+
+// =============================================================================
+// Notification writer — sends JSON-RPC notifications to stdout during execution
+// =============================================================================
+
+/// Writes JSON-RPC 2.0 notifications to the shared stdout.
+///
+/// Used for progress notifications during long-running tool calls and for
+/// logging messages. Thread-safe (wraps `Arc<Mutex<BufWriter<Stdout>>>`).
+#[derive(Clone)]
+struct NotificationWriter {
+    stdout: Arc<Mutex<BufWriter<std::io::Stdout>>>,
+}
+
+impl NotificationWriter {
+    /// Send a `notifications/progress` to the client.
+    fn send_progress(
+        &self,
+        token: &serde_json::Value,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) {
+        let mut params = serde_json::json!({
+            "progressToken": token,
+            "progress": progress,
+        });
+        if let Some(t) = total {
+            params["total"] = serde_json::json!(t);
+        }
+        if let Some(m) = message {
+            params["message"] = serde_json::json!(m);
+        }
+        self.send_notification("notifications/progress", &params);
+    }
+
+    /// Send a `notifications/message` (MCP logging) to the client.
+    fn send_log(&self, level: LogLevel, logger: &str, data: &serde_json::Value) {
+        let params = serde_json::json!({
+            "level": level,
+            "logger": logger,
+            "data": data,
+        });
+        self.send_notification("notifications/message", &params);
+    }
+
+    fn send_notification(&self, method: &str, params: &serde_json::Value) {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        if let Ok(json) = serde_json::to_string(&notification) {
+            let mut out = self.stdout.lock();
+            let _ = writeln!(out, "{json}");
+            let _ = out.flush();
+        }
+    }
+}
+
+// =============================================================================
+// Searcher cache
+// =============================================================================
 
 /// Cached searcher entry with LRU tracking
 struct CachedSearcher {
@@ -31,18 +96,23 @@ enum IndexingStatus {
     Failed(String),
 }
 
+/// Idle eviction timeout: entries unused for this duration are dropped
+const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
+// =============================================================================
+// MCP Server
+// =============================================================================
+
 pub struct McpServer {
     config: SemantexConfig,
     /// LRU cache of `HybridSearcher` instances keyed by canonical index directory.
-    /// Avoids reloading the PLAID index, sparse index, and `SQLite` per request.
     cache: Mutex<HashMap<PathBuf, Arc<CachedSearcher>>>,
     max_cached: usize,
     /// Per-project indexing status — prevents double-spawning background index builds.
     index_states: Arc<Mutex<HashMap<PathBuf, IndexingStatus>>>,
+    /// Current MCP logging level — only messages at or above this level are sent.
+    log_level: Mutex<LogLevel>,
 }
-
-/// Idle eviction timeout: entries unused for this duration are dropped
-const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
 impl McpServer {
     pub fn new(config: SemantexConfig) -> Self {
@@ -55,43 +125,38 @@ impl McpServer {
             cache: Mutex::new(HashMap::new()),
             max_cached,
             index_states: Arc::new(Mutex::new(HashMap::new())),
+            log_level: Mutex::new(LogLevel::default()),
         }
     }
 
-    /// Get or create a cached searcher for the given index directory.
+    // -------------------------------------------------------------------------
+    // Searcher cache
+    // -------------------------------------------------------------------------
+
     fn get_searcher(&self, index_dir: &std::path::Path) -> Result<Arc<CachedSearcher>> {
         let mut cache = self.cache.lock();
-
-        // Evict idle entries (unused for >10 minutes)
         let now = Instant::now();
         cache.retain(|_, entry| {
             now.duration_since(*entry.last_used.lock()).as_secs() < IDLE_TIMEOUT_SECS
         });
 
-        // Check cache — update last_used on hit
         if let Some(entry) = cache.get(index_dir) {
-            tracing::debug!(index_dir = %index_dir.display(), "Searcher cache hit");
             *entry.last_used.lock() = now;
             return Ok(Arc::clone(entry));
         }
 
-        // Cache miss — create new searcher
-        tracing::info!(index_dir = %index_dir.display(), "Searcher cache miss, opening new searcher");
         let searcher = HybridSearcher::open(index_dir, &self.config)?;
-
         let entry = Arc::new(CachedSearcher {
             searcher,
             last_used: Mutex::new(now),
         });
 
-        // Evict LRU if at capacity
         if cache.len() >= self.max_cached
             && let Some(lru_key) = cache
                 .iter()
                 .min_by_key(|(_, v)| *v.last_used.lock())
                 .map(|(k, _)| k.clone())
         {
-            tracing::info!(evicted = %lru_key.display(), "Evicting LRU searcher from cache");
             cache.remove(&lru_key);
         }
 
@@ -99,18 +164,21 @@ impl McpServer {
         Ok(entry)
     }
 
-    /// Invalidate cache entry for a path (e.g., after re-indexing)
     fn invalidate_cache(&self, index_dir: &std::path::Path) {
-        let mut cache = self.cache.lock();
-        if cache.remove(index_dir).is_some() {
-            tracing::info!(index_dir = %index_dir.display(), "Invalidated searcher cache entry");
-        }
+        self.cache.lock().remove(index_dir);
     }
 
-    /// Run the MCP server on stdin/stdout
+    // -------------------------------------------------------------------------
+    // Main I/O loop
+    // -------------------------------------------------------------------------
+
+    /// Run the MCP server on stdin/stdout.
     pub fn run(&self) -> Result<()> {
         let stdin = std::io::stdin();
-        let mut stdout = std::io::stdout();
+        let stdout = Arc::new(Mutex::new(BufWriter::new(std::io::stdout())));
+        let writer = NotificationWriter {
+            stdout: Arc::clone(&stdout),
+        };
 
         for line in stdin.lock().lines() {
             let line = line?;
@@ -122,29 +190,65 @@ impl McpServer {
                 Ok(req) => req,
                 Err(e) => {
                     let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
-                    writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
-                    stdout.flush()?;
+                    let mut out = stdout.lock();
+                    writeln!(out, "{}", serde_json::to_string(&resp)?)?;
+                    out.flush()?;
                     continue;
                 }
             };
 
-            let response = self.handle_request(&request);
-            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-            stdout.flush()?;
+            // JSON-RPC 2.0: Notifications (no id) MUST NOT receive a response.
+            if request.is_notification() {
+                self.handle_notification(&request);
+                continue;
+            }
+
+            let response = self.handle_request(&request, &writer);
+            let mut out = stdout.lock();
+            writeln!(out, "{}", serde_json::to_string(&response)?)?;
+            out.flush()?;
         }
 
         Ok(())
     }
 
-    fn handle_request(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
+    // -------------------------------------------------------------------------
+    // Notification handling (no response)
+    // -------------------------------------------------------------------------
+
+    #[allow(clippy::unused_self)]
+    fn handle_notification(&self, req: &JsonRpcRequest) {
+        match req.method.as_str() {
+            "notifications/initialized" => {
+                tracing::debug!("Client initialized");
+            }
+            "notifications/cancelled" => {
+                // We don't support cancellation yet, but silently acknowledge.
+                if let Some(request_id) = req.params.get("requestId") {
+                    tracing::debug!(?request_id, "Client cancelled request (not supported)");
+                }
+            }
+            "notifications/roots/list_changed" => {
+                tracing::debug!("Client roots changed (not used)");
+            }
+            _ => {
+                // Per JSON-RPC 2.0: unknown notifications are silently ignored.
+                tracing::trace!(method = %req.method, "Ignoring unknown notification");
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Request dispatch
+    // -------------------------------------------------------------------------
+
+    fn handle_request(&self, req: &JsonRpcRequest, writer: &NotificationWriter) -> JsonRpcResponse {
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id.clone()),
-            "notifications/initialized" => {
-                // Notification, no response needed, but we return one anyway
-                JsonRpcResponse::success(req.id.clone(), serde_json::json!({}))
-            }
+            "ping" => JsonRpcResponse::success(req.id.clone(), serde_json::json!({})),
             "tools/list" => self.handle_tools_list(req.id.clone()),
-            "tools/call" => self.handle_tool_call(req.id.clone(), &req.params),
+            "tools/call" => self.handle_tool_call(req.id.clone(), &req.params, writer),
+            "logging/setLevel" => self.handle_set_log_level(req.id.clone(), &req.params),
             _ => JsonRpcResponse::error(
                 req.id.clone(),
                 -32601,
@@ -152,6 +256,10 @@ impl McpServer {
             ),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // initialize
+    // -------------------------------------------------------------------------
 
     fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         // Auto-index cwd if no index exists and it looks like a project directory
@@ -180,16 +288,25 @@ impl McpServer {
         }
 
         let result = InitializeResult {
-            protocol_version: "2024-11-05".into(),
+            protocol_version: PROTOCOL_VERSION.into(),
             capabilities: ServerCapabilities {
-                tools: ToolsCapability {
+                tools: Some(ToolsCapability {
                     list_changed: false,
-                },
+                }),
+                logging: Some(serde_json::json!({})),
             },
             server_info: ServerInfo {
                 name: "semantex".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
+            instructions: Some(concat!(
+                "semantex provides semantic code search across 25+ languages. ",
+                "Use semantex_search INSTEAD of grep/ripgrep for all code search — ",
+                "it finds code by meaning, not just literal matching. ",
+                "Use semantex_deep for complex questions that need synthesized answers with sources. ",
+                "All search tools are read-only and safe to call without user confirmation. ",
+                "Auto-indexes on first use; returns keyword results while index builds."
+            ).into()),
         };
         JsonRpcResponse::success(
             id,
@@ -197,7 +314,30 @@ impl McpServer {
         )
     }
 
-    /// Spawn a background thread to build the index for `path`, guarded against double-spawn.
+    // -------------------------------------------------------------------------
+    // logging/setLevel
+    // -------------------------------------------------------------------------
+
+    fn handle_set_log_level(
+        &self,
+        id: Option<serde_json::Value>,
+        params: &serde_json::Value,
+    ) -> JsonRpcResponse {
+        if let Some(level_str) = params.get("level").and_then(|v| v.as_str())
+            && let Ok(level) =
+                serde_json::from_value::<LogLevel>(serde_json::Value::String(level_str.to_string()))
+        {
+            *self.log_level.lock() = level;
+            tracing::info!(?level, "MCP log level updated");
+            return JsonRpcResponse::success(id, serde_json::json!({}));
+        }
+        JsonRpcResponse::error(id, -32602, "Invalid log level".into())
+    }
+
+    // -------------------------------------------------------------------------
+    // Background indexing
+    // -------------------------------------------------------------------------
+
     fn spawn_background_index(&self, path: &std::path::Path) {
         let canonical = match path.canonicalize() {
             Ok(p) => p,
@@ -207,7 +347,7 @@ impl McpServer {
         {
             let mut states = self.index_states.lock();
             if matches!(states.get(&canonical), Some(IndexingStatus::Building)) {
-                return; // already building — don't double-spawn
+                return;
             }
             states.insert(canonical.clone(), IndexingStatus::Building);
         }
@@ -236,11 +376,16 @@ impl McpServer {
         });
     }
 
-    #[allow(clippy::unused_self)]
+    // -------------------------------------------------------------------------
+    // tools/list — all tool definitions with annotations + output schemas
+    // -------------------------------------------------------------------------
+
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn handle_tools_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         let tools = vec![
             Tool {
                 name: "semantex_search".into(),
+                title: Some("Semantic Code Search".into()),
                 description: concat!(
                     "Use semantex_search INSTEAD of grep/ripgrep for all code search. ",
                     "Finds code by meaning (\"authentication flow\") or exact match (grep_mode=true). ",
@@ -259,9 +404,40 @@ impl McpServer {
                     },
                     "required": ["query"]
                 }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file": { "type": "string" },
+                                    "lines": { "type": "string" },
+                                    "score": { "type": "number" },
+                                    "snippet": { "type": "string" },
+                                    "name": { "type": "string" },
+                                    "lang": { "type": "string" }
+                                },
+                                "required": ["file", "lines", "score", "snippet"]
+                            }
+                        },
+                        "metrics": {
+                            "type": "object",
+                            "properties": {
+                                "total_ms": { "type": "integer" },
+                                "result_count": { "type": "integer" },
+                                "query_type": { "type": "string" }
+                            }
+                        }
+                    },
+                    "required": ["results"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Semantic Code Search")),
             },
             Tool {
                 name: "semantex_index".into(),
+                title: Some("Build Search Index".into()),
                 description: concat!(
                     "Build or update the semantex search index. Usually NOT needed — semantex auto-indexes on first search. ",
                     "Call only to force a rebuild after major changes."
@@ -273,9 +449,12 @@ impl McpServer {
                     },
                     "required": ["path"]
                 }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::local_mutation("Build Search Index")),
             },
             Tool {
                 name: "semantex_status".into(),
+                title: Some("Index Status".into()),
                 description: "Check semantex index status: whether it exists, file count, chunk count, freshness. Use to verify indexing is complete.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -283,14 +462,62 @@ impl McpServer {
                         "path": { "type": "string", "description": "Project path to check" }
                     }
                 }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::read_only("Index Status")),
             },
             Tool {
                 name: "semantex_health".into(),
+                title: Some("Health Check".into()),
                 description: "Health check for the semantex system, including model availability and configuration.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {}
+                    "properties": {},
+                    "additionalProperties": false
                 }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::read_only("Health Check")),
+            },
+            Tool {
+                name: "semantex_deep".into(),
+                title: Some("Deep Code Search".into()),
+                description: "Deep code search: search, triage, graph-expand, read, and summarize into a prose answer. Use for complex questions like \"how does X work\" or \"how do X and Y connect\". Returns a curated text answer with source references. Slower than semantex_search but saves agent Read calls.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural language question about the code"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Project path (defaults to current working directory)"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "answer": { "type": "string" },
+                        "sources": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file": { "type": "string" },
+                                    "start_line": { "type": "integer" },
+                                    "end_line": { "type": "integer" },
+                                    "name": { "type": "string" },
+                                    "kind": { "type": "string" }
+                                },
+                                "required": ["file", "start_line", "end_line"]
+                            }
+                        },
+                        "metrics": { "type": "object" }
+                    },
+                    "required": ["answer", "sources"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Deep Code Search")),
             },
         ];
 
@@ -300,10 +527,15 @@ impl McpServer {
         )
     }
 
+    // -------------------------------------------------------------------------
+    // tools/call — dispatch + structured output
+    // -------------------------------------------------------------------------
+
     fn handle_tool_call(
         &self,
         id: Option<serde_json::Value>,
         params: &serde_json::Value,
+        writer: &NotificationWriter,
     ) -> JsonRpcResponse {
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let arguments = params
@@ -311,42 +543,98 @@ impl McpServer {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
+        // Extract _meta.progressToken if the client sent one.
+        let progress_token = params
+            .get("_meta")
+            .and_then(|m| m.get("progressToken"))
+            .cloned();
+
         let result = match tool_name {
-            "semantex_search" => self.tool_search(&arguments),
-            "semantex_index" => self.tool_index(&arguments),
-            "semantex_status" => self.tool_status(&arguments),
-            "semantex_health" => self.tool_health(&arguments),
+            "semantex_search" => self.tool_search(&arguments, writer, progress_token.as_ref()),
+            "semantex_index" => self.tool_index(&arguments).map(ToolOutput::text),
+            "semantex_status" => self.tool_status(&arguments).map(ToolOutput::text),
+            "semantex_health" => self.tool_health(&arguments).map(ToolOutput::text),
+            "semantex_deep" => self.tool_deep_search(&arguments, writer, progress_token.as_ref()),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 
         match result {
-            Ok(text) => JsonRpcResponse::success(
-                id,
-                serde_json::to_value(ToolCallResult {
-                    content: vec![ToolContent {
-                        content_type: "text".into(),
-                        text,
-                    }],
-                    is_error: None,
-                })
-                .expect("ToolCallResult serialization"),
-            ),
-            Err(e) => JsonRpcResponse::success(
-                id,
-                serde_json::to_value(ToolCallResult {
-                    content: vec![ToolContent {
-                        content_type: "text".into(),
-                        text: format!("Error: {e}"),
-                    }],
-                    is_error: Some(true),
-                })
-                .expect("ToolCallResult serialization"),
-            ),
+            Ok(output) => {
+                // Log tool completion at info level
+                self.maybe_log(
+                    writer,
+                    LogLevel::Info,
+                    "tools",
+                    &serde_json::json!({
+                        "tool": tool_name,
+                        "status": "ok",
+                    }),
+                );
+
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::to_value(ToolCallResult {
+                        content: vec![ToolContent {
+                            content_type: "text".into(),
+                            text: output.text,
+                        }],
+                        is_error: None,
+                        structured_content: output.structured,
+                    })
+                    .expect("ToolCallResult serialization"),
+                )
+            }
+            Err(e) => {
+                self.maybe_log(
+                    writer,
+                    LogLevel::Error,
+                    "tools",
+                    &serde_json::json!({
+                        "tool": tool_name,
+                        "error": format!("{e}"),
+                    }),
+                );
+
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::to_value(ToolCallResult {
+                        content: vec![ToolContent {
+                            content_type: "text".into(),
+                            text: format!("Error: {e}"),
+                        }],
+                        is_error: Some(true),
+                        structured_content: None,
+                    })
+                    .expect("ToolCallResult serialization"),
+                )
+            }
         }
     }
 
-    #[tracing::instrument(skip(self, args), fields(tool = "search"))]
-    fn tool_search(&self, args: &serde_json::Value) -> Result<String> {
+    /// Send a log notification if the level meets the current threshold.
+    fn maybe_log(
+        &self,
+        writer: &NotificationWriter,
+        level: LogLevel,
+        logger: &str,
+        data: &serde_json::Value,
+    ) {
+        if level >= *self.log_level.lock() {
+            writer.send_log(level, logger, data);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Tool: semantex_search
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args, _writer, _progress_token), fields(tool = "search"))]
+    fn tool_search(
+        &self,
+        args: &serde_json::Value,
+        _writer: &NotificationWriter,
+        _progress_token: Option<&serde_json::Value>,
+    ) -> Result<ToolOutput> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -368,16 +656,8 @@ impl McpServer {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        tracing::info!(
-            query,
-            path = %path.display(),
-            max_results,
-            rerank,
-            grep_mode,
-            "MCP search request"
-        );
+        tracing::info!(query, path = %path.display(), max_results, rerank, grep_mode, "MCP search");
 
-        // Check index state — fall back to ripgrep if index not ready
         let idx_state = state::detect(&path);
         match idx_state {
             IndexState::Ready => {
@@ -391,7 +671,6 @@ impl McpServer {
         }
     }
 
-    /// Perform a full semantex search using the index.
     fn do_semantex_search(
         &self,
         query: &str,
@@ -399,7 +678,7 @@ impl McpServer {
         max_results: usize,
         rerank: bool,
         grep_mode: bool,
-    ) -> Result<String> {
+    ) -> Result<ToolOutput> {
         let index_dir = SemantexConfig::project_index_dir(path);
 
         let search_output = if grep_mode {
@@ -427,43 +706,63 @@ impl McpServer {
                     "score": score,
                     "snippet": snippet,
                 });
-                match &r.chunk.chunk_type {
-                    semantex_core::types::ChunkType::AstNode { name, language, .. } => {
-                        val["name"] = serde_json::Value::String(name.clone());
-                        val["lang"] = serde_json::Value::String(language.clone());
-                    }
-                    _ => {}
+                if let semantex_core::types::ChunkType::AstNode { name, language, .. } =
+                    &r.chunk.chunk_type
+                {
+                    val["name"] = serde_json::Value::String(name.clone());
+                    val["lang"] = serde_json::Value::String(language.clone());
                 }
                 val
             })
             .collect();
 
+        let metrics = &search_output.metrics;
+        let metrics_json = serde_json::json!({
+            "total_ms": metrics.total_ms,
+            "result_count": metrics.result_count,
+            "query_type": metrics.query_type,
+        });
+
+        // Structured content (machine-readable, for clients that support outputSchema)
+        let structured = serde_json::json!({
+            "results": json_results,
+            "metrics": metrics_json,
+        });
+
+        // Text content (human/LLM-readable fallback)
         let json_text = serde_json::to_string(&json_results)?;
         let response_bytes = json_text.len();
-        let metrics = search_output.metrics;
-        let footer = format_metrics_footer(&metrics, response_bytes);
-        Ok(format!("{json_text}\n\n{footer}"))
+        let footer = format_metrics_footer(metrics, response_bytes);
+        let text = format!("{json_text}\n\n{footer}");
+
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
     }
 
-    /// Fall back to ripgrep for keyword search while the index builds.
     fn do_ripgrep_fallback(
         query: &str,
         path: &std::path::Path,
         max_results: usize,
-    ) -> Result<String> {
+    ) -> Result<ToolOutput> {
         if !ripgrep_fallback::is_rg_available() {
-            return Ok(
+            return Ok(ToolOutput::text(
                 "Note: Index building. ripgrep not available for keyword fallback.\n\n[]"
                     .to_string(),
-            );
+            ));
         }
 
         let results = ripgrep_fallback::search(query, path, max_results)?;
         let json = ripgrep_fallback::format_as_json(&results);
-        Ok(format!(
+        Ok(ToolOutput::text(format!(
             "Note: Index building. Showing keyword (ripgrep) results.\n\n{json}"
-        ))
+        )))
     }
+
+    // -------------------------------------------------------------------------
+    // Tool: semantex_index
+    // -------------------------------------------------------------------------
 
     #[tracing::instrument(skip(self, args), fields(tool = "index"))]
     fn tool_index(&self, args: &serde_json::Value) -> Result<String> {
@@ -475,12 +774,8 @@ impl McpServer {
 
         tracing::info!(path = %path.display(), "MCP index request");
 
-        // Invalidate cached searcher for this project since index is being rebuilt
         let index_dir = SemantexConfig::project_index_dir(&path);
         self.invalidate_cache(&index_dir);
-
-        // Run indexing in the background to avoid blocking the MCP event loop.
-        // The caller can use semantex_status to check progress.
         self.spawn_background_index(&path);
 
         Ok(format!(
@@ -488,6 +783,10 @@ impl McpServer {
             path.display()
         ))
     }
+
+    // -------------------------------------------------------------------------
+    // Tool: semantex_status
+    // -------------------------------------------------------------------------
 
     #[allow(clippy::unused_self)]
     #[tracing::instrument(skip(self, args), fields(tool = "status"))]
@@ -512,6 +811,10 @@ impl McpServer {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Tool: semantex_health
+    // -------------------------------------------------------------------------
+
     #[tracing::instrument(skip(self, _args), fields(tool = "health"))]
     fn tool_health(&self, _args: &serde_json::Value) -> Result<String> {
         use semantex_core::embedding::model_manager;
@@ -523,11 +826,9 @@ impl McpServer {
         ));
         status.push("=".repeat(50));
 
-        // Check models directory
         let models_dir = self.config.models_dir();
         status.push(format!("\nModels Directory: {}", models_dir.display()));
 
-        // Check ColBERT model
         if model_manager::is_colbert_downloaded(&models_dir) {
             let model_dir = models_dir.join("LateOn-Code-edge");
             let model_path = model_dir.join("model_int8.onnx");
@@ -556,14 +857,12 @@ impl McpServer {
             status.push("  Run 'semantex download-models' to download".to_string());
         }
 
-        // Reranker status
         if self.config.rerank {
             status.push("\nReranker: ENABLED (fastembed JINA Reranker v1 Turbo)".to_string());
         } else {
             status.push("\nReranker: DISABLED".to_string());
         }
 
-        // Configuration
         status.push("\nConfiguration:".to_string());
         status.push(format!("  Chunk size: {}", self.config.chunk_size));
         status.push(format!("  Chunk overlap: {}", self.config.chunk_overlap));
@@ -580,7 +879,6 @@ impl McpServer {
             self.config.rerank_candidates
         ));
 
-        // Cache status
         let cache = self.cache.lock();
         status.push(format!(
             "\nSearcher Cache: {}/{} entries",
@@ -595,9 +893,164 @@ impl McpServer {
 
         Ok(status.join("\n"))
     }
+
+    // -------------------------------------------------------------------------
+    // Tool: semantex_deep (with progress notifications)
+    // -------------------------------------------------------------------------
+
+    #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(skip(self, args, writer, progress_token), fields(tool = "deep_search"))]
+    fn tool_deep_search(
+        &self,
+        args: &serde_json::Value,
+        writer: &NotificationWriter,
+        progress_token: Option<&serde_json::Value>,
+    ) -> Result<ToolOutput> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
+
+        let path = args.get("path").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            PathBuf::from,
+        );
+
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+
+        tracing::info!(query, path = %path.display(), "MCP deep search");
+
+        let idx_state = state::detect(&path);
+        match idx_state {
+            IndexState::NotIndexed | IndexState::Stale => {
+                self.spawn_background_index(&path);
+                return Ok(ToolOutput::text("Index not ready. Building index in background — deep search requires a complete index. Try again in a moment.".to_string()));
+            }
+            IndexState::Building => {
+                return Ok(ToolOutput::text("Index is currently building. Deep search requires a complete index. Try again in a moment.".to_string()));
+            }
+            IndexState::Ready => {}
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let cached = self.get_searcher(&index_dir)?;
+
+        // Run deep search with progress notifications if client sent a progressToken.
+        let result = if let Some(token) = progress_token {
+            let writer_clone = writer.clone();
+            let token_clone = token.clone();
+            deep_search::deep_search_with_progress(
+                &cached.searcher,
+                query,
+                20,
+                true,
+                &move |step, total, msg| {
+                    writer_clone.send_progress(
+                        &token_clone,
+                        f64::from(step),
+                        Some(f64::from(total)),
+                        Some(msg),
+                    );
+                },
+            )?
+        } else {
+            deep_search::deep_search(&cached.searcher, query, 20, true)?
+        };
+
+        // Build text output (human/LLM-readable)
+        use std::fmt::Write as _;
+        let mut output = String::new();
+        output.push_str("<answer>\n");
+        output.push_str(&result.answer);
+        output.push_str("\n</answer>\n\nSources:\n");
+        for s in &result.sources {
+            let _ = write!(output, "  {}:{}-{}", s.file, s.start_line, s.end_line);
+            if let Some(ref name) = s.name {
+                let _ = write!(output, " {name}");
+            }
+            if let Some(ref kind) = s.kind {
+                let _ = write!(output, " [{kind}]");
+            }
+            output.push('\n');
+        }
+
+        let m = &result.metrics;
+        let _ = write!(
+            output,
+            "\n[semantex_deep_metrics: total_ms={} search_ms={} triage_ms={} graph_ms={} read_ms={} summarize_ms={} chunks_read={}]",
+            m.total_ms,
+            m.search_ms,
+            m.triage_ms,
+            m.graph_ms,
+            m.read_ms,
+            m.summarize_ms,
+            m.chunks_read
+        );
+
+        // Build structured output (machine-readable)
+        let sources_json: Vec<serde_json::Value> = result
+            .sources
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::json!({
+                    "file": s.file,
+                    "start_line": s.start_line,
+                    "end_line": s.end_line,
+                });
+                if let Some(ref name) = s.name {
+                    v["name"] = serde_json::Value::String(name.clone());
+                }
+                if let Some(ref kind) = s.kind {
+                    v["kind"] = serde_json::Value::String(kind.clone());
+                }
+                v
+            })
+            .collect();
+
+        let structured = serde_json::json!({
+            "answer": result.answer,
+            "sources": sources_json,
+            "metrics": {
+                "total_ms": m.total_ms,
+                "search_ms": m.search_ms,
+                "triage_ms": m.triage_ms,
+                "graph_ms": m.graph_ms,
+                "read_ms": m.read_ms,
+                "summarize_ms": m.summarize_ms,
+                "chunks_read": m.chunks_read,
+            }
+        });
+
+        Ok(ToolOutput {
+            text: output,
+            structured: Some(structured),
+        })
+    }
 }
 
-/// Format a compact metrics footer for MCP responses.
+// =============================================================================
+// Tool output helper
+// =============================================================================
+
+/// Carries both text content and optional structured content from a tool call.
+struct ToolOutput {
+    text: String,
+    structured: Option<serde_json::Value>,
+}
+
+impl ToolOutput {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            structured: None,
+        }
+    }
+}
+
+// =============================================================================
+// Formatting helpers
+// =============================================================================
+
 fn format_metrics_footer(
     metrics: &semantex_core::search::SearchMetrics,
     response_bytes: usize,

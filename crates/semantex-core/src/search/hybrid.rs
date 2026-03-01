@@ -140,6 +140,16 @@ impl HybridSearcher {
     /// Reload the sparse index reader to pick up incremental updates.
     /// The PLAID index is memory-mapped and picks up changes automatically on re-open,
     /// but Tantivy requires an explicit reader reload.
+    /// Provide read-only access to the chunk store for graph queries.
+    /// Used by the daemon handler and the direct fallback path.
+    pub(crate) fn with_store<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&crate::index::storage::ChunkStore) -> T,
+    {
+        let store = self.store.lock();
+        f(&store)
+    }
+
     pub fn reload(&self) -> Result<()> {
         if let Some(ref sparse) = self.sparse {
             sparse.reload()?;
@@ -740,8 +750,12 @@ impl HybridSearcher {
             rerank_ms = Some(rerank_start.elapsed().as_millis() as u64);
         }
 
-        // Stage 4: Adaptive result sizing, confidence threshold, and deduplication
-        let adaptive_config = self.config.adaptive_config();
+        // Stage 4: Adaptive result sizing, confidence threshold, and deduplication.
+        // Exhaustive mode: widen range, skip dedup, lower threshold.
+        let mut adaptive_config = self.config.adaptive_config();
+        if is_exhaustive_query(&effective_text) {
+            adaptive_config.exhaustive = true;
+        }
         let pre_adaptive_count = results.len();
         adaptive::apply_adaptive_pipeline(
             &mut results,
@@ -954,6 +968,30 @@ impl HybridSearcher {
             results,
         })
     }
+}
+
+/// Heuristic: exhaustive queries ask for complete enumeration of all instances.
+/// Examples: "find all error handling", "list every config option", "all places where X".
+/// These benefit from wider result ranges, no per-file dedup, and lower score thresholds.
+fn is_exhaustive_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    let signals: &[&str] = &[
+        "find all",
+        "list all",
+        "all places",
+        "all patterns",
+        "all ways",
+        "all instances",
+        "all cases",
+        "every ",
+        "each ",
+        "enumerate",
+        "exhaustive",
+        "complete list",
+        "anywhere ",
+        "throughout",
+    ];
+    signals.iter().any(|s| q.contains(s))
 }
 
 /// Heuristic: architectural queries are long semantic queries about flows/pipelines/lifecycles.

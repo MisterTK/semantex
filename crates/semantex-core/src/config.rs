@@ -164,6 +164,7 @@ impl SemantexConfig {
             min_score_mixed: self.min_score_mixed,
             deduplicate: self.adaptive_dedup,
             dedup_score_gap: self.adaptive_dedup_gap,
+            exhaustive: false, // set per-query in hybrid.rs
         }
     }
 

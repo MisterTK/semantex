@@ -225,6 +225,10 @@ pub fn daemon_search(
         metrics: response
             .get("metrics")
             .and_then(|m| serde_json::from_value(m.clone()).ok()),
+        confidence: response
+            .get("confidence")
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string),
     })
 }
 
@@ -275,6 +279,154 @@ pub fn daemon_search_binary(
         }
         other => anyhow::bail!("Unexpected response type: {other:?}"),
     }
+}
+
+/// Send a binary graph walk request to the daemon at the given port.
+pub fn daemon_graph_walk_binary(
+    port: u16,
+    request: protocol::GraphWalkRequest,
+) -> Result<protocol::GraphWalkResponse> {
+    use std::io::Read;
+
+    let bin_req = protocol::BinaryRequest::GraphWalk(request);
+    let frame = protocol::encode_binary_request(&bin_req);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let mut magic = [0u8; 1];
+    stream.read_exact(&mut magic)?;
+    if magic[0] != protocol::BINARY_MAGIC {
+        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
+    }
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+
+    let bin_resp = protocol::decode_binary_response(&payload)
+        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
+
+    match bin_resp {
+        protocol::BinaryResponse::GraphWalk(gr) => Ok(gr),
+        protocol::BinaryResponse::Error(e) => {
+            anyhow::bail!("Daemon error: {}", e.message)
+        }
+        other => anyhow::bail!("Unexpected response type: {other:?}"),
+    }
+}
+
+/// Send a binary multi-search request to the daemon at the given port.
+/// Returns all SearchResponses (one per query) or an error.
+pub fn daemon_multi_search_binary(
+    port: u16,
+    request: protocol::MultiSearchRequest,
+) -> Result<protocol::MultiSearchResponse> {
+    use std::io::Read;
+
+    let bin_req = protocol::BinaryRequest::MultiSearch(request);
+    let frame = protocol::encode_binary_request(&bin_req);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let mut magic = [0u8; 1];
+    stream.read_exact(&mut magic)?;
+    if magic[0] != protocol::BINARY_MAGIC {
+        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
+    }
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+
+    let bin_resp = protocol::decode_binary_response(&payload)
+        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
+
+    match bin_resp {
+        protocol::BinaryResponse::MultiSearch(mr) => Ok(mr),
+        protocol::BinaryResponse::Error(e) => {
+            anyhow::bail!("Daemon error: {}", e.message)
+        }
+        other => anyhow::bail!("Unexpected response type: {other:?}"),
+    }
+}
+
+/// Send a binary deep search request to the daemon at the given port.
+pub fn daemon_deep_search_binary(
+    port: u16,
+    request: protocol::DeepSearchRequest,
+) -> Result<protocol::DeepSearchResponse> {
+    use std::io::Read;
+
+    let bin_req = protocol::BinaryRequest::DeepSearch(request);
+    let frame = protocol::encode_binary_request(&bin_req);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?; // deep takes longer
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let mut magic = [0u8; 1];
+    stream.read_exact(&mut magic)?;
+    if magic[0] != protocol::BINARY_MAGIC {
+        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
+    }
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+
+    let bin_resp = protocol::decode_binary_response(&payload)
+        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
+
+    match bin_resp {
+        protocol::BinaryResponse::DeepSearch(dr) => Ok(dr),
+        protocol::BinaryResponse::Error(e) => {
+            anyhow::bail!("Daemon error: {}", e.message)
+        }
+        other => anyhow::bail!("Unexpected response type: {other:?}"),
+    }
+}
+
+/// Perform a graph walk directly against the index without a running daemon.
+/// Used as a fallback when the daemon is unavailable.
+pub fn graph_walk_direct(
+    symbol: &str,
+    index_dir: &std::path::Path,
+    config: &SemantexConfig,
+) -> Result<protocol::GraphWalkResponse> {
+    let searcher = HybridSearcher::open_sparse_only(index_dir, config)
+        .context("Failed to open search index for graph walk")?;
+    searcher.with_store(|store| handler::graph_walk_from_store(store, symbol))
 }
 
 /// Send a binary health check to the daemon at the given port.

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Installation scope — mirrors Claude Code's own settings hierarchy.
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -42,22 +43,19 @@ fn prompt_scope() -> Result<InstallScope> {
 
     eprintln!("Where should semantex hooks be installed?\n");
     eprintln!(
-        "  {}  {}  {}",
+        "  {}  {}  all your projects (you only)",
         "user   ".bold(),
         "~/.claude/settings.json         ".dimmed(),
-        "all your projects (you only)"
     );
     eprintln!(
-        "  {}  {}  {}",
+        "  {}  {}  this repo, shared with team via git",
         "project".bold(),
         ".claude/settings.json           ".dimmed(),
-        "this repo, shared with team via git"
     );
     eprintln!(
-        "  {}  {}  {}",
+        "  {}  {}  this repo, you only (gitignored)",
         "local  ".bold(),
         ".claude/settings.local.json     ".dimmed(),
-        "this repo, you only (gitignored)"
     );
     eprintln!();
 
@@ -201,7 +199,7 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
 }
 
 /// Append `entry` to the `.gitignore` inside `dir` if not already present.
-fn ensure_gitignored(dir: &PathBuf, entry: &str) {
+fn ensure_gitignored(dir: &Path, entry: &str) {
     // Walk up to find the nearest .gitignore (repo root or dir itself)
     let candidates = [dir.join(".gitignore"), dir.join("../.gitignore")];
     for gitignore_path in &candidates {
@@ -210,7 +208,6 @@ fn ensure_gitignored(dir: &PathBuf, entry: &str) {
             if existing.lines().any(|l| l.trim() == entry) {
                 return;
             }
-            use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

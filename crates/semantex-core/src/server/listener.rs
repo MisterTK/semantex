@@ -19,7 +19,7 @@ fn current_rss_bytes() -> Option<u64> {
     // SAFETY: getrusage is a standard POSIX call; zeroing the struct is valid.
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+        if libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) == 0 {
             Some(usage.ru_maxrss as u64) // bytes on macOS
         } else {
             None
@@ -140,20 +140,21 @@ impl Listener {
 
             // RSS guard — checked every 500 iterations (~5 s at 10 ms/iteration)
             loop_count += 1;
-            if rss_limit_mb > 0 && loop_count % 500 == 0 {
-                if let Some(rss_bytes) = current_rss_bytes() {
-                    let rss_mb = rss_bytes / (1024 * 1024);
-                    if rss_mb > rss_limit_mb {
-                        tracing::warn!(
-                            rss_mb,
-                            rss_limit_mb,
-                            "RSS limit exceeded ({} MB > {} MB) — daemon exiting to free memory. \
-                             Next search will restart it.",
-                            rss_mb,
-                            rss_limit_mb
-                        );
-                        break;
-                    }
+            if rss_limit_mb > 0
+                && loop_count.is_multiple_of(500)
+                && let Some(rss_bytes) = current_rss_bytes()
+            {
+                let rss_mb = rss_bytes / (1024 * 1024);
+                if rss_mb > rss_limit_mb {
+                    tracing::warn!(
+                        rss_mb,
+                        rss_limit_mb,
+                        "RSS limit exceeded ({} MB > {} MB) — daemon exiting to free memory. \
+                         Next search will restart it.",
+                        rss_mb,
+                        rss_limit_mb
+                    );
+                    break;
                 }
             }
 

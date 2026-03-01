@@ -92,7 +92,7 @@ pub fn cmd_session_hook() -> Result<()> {
 
     let additional_context = format!(
         "semantex semantic code search is available (index: {}).\n\
-         Use `semantex \"query\"` for all code search. Use `semantex --grep \"literal\"` for exact match.\n\
+         Use `semantex --refs \"query\"` for all code search. Use `semantex --grep \"literal\"` for exact match.\n\
          Fallback: Grep for regex patterns, Glob for file names.",
         index_dir.display()
     );
@@ -126,7 +126,7 @@ pub fn cmd_grep_hook() -> Result<()> {
             "hookEventName": "PreToolUse",
             "additionalContext": concat!(
                 "Use semantex via Bash instead of Grep/Glob — semantex finds code by meaning and replaces grep for code search.\n",
-                "Commands: `semantex \"query\" .`, `semantex -e \"pattern\" \"query\"`, `semantex --grep \"literal\"`",
+                "Commands: `semantex --refs \"query\"`, `semantex --refs -e \"pattern\" \"query\"`, `semantex --grep \"literal\"`",
             ),
         }
     });
@@ -155,11 +155,11 @@ pub fn cmd_task_hook() -> Result<()> {
                 "IMPORTANT: semantex (semantic code search) is available in this project. ",
                 "Use semantex via Bash for ALL code searches instead of Grep or Glob tools.\n\n",
                 "Commands:\n",
-                "- `semantex \"natural language query\" .` — semantic search\n",
-                "- `semantex -e \"regex\" \"query\"` — regex + semantic hybrid\n",
+                "- `semantex --refs \"natural language query\"` — semantic search (compact refs, then Read what you need)\n",
+                "- `semantex --refs -e \"regex\" \"query\"` — regex + semantic hybrid\n",
                 "- `semantex --grep \"literal\"` — fast exact/BM25 search\n",
-                "- `semantex -c \"query\" .` — include code snippets\n",
-                "- `semantex --code-only \"query\" .` — exclude docs/config\n\n",
+                "- `semantex --refs --code-only \"query\"` — exclude docs/config\n\n",
+                "Always use --refs for semantic search — outputs file:line references only, minimises tokens.\n",
                 "Only fall back to Grep for exact regex on file content, or Glob for finding files by name pattern.",
             ),
         }

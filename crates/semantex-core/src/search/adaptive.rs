@@ -24,6 +24,8 @@ pub struct AdaptiveConfig {
     pub deduplicate: bool,
     /// Score gap threshold for keeping multiple chunks from the same file
     pub dedup_score_gap: f32,
+    /// Exhaustive mode: "find all X" queries — wider range, lower threshold, no dedup
+    pub exhaustive: bool,
 }
 
 impl Default for AdaptiveConfig {
@@ -36,6 +38,7 @@ impl Default for AdaptiveConfig {
             min_score_mixed: 0.10,
             deduplicate: true,
             dedup_score_gap: 0.10,
+            exhaustive: false,
         }
     }
 }
@@ -52,8 +55,12 @@ impl AdaptiveConfig {
     }
 }
 
-/// Result size range per query type
-fn size_range(query_type: QueryType) -> (usize, usize) {
+/// Result size range per query type.
+/// Exhaustive mode expands the max to surface more patterns for "find all X" queries.
+fn size_range(query_type: QueryType, exhaustive: bool) -> (usize, usize) {
+    if exhaustive {
+        return (5, 25);
+    }
     match query_type {
         QueryType::Identifier | QueryType::Keyword | QueryType::Semantic => (3, 15),
         QueryType::Mixed => (5, 15),
@@ -69,12 +76,17 @@ fn size_range(query_type: QueryType) -> (usize, usize) {
 /// Identifier queries use tight elbow detection (0.5% threshold) to improve
 /// precision: symbol lookups have natural clusters between primary files
 /// (definition + direct users) and secondary files (incidental importers).
-pub fn adaptive_max_results(scores: &[f32], query_type: QueryType, requested_max: usize) -> usize {
+pub fn adaptive_max_results(
+    scores: &[f32],
+    query_type: QueryType,
+    requested_max: usize,
+    exhaustive: bool,
+) -> usize {
     if scores.is_empty() {
         return 0;
     }
 
-    let (min_results, max_results) = size_range(query_type);
+    let (min_results, max_results) = size_range(query_type, exhaustive);
     // Adaptive range max is the hard cap; user's requested_max further limits output
     let range_cap = max_results;
 
@@ -187,16 +199,30 @@ pub fn apply_adaptive_pipeline(
     requested_max: usize,
     config: &AdaptiveConfig,
 ) {
+    let exhaustive = config.exhaustive;
+
     if !config.enabled || results.is_empty() {
         results.truncate(requested_max);
         return;
     }
 
-    // Stage 1: Confidence threshold
-    apply_confidence_threshold(results, query_type, config);
+    // Stage 1: Confidence threshold.
+    // Exhaustive mode halves the threshold to include more borderline matches.
+    if exhaustive {
+        let threshold = config.min_score(query_type) * 0.5;
+        if let Some(top) = results.first().map(|r| r.score)
+            && top > 0.0
+        {
+            results.retain(|r| r.score >= top * threshold);
+        }
+    } else {
+        apply_confidence_threshold(results, query_type, config);
+    }
 
-    // Stage 2: Deduplication
-    if config.deduplicate {
+    // Stage 2: Deduplication.
+    // Exhaustive mode skips per-file dedup so multiple chunks from different
+    // sections of the same file can surface distinct patterns.
+    if config.deduplicate && !exhaustive {
         deduplicate_by_file(results, config.dedup_score_gap);
     }
 
@@ -216,8 +242,8 @@ pub fn apply_adaptive_pipeline(
     //      appear in many files with similar scores (e.g. junctionUserId).
     //
     // For all other query types, use raw chunk scores (original behavior).
-    if query_type == QueryType::Identifier {
-        let (_, max_range) = size_range(query_type);
+    if query_type == QueryType::Identifier && !exhaustive {
+        let (_, max_range) = size_range(query_type, false);
         let file_best: Vec<(PathBuf, f32)> = {
             let mut map: HashMap<PathBuf, f32> = HashMap::new();
             for r in &*results {
@@ -233,7 +259,8 @@ pub fn apply_adaptive_pipeline(
 
         let total_files = file_best.len();
         let file_scores: Vec<f32> = file_best.iter().map(|(_, s)| *s).collect();
-        let adaptive_file_count = adaptive_max_results(&file_scores, query_type, requested_max);
+        let adaptive_file_count =
+            adaptive_max_results(&file_scores, query_type, requested_max, false);
 
         // Apply precision mode only when the elbow selects ≤ 2/3 of total files.
         // Selecting > 2/3 of files means the "elbow" is an end-of-list artifact
@@ -262,8 +289,13 @@ pub fn apply_adaptive_pipeline(
             results.truncate(max_range.min(requested_max));
         }
     } else {
+        let effective_max = if exhaustive {
+            requested_max.max(25)
+        } else {
+            requested_max
+        };
         let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
-        let adaptive_count = adaptive_max_results(&scores, query_type, requested_max);
+        let adaptive_count = adaptive_max_results(&scores, query_type, effective_max, exhaustive);
         results.truncate(adaptive_count);
     }
 }
@@ -293,21 +325,24 @@ mod tests {
 
     #[test]
     fn test_adaptive_empty_scores() {
-        assert_eq!(adaptive_max_results(&[], QueryType::Semantic, 10), 0);
+        assert_eq!(adaptive_max_results(&[], QueryType::Semantic, 10, false), 0);
     }
 
     #[test]
     fn test_adaptive_fewer_than_min() {
         // Semantic min is 3, but only 2 results
         let scores = vec![0.5, 0.4];
-        assert_eq!(adaptive_max_results(&scores, QueryType::Semantic, 10), 2);
+        assert_eq!(
+            adaptive_max_results(&scores, QueryType::Semantic, 10, false),
+            2
+        );
     }
 
     #[test]
     fn test_adaptive_tight_cluster_uses_max_range() {
         // All scores very similar -> should use max for semantic (15)
         let scores: Vec<f32> = (0..30).map(|i| 1.0 - i as f32 * 0.001).collect();
-        let result = adaptive_max_results(&scores, QueryType::Semantic, 50);
+        let result = adaptive_max_results(&scores, QueryType::Semantic, 50, false);
         assert_eq!(result, 15); // max for Semantic
     }
 
@@ -316,7 +351,7 @@ mod tests {
         // Clear elbow at position 3 for Keyword type (min=3)
         let scores = vec![0.5, 0.48, 0.47, 0.1, 0.09, 0.08, 0.07, 0.06];
         // The drop from 0.47 to 0.1 is (0.37/0.5) = 0.74, huge gap at index 3
-        let result = adaptive_max_results(&scores, QueryType::Keyword, 10);
+        let result = adaptive_max_results(&scores, QueryType::Keyword, 10, false);
         assert_eq!(result, 3);
     }
 
@@ -326,7 +361,7 @@ mod tests {
         // Scores: big drop at i=3 (0.47→0.1 = 74% relative), which is well above 0.5%.
         // With min_results=3, elbow fires at i=3 → returns 3 results.
         let scores = vec![0.5, 0.48, 0.47, 0.1, 0.09, 0.08, 0.07, 0.06];
-        let result = adaptive_max_results(&scores, QueryType::Identifier, 50);
+        let result = adaptive_max_results(&scores, QueryType::Identifier, 50, false);
         assert_eq!(result, 3);
     }
 
@@ -334,7 +369,7 @@ mod tests {
     fn test_adaptive_respects_requested_max() {
         let scores: Vec<f32> = (0..30).map(|i| 1.0 - i as f32 * 0.01).collect();
         // Mixed range is 5-15, requested_max=5 limits output to 5
-        let result = adaptive_max_results(&scores, QueryType::Mixed, 5);
+        let result = adaptive_max_results(&scores, QueryType::Mixed, 5, false);
         assert!(result <= 5);
     }
 
@@ -342,7 +377,7 @@ mod tests {
     fn test_adaptive_identifier_range() {
         // 15 tightly clustered scores
         let scores: Vec<f32> = (0..15).map(|i| 1.0 - i as f32 * 0.002).collect();
-        let result = adaptive_max_results(&scores, QueryType::Identifier, 50);
+        let result = adaptive_max_results(&scores, QueryType::Identifier, 50, false);
         assert!(result >= 3); // min
         assert!(result <= 15); // max for Identifier (no elbow, returns up to max)
     }
@@ -631,9 +666,12 @@ mod tests {
 
     #[test]
     fn test_size_ranges() {
-        assert_eq!(size_range(QueryType::Identifier), (3, 15));
-        assert_eq!(size_range(QueryType::Keyword), (3, 15));
-        assert_eq!(size_range(QueryType::Semantic), (3, 15));
-        assert_eq!(size_range(QueryType::Mixed), (5, 15));
+        assert_eq!(size_range(QueryType::Identifier, false), (3, 15));
+        assert_eq!(size_range(QueryType::Keyword, false), (3, 15));
+        assert_eq!(size_range(QueryType::Semantic, false), (3, 15));
+        assert_eq!(size_range(QueryType::Mixed, false), (5, 15));
+        // Exhaustive mode expands range for all types
+        assert_eq!(size_range(QueryType::Semantic, true), (5, 25));
+        assert_eq!(size_range(QueryType::Mixed, true), (5, 25));
     }
 }

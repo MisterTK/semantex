@@ -179,6 +179,19 @@ impl StructuredChunkMeta {
             parts.push(format!("returns {ret}"));
         }
 
+        // Docstring (first sentence) — surfaced early so summaries are human-readable
+        if let Some(ref doc) = self.docstring {
+            let first_sentence = doc.split('.').next().unwrap_or(doc);
+            if first_sentence.len() < 200 {
+                parts.push(first_sentence.trim().to_string());
+            }
+        }
+
+        // Semantic role — surfaced early for quick triage
+        if let Some(ref role) = self.semantic_role {
+            parts.push(format!("role: {}", role.as_label()));
+        }
+
         // Layer 2: Call graph (most impactful for vocabulary bridging)
         if !self.calls.is_empty() {
             let expanded_calls: Vec<String> =
@@ -260,11 +273,6 @@ impl StructuredChunkMeta {
             }
         }
 
-        // Layer 6: Semantic role
-        if let Some(ref role) = self.semantic_role {
-            parts.push(format!("role: {}", role.as_label()));
-        }
-
         // Doc tags (Layer 1 enhanced)
         for dt in &self.doc_tags {
             match dt.tag.as_str() {
@@ -284,15 +292,6 @@ impl StructuredChunkMeta {
             }
         }
 
-        // Docstring (Layer 1, but added last as supplementary)
-        if let Some(ref doc) = self.docstring {
-            // Take first sentence of docstring, limited to 200 chars
-            let first_sentence = doc.split('.').next().unwrap_or(doc);
-            if first_sentence.len() < 200 {
-                parts.push(first_sentence.trim().to_string());
-            }
-        }
-
         self.nl_summary = parts.join("; ");
     }
 
@@ -305,6 +304,219 @@ impl StructuredChunkMeta {
     pub fn kind_label(&self) -> &str {
         self.kind.as_deref().unwrap_or("function")
     }
+
+    /// Generate a compact, agent-optimized display summary.
+    ///
+    /// Unlike `nl_summary` (designed for BM25 index enrichment), this output
+    /// preserves original identifier casing and filters trivial calls to
+    /// minimize tokens while maximizing actionable information.
+    ///
+    /// Format:
+    /// ```text
+    /// {signature or reconstructed sig}
+    ///   {docstring first sentence}
+    ///   calls: {non-trivial calls, max 5}
+    ///   called_by: {callers, max 5}
+    ///   implements: {trait names}
+    ///   [{semantic_role}]
+    /// ```
+    pub fn display_summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        // Line 1: signature (or reconstructed fallback)
+        if let Some(ref sig) = self.signature {
+            parts.push(sig.clone());
+        } else if let Some(ref name) = self.name {
+            let kind = self.kind.as_deref();
+            let kind_prefix = match kind {
+                Some("fn" | "function" | "method") => "fn ",
+                Some("class") => "class ",
+                Some("struct") => "struct ",
+                Some("enum") => "enum ",
+                Some("interface") => "interface ",
+                Some("module") => "mod ",
+                Some(other) => {
+                    parts.push(format!("{other} {name}"));
+                    ""
+                }
+                None => "fn ",
+            };
+            if !kind_prefix.is_empty() {
+                let mut sig = format!("{kind_prefix}{name}");
+                let is_type_decl = matches!(
+                    kind,
+                    Some("class" | "struct" | "enum" | "interface" | "module")
+                );
+                if !self.params.is_empty() && !is_type_decl {
+                    sig.push('(');
+                    sig.push_str(&self.params.join(", "));
+                    sig.push(')');
+                }
+                if let Some(ref ret) = self.return_type {
+                    sig.push_str(" -> ");
+                    sig.push_str(ret);
+                }
+                parts.push(sig);
+            }
+        }
+
+        // Line 2: docstring first sentence (max 120 chars)
+        if let Some(ref doc) = self.docstring {
+            let first = doc.split('.').next().unwrap_or(doc).trim();
+            if !first.is_empty() && first.len() <= 120 {
+                parts.push(format!("  {first}"));
+            }
+        }
+
+        // Line 3: filtered calls (non-trivial, max 5)
+        let filtered_calls: Vec<&str> = self
+            .calls
+            .iter()
+            .filter(|c| !is_trivial_call(c))
+            .take(5)
+            .map(String::as_str)
+            .collect();
+        if !filtered_calls.is_empty() {
+            parts.push(format!("  calls: {}", filtered_calls.join(", ")));
+        }
+
+        // Line 4: called_by (max 5)
+        if !self.called_by.is_empty() {
+            let callers: Vec<&str> = self.called_by.iter().take(5).map(String::as_str).collect();
+            parts.push(format!("  called_by: {}", callers.join(", ")));
+        }
+
+        // Line 5: implements (for structs/classes)
+        if !self.implements.is_empty() {
+            let traits: Vec<&str> = self
+                .implements
+                .iter()
+                .map(|r| r.trait_name.as_str())
+                .collect();
+            parts.push(format!("  implements: {}", traits.join(", ")));
+        }
+
+        // Line 6: semantic role
+        if let Some(ref role) = self.semantic_role {
+            let label = match role {
+                SemanticRole::Constructor => "constructor",
+                SemanticRole::Destructor => "destructor",
+                SemanticRole::Validator => "validator",
+                SemanticRole::Transformer => "transformer",
+                SemanticRole::Fetcher => "fetcher",
+                SemanticRole::Persister => "persister",
+                SemanticRole::Handler => "handler",
+                SemanticRole::Middleware => "middleware",
+                SemanticRole::ErrorHandler => "error_handler",
+                SemanticRole::Sanitizer => "sanitizer",
+                SemanticRole::Orchestrator => "orchestrator",
+            };
+            parts.push(format!("  [{label}]"));
+        }
+
+        parts.join("\n")
+    }
+}
+
+/// Ubiquitous stdlib/builtin calls that provide no architectural insight.
+/// Used by `display_summary()` to filter noise from the calls list.
+const TRIVIAL_CALLS: &[&str] = &[
+    // Collection operations
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "get",
+    "set",
+    "len",
+    "is_empty",
+    "contains",
+    "iter",
+    "into_iter",
+    "collect",
+    "extend",
+    "clear",
+    "first",
+    "last",
+    "next",
+    // String operations
+    "to_string",
+    "as_str",
+    "to_owned",
+    "trim",
+    "split",
+    "join",
+    "starts_with",
+    "ends_with",
+    "replace",
+    "chars",
+    "lines",
+    // Formatting
+    "format",
+    "write",
+    "writeln",
+    "println",
+    "eprintln",
+    "print",
+    "display",
+    // Option/Result
+    "unwrap",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "expect",
+    "ok",
+    "err",
+    "map",
+    "and_then",
+    "or_else",
+    "map_or",
+    "map_or_else",
+    "map_err",
+    "is_some",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "as_ref",
+    "as_deref",
+    // Conversion
+    "into",
+    "from",
+    "try_into",
+    "try_from",
+    "as_mut",
+    "clone",
+    "to_vec",
+    // Comparison
+    "eq",
+    "ne",
+    "cmp",
+    "partial_cmp",
+    "min",
+    "max",
+    // Memory
+    "drop",
+    "take",
+    "swap",
+    "replace",
+    // Type checking (dynamic languages)
+    "typeof",
+    "instanceof",
+    // Logging (cross-language)
+    "log",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "trace",
+];
+
+/// Check if a call name is a ubiquitous stdlib operation (no architectural insight).
+///
+/// Extracts the last segment after `.` or `::` and checks against `TRIVIAL_CALLS`.
+pub fn is_trivial_call(call: &str) -> bool {
+    let segment = call.rsplit(['.', ':']).next().unwrap_or(call);
+    TRIVIAL_CALLS.contains(&segment)
 }
 
 /// Expand a programming identifier into space-separated words.
@@ -639,5 +851,229 @@ mod tests {
         assert!(meta.implements.is_empty());
         assert!(meta.resolved_imports.is_empty());
         assert!(meta.semantic_role.is_none());
+    }
+
+    // --- display_summary tests ---
+
+    #[test]
+    fn test_display_summary_with_signature() {
+        let meta = StructuredChunkMeta {
+            name: Some("handle_search".to_string()),
+            signature: Some("fn handle_search(&self, req: SearchRequest) -> Response".to_string()),
+            docstring: Some("Handle an incoming search request. Returns response.".to_string()),
+            calls: vec![
+                "self.searcher.search".to_string(),
+                "format".to_string(), // trivial — filtered
+                "push".to_string(),   // trivial — filtered
+                "search_count.fetch_add".to_string(),
+            ],
+            called_by: vec!["handle".to_string()],
+            semantic_role: Some(SemanticRole::Handler),
+            kind: Some("fn".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(
+            summary.contains("fn handle_search(&self, req: SearchRequest) -> Response"),
+            "signature missing: {summary}"
+        );
+        assert!(
+            summary.contains("Handle an incoming search request"),
+            "docstring missing: {summary}"
+        );
+        assert!(
+            summary.contains("calls: self.searcher.search, search_count.fetch_add"),
+            "calls missing: {summary}"
+        );
+        assert!(
+            !summary.contains("format"),
+            "trivial call 'format' should be filtered"
+        );
+        assert!(
+            !summary.contains("push"),
+            "trivial call 'push' should be filtered"
+        );
+        assert!(
+            summary.contains("called_by: handle"),
+            "called_by missing: {summary}"
+        );
+        assert!(summary.contains("[handler]"), "role missing: {summary}");
+    }
+
+    #[test]
+    fn test_display_summary_fallback_no_signature() {
+        let meta = StructuredChunkMeta {
+            name: Some("validate_input".to_string()),
+            params: vec!["input: &str".to_string(), "strict: bool".to_string()],
+            return_type: Some("Result<()>".to_string()),
+            kind: Some("fn".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(
+            summary.contains("fn validate_input(input: &str, strict: bool) -> Result<()>"),
+            "fallback sig wrong: {summary}"
+        );
+    }
+
+    #[test]
+    fn test_display_summary_struct() {
+        let meta = StructuredChunkMeta {
+            name: Some("HybridSearcher".to_string()),
+            signature: Some("pub struct HybridSearcher".to_string()),
+            docstring: Some("Combines dense and sparse search. With reranking.".to_string()),
+            implements: vec![ImplRelation {
+                implementor: "HybridSearcher".to_string(),
+                trait_name: "Drop".to_string(),
+            }],
+            kind: Some("struct".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(summary.contains("pub struct HybridSearcher"), "{summary}");
+        assert!(
+            summary.contains("Combines dense and sparse search"),
+            "{summary}"
+        );
+        assert!(summary.contains("implements: Drop"), "{summary}");
+    }
+
+    #[test]
+    fn test_display_summary_minimal() {
+        let meta = StructuredChunkMeta {
+            name: Some("main".to_string()),
+            kind: Some("fn".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert_eq!(summary, "fn main");
+    }
+
+    #[test]
+    fn test_display_summary_no_name() {
+        let meta = StructuredChunkMeta::default();
+        let summary = meta.display_summary();
+        assert!(summary.is_empty(), "empty meta should yield empty summary");
+    }
+
+    #[test]
+    fn test_display_summary_all_trivial_calls() {
+        let meta = StructuredChunkMeta {
+            name: Some("f".to_string()),
+            calls: vec!["push".to_string(), "len".to_string(), "clone".to_string()],
+            kind: Some("fn".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(
+            !summary.contains("calls:"),
+            "all-trivial calls should produce no calls line"
+        );
+    }
+
+    #[test]
+    fn test_display_summary_calls_max_5() {
+        let meta = StructuredChunkMeta {
+            name: Some("f".to_string()),
+            calls: vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                "delta".to_string(),
+                "epsilon".to_string(),
+                "zeta".to_string(),
+            ],
+            kind: Some("fn".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(
+            summary.contains("calls: alpha, beta, gamma, delta, epsilon"),
+            "{summary}"
+        );
+        assert!(!summary.contains("zeta"), "6th call should be truncated");
+    }
+
+    #[test]
+    fn test_display_summary_docstring_too_long_excluded() {
+        let meta = StructuredChunkMeta {
+            name: Some("f".to_string()),
+            docstring: Some("x".repeat(200)),
+            kind: Some("fn".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        // No '.' so first sentence = whole string > 120 chars = excluded
+        assert_eq!(
+            summary, "fn f",
+            "long docstring should be excluded: {summary}"
+        );
+    }
+
+    #[test]
+    fn test_display_summary_enum() {
+        let meta = StructuredChunkMeta {
+            name: Some("Request".to_string()),
+            signature: Some("pub enum Request".to_string()),
+            kind: Some("enum".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert_eq!(summary, "pub enum Request");
+    }
+
+    #[test]
+    fn test_display_summary_module_fallback() {
+        let meta = StructuredChunkMeta {
+            name: Some("server".to_string()),
+            kind: Some("module".to_string()),
+            docstring: Some("TCP daemon server for handling search requests.".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(summary.contains("mod server"), "{summary}");
+        assert!(
+            summary.contains("TCP daemon server for handling search requests"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn test_display_summary_method_kind() {
+        let meta = StructuredChunkMeta {
+            name: Some("run".to_string()),
+            kind: Some("method".to_string()),
+            params: vec!["&self".to_string()],
+            return_type: Some("()".to_string()),
+            ..Default::default()
+        };
+        let summary = meta.display_summary();
+        assert!(summary.contains("fn run(&self) -> ()"), "{summary}");
+    }
+
+    // --- is_trivial_call tests ---
+
+    #[test]
+    fn test_is_trivial_call_simple() {
+        assert!(is_trivial_call("push"));
+        assert!(is_trivial_call("unwrap"));
+        assert!(is_trivial_call("clone"));
+        assert!(is_trivial_call("format"));
+    }
+
+    #[test]
+    fn test_is_trivial_call_qualified() {
+        assert!(is_trivial_call("self.results.push"));
+        assert!(is_trivial_call("Vec::len"));
+        assert!(is_trivial_call("option.unwrap_or"));
+    }
+
+    #[test]
+    fn test_is_trivial_call_non_trivial() {
+        assert!(!is_trivial_call("search"));
+        assert!(!is_trivial_call("self.searcher.search"));
+        assert!(!is_trivial_call("validate_credentials"));
+        assert!(!is_trivial_call("db.query"));
+        assert!(!is_trivial_call("new")); // constructors carry information
     }
 }
