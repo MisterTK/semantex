@@ -95,42 +95,7 @@ impl<'a> Handler<'a> {
                     .iter()
                     .map(|r| {
                         let (chunk_type_str, name, language, kind, summary) =
-                            match &r.chunk.chunk_type {
-                                ChunkType::AstNode {
-                                    name,
-                                    kind,
-                                    language,
-                                    structured_meta,
-                                    ..
-                                } => {
-                                    let kind_str = Some(kind.to_string());
-                                    let summary_str = structured_meta
-                                        .as_ref()
-                                        .map(|meta| meta.display_summary())
-                                        .filter(|s| !s.is_empty());
-                                    (
-                                        "AstNode".to_string(),
-                                        Some(name.clone()),
-                                        Some(language.clone()),
-                                        kind_str,
-                                        summary_str,
-                                    )
-                                }
-                                ChunkType::TextWindow { .. } => (
-                                    "TextWindow".to_string(),
-                                    None,
-                                    None,
-                                    Some("text".to_string()),
-                                    None,
-                                ),
-                                ChunkType::PdfPage { .. } => (
-                                    "PdfPage".to_string(),
-                                    None,
-                                    None,
-                                    Some("pdf".to_string()),
-                                    None,
-                                ),
-                            };
+                            chunk_type_meta(&r.chunk.chunk_type);
 
                         let content = if req.include_content {
                             if req.snippet {
@@ -182,21 +147,7 @@ impl<'a> Handler<'a> {
                     }
                 }
 
-                let confidence = if items.is_empty() {
-                    Some("none".to_string())
-                } else {
-                    let top_score = items[0].score;
-                    let second_score = items.get(1).map_or(0.0, |i| i.score);
-                    let gap = top_score - second_score;
-
-                    if top_score > 0.5 && gap > 0.15 {
-                        Some("high".to_string())
-                    } else if top_score > 0.25 {
-                        Some("medium".to_string())
-                    } else {
-                        Some("low".to_string())
-                    }
-                };
+                let confidence = Some(compute_confidence(&items));
 
                 Response::Search(SearchResponse {
                     results: items,
@@ -233,35 +184,7 @@ impl<'a> Handler<'a> {
             req.max_results,
             req.use_graph,
         ) {
-            Ok(result) => {
-                let sources = result
-                    .sources
-                    .into_iter()
-                    .map(|s| DeepSearchSource {
-                        file: s.file,
-                        start_line: s.start_line,
-                        end_line: s.end_line,
-                        name: s.name,
-                        kind: s.kind,
-                    })
-                    .collect();
-                Response::DeepSearch(DeepSearchResponse {
-                    answer: result.answer,
-                    sources,
-                    metrics: DeepResponseMetrics {
-                        search_ms: result.metrics.search_ms,
-                        triage_ms: result.metrics.triage_ms,
-                        graph_ms: result.metrics.graph_ms,
-                        read_ms: result.metrics.read_ms,
-                        summarize_ms: result.metrics.summarize_ms,
-                        total_ms: result.metrics.total_ms,
-                        chunks_searched: result.metrics.chunks_searched,
-                        chunks_read: result.metrics.chunks_read,
-                        confidence_zone: result.metrics.confidence_zone,
-                    },
-                    confidence: result.confidence,
-                })
-            }
+            Ok(result) => Response::DeepSearch(deep_result_to_response(result)),
             Err(e) => Response::Error(ErrorResponse {
                 message: format!("Deep search failed: {e}"),
             }),
@@ -286,6 +209,57 @@ impl<'a> Handler<'a> {
                 message: format!("Graph walk failed: {e}"),
             }),
         }
+    }
+}
+
+/// Compute a confidence string from sorted search result items.
+/// Items must be sorted by descending score.
+pub(crate) fn compute_confidence(items: &[SearchResultItem]) -> String {
+    if items.is_empty() {
+        return "none".into();
+    }
+    let top = items[0].score;
+    let second = items.get(1).map_or(0.0, |i| i.score);
+    let gap = top - second;
+    if top > 0.5 && gap > 0.15 {
+        "high".into()
+    } else if top > 0.25 {
+        "medium".into()
+    } else {
+        "low".into()
+    }
+}
+
+/// Convert a deep search result into the wire response type.
+pub(crate) fn deep_result_to_response(
+    result: crate::search::deep::DeepResult,
+) -> DeepSearchResponse {
+    let sources = result
+        .sources
+        .into_iter()
+        .map(|s| DeepSearchSource {
+            file: s.file,
+            start_line: s.start_line,
+            end_line: s.end_line,
+            name: s.name,
+            kind: s.kind,
+        })
+        .collect();
+    DeepSearchResponse {
+        answer: result.answer,
+        sources,
+        metrics: DeepResponseMetrics {
+            search_ms: result.metrics.search_ms,
+            triage_ms: result.metrics.triage_ms,
+            graph_ms: result.metrics.graph_ms,
+            read_ms: result.metrics.read_ms,
+            summarize_ms: result.metrics.summarize_ms,
+            total_ms: result.metrics.total_ms,
+            chunks_searched: result.metrics.chunks_searched,
+            chunks_read: result.metrics.chunks_read,
+            confidence_zone: result.metrics.confidence_zone,
+        },
+        confidence: result.confidence,
     }
 }
 
@@ -373,9 +347,12 @@ pub(crate) fn graph_walk_from_store(
     })
 }
 
-/// Convert a Chunk to a SearchResultItem (with kind/summary populated)
-pub(crate) fn chunk_to_item(chunk: &Chunk) -> SearchResultItem {
-    let (chunk_type_str, name, language, kind, summary) = match &chunk.chunk_type {
+/// Extract display metadata from a ChunkType.
+/// Returns `(chunk_type_str, name, language, kind, summary)`.
+pub(crate) fn chunk_type_meta(
+    ct: &crate::types::ChunkType,
+) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
+    match ct {
         crate::types::ChunkType::AstNode {
             name,
             kind,
@@ -383,8 +360,7 @@ pub(crate) fn chunk_to_item(chunk: &Chunk) -> SearchResultItem {
             structured_meta,
             ..
         } => {
-            let kind_str = Some(kind.to_string());
-            let summary_str = structured_meta
+            let summary = structured_meta
                 .as_ref()
                 .map(|meta| meta.display_summary())
                 .filter(|s| !s.is_empty());
@@ -392,25 +368,22 @@ pub(crate) fn chunk_to_item(chunk: &Chunk) -> SearchResultItem {
                 "AstNode".to_string(),
                 Some(name.clone()),
                 Some(language.clone()),
-                kind_str,
-                summary_str,
+                Some(kind.to_string()),
+                summary,
             )
         }
-        crate::types::ChunkType::TextWindow { .. } => (
-            "TextWindow".to_string(),
-            None,
-            None,
-            Some("text".to_string()),
-            None,
-        ),
-        crate::types::ChunkType::PdfPage { .. } => (
-            "PdfPage".to_string(),
-            None,
-            None,
-            Some("pdf".to_string()),
-            None,
-        ),
-    };
+        crate::types::ChunkType::TextWindow { .. } => {
+            ("TextWindow".to_string(), None, None, Some("text".to_string()), None)
+        }
+        crate::types::ChunkType::PdfPage { .. } => {
+            ("PdfPage".to_string(), None, None, Some("pdf".to_string()), None)
+        }
+    }
+}
+
+/// Convert a Chunk to a SearchResultItem (with kind/summary populated)
+pub(crate) fn chunk_to_item(chunk: &Chunk) -> SearchResultItem {
+    let (chunk_type_str, name, language, kind, summary) = chunk_type_meta(&chunk.chunk_type);
     SearchResultItem {
         file: chunk.file_path.display().to_string(),
         start_line: chunk.start_line,
@@ -432,42 +405,8 @@ pub(crate) fn search_result_to_item(
     result: &crate::types::SearchResult,
     include_content: bool,
 ) -> SearchResultItem {
-    let (chunk_type_str, name, language, kind, summary) = match &result.chunk.chunk_type {
-        crate::types::ChunkType::AstNode {
-            name,
-            kind,
-            language,
-            structured_meta,
-            ..
-        } => {
-            let kind_str = Some(kind.to_string());
-            let summary_str = structured_meta
-                .as_ref()
-                .map(|meta| meta.display_summary())
-                .filter(|s| !s.is_empty());
-            (
-                "AstNode".to_string(),
-                Some(name.clone()),
-                Some(language.clone()),
-                kind_str,
-                summary_str,
-            )
-        }
-        crate::types::ChunkType::TextWindow { .. } => (
-            "TextWindow".to_string(),
-            None,
-            None,
-            Some("text".to_string()),
-            None,
-        ),
-        crate::types::ChunkType::PdfPage { .. } => (
-            "PdfPage".to_string(),
-            None,
-            None,
-            Some("pdf".to_string()),
-            None,
-        ),
-    };
+    let (chunk_type_str, name, language, kind, summary) =
+        chunk_type_meta(&result.chunk.chunk_type);
 
     let content = if include_content {
         Some(result.chunk.content.clone())

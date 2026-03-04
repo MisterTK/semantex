@@ -2,15 +2,16 @@ use std::path::{Path, PathBuf};
 use crate::search::SearchQuery;
 use crate::search::hybrid::HybridSearcher;
 use crate::server::protocol::{
-    AgentRequest, AgentResponse, AgentMetrics, DeepSearchResponse, DeepSearchSource,
-    DeepResponseMetrics, GraphWalkResponse, SearchResponse, SearchResultItem,
+    AgentRequest, AgentResponse, AgentMetrics, GraphWalkResponse, SearchResponse, SearchResultItem,
 };
 use super::agent_classifier::{AgentRoute, classify_agent_query, extract_symbol};
 use super::agent_formatter::{
     DEFAULT_BUDGET, FormatStyle, format_search_results, format_deep_results,
     format_graph_results, format_code_blocks,
 };
-use crate::server::handler::{search_result_to_item, graph_walk_from_store};
+use crate::server::handler::{
+    compute_confidence, deep_result_to_response, graph_walk_from_store, search_result_to_item,
+};
 use crate::search::deep as deep_search_module;
 
 /// Result from an individual handler method.
@@ -78,8 +79,9 @@ impl<'a> AgentPipeline<'a> {
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
+                let count = items.len();
                 let resp = SearchResponse {
-                    results: items.clone(),
+                    results: items,
                     duration_ms: output.metrics.total_ms,
                     dense_count: output.metrics.dense_count,
                     sparse_count: output.metrics.sparse_count,
@@ -90,7 +92,7 @@ impl<'a> AgentPipeline<'a> {
                 HandlerResult {
                     formatted: format_search_results(&resp, FormatStyle::Default, budget),
                     fallback_used: is_fallback,
-                    result_count: items.len(),
+                    result_count: count,
                 }
             }
             _ => {
@@ -157,8 +159,9 @@ impl<'a> AgentPipeline<'a> {
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
+                let count = items.len();
                 let resp = SearchResponse {
-                    results: items.clone(),
+                    results: items,
                     duration_ms: output.metrics.total_ms,
                     dense_count: output.metrics.dense_count,
                     sparse_count: output.metrics.sparse_count,
@@ -169,7 +172,7 @@ impl<'a> AgentPipeline<'a> {
                 return HandlerResult {
                     formatted: format_search_results(&resp, FormatStyle::Default, budget),
                     fallback_used: false,
-                    result_count: items.len(),
+                    result_count: count,
                 };
             }
         }
@@ -180,8 +183,9 @@ impl<'a> AgentPipeline<'a> {
                 let items: Vec<SearchResultItem> = output.results.iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
+                let count = items.len();
                 let resp = SearchResponse {
-                    results: items.clone(),
+                    results: items,
                     duration_ms: output.metrics.total_ms,
                     dense_count: 0,
                     sparse_count: output.metrics.sparse_count,
@@ -192,7 +196,7 @@ impl<'a> AgentPipeline<'a> {
                 HandlerResult {
                     formatted: format_search_results(&resp, FormatStyle::Default, budget),
                     fallback_used: true,
-                    result_count: items.len(),
+                    result_count: count,
                 }
             }
             _ => HandlerResult {
@@ -350,49 +354,6 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
     }
 }
 
-/// Helper: compute confidence string from search result items.
-fn compute_confidence(items: &[SearchResultItem]) -> String {
-    if items.is_empty() {
-        return "none".into();
-    }
-    let top = items[0].score;
-    let second = items.get(1).map_or(0.0, |i| i.score);
-    let gap = top - second;
-    if top > 0.5 && gap > 0.15 {
-        "high".into()
-    } else if top > 0.25 {
-        "medium".into()
-    } else {
-        "low".into()
-    }
-}
-
-/// Helper: convert a deep_search result to DeepSearchResponse protocol type.
-fn deep_result_to_response(result: crate::search::deep::DeepResult) -> DeepSearchResponse {
-    let sources = result.sources.into_iter().map(|s| DeepSearchSource {
-        file: s.file,
-        start_line: s.start_line,
-        end_line: s.end_line,
-        name: s.name,
-        kind: s.kind,
-    }).collect();
-    DeepSearchResponse {
-        answer: result.answer,
-        sources,
-        metrics: DeepResponseMetrics {
-            search_ms: result.metrics.search_ms,
-            triage_ms: result.metrics.triage_ms,
-            graph_ms: result.metrics.graph_ms,
-            read_ms: result.metrics.read_ms,
-            summarize_ms: result.metrics.summarize_ms,
-            total_ms: result.metrics.total_ms,
-            chunks_searched: result.metrics.chunks_searched,
-            chunks_read: result.metrics.chunks_read,
-            confidence_zone: result.metrics.confidence_zone,
-        },
-        confidence: result.confidence,
-    }
-}
 
 #[cfg(test)]
 mod tests {

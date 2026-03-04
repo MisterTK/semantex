@@ -55,14 +55,13 @@ impl std::fmt::Display for AgentRoute {
 
 /// Returns true if the query looks like a regex pattern.
 fn is_regex(query: &str) -> bool {
-    // \b \B \d \D \s \S \w \W
-    let chars: Vec<char> = query.chars().collect();
-    for i in 0..chars.len().saturating_sub(1) {
-        if chars[i] == '\\' {
-            if let Some(&next) = chars.get(i + 1) {
-                if matches!(next, 'b' | 'B' | 'd' | 'D' | 's' | 'S' | 'w' | 'W') {
-                    return true;
-                }
+    // \b \B \d \D \s \S \w \W — backslash and these classes are all ASCII,
+    // so byte iteration is safe and avoids allocating a Vec<char>.
+    let bytes = query.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'\\' {
+            if matches!(bytes[i + 1], b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W') {
+                return true;
             }
         }
     }

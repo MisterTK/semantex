@@ -235,30 +235,27 @@ pub fn daemon_search(
     })
 }
 
-/// Send a binary (bincode) search request to the daemon at the given port.
-/// Returns the SearchResponse or an error. Much faster than JSON.
-pub fn daemon_search_binary(
+/// Open a TCP connection to the daemon, send a binary request frame, and return
+/// the decoded binary response. `read_timeout_s` controls the read deadline.
+fn send_binary_request(
     port: u16,
-    request: protocol::SearchRequest,
-) -> Result<protocol::SearchResponse> {
+    req: &protocol::BinaryRequest,
+    read_timeout_s: u64,
+) -> Result<protocol::BinaryResponse> {
     use std::io::Read;
 
-    let bin_req = protocol::BinaryRequest::Search(request);
-
-    let frame = protocol::encode_binary_request(&bin_req);
+    let frame = protocol::encode_binary_request(req);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
 
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(read_timeout_s)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    // Send binary frame
     stream.write_all(&frame)?;
     stream.flush()?;
 
-    // Read binary response: [magic:1][len:4 LE][payload]
     let mut magic = [0u8; 1];
     stream.read_exact(&mut magic)?;
     if magic[0] != protocol::BINARY_MAGIC {
@@ -272,14 +269,20 @@ pub fn daemon_search_binary(
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload)?;
 
-    let bin_resp = protocol::decode_binary_response(&payload)
-        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
+    protocol::decode_binary_response(&payload)
+        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))
+}
 
-    match bin_resp {
+/// Send a binary (bincode) search request to the daemon at the given port.
+/// Returns the SearchResponse or an error. Much faster than JSON.
+pub fn daemon_search_binary(
+    port: u16,
+    request: protocol::SearchRequest,
+) -> Result<protocol::SearchResponse> {
+    let bin_req = protocol::BinaryRequest::Search(request);
+    match send_binary_request(port, &bin_req, 30)? {
         protocol::BinaryResponse::Search(sr) => Ok(sr),
-        protocol::BinaryResponse::Error(e) => {
-            anyhow::bail!("Daemon error: {}", e.message)
-        }
+        protocol::BinaryResponse::Error(e) => anyhow::bail!("Daemon error: {}", e.message),
         other => anyhow::bail!("Unexpected response type: {other:?}"),
     }
 }
@@ -289,42 +292,10 @@ pub fn daemon_graph_walk_binary(
     port: u16,
     request: protocol::GraphWalkRequest,
 ) -> Result<protocol::GraphWalkResponse> {
-    use std::io::Read;
-
     let bin_req = protocol::BinaryRequest::GraphWalk(request);
-    let frame = protocol::encode_binary_request(&bin_req);
-
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    stream.write_all(&frame)?;
-    stream.flush()?;
-
-    let mut magic = [0u8; 1];
-    stream.read_exact(&mut magic)?;
-    if magic[0] != protocol::BINARY_MAGIC {
-        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
-    }
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let bin_resp = protocol::decode_binary_response(&payload)
-        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
-
-    match bin_resp {
+    match send_binary_request(port, &bin_req, 30)? {
         protocol::BinaryResponse::GraphWalk(gr) => Ok(gr),
-        protocol::BinaryResponse::Error(e) => {
-            anyhow::bail!("Daemon error: {}", e.message)
-        }
+        protocol::BinaryResponse::Error(e) => anyhow::bail!("Daemon error: {}", e.message),
         other => anyhow::bail!("Unexpected response type: {other:?}"),
     }
 }
@@ -335,42 +306,10 @@ pub fn daemon_multi_search_binary(
     port: u16,
     request: protocol::MultiSearchRequest,
 ) -> Result<protocol::MultiSearchResponse> {
-    use std::io::Read;
-
     let bin_req = protocol::BinaryRequest::MultiSearch(request);
-    let frame = protocol::encode_binary_request(&bin_req);
-
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    stream.write_all(&frame)?;
-    stream.flush()?;
-
-    let mut magic = [0u8; 1];
-    stream.read_exact(&mut magic)?;
-    if magic[0] != protocol::BINARY_MAGIC {
-        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
-    }
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let bin_resp = protocol::decode_binary_response(&payload)
-        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
-
-    match bin_resp {
+    match send_binary_request(port, &bin_req, 30)? {
         protocol::BinaryResponse::MultiSearch(mr) => Ok(mr),
-        protocol::BinaryResponse::Error(e) => {
-            anyhow::bail!("Daemon error: {}", e.message)
-        }
+        protocol::BinaryResponse::Error(e) => anyhow::bail!("Daemon error: {}", e.message),
         other => anyhow::bail!("Unexpected response type: {other:?}"),
     }
 }
@@ -380,42 +319,10 @@ pub fn daemon_deep_search_binary(
     port: u16,
     request: protocol::DeepSearchRequest,
 ) -> Result<protocol::DeepSearchResponse> {
-    use std::io::Read;
-
     let bin_req = protocol::BinaryRequest::DeepSearch(request);
-    let frame = protocol::encode_binary_request(&bin_req);
-
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?; // deep takes longer
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    stream.write_all(&frame)?;
-    stream.flush()?;
-
-    let mut magic = [0u8; 1];
-    stream.read_exact(&mut magic)?;
-    if magic[0] != protocol::BINARY_MAGIC {
-        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
-    }
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let bin_resp = protocol::decode_binary_response(&payload)
-        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
-
-    match bin_resp {
+    match send_binary_request(port, &bin_req, 60)? {
         protocol::BinaryResponse::DeepSearch(dr) => Ok(dr),
-        protocol::BinaryResponse::Error(e) => {
-            anyhow::bail!("Daemon error: {}", e.message)
-        }
+        protocol::BinaryResponse::Error(e) => anyhow::bail!("Daemon error: {}", e.message),
         other => anyhow::bail!("Unexpected response type: {other:?}"),
     }
 }
@@ -425,42 +332,10 @@ pub fn daemon_agent_binary(
     port: u16,
     request: protocol::AgentRequest,
 ) -> Result<protocol::AgentResponse> {
-    use std::io::Read;
-
     let bin_req = protocol::BinaryRequest::Agent(request);
-    let frame = protocol::encode_binary_request(&bin_req);
-
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
-
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    stream.write_all(&frame)?;
-    stream.flush()?;
-
-    let mut magic = [0u8; 1];
-    stream.read_exact(&mut magic)?;
-    if magic[0] != protocol::BINARY_MAGIC {
-        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
-    }
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let bin_resp = protocol::decode_binary_response(&payload)
-        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
-
-    match bin_resp {
+    match send_binary_request(port, &bin_req, 60)? {
         protocol::BinaryResponse::Agent(ar) => Ok(ar),
-        protocol::BinaryResponse::Error(e) => {
-            anyhow::bail!("Daemon error: {}", e.message)
-        }
+        protocol::BinaryResponse::Error(e) => anyhow::bail!("Daemon error: {}", e.message),
         other => anyhow::bail!("Unexpected response type: {other:?}"),
     }
 }

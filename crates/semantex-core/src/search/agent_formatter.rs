@@ -14,19 +14,6 @@ pub enum FormatStyle {
     Grep,
 }
 
-/// Format a single result item reference: `file:start-end name [kind]`
-pub fn format_ref(item: &SearchResultItem) -> String {
-    let mut s = format!("{}:{}-{}", item.file, item.start_line, item.end_line);
-    if let Some(name) = &item.name {
-        s.push(' ');
-        s.push_str(name);
-    }
-    if let Some(kind) = &item.kind {
-        s.push_str(&format!(" [{kind}]"));
-    }
-    s
-}
-
 /// Format search results as a human-readable string.
 pub fn format_search_results(response: &SearchResponse, style: FormatStyle, budget: usize) -> String {
     if response.results.is_empty() {
@@ -92,7 +79,12 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
         if let Some(text) = preview {
             let text_normalized = text.replace('\n', " ");
             let truncated = if text_normalized.len() > 200 {
-                &text_normalized[..200]
+                // Walk back from byte 200 to find a valid char boundary
+                let end = (0..=200.min(text_normalized.len()))
+                    .rev()
+                    .find(|&i| text_normalized.is_char_boundary(i))
+                    .unwrap_or(0);
+                &text_normalized[..end]
             } else {
                 &text_normalized
             };
@@ -260,15 +252,6 @@ pub fn format_code_blocks(
     code_contents: &[String],
     budget: usize,
 ) -> String {
-    let non_empty = results
-        .iter()
-        .zip(code_contents.iter())
-        .any(|(_, code)| !code.is_empty());
-
-    if !non_empty {
-        return "No code blocks to display.".to_string();
-    }
-
     let mut out = String::new();
     let mut total_chars = 0usize;
     let mut blocks_written = 0usize;
@@ -316,6 +299,9 @@ pub fn format_code_blocks(
         blocks_written += 1;
     }
 
+    if blocks_written == 0 {
+        return "No code blocks to display.".to_string();
+    }
     out
 }
 
