@@ -414,6 +414,10 @@ impl McpServer {
                         "full_code": {
                             "type": "boolean",
                             "description": "Include full source code blocks in response (default: false)"
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Response size budget in bytes (default: 12000, ~3K tokens)"
                         }
                     },
                     "required": ["query"]
@@ -729,10 +733,16 @@ impl McpServer {
         let cached = self.get_searcher(&index_dir)?;
         let pipeline = AgentPipeline::new(&cached.searcher, path.clone());
 
+        let budget = args
+            .get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(12_000);
+
         let request = AgentRequest {
             query: query.to_string(),
             route: None,
-            budget: Some(12_000),
+            budget: Some(budget),
             full_code,
         };
 
@@ -1120,7 +1130,8 @@ impl McpServer {
         }
 
         let m = &result.metrics;
-        let unique_files: std::collections::HashSet<&str> = result.sources.iter().map(|s| s.file.as_str()).collect();
+        let unique_files: std::collections::HashSet<&str> =
+            result.sources.iter().map(|s| s.file.as_str()).collect();
         let unique_file_count = unique_files.len();
         let coverage = &result.metrics.confidence_zone;
 

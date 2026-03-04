@@ -14,8 +14,26 @@ pub enum FormatStyle {
     Grep,
 }
 
+/// Format a single result item as a compact reference string: `file:start-end[ name][ [kind]]`.
+pub(crate) fn format_ref(item: &SearchResultItem) -> String {
+    use std::fmt::Write as _;
+    let mut s = format!("{}:{}-{}", item.file, item.start_line, item.end_line);
+    if let Some(name) = &item.name {
+        s.push(' ');
+        s.push_str(name);
+    }
+    if let Some(kind) = &item.kind {
+        let _ = write!(s, " [{kind}]");
+    }
+    s
+}
+
 /// Format search results as a human-readable string.
-pub fn format_search_results(response: &SearchResponse, style: FormatStyle, budget: usize) -> String {
+pub fn format_search_results(
+    response: &SearchResponse,
+    style: FormatStyle,
+    budget: usize,
+) -> String {
     if response.results.is_empty() {
         return "No results.".to_string();
     }
@@ -59,7 +77,10 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
         let mut block = String::new();
 
         // Line 1: file:start-end name [kind] (score)
-        block.push_str(&format!("{}:{}-{}", item.file, item.start_line, item.end_line));
+        block.push_str(&format!(
+            "{}:{}-{}",
+            item.file, item.start_line, item.end_line
+        ));
         if let Some(name) = &item.name {
             block.push(' ');
             block.push_str(name);
@@ -107,10 +128,7 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
         parts.push(block);
     }
 
-    let confidence = response
-        .confidence
-        .as_deref()
-        .unwrap_or("unknown");
+    let confidence = response.confidence.as_deref().unwrap_or("unknown");
     let footer = format!(
         "[{} results, {}ms, confidence: {}]",
         total_count, response.duration_ms, confidence
@@ -153,7 +171,10 @@ pub fn format_deep_results(response: &DeepSearchResponse, budget: usize) -> Stri
         }
         out.push_str("Sources:\n");
         for src in &response.sources {
-            out.push_str(&format!("  {}:{}-{}", src.file, src.start_line, src.end_line));
+            out.push_str(&format!(
+                "  {}:{}-{}",
+                src.file, src.start_line, src.end_line
+            ));
             if let Some(name) = &src.name {
                 out.push(' ');
                 out.push_str(name);
@@ -200,21 +221,13 @@ pub fn format_graph_results(response: &GraphWalkResponse) -> String {
         out.push_str(&format!("{} ({}):\n", title, items.len()));
         let shown = items.len().min(MAX_GRAPH_SECTION);
         for item in &items[..shown] {
-            out.push_str(&format!(
-                "  {}:{}-{}",
-                item.file, item.start_line, item.end_line
-            ));
-            if let Some(name) = &item.name {
-                out.push(' ');
-                out.push_str(name);
-            }
-            if let Some(kind) = &item.kind {
-                out.push_str(&format!(" [{kind}]"));
-            }
-            out.push('\n');
+            out.push_str(&format!("  {}\n", format_ref(item)));
         }
         if items.len() > MAX_GRAPH_SECTION {
-            out.push_str(&format!("  ... and {} more\n", items.len() - MAX_GRAPH_SECTION));
+            out.push_str(&format!(
+                "  ... and {} more\n",
+                items.len() - MAX_GRAPH_SECTION
+            ));
         }
     }
 
@@ -223,18 +236,7 @@ pub fn format_graph_results(response: &GraphWalkResponse) -> String {
         out.push_str("Target:\n");
         let shown = response.target.len().min(MAX_GRAPH_SECTION);
         for item in &response.target[..shown] {
-            out.push_str(&format!(
-                "  {}:{}-{}",
-                item.file, item.start_line, item.end_line
-            ));
-            if let Some(name) = &item.name {
-                out.push(' ');
-                out.push_str(name);
-            }
-            if let Some(kind) = &item.kind {
-                out.push_str(&format!(" [{kind}]"));
-            }
-            out.push('\n');
+            out.push_str(&format!("  {}\n", format_ref(item)));
         }
     }
 
@@ -265,7 +267,10 @@ pub fn format_code_blocks(
 
         let mut block = String::new();
         // Header
-        block.push_str(&format!("### {}:{}-{}", item.file, item.start_line, item.end_line));
+        block.push_str(&format!(
+            "### {}:{}-{}",
+            item.file, item.start_line, item.end_line
+        ));
         if let Some(name) = &item.name {
             block.push_str(&format!(" — {name}"));
         }
@@ -336,7 +341,14 @@ mod tests {
     #[test]
     fn test_format_default_single_result() {
         let resp = SearchResponse {
-            results: vec![make_result("src/auth.rs", 10, 20, Some("Auth"), Some("struct"), 0.85)],
+            results: vec![make_result(
+                "src/auth.rs",
+                10,
+                20,
+                Some("Auth"),
+                Some("struct"),
+                0.85,
+            )],
             duration_ms: 17,
             dense_count: 5,
             sparse_count: 8,
@@ -419,8 +431,22 @@ mod tests {
     #[test]
     fn test_format_graph_omits_empty_sections() {
         let resp = GraphWalkResponse {
-            target: vec![make_result("src/auth.rs", 10, 50, Some("Auth"), Some("struct"), 1.0)],
-            callers: vec![make_result("src/mid.rs", 5, 20, Some("check"), Some("fn"), 0.9)],
+            target: vec![make_result(
+                "src/auth.rs",
+                10,
+                50,
+                Some("Auth"),
+                Some("struct"),
+                1.0,
+            )],
+            callers: vec![make_result(
+                "src/mid.rs",
+                5,
+                20,
+                Some("check"),
+                Some("fn"),
+                0.9,
+            )],
             callees: vec![],
             type_refs: vec![],
             hierarchy: vec![],
@@ -482,6 +508,35 @@ mod tests {
         let out = format_deep_results(&resp, 5000);
         assert!(out.len() < 6000);
         assert!(out.contains("[answer truncated]"));
+    }
+
+    #[test]
+    fn test_code_blocks_no_content() {
+        // All items have empty content → should return the sentinel string
+        let results: Vec<SearchResultItem> = (0..3)
+            .map(|i| {
+                let mut item = make_result(&format!("file{i}.rs"), 1, 10, None, None, 0.5);
+                item.content = Some(String::new());
+                item
+            })
+            .collect();
+        let code: Vec<String> = vec![String::new(); 3];
+        assert_eq!(
+            format_code_blocks(&results, &code, DEFAULT_BUDGET),
+            "No code blocks to display."
+        );
+    }
+
+    #[test]
+    fn test_format_graph_all_empty() {
+        let resp = GraphWalkResponse {
+            target: vec![],
+            callers: vec![],
+            callees: vec![],
+            type_refs: vec![],
+            hierarchy: vec![],
+        };
+        assert_eq!(format_graph_results(&resp), "No graph data found.");
     }
 
     #[test]

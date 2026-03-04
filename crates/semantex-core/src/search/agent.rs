@@ -1,18 +1,18 @@
-use std::path::{Path, PathBuf};
-use crate::search::SearchQuery;
-use crate::search::hybrid::HybridSearcher;
-use crate::server::protocol::{
-    AgentRequest, AgentResponse, AgentMetrics, GraphWalkResponse, SearchResponse, SearchResultItem,
-};
 use super::agent_classifier::{AgentRoute, classify_agent_query, extract_symbol};
 use super::agent_formatter::{
-    DEFAULT_BUDGET, FormatStyle, format_search_results, format_deep_results,
-    format_graph_results, format_code_blocks,
+    DEFAULT_BUDGET, FormatStyle, format_code_blocks, format_deep_results, format_graph_results,
+    format_search_results,
 };
+use crate::search::SearchQuery;
+use crate::search::deep as deep_search_module;
+use crate::search::hybrid::HybridSearcher;
 use crate::server::handler::{
     compute_confidence, deep_result_to_response, graph_walk_from_store, search_result_to_item,
 };
-use crate::search::deep as deep_search_module;
+use crate::server::protocol::{
+    AgentMetrics, AgentRequest, AgentResponse, GraphWalkResponse, SearchResponse, SearchResultItem,
+};
+use std::path::{Path, PathBuf};
 
 /// Result from an individual handler method.
 pub(crate) struct HandlerResult {
@@ -29,14 +29,19 @@ pub struct AgentPipeline<'a> {
 
 impl<'a> AgentPipeline<'a> {
     pub fn new(searcher: &'a HybridSearcher, project_root: PathBuf) -> Self {
-        Self { searcher, project_root }
+        Self {
+            searcher,
+            project_root,
+        }
     }
 
     pub fn handle(&self, request: &AgentRequest) -> AgentResponse {
         let start = std::time::Instant::now();
         let classify_start = std::time::Instant::now();
 
-        let route = request.route.unwrap_or_else(|| classify_agent_query(&request.query));
+        let route = request
+            .route
+            .unwrap_or_else(|| classify_agent_query(&request.query));
         let classify_us = classify_start.elapsed().as_micros() as u64;
 
         let budget = request.budget.unwrap_or(DEFAULT_BUDGET);
@@ -44,12 +49,14 @@ impl<'a> AgentPipeline<'a> {
         let search_start = std::time::Instant::now();
         let result = match route {
             AgentRoute::FilePattern => self.handle_file_pattern(&request.query),
-            AgentRoute::Regex       => self.handle_regex(&request.query, budget),
+            AgentRoute::Regex => self.handle_regex(&request.query, budget),
             AgentRoute::ExactSymbol => self.handle_exact_symbol(&request.query, budget),
-            AgentRoute::Structural  => self.handle_structural(&request.query, budget),
-            AgentRoute::Deep        => self.handle_deep(&request.query, budget, false),
-            AgentRoute::Analytical  => self.handle_analytical(&request.query, budget),
-            AgentRoute::Semantic    => self.handle_semantic(&request.query, budget, false),
+            AgentRoute::Structural => self.handle_structural(&request.query, budget),
+            AgentRoute::Deep => self.handle_deep(&request.query, budget, false),
+            AgentRoute::Analytical => {
+                self.handle_analytical(&request.query, budget, request.full_code)
+            }
+            AgentRoute::Semantic => self.handle_semantic(&request.query, budget, false),
         };
         let search_ms = search_start.elapsed().as_millis() as u64;
 
@@ -75,7 +82,9 @@ impl<'a> AgentPipeline<'a> {
         let sq = SearchQuery::new(query).max_results(10);
         match self.searcher.search(&sq) {
             Ok(output) if !output.results.is_empty() => {
-                let items: Vec<SearchResultItem> = output.results.iter()
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
@@ -155,7 +164,9 @@ impl<'a> AgentPipeline<'a> {
         let sq = SearchQuery::new(symbol).max_results(5);
         if let Ok(output) = self.searcher.search(&sq) {
             if !output.results.is_empty() {
-                let items: Vec<SearchResultItem> = output.results.iter()
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
@@ -180,7 +191,9 @@ impl<'a> AgentPipeline<'a> {
         let sq = SearchQuery::new(symbol).grep_mode().max_results(10);
         match self.searcher.search(&sq) {
             Ok(output) if !output.results.is_empty() => {
-                let items: Vec<SearchResultItem> = output.results.iter()
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let count = items.len();
@@ -218,8 +231,11 @@ impl<'a> AgentPipeline<'a> {
                     hierarchy: vec![],
                 })
             });
-            let total = resp.target.len() + resp.callers.len() + resp.callees.len()
-                + resp.type_refs.len() + resp.hierarchy.len();
+            let total = resp.target.len()
+                + resp.callers.len()
+                + resp.callees.len()
+                + resp.type_refs.len()
+                + resp.hierarchy.len();
             if total > 0 {
                 return HandlerResult {
                     formatted: format_graph_results(&resp),
@@ -232,24 +248,46 @@ impl<'a> AgentPipeline<'a> {
         self.handle_deep(query, budget, true)
     }
 
-    fn handle_analytical(&self, query: &str, budget: usize) -> HandlerResult {
+    fn handle_analytical(&self, query: &str, budget: usize, full_code: bool) -> HandlerResult {
         let sq = SearchQuery::new(query).max_results(5).code_only();
         match self.searcher.search(&sq) {
             Ok(output) if !output.results.is_empty() => {
-                let items: Vec<SearchResultItem> = output.results.iter()
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
-                let code_contents: Vec<String> = items.iter()
-                    .map(|i| i.content.clone().unwrap_or_default())
-                    .collect();
-                let formatted = format_code_blocks(&items, &code_contents, budget);
-                if formatted == "No code blocks to display." {
-                    return self.handle_deep(query, budget, true);
-                }
-                HandlerResult {
-                    formatted,
-                    fallback_used: false,
-                    result_count: items.len(),
+                let count = items.len();
+                if full_code {
+                    let code_contents: Vec<String> = items
+                        .iter()
+                        .map(|i| i.content.clone().unwrap_or_default())
+                        .collect();
+                    let formatted = format_code_blocks(&items, &code_contents, budget);
+                    if formatted == "No code blocks to display." {
+                        return self.handle_deep(query, budget, true);
+                    }
+                    HandlerResult {
+                        formatted,
+                        fallback_used: false,
+                        result_count: count,
+                    }
+                } else {
+                    let confidence = compute_confidence(&items);
+                    let resp = crate::server::protocol::SearchResponse {
+                        results: items,
+                        duration_ms: output.metrics.total_ms,
+                        dense_count: output.metrics.dense_count,
+                        sparse_count: output.metrics.sparse_count,
+                        fused_count: output.metrics.fused_count,
+                        metrics: None,
+                        confidence: Some(confidence),
+                    };
+                    HandlerResult {
+                        formatted: format_search_results(&resp, FormatStyle::Default, budget),
+                        fallback_used: false,
+                        result_count: count,
+                    }
                 }
             }
             _ => self.handle_deep(query, budget, true),
@@ -260,10 +298,17 @@ impl<'a> AgentPipeline<'a> {
         let sq = SearchQuery::new(query).grep_mode().max_results(20);
         let (items, duration_ms, sparse_count, fused_count) = match self.searcher.search(&sq) {
             Ok(output) => {
-                let items: Vec<SearchResultItem> = output.results.iter()
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
-                (items, output.metrics.total_ms, output.metrics.sparse_count, output.metrics.fused_count)
+                (
+                    items,
+                    output.metrics.total_ms,
+                    output.metrics.sparse_count,
+                    output.metrics.fused_count,
+                )
             }
             Err(_) => (vec![], 0u64, 0usize, 0usize),
         };
@@ -325,7 +370,10 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
         }
         // Skip .git, .semantex, node_modules, target
         let should_skip = path.components().any(|c| {
-            matches!(c.as_os_str().to_str(), Some(".git" | ".semantex" | "node_modules" | "target"))
+            matches!(
+                c.as_os_str().to_str(),
+                Some(".git" | ".semantex" | "node_modules" | "target")
+            )
         });
         if should_skip {
             continue;
@@ -354,14 +402,13 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_dispatch_routes_file_pattern() {
-        use super::super::agent_classifier::{classify_agent_query, AgentRoute};
+        use super::super::agent_classifier::{AgentRoute, classify_agent_query};
         assert_eq!(classify_agent_query("*.rs"), AgentRoute::FilePattern);
     }
 
