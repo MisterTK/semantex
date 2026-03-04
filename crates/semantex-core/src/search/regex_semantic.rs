@@ -120,14 +120,8 @@ mod tests {
 
     #[test]
     fn merge_results_uses_max_score() {
-        let regex = vec![
-            ScoredChunkId::new(1, 0.8),
-            ScoredChunkId::new(2, 0.5),
-        ];
-        let semantic = vec![
-            ScoredChunkId::new(1, 0.6),
-            ScoredChunkId::new(3, 0.9),
-        ];
+        let regex = vec![ScoredChunkId::new(1, 0.8), ScoredChunkId::new(2, 0.5)];
+        let semantic = vec![ScoredChunkId::new(1, 0.6), ScoredChunkId::new(3, 0.9)];
 
         let merged = merge_regex_semantic(&regex, &semantic, 1.0, 1.0);
         assert_eq!(merged.len(), 3);

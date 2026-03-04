@@ -171,7 +171,11 @@ fn chunk_header(chunk: &ReadChunk) -> String {
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(&chunk.file);
-    let _ = write!(header, "{}:{}-{}", short_file, chunk.start_line, chunk.end_line);
+    let _ = write!(
+        header,
+        "{}:{}-{}",
+        short_file, chunk.start_line, chunk.end_line
+    );
     if let Some(ref name) = chunk.name {
         let _ = write!(header, " {name}");
     }
@@ -207,8 +211,17 @@ fn clean_summary(summary: &str) -> Option<String> {
     // and contain only parameter/return info that the code already shows
     let lower = truncated.to_lowercase();
     let signature_prefixes = [
-        "function ", "module ", "struct ", "enum ", "impl ", "class ",
-        "interface ", "method ", "constant ", "variable ", "type ",
+        "function ",
+        "module ",
+        "struct ",
+        "enum ",
+        "impl ",
+        "class ",
+        "interface ",
+        "method ",
+        "constant ",
+        "variable ",
+        "type ",
     ];
     if signature_prefixes.iter().any(|p| lower.starts_with(p)) {
         // It's a signature restatement — skip it entirely
@@ -276,9 +289,7 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
             continue;
         }
         // Skip pure comments (but keep doc comments — they have useful content)
-        if (trimmed.starts_with("//") && !trimmed.starts_with("///"))
-            || trimmed.starts_with('#')
-        {
+        if (trimmed.starts_with("//") && !trimmed.starts_with("///")) || trimmed.starts_with('#') {
             continue;
         }
 
@@ -301,17 +312,17 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
 
     for (_, line, _) in &matching_lines {
         // Truncate very long lines
-        let display = if line.len() > 120 { &line[..120] } else { line.as_str() };
+        let display = if line.len() > 120 {
+            &line[..120]
+        } else {
+            line.as_str()
+        };
         let _ = writeln!(block, "    {display}");
         has_content = true;
     }
 
     // Only return the block if we found something useful beyond the header
-    if has_content {
-        block
-    } else {
-        String::new()
-    }
+    if has_content { block } else { String::new() }
 }
 
 #[cfg(test)]
@@ -442,9 +453,13 @@ mod tests {
                     &format!("file_{i}.rs"),
                     &format!("search_item_{i}"),
                     "fn",
-                    &format!("pub fn search_item_{i}(query: &str) -> Option<Item> {{ query.search() }}"),
+                    &format!(
+                        "pub fn search_item_{i}(query: &str) -> Option<Item> {{ query.search() }}"
+                    ),
                 );
-                c.docstring = Some(format!("Search for item {i} in the database using the query."));
+                c.docstring = Some(format!(
+                    "Search for item {i} in the database using the query."
+                ));
                 c
             })
             .collect();
@@ -472,7 +487,10 @@ mod tests {
 
     #[test]
     fn test_code_lines_indented() {
-        let chunk = make_chunk("x.rs", "pub fn authenticate_user(token: &str) -> bool { true }");
+        let chunk = make_chunk(
+            "x.rs",
+            "pub fn authenticate_user(token: &str) -> bool { true }",
+        );
         let result = extractive_summarize("authenticate token", &[chunk]);
         // Code lines should be 4-space indented
         assert!(

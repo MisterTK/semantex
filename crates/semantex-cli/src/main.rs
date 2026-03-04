@@ -528,9 +528,16 @@ fn main() -> Result<()> {
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
         Some(Commands::Validate { path }) => commands::validate::run(&path),
-        Some(Commands::Agent { query, path, route, full, budget, json }) => {
-            use semantex_core::server::protocol::AgentRequest;
+        Some(Commands::Agent {
+            query,
+            path,
+            route,
+            full,
+            budget,
+            json,
+        }) => {
             use semantex_core::search::agent_classifier::AgentRoute;
+            use semantex_core::server::protocol::AgentRequest;
 
             let route_override = match route.as_deref() {
                 None => None,
@@ -542,11 +549,14 @@ fn main() -> Result<()> {
                     "regex" => AgentRoute::Regex,
                     "analytical" => AgentRoute::Analytical,
                     "file_pattern" | "files" => AgentRoute::FilePattern,
-                    other => anyhow::bail!("Unknown route: {other}. Valid: semantic, deep, exact_symbol, structural, regex, analytical, file_pattern"),
+                    other => anyhow::bail!(
+                        "Unknown route: {other}. Valid: semantic, deep, exact_symbol, structural, regex, analytical, file_pattern"
+                    ),
                 }),
             };
 
-            let project_path = path.canonicalize()
+            let project_path = path
+                .canonicalize()
                 .with_context(|| format!("Invalid path: {}", path.display()))?;
             let port = semantex_core::server::read_daemon_port(&project_path)
                 .context("Daemon not running. Start it with: semantex serve <path>")?;

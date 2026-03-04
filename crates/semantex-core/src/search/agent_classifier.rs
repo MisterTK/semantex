@@ -60,7 +60,10 @@ fn is_regex(query: &str) -> bool {
     let bytes = query.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
         if bytes[i] == b'\\' {
-            if matches!(bytes[i + 1], b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W') {
+            if matches!(
+                bytes[i + 1],
+                b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W'
+            ) {
                 return true;
             }
         }
@@ -87,7 +90,11 @@ fn is_regex(query: &str) -> bool {
         let after_open = &query[open + 1..];
         if let Some(close) = after_open.find(')') {
             let inner = &after_open[..close];
-            if inner.contains('|') || inner.contains('?') || inner.contains('*') || inner.contains('+') {
+            if inner.contains('|')
+                || inner.contains('?')
+                || inner.contains('*')
+                || inner.contains('+')
+            {
                 return true;
             }
         }
@@ -263,11 +270,17 @@ mod tests {
 
     #[test]
     fn test_glob_star() {
-        assert_eq!(classify_agent_query("**/*.test.ts"), AgentRoute::FilePattern);
+        assert_eq!(
+            classify_agent_query("**/*.test.ts"),
+            AgentRoute::FilePattern
+        );
     }
     #[test]
     fn test_glob_qmark() {
-        assert_eq!(classify_agent_query("src/?/index.js"), AgentRoute::FilePattern);
+        assert_eq!(
+            classify_agent_query("src/?/index.js"),
+            AgentRoute::FilePattern
+        );
     }
     #[test]
     fn test_glob_plain_star() {
@@ -275,7 +288,10 @@ mod tests {
     }
     #[test]
     fn test_trailing_qmark_not_glob() {
-        assert_eq!(classify_agent_query("how does auth work?"), AgentRoute::Deep);
+        assert_eq!(
+            classify_agent_query("how does auth work?"),
+            AgentRoute::Deep
+        );
     }
     #[test]
     fn test_lib_qmark_glob() {
@@ -305,15 +321,24 @@ mod tests {
     }
     #[test]
     fn test_snake_case() {
-        assert_eq!(classify_agent_query("handle_request"), AgentRoute::ExactSymbol);
+        assert_eq!(
+            classify_agent_query("handle_request"),
+            AgentRoute::ExactSymbol
+        );
     }
     #[test]
     fn test_backtick_wrap() {
-        assert_eq!(classify_agent_query("`processPayment`"), AgentRoute::ExactSymbol);
+        assert_eq!(
+            classify_agent_query("`processPayment`"),
+            AgentRoute::ExactSymbol
+        );
     }
     #[test]
     fn test_dot_path() {
-        assert_eq!(classify_agent_query("auth.middleware"), AgentRoute::ExactSymbol);
+        assert_eq!(
+            classify_agent_query("auth.middleware"),
+            AgentRoute::ExactSymbol
+        );
     }
     #[test]
     fn test_html_parser() {
@@ -321,7 +346,10 @@ mod tests {
     }
     #[test]
     fn test_xml_http() {
-        assert_eq!(classify_agent_query("XMLHttpRequest"), AgentRoute::ExactSymbol);
+        assert_eq!(
+            classify_agent_query("XMLHttpRequest"),
+            AgentRoute::ExactSymbol
+        );
     }
     #[test]
     fn test_single_lower() {
@@ -334,28 +362,46 @@ mod tests {
 
     #[test]
     fn test_who_calls() {
-        assert_eq!(classify_agent_query("who calls authenticate"), AgentRoute::Structural);
+        assert_eq!(
+            classify_agent_query("who calls authenticate"),
+            AgentRoute::Structural
+        );
     }
     #[test]
     fn test_depends_on() {
-        assert_eq!(classify_agent_query("what depends on DatabasePool"), AgentRoute::Structural);
+        assert_eq!(
+            classify_agent_query("what depends on DatabasePool"),
+            AgentRoute::Structural
+        );
     }
     #[test]
     fn test_callers_of() {
-        assert_eq!(classify_agent_query("callers of handleRequest"), AgentRoute::Structural);
+        assert_eq!(
+            classify_agent_query("callers of handleRequest"),
+            AgentRoute::Structural
+        );
     }
 
     #[test]
     fn test_how_query() {
-        assert_eq!(classify_agent_query("how does authentication work?"), AgentRoute::Deep);
+        assert_eq!(
+            classify_agent_query("how does authentication work?"),
+            AgentRoute::Deep
+        );
     }
     #[test]
     fn test_explain() {
-        assert_eq!(classify_agent_query("explain the payment pipeline"), AgentRoute::Deep);
+        assert_eq!(
+            classify_agent_query("explain the payment pipeline"),
+            AgentRoute::Deep
+        );
     }
     #[test]
     fn test_why_query() {
-        assert_eq!(classify_agent_query("why does the cache invalidate on deploy"), AgentRoute::Deep);
+        assert_eq!(
+            classify_agent_query("why does the cache invalidate on deploy"),
+            AgentRoute::Deep
+        );
     }
     #[test]
     fn test_what_is_foo() {
@@ -364,24 +410,39 @@ mod tests {
 
     #[test]
     fn test_most_complex() {
-        assert_eq!(classify_agent_query("most complex functions in this repo"), AgentRoute::Analytical);
+        assert_eq!(
+            classify_agent_query("most complex functions in this repo"),
+            AgentRoute::Analytical
+        );
     }
     #[test]
     fn test_compare() {
-        assert_eq!(classify_agent_query("compare auth approaches"), AgentRoute::Analytical);
+        assert_eq!(
+            classify_agent_query("compare auth approaches"),
+            AgentRoute::Analytical
+        );
     }
     #[test]
     fn test_review() {
-        assert_eq!(classify_agent_query("review the error handling"), AgentRoute::Analytical);
+        assert_eq!(
+            classify_agent_query("review the error handling"),
+            AgentRoute::Analytical
+        );
     }
 
     #[test]
     fn test_semantic_default() {
-        assert_eq!(classify_agent_query("authentication middleware"), AgentRoute::Semantic);
+        assert_eq!(
+            classify_agent_query("authentication middleware"),
+            AgentRoute::Semantic
+        );
     }
     #[test]
     fn test_semantic_multi() {
-        assert_eq!(classify_agent_query("database connection pool"), AgentRoute::Semantic);
+        assert_eq!(
+            classify_agent_query("database connection pool"),
+            AgentRoute::Semantic
+        );
     }
     #[test]
     fn test_empty() {
@@ -390,15 +451,24 @@ mod tests {
 
     #[test]
     fn test_extract_backtick() {
-        assert_eq!(extract_symbol("who calls `authenticate`"), Some("authenticate".into()));
+        assert_eq!(
+            extract_symbol("who calls `authenticate`"),
+            Some("authenticate".into())
+        );
     }
     #[test]
     fn test_extract_camel() {
-        assert_eq!(extract_symbol("callers of AuthService"), Some("AuthService".into()));
+        assert_eq!(
+            extract_symbol("callers of AuthService"),
+            Some("AuthService".into())
+        );
     }
     #[test]
     fn test_extract_snake() {
-        assert_eq!(extract_symbol("what uses handle_request"), Some("handle_request".into()));
+        assert_eq!(
+            extract_symbol("what uses handle_request"),
+            Some("handle_request".into())
+        );
     }
     #[test]
     fn test_extract_none() {
@@ -406,6 +476,9 @@ mod tests {
     }
     #[test]
     fn test_extract_dot() {
-        assert_eq!(extract_symbol("who calls `auth.service`"), Some("auth.service".into()));
+        assert_eq!(
+            extract_symbol("who calls `auth.service`"),
+            Some("auth.service".into())
+        );
     }
 }

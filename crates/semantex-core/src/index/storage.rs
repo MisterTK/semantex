@@ -371,7 +371,10 @@ impl ChunkStore {
             .prepare("SELECT path, mtime FROM files LIMIT ?1")?;
         let rows = stmt
             .query_map(params![limit as i64], |row| {
-                Ok((PathBuf::from(row.get::<_, String>(0)?), row.get::<_, i64>(1)?))
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row.get::<_, i64>(1)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)

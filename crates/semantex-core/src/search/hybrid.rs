@@ -488,11 +488,7 @@ impl HybridSearcher {
         } else {
             GraphPropagationConfig::for_query_type(&query_type, candidates).with_env_overrides()
         };
-        let scored_ids: Vec<ScoredChunkId> = fused
-            .iter()
-            .take(fetch_count)
-            .cloned()
-            .collect();
+        let scored_ids: Vec<ScoredChunkId> = fused.iter().take(fetch_count).cloned().collect();
         let expanded = graph_propagation::propagate(&scored_ids, &store, &graph_config)?;
 
         // Merge propagated chunks into fused list
@@ -1218,14 +1214,8 @@ mod tests {
     #[test]
     fn test_rrf_unique_items() {
         // When lists have different items, all should appear
-        let list_a = vec![
-            ScoredChunkId::new(1, 0.9),
-            ScoredChunkId::new(2, 0.8),
-        ];
-        let list_b = vec![
-            ScoredChunkId::new(3, 0.9),
-            ScoredChunkId::new(4, 0.8),
-        ];
+        let list_a = vec![ScoredChunkId::new(1, 0.9), ScoredChunkId::new(2, 0.8)];
+        let list_b = vec![ScoredChunkId::new(3, 0.9), ScoredChunkId::new(4, 0.8)];
 
         let result = rrf_fuse(&list_a, &list_b, 60.0, &EQUAL);
 
@@ -1240,10 +1230,7 @@ mod tests {
     #[test]
     fn test_rrf_k_parameter_effect() {
         // Lower k makes rank position more important
-        let list_a = vec![
-            ScoredChunkId::new(1, 0.9),
-            ScoredChunkId::new(2, 0.1),
-        ];
+        let list_a = vec![ScoredChunkId::new(1, 0.9), ScoredChunkId::new(2, 0.1)];
         let list_b = vec![ScoredChunkId::new(2, 0.9)];
 
         // With high k (60), early ranks matter less
@@ -1348,14 +1335,8 @@ mod tests {
         // With equal-ish weights, items in both lists still win
         let mixed_weights = query_classifier::QueryType::Mixed.fusion_weights();
 
-        let dense_list = vec![
-            ScoredChunkId::new(1, 0.9),
-            ScoredChunkId::new(2, 0.7),
-        ];
-        let sparse_list = vec![
-            ScoredChunkId::new(2, 10.0),
-            ScoredChunkId::new(3, 5.0),
-        ];
+        let dense_list = vec![ScoredChunkId::new(1, 0.9), ScoredChunkId::new(2, 0.7)];
+        let sparse_list = vec![ScoredChunkId::new(2, 10.0), ScoredChunkId::new(3, 5.0)];
 
         let result = rrf_fuse(&dense_list, &sparse_list, 60.0, &mixed_weights);
 
@@ -1429,10 +1410,7 @@ mod tests {
 
         #[test]
         fn test_grep_mode_deduplicates() {
-            let sparse = vec![
-                ScoredChunkId::new(10, 5.0),
-                ScoredChunkId::new(20, 3.0),
-            ];
+            let sparse = vec![ScoredChunkId::new(10, 5.0), ScoredChunkId::new(20, 3.0)];
             // Chunk 10 appears in both exact and sparse
             let exact = vec![10, 30];
 

@@ -322,8 +322,14 @@ mod tests {
 
         // Per-channel scores: chunk 5 should have all three > 0
         assert!(result[0].score_dense > 0.0, "chunk 5 should have dense > 0");
-        assert!(result[0].score_sparse > 0.0, "chunk 5 should have sparse > 0");
-        assert!((result[0].score_exact - 1.0).abs() < f32::EPSILON, "chunk 5 exact should be 1.0");
+        assert!(
+            result[0].score_sparse > 0.0,
+            "chunk 5 should have sparse > 0"
+        );
+        assert!(
+            (result[0].score_exact - 1.0).abs() < f32::EPSILON,
+            "chunk 5 exact should be 1.0"
+        );
     }
 
     #[test]
@@ -468,12 +474,18 @@ mod tests {
     #[test]
     fn test_max_possible_identifier() {
         let mp = QueryType::Identifier.triple_fusion_weights().max_possible();
-        assert!((mp - 5.8).abs() < f32::EPSILON, "Identifier max_possible should be 5.8, got {mp}");
+        assert!(
+            (mp - 5.8).abs() < f32::EPSILON,
+            "Identifier max_possible should be 5.8, got {mp}"
+        );
     }
 
     #[test]
     fn test_max_possible_semantic() {
         let mp = QueryType::Semantic.triple_fusion_weights().max_possible();
-        assert!((mp - 1.7).abs() < f32::EPSILON, "Semantic max_possible should be 1.7, got {mp}");
+        assert!(
+            (mp - 1.7).abs() < f32::EPSILON,
+            "Semantic max_possible should be 1.7, got {mp}"
+        );
     }
 }

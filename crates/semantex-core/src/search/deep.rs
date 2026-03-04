@@ -136,7 +136,12 @@ fn kind_matches_preference(kind: Option<&str>, pref: PreferredKind) -> bool {
 /// Triage search results: deduplicate, enforce per-file caps, apply preference boosts.
 ///
 /// Returns indices into `results` for the selected chunks (preserving original order).
-fn triage_results(query: &str, results: &[SearchResult], max_chunks: usize, max_possible: f32) -> Vec<usize> {
+fn triage_results(
+    query: &str,
+    results: &[SearchResult],
+    max_chunks: usize,
+    max_possible: f32,
+) -> Vec<usize> {
     let pref = classify_query_preference(query);
 
     // Pass 1: Compute adjusted scores for all candidates.
@@ -507,7 +512,9 @@ fn deep_search_inner(
     let confidence = if output.results.is_empty() {
         0.0
     } else {
-        let top_scores: Vec<f32> = output.results.iter()
+        let top_scores: Vec<f32> = output
+            .results
+            .iter()
             .take(3)
             .map(|r| (r.score / max_possible).min(1.0))
             .collect();
@@ -616,7 +623,9 @@ fn deep_search_inner(
         if answer.is_empty() || answer == "No relevant code found for this query." {
             "No relevant code found for this query.".to_string()
         } else {
-            format!("{answer}\n\n[Low confidence: results may not be relevant to the query. Consider rephrasing or checking if the codebase covers this topic.]")
+            format!(
+                "{answer}\n\n[Low confidence: results may not be relevant to the query. Consider rephrasing or checking if the codebase covers this topic.]"
+            )
         }
     } else {
         answer
@@ -823,13 +832,13 @@ mod tests {
 
     #[test]
     fn test_docstring_boost_matching_terms() {
-        let chunk = make_chunk_with_docstring(
-            "Run the full deep search pipeline for a query.",
-            "",
-        );
+        let chunk = make_chunk_with_docstring("Run the full deep search pipeline for a query.", "");
         let boost = compute_docstring_boost("how does the deep search pipeline work", &chunk);
         // "deep", "search", "pipeline" should match → 3 * 0.15 = 0.45
-        assert!(boost > 0.3, "Expected boost > 0.3 for 3 matching terms, got {boost}");
+        assert!(
+            boost > 0.3,
+            "Expected boost > 0.3 for 3 matching terms, got {boost}"
+        );
         assert!(boost <= 0.6, "Boost should be capped at 0.6, got {boost}");
     }
 
@@ -849,10 +858,8 @@ mod tests {
 
     #[test]
     fn test_docstring_boost_no_matching_terms() {
-        let chunk = make_chunk_with_docstring(
-            "Authenticate user credentials against the database.",
-            "",
-        );
+        let chunk =
+            make_chunk_with_docstring("Authenticate user credentials against the database.", "");
         let boost = compute_docstring_boost("deep search pipeline", &chunk);
         assert_eq!(boost, 0.0, "No matching terms should produce zero boost");
     }
@@ -875,12 +882,12 @@ mod tests {
 
     #[test]
     fn test_docstring_boost_from_nl_summary() {
-        let chunk = make_chunk_with_docstring(
-            "",
-            "Run the full deep search pipeline",
-        );
+        let chunk = make_chunk_with_docstring("", "Run the full deep search pipeline");
         let boost = compute_docstring_boost("deep search pipeline", &chunk);
-        assert!(boost > 0.3, "NL summary should also contribute to boost, got {boost}");
+        assert!(
+            boost > 0.3,
+            "NL summary should also contribute to boost, got {boost}"
+        );
     }
 
     #[test]
@@ -892,7 +899,10 @@ mod tests {
             make_ast_result("b.rs", "deep_search_inner", 1, 20, 0.8),
         ];
         // Add docstring to deep_search_inner
-        if let ChunkType::AstNode { structured_meta, .. } = &mut results[1].chunk.chunk_type {
+        if let ChunkType::AstNode {
+            structured_meta, ..
+        } = &mut results[1].chunk.chunk_type
+        {
             use crate::chunking::structured_meta::StructuredChunkMeta;
             *structured_meta = Some(Box::new(StructuredChunkMeta {
                 docstring: Some("Run the full deep search pipeline for a query.".to_string()),
@@ -903,14 +913,10 @@ mod tests {
         // deep_search_inner (index 1) should come first due to docstring boost
         assert_eq!(indices, vec![0, 1]); // sorted by original index
         // But let's verify the scoring directly
-        let boost_a = compute_docstring_boost(
-            "how does the deep search pipeline work",
-            &results[0].chunk,
-        );
-        let boost_b = compute_docstring_boost(
-            "how does the deep search pipeline work",
-            &results[1].chunk,
-        );
+        let boost_a =
+            compute_docstring_boost("how does the deep search pipeline work", &results[0].chunk);
+        let boost_b =
+            compute_docstring_boost("how does the deep search pipeline work", &results[1].chunk);
         assert!(
             boost_b > boost_a,
             "deep_search_inner should have higher docstring boost ({boost_b}) than classify ({boost_a})"
@@ -926,7 +932,8 @@ mod tests {
         let max_possible = 1.7_f32;
         let scores = [1.2_f32, 1.0, 0.9]; // well above noise floor when normalized
 
-        let top_scores: Vec<f32> = scores.iter()
+        let top_scores: Vec<f32> = scores
+            .iter()
             .take(3)
             .map(|&s| (s / max_possible).min(1.0))
             .collect();
@@ -951,7 +958,8 @@ mod tests {
         let max_possible = 5.8_f32;
         let scores = [0.2_f32, 0.15, 0.1]; // ~0.03–0.04 normalized → below noise floor
 
-        let top_scores: Vec<f32> = scores.iter()
+        let top_scores: Vec<f32> = scores
+            .iter()
             .take(3)
             .map(|&s| (s / max_possible).min(1.0))
             .collect();
@@ -982,8 +990,8 @@ mod tests {
         // Results with scores below noise floor should be filtered out.
         // Using max_possible = 1.0 so normalized = raw score.
         let results = vec![
-            make_ast_result("a.rs", "good_fn", 1, 20, 0.5),       // normalized 0.5 > 0.08
-            make_ast_result("b.rs", "noise_fn", 1, 20, 0.05),     // normalized 0.05 < 0.08
+            make_ast_result("a.rs", "good_fn", 1, 20, 0.5), // normalized 0.5 > 0.08
+            make_ast_result("b.rs", "noise_fn", 1, 20, 0.05), // normalized 0.05 < 0.08
             make_ast_result("c.rs", "barely_noise", 1, 20, 0.07), // normalized 0.07 < 0.08
         ];
         let indices = triage_results("test query", &results, 8, 1.0);

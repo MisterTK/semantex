@@ -357,10 +357,10 @@ fn check_graph_consistency(index_dir: &Path) -> CheckResult {
 
 /// Read and parse meta.json.
 fn read_meta(meta_path: &Path) -> Result<IndexMeta> {
-    let content =
-        std::fs::read_to_string(meta_path).with_context(|| format!("reading {}", meta_path.display()))?;
-    let meta: IndexMeta =
-        serde_json::from_str(&content).with_context(|| format!("parsing {}", meta_path.display()))?;
+    let content = std::fs::read_to_string(meta_path)
+        .with_context(|| format!("reading {}", meta_path.display()))?;
+    let meta: IndexMeta = serde_json::from_str(&content)
+        .with_context(|| format!("parsing {}", meta_path.display()))?;
     Ok(meta)
 }
 

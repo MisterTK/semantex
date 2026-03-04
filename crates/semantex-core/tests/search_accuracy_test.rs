@@ -759,7 +759,7 @@ fn test_rrf_fusion_correctness() -> Result<()> {
     ];
     let sparse = vec![
         ScoredChunkId::new(200, 12.5), // In both
-        ScoredChunkId::new(400, 8.3), // Only in sparse
+        ScoredChunkId::new(400, 8.3),  // Only in sparse
     ];
 
     let fused = rrf_fuse(

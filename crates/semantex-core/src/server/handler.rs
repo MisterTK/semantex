@@ -351,7 +351,13 @@ pub(crate) fn graph_walk_from_store(
 /// Returns `(chunk_type_str, name, language, kind, summary)`.
 pub(crate) fn chunk_type_meta(
     ct: &crate::types::ChunkType,
-) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     match ct {
         crate::types::ChunkType::AstNode {
             name,
@@ -372,12 +378,20 @@ pub(crate) fn chunk_type_meta(
                 summary,
             )
         }
-        crate::types::ChunkType::TextWindow { .. } => {
-            ("TextWindow".to_string(), None, None, Some("text".to_string()), None)
-        }
-        crate::types::ChunkType::PdfPage { .. } => {
-            ("PdfPage".to_string(), None, None, Some("pdf".to_string()), None)
-        }
+        crate::types::ChunkType::TextWindow { .. } => (
+            "TextWindow".to_string(),
+            None,
+            None,
+            Some("text".to_string()),
+            None,
+        ),
+        crate::types::ChunkType::PdfPage { .. } => (
+            "PdfPage".to_string(),
+            None,
+            None,
+            Some("pdf".to_string()),
+            None,
+        ),
     }
 }
 
@@ -405,8 +419,7 @@ pub(crate) fn search_result_to_item(
     result: &crate::types::SearchResult,
     include_content: bool,
 ) -> SearchResultItem {
-    let (chunk_type_str, name, language, kind, summary) =
-        chunk_type_meta(&result.chunk.chunk_type);
+    let (chunk_type_str, name, language, kind, summary) = chunk_type_meta(&result.chunk.chunk_type);
 
     let content = if include_content {
         Some(result.chunk.content.clone())
