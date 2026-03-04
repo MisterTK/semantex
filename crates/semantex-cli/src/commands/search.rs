@@ -573,10 +573,7 @@ fn spawn_daemon_if_needed(project_path: &std::path::Path) {
         return;
     }
 
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let _ = std::process::Command::new(&exe)
+    let _ = std::process::Command::new("semantex")
         .arg("serve")
         .arg(project_path)
         .stdin(std::process::Stdio::null())
@@ -1318,6 +1315,7 @@ fn print_deep(resp: &semantex_core::server::protocol::DeepSearchResponse) -> Res
     writeln!(out, "</answer>")?;
     writeln!(out)?;
     writeln!(out, "Sources:")?;
+    let mut unique_files: HashSet<&str> = HashSet::new();
     for s in &resp.sources {
         write!(out, "  {}:{}-{}", s.file, s.start_line, s.end_line)?;
         if let Some(ref name) = s.name {
@@ -1327,7 +1325,15 @@ fn print_deep(resp: &semantex_core::server::protocol::DeepSearchResponse) -> Res
             write!(out, " [{kind}]")?;
         }
         writeln!(out)?;
+        unique_files.insert(&s.file);
     }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "[Complete: {} chunks read across {} files — no further Read calls needed]",
+        resp.metrics.chunks_read,
+        unique_files.len()
+    )?;
     out.flush()?;
     Ok(())
 }

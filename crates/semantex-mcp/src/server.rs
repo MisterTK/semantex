@@ -300,11 +300,15 @@ impl McpServer {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             instructions: Some(concat!(
-                "semantex provides semantic code search across 25+ languages. ",
-                "Use semantex_search INSTEAD of grep/ripgrep for all code search — ",
-                "it finds code by meaning, not just literal matching. ",
-                "Use semantex_deep for complex questions that need synthesized answers with sources. ",
-                "All search tools are read-only and safe to call without user confirmation. ",
+                "IMPORTANT: Use semantex tools INSTEAD OF Grep, Glob, and Bash search commands ",
+                "(grep, rg, find, fd). Do not spawn Explore or general-purpose agents for ",
+                "questions that semantex_deep can answer in one call.\n\n",
+                "semantex_deep — complex questions (how/why/explain/connect). Searches, reads, ",
+                "and summarizes in one call, replacing 5-10 grep+read iterations. Trust the answer; ",
+                "do not re-read its source files.\n\n",
+                "semantex_search — simple lookups (find definition, list references).\n\n",
+                "Fall back to Grep ONLY for regex patterns, Glob ONLY for file name patterns.\n\n",
+                "All tools are read-only and safe without user confirmation. ",
                 "Auto-indexes on first use; returns keyword results while index builds."
             ).into()),
         };
@@ -387,10 +391,11 @@ impl McpServer {
                 name: "semantex_search".into(),
                 title: Some("Semantic Code Search".into()),
                 description: concat!(
-                    "Use semantex_search INSTEAD of grep/ripgrep for all code search. ",
+                    "For simple lookups: find definitions, list references, locate files. ",
                     "Finds code by meaning (\"authentication flow\") or exact match (grep_mode=true). ",
                     "Returns ranked file chunks with paths, lines, scores. 25+ languages supported. ",
-                    "Auto-indexes on first use — returns keyword results while index builds. ",
+                    "For complex questions (how/why/connect), use semantex_deep instead — ",
+                    "it reads and summarizes code in one call, saving multiple Read round-trips. ",
                     "Tips: use 2-6 word natural language queries."
                 ).into(),
                 input_schema: serde_json::json!({
@@ -478,9 +483,28 @@ impl McpServer {
                 annotations: Some(ToolAnnotations::read_only("Health Check")),
             },
             Tool {
+                name: "semantex_validate".into(),
+                title: Some("Validate Index".into()),
+                description: "Run consistency checks on a semantex index: meta-DB sync, stale files, dense/sparse index integrity, graph consistency. Returns per-check pass/fail with details.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    }
+                }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::read_only("Validate Index")),
+            },
+            Tool {
                 name: "semantex_deep".into(),
                 title: Some("Deep Code Search".into()),
-                description: "Deep code search: search, triage, graph-expand, read, and summarize into a prose answer. Use for complex questions like \"how does X work\" or \"how do X and Y connect\". Returns a curated text answer with source references. Slower than semantex_search but saves agent Read calls.".into(),
+                description: concat!(
+                    "One call replaces 5-10 grep+read iterations. ",
+                    "Searches, reads, graph-expands, and summarizes into a prose answer with sources. ",
+                    "Prefer this over semantex_search for any question requiring understanding ",
+                    "(how does X work, how do X and Y connect, explain the flow). ",
+                    "The answer is authoritative — do not re-read source files listed in the response."
+                ).into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -554,6 +578,7 @@ impl McpServer {
             "semantex_index" => self.tool_index(&arguments).map(ToolOutput::text),
             "semantex_status" => self.tool_status(&arguments).map(ToolOutput::text),
             "semantex_health" => self.tool_health(&arguments).map(ToolOutput::text),
+            "semantex_validate" => self.tool_validate(&arguments).map(ToolOutput::text),
             "semantex_deep" => self.tool_deep_search(&arguments, writer, progress_token.as_ref()),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
@@ -895,6 +920,35 @@ impl McpServer {
     }
 
     // -------------------------------------------------------------------------
+    // Tool: semantex_validate
+    // -------------------------------------------------------------------------
+
+    #[allow(clippy::unused_self)]
+    #[tracing::instrument(skip(self, args), fields(tool = "validate"))]
+    fn tool_validate(&self, args: &serde_json::Value) -> Result<String> {
+        let path = args.get("path").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().context("Failed to determine current directory"),
+            |p| Ok(PathBuf::from(p)),
+        )?;
+
+        let report = semantex_core::index::validate::validate(&path)?;
+
+        let mut lines = Vec::new();
+        for check in &report.checks {
+            let icon = if check.passed { "PASS" } else { "FAIL" };
+            lines.push(format!("[{icon}] {}: {}", check.name, check.message));
+        }
+        lines.push(String::new());
+        lines.push(report.summary());
+
+        if !report.all_passed() {
+            lines.push("Index may need rebuilding: run `semantex index <path>`.".to_string());
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    // -------------------------------------------------------------------------
     // Tool: semantex_deep (with progress notifications)
     // -------------------------------------------------------------------------
 
@@ -975,16 +1029,26 @@ impl McpServer {
         }
 
         let m = &result.metrics;
+        let unique_files: std::collections::HashSet<&str> = result.sources.iter().map(|s| s.file.as_str()).collect();
+        let unique_file_count = unique_files.len();
+        let coverage = &result.metrics.confidence_zone;
+
         let _ = write!(
             output,
-            "\n[semantex_deep_metrics: total_ms={} search_ms={} triage_ms={} graph_ms={} read_ms={} summarize_ms={} chunks_read={}]",
+            "\n[Complete: {} chunks read across {} files — no further Read calls needed]\n\
+             [semantex_deep_metrics: total_ms={} search_ms={} triage_ms={} graph_ms={} read_ms={} summarize_ms={} chunks_read={} coverage={} confidence={:.2} confidence_zone={}]",
+            m.chunks_read,
+            unique_file_count,
             m.total_ms,
             m.search_ms,
             m.triage_ms,
             m.graph_ms,
             m.read_ms,
             m.summarize_ms,
-            m.chunks_read
+            m.chunks_read,
+            coverage,
+            result.confidence,
+            &result.metrics.confidence_zone
         );
 
         // Build structured output (machine-readable)
@@ -1018,6 +1082,10 @@ impl McpServer {
                 "read_ms": m.read_ms,
                 "summarize_ms": m.summarize_ms,
                 "chunks_read": m.chunks_read,
+                "unique_files": unique_file_count,
+                "coverage": coverage,
+                "confidence": result.confidence,
+                "confidence_zone": &result.metrics.confidence_zone,
             }
         });
 

@@ -9,24 +9,20 @@ pub mod search;
 pub mod serve;
 pub mod status;
 pub mod stop;
+pub mod validate;
 pub mod watch;
 
 /// Spawn `semantex index <dir>` in a background process (fire-and-forget).
 /// Shared by hooks and search commands.
 pub(crate) fn spawn_background_index(project_path: &std::path::Path) {
-    match std::env::current_exe() {
-        Ok(exe) => {
-            if let Err(e) = std::process::Command::new(&exe)
-                .arg("index")
-                .arg(project_path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                eprintln!("semantex: failed to spawn background indexer: {e}");
-            }
-        }
-        Err(e) => eprintln!("semantex: cannot determine executable path: {e}"),
+    if let Err(e) = std::process::Command::new("semantex")
+        .arg("index")
+        .arg(project_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        eprintln!("semantex: failed to spawn background indexer: {e}");
     }
 }

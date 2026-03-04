@@ -363,6 +363,20 @@ impl ChunkStore {
         Ok(count as u64)
     }
 
+    /// Get a sample of file paths with their stored mtimes (for validation).
+    /// Returns up to `limit` entries as (path, stored_mtime).
+    pub fn get_file_mtimes_sample(&self, limit: usize) -> Result<Vec<(PathBuf, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime FROM files LIMIT ?1")?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((PathBuf::from(row.get::<_, String>(0)?), row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Case-insensitive substring search over chunk content using SQLite LIKE.
     /// Replaces the in-memory ExactIndex to avoid duplicating all chunk content in RAM.
     pub fn search_exact(&self, query: &str, limit: usize) -> Result<Vec<u64>> {

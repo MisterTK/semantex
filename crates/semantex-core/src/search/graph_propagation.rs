@@ -232,10 +232,7 @@ pub fn propagate(
     // Build final result: seeds with original scores + propagated with scaled scores
     let mut result: Vec<ScoredChunkId> = seeds.to_vec();
     for (chunk_id, prop_score) in &propagated {
-        result.push(ScoredChunkId {
-            chunk_id: *chunk_id,
-            score: prop_score * max_seed_score,
-        });
+        result.push(ScoredChunkId::new(*chunk_id, prop_score * max_seed_score));
     }
 
     result.sort_by(|a, b| {
@@ -261,10 +258,7 @@ mod tests {
     use super::*;
 
     fn scored(id: u64, score: f32) -> ScoredChunkId {
-        ScoredChunkId {
-            chunk_id: id,
-            score,
-        }
+        ScoredChunkId::new(id, score)
     }
 
     #[test]

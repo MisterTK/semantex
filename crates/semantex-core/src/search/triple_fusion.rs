@@ -11,6 +11,13 @@ pub struct TripleFusionWeights {
     pub w_exact: f32,
 }
 
+impl TripleFusionWeights {
+    /// Theoretical max fused score: all three channels at normalized 1.0.
+    pub fn max_possible(&self) -> f32 {
+        self.w_dense + self.w_sparse + self.w_exact
+    }
+}
+
 struct CachedWeightOverrides {
     identifier: Option<TripleFusionWeights>,
     keyword: Option<TripleFusionWeights>,
@@ -130,27 +137,62 @@ pub fn triple_cc_fuse(
     exact_ids: &[u64],
     weights: &TripleFusionWeights,
 ) -> Vec<ScoredChunkId> {
-    let mut scores: HashMap<u64, f32> = HashMap::new();
+    // Track per-channel normalized scores alongside total
+    struct ChannelScores {
+        total: f32,
+        dense: f32,
+        sparse: f32,
+        exact: f32,
+    }
+
+    let mut scores: HashMap<u64, ChannelScores> = HashMap::new();
 
     // Normalize and accumulate dense scores
     for (chunk_id, norm_score) in top_score_normalize(dense_list) {
-        *scores.entry(chunk_id).or_insert(0.0) += weights.w_dense * norm_score;
+        let entry = scores.entry(chunk_id).or_insert(ChannelScores {
+            total: 0.0,
+            dense: 0.0,
+            sparse: 0.0,
+            exact: 0.0,
+        });
+        entry.dense = norm_score;
+        entry.total += weights.w_dense * norm_score;
     }
 
     // Normalize and accumulate sparse scores
     for (chunk_id, norm_score) in top_score_normalize(sparse_list) {
-        *scores.entry(chunk_id).or_insert(0.0) += weights.w_sparse * norm_score;
+        let entry = scores.entry(chunk_id).or_insert(ChannelScores {
+            total: 0.0,
+            dense: 0.0,
+            sparse: 0.0,
+            exact: 0.0,
+        });
+        entry.sparse = norm_score;
+        entry.total += weights.w_sparse * norm_score;
     }
 
     // Exact matches: always score 1.0 (they are binary: match or no match)
     for &chunk_id in exact_ids {
-        *scores.entry(chunk_id).or_insert(0.0) += weights.w_exact * 1.0;
+        let entry = scores.entry(chunk_id).or_insert(ChannelScores {
+            total: 0.0,
+            dense: 0.0,
+            sparse: 0.0,
+            exact: 0.0,
+        });
+        entry.exact = 1.0;
+        entry.total += weights.w_exact;
     }
 
     // Convert to scored chunks and sort by descending CC score
     let mut fused: Vec<ScoredChunkId> = scores
         .into_iter()
-        .map(|(chunk_id, score)| ScoredChunkId { chunk_id, score })
+        .map(|(chunk_id, cs)| ScoredChunkId {
+            chunk_id,
+            score: cs.total,
+            score_dense: cs.dense,
+            score_sparse: cs.sparse,
+            score_exact: cs.exact,
+        })
         .collect();
 
     fused.sort_by(|a, b| {
@@ -166,10 +208,7 @@ mod tests {
     use super::*;
 
     fn s(id: u64, score: f32) -> ScoredChunkId {
-        ScoredChunkId {
-            chunk_id: id,
-            score,
-        }
+        ScoredChunkId::new(id, score)
     }
 
     // --- top_score_normalize tests ---
@@ -280,6 +319,11 @@ mod tests {
         // Chunk 20: sparse=5/10=0.5
         assert_eq!(result[0].chunk_id, 5);
         assert!((result[0].score - 3.0).abs() < f32::EPSILON);
+
+        // Per-channel scores: chunk 5 should have all three > 0
+        assert!(result[0].score_dense > 0.0, "chunk 5 should have dense > 0");
+        assert!(result[0].score_sparse > 0.0, "chunk 5 should have sparse > 0");
+        assert!((result[0].score_exact - 1.0).abs() < f32::EPSILON, "chunk 5 exact should be 1.0");
     }
 
     #[test]
@@ -372,5 +416,64 @@ mod tests {
         assert!((weights.w_dense - 0.3).abs() < f32::EPSILON);
         assert!((weights.w_sparse - 0.6).abs() < f32::EPSILON);
         assert!((weights.w_exact - 2.0).abs() < f32::EPSILON);
+    }
+
+    // --- per-channel score tests ---
+
+    #[test]
+    fn test_per_channel_scores_preserved() {
+        let weights = TripleFusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+
+        // Chunk 1: dense only; Chunk 2: sparse only; Chunk 3: exact only; Chunk 4: all three
+        let dense = vec![s(1, 0.8), s(4, 0.6)];
+        let sparse = vec![s(2, 5.0), s(4, 3.0)];
+        let exact = vec![3, 4];
+
+        let result = triple_cc_fuse(&dense, &sparse, &exact, &weights);
+        let by_id: HashMap<u64, &ScoredChunkId> = result.iter().map(|r| (r.chunk_id, r)).collect();
+
+        // Chunk 1: dense only
+        let c1 = by_id[&1];
+        assert!((c1.score_dense - 1.0).abs() < f32::EPSILON); // top-score normalized (single → 1.0 ... wait, there are 2 dense items)
+        // Actually dense has 2 items: [0.8, 0.6], max=0.8. So chunk 1 = 0.8/0.8 = 1.0, chunk 4 = 0.6/0.8 = 0.75
+        assert!((c1.score_dense - 1.0).abs() < f32::EPSILON);
+        assert!(c1.score_sparse.abs() < f32::EPSILON);
+        assert!(c1.score_exact.abs() < f32::EPSILON);
+
+        // Chunk 2: sparse only
+        let c2 = by_id[&2];
+        assert!(c2.score_dense.abs() < f32::EPSILON);
+        assert!((c2.score_sparse - 1.0).abs() < f32::EPSILON); // 5/5 = 1.0
+        assert!(c2.score_exact.abs() < f32::EPSILON);
+
+        // Chunk 3: exact only
+        let c3 = by_id[&3];
+        assert!(c3.score_dense.abs() < f32::EPSILON);
+        assert!(c3.score_sparse.abs() < f32::EPSILON);
+        assert!((c3.score_exact - 1.0).abs() < f32::EPSILON);
+
+        // Chunk 4: all three
+        let c4 = by_id[&4];
+        assert!(c4.score_dense > 0.0);
+        assert!(c4.score_sparse > 0.0);
+        assert!((c4.score_exact - 1.0).abs() < f32::EPSILON);
+    }
+
+    // --- max_possible tests ---
+
+    #[test]
+    fn test_max_possible_identifier() {
+        let mp = QueryType::Identifier.triple_fusion_weights().max_possible();
+        assert!((mp - 5.8).abs() < f32::EPSILON, "Identifier max_possible should be 5.8, got {mp}");
+    }
+
+    #[test]
+    fn test_max_possible_semantic() {
+        let mp = QueryType::Semantic.triple_fusion_weights().max_possible();
+        assert!((mp - 1.7).abs() < f32::EPSILON, "Semantic max_possible should be 1.7, got {mp}");
     }
 }

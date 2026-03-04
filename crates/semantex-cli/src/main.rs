@@ -128,10 +128,6 @@ struct Cli {
     #[arg(long, hide = true)]
     session_hook: bool,
 
-    /// Internal: Claude Code task hook (outputs JSON for agent prompts)
-    #[arg(long, hide = true)]
-    task_hook: bool,
-
     /// Internal: Claude Code PreToolUse hook for Grep|Glob interception
     #[arg(long, hide = true)]
     grep_hook: bool,
@@ -139,6 +135,19 @@ struct Cli {
     /// Internal: Claude Code SessionEnd hook for daemon cleanup
     #[arg(long, hide = true)]
     session_end_hook: bool,
+
+    /// Internal: Claude Code SubagentStart hook for subagent context injection
+    #[arg(long, hide = true)]
+    subagent_hook: bool,
+
+    /// Internal: Claude Code PreToolUse hook for Bash search interception
+    #[arg(long, hide = true)]
+    bash_hook: bool,
+
+    /// Hard-deny mode for hooks: block the tool call instead of just nudging.
+    /// Use with --grep-hook or --bash-hook.
+    #[arg(long, hide = true)]
+    deny: bool,
 
     /// Uninstall semantex hooks from Claude Code
     #[arg(long)]
@@ -240,6 +249,12 @@ enum Commands {
     },
     /// Stop persistent client
     Disconnect,
+    /// Validate index consistency (meta-DB sync, stale files, dense/sparse integrity, graph)
+    Validate {
+        /// Path to validate (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 /// Find ONNX Runtime shared library on platform-specific paths.
@@ -327,14 +342,17 @@ fn main() -> Result<()> {
     if cli.session_hook {
         return commands::hooks::cmd_session_hook();
     }
-    if cli.task_hook {
-        return commands::hooks::cmd_task_hook();
-    }
     if cli.grep_hook {
-        return commands::hooks::cmd_grep_hook();
+        return commands::hooks::cmd_grep_hook(cli.deny);
     }
     if cli.session_end_hook {
         return commands::hooks::cmd_session_end_hook();
+    }
+    if cli.subagent_hook {
+        return commands::hooks::cmd_subagent_hook();
+    }
+    if cli.bash_hook {
+        return commands::hooks::cmd_bash_hook(cli.deny);
     }
     if cli.uninstall_claude_code {
         return commands::install::uninstall_claude_code();
@@ -484,6 +502,7 @@ fn main() -> Result<()> {
         Some(Commands::InstallOpenCode) => commands::install::install_opencode(),
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
+        Some(Commands::Validate { path }) => commands::validate::run(&path),
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {

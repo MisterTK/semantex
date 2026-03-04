@@ -396,10 +396,7 @@ impl HybridSearcher {
                         existing.score = hit.score;
                     }
                 } else if !existing_ids.contains(&hit.chunk_id) {
-                    fused.push(ScoredChunkId {
-                        chunk_id: hit.chunk_id,
-                        score: hit.score,
-                    });
+                    fused.push(ScoredChunkId::new(hit.chunk_id, hit.score));
                 }
             }
             fused.sort_by(|a, b| {
@@ -494,10 +491,7 @@ impl HybridSearcher {
         let scored_ids: Vec<ScoredChunkId> = fused
             .iter()
             .take(fetch_count)
-            .map(|s| ScoredChunkId {
-                chunk_id: s.chunk_id,
-                score: s.score,
-            })
+            .cloned()
             .collect();
         let expanded = graph_propagation::propagate(&scored_ids, &store, &graph_config)?;
 
@@ -532,10 +526,7 @@ impl HybridSearcher {
                 .iter()
                 .filter(|s| !existing_ids.contains(&s.chunk_id))
             {
-                fused.push(ScoredChunkId {
-                    chunk_id: s.chunk_id,
-                    score: s.score,
-                });
+                fused.push(s.clone());
             }
             fused.sort_by(|a, b| {
                 b.score
@@ -684,6 +675,9 @@ impl HybridSearcher {
                         chunk,
                         score: scored.score,
                         source: chunk_source,
+                        score_dense: scored.score_dense,
+                        score_sparse: scored.score_sparse,
+                        score_exact: scored.score_exact,
                     }
                 })
             })
@@ -922,6 +916,9 @@ impl HybridSearcher {
                         chunk,
                         score: scored.score,
                         source: SearchSource::Sparse,
+                        score_dense: scored.score_dense,
+                        score_sparse: scored.score_sparse,
+                        score_exact: scored.score_exact,
                     })
             })
             .filter(|result| {
@@ -1071,7 +1068,7 @@ pub fn rrf_fuse(
     // Convert to scored chunks and sort by descending RRF score
     let mut fused: Vec<ScoredChunkId> = scores
         .into_iter()
-        .map(|(chunk_id, score)| ScoredChunkId { chunk_id, score })
+        .map(|(chunk_id, score)| ScoredChunkId::new(chunk_id, score))
         .collect();
 
     fused.sort_by(|a, b| {
@@ -1099,10 +1096,7 @@ pub fn grep_mode_fuse(sparse_list: &[ScoredChunkId], exact_ids: &[u64]) -> Vec<S
     // Exact matches first, all at score 1.0 (highest priority)
     for &id in exact_ids {
         if seen.insert(id) {
-            fused.push(ScoredChunkId {
-                chunk_id: id,
-                score: 1.0,
-            });
+            fused.push(ScoredChunkId::new(id, 1.0));
         }
     }
 
@@ -1112,10 +1106,7 @@ pub fn grep_mode_fuse(sparse_list: &[ScoredChunkId], exact_ids: &[u64]) -> Vec<S
             // Normalize BM25 scores to 0..1 range below exact matches
             // Use a sigmoid-like normalization so scores stay meaningful
             let normalized = item.score / (item.score + 1.0);
-            fused.push(ScoredChunkId {
-                chunk_id: item.chunk_id,
-                score: normalized,
-            });
+            fused.push(ScoredChunkId::new(item.chunk_id, normalized));
         }
     }
 
@@ -1142,7 +1133,7 @@ fn dual_route_fuse(
     }
     let mut fused: Vec<ScoredChunkId> = scores
         .into_iter()
-        .map(|(chunk_id, score)| ScoredChunkId { chunk_id, score })
+        .map(|(chunk_id, score)| ScoredChunkId::new(chunk_id, score))
         .collect();
     fused.sort_by(|a, b| {
         b.score
@@ -1184,18 +1175,9 @@ mod tests {
     fn test_rrf_identical_rankings() {
         // When both rankers agree perfectly, RRF should preserve order
         let list_a = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.8,
-            },
-            ScoredChunkId {
-                chunk_id: 3,
-                score: 0.7,
-            },
+            ScoredChunkId::new(1, 0.9),
+            ScoredChunkId::new(2, 0.8),
+            ScoredChunkId::new(3, 0.7),
         ];
         let list_b = list_a.clone();
 
@@ -1212,32 +1194,14 @@ mod tests {
     fn test_rrf_complementary_rankings() {
         // When rankers have different orderings, RRF should favor items with balanced ranks
         let list_a = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.8,
-            },
-            ScoredChunkId {
-                chunk_id: 3,
-                score: 0.7,
-            },
+            ScoredChunkId::new(1, 0.9),
+            ScoredChunkId::new(2, 0.8),
+            ScoredChunkId::new(3, 0.7),
         ];
         let list_b = vec![
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 3,
-                score: 0.8,
-            },
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.7,
-            },
+            ScoredChunkId::new(2, 0.9),
+            ScoredChunkId::new(3, 0.8),
+            ScoredChunkId::new(1, 0.7),
         ];
 
         let result = rrf_fuse(&list_a, &list_b, 60.0, &EQUAL);
@@ -1255,24 +1219,12 @@ mod tests {
     fn test_rrf_unique_items() {
         // When lists have different items, all should appear
         let list_a = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.8,
-            },
+            ScoredChunkId::new(1, 0.9),
+            ScoredChunkId::new(2, 0.8),
         ];
         let list_b = vec![
-            ScoredChunkId {
-                chunk_id: 3,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 4,
-                score: 0.8,
-            },
+            ScoredChunkId::new(3, 0.9),
+            ScoredChunkId::new(4, 0.8),
         ];
 
         let result = rrf_fuse(&list_a, &list_b, 60.0, &EQUAL);
@@ -1289,19 +1241,10 @@ mod tests {
     fn test_rrf_k_parameter_effect() {
         // Lower k makes rank position more important
         let list_a = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.1,
-            },
+            ScoredChunkId::new(1, 0.9),
+            ScoredChunkId::new(2, 0.1),
         ];
-        let list_b = vec![ScoredChunkId {
-            chunk_id: 2,
-            score: 0.9,
-        }];
+        let list_b = vec![ScoredChunkId::new(2, 0.9)];
 
         // With high k (60), early ranks matter less
         let result_high_k = rrf_fuse(&list_a, &list_b, 60.0, &EQUAL);
@@ -1318,10 +1261,7 @@ mod tests {
 
     #[test]
     fn test_rrf_empty_lists() {
-        let list_a = vec![ScoredChunkId {
-            chunk_id: 1,
-            score: 0.9,
-        }];
+        let list_a = vec![ScoredChunkId::new(1, 0.9)];
         let list_b: Vec<ScoredChunkId> = vec![];
 
         let result = rrf_fuse(&list_a, &list_b, 60.0, &EQUAL);
@@ -1342,33 +1282,15 @@ mod tests {
         // RANK position, making it more robust to score scale differences.
 
         let dense_results = vec![
-            ScoredChunkId {
-                chunk_id: 100,
-                score: 0.95,
-            }, // False positive, high semantic similarity
-            ScoredChunkId {
-                chunk_id: 200,
-                score: 0.75,
-            }, // True positive, appears in both
-            ScoredChunkId {
-                chunk_id: 300,
-                score: 0.60,
-            },
+            ScoredChunkId::new(100, 0.95), // False positive, high semantic similarity
+            ScoredChunkId::new(200, 0.75), // True positive, appears in both
+            ScoredChunkId::new(300, 0.60),
         ];
 
         let bm25_results = vec![
-            ScoredChunkId {
-                chunk_id: 200,
-                score: 12.5,
-            }, // True positive, different scale
-            ScoredChunkId {
-                chunk_id: 400,
-                score: 8.3,
-            },
-            ScoredChunkId {
-                chunk_id: 500,
-                score: 6.1,
-            },
+            ScoredChunkId::new(200, 12.5), // True positive, different scale
+            ScoredChunkId::new(400, 8.3),
+            ScoredChunkId::new(500, 6.1),
         ];
 
         let rrf_result = rrf_fuse(&dense_results, &bm25_results, 60.0, &EQUAL);
@@ -1395,14 +1317,8 @@ mod tests {
         // Identifier query weights: dense=0.2, sparse=1.0
         let ident_weights = query_classifier::QueryType::Identifier.fusion_weights();
 
-        let dense_list = vec![ScoredChunkId {
-            chunk_id: 1,
-            score: 0.95,
-        }];
-        let sparse_list = vec![ScoredChunkId {
-            chunk_id: 2,
-            score: 15.0,
-        }];
+        let dense_list = vec![ScoredChunkId::new(1, 0.95)];
+        let sparse_list = vec![ScoredChunkId::new(2, 15.0)];
 
         let result = rrf_fuse(&dense_list, &sparse_list, 60.0, &ident_weights);
 
@@ -1417,14 +1333,8 @@ mod tests {
         // Semantic query weights: dense=0.1, sparse=0.9
         let sem_weights = query_classifier::QueryType::Semantic.fusion_weights();
 
-        let dense_list = vec![ScoredChunkId {
-            chunk_id: 1,
-            score: 0.95,
-        }];
-        let sparse_list = vec![ScoredChunkId {
-            chunk_id: 2,
-            score: 15.0,
-        }];
+        let dense_list = vec![ScoredChunkId::new(1, 0.95)];
+        let sparse_list = vec![ScoredChunkId::new(2, 15.0)];
 
         let result = rrf_fuse(&dense_list, &sparse_list, 60.0, &sem_weights);
 
@@ -1439,24 +1349,12 @@ mod tests {
         let mixed_weights = query_classifier::QueryType::Mixed.fusion_weights();
 
         let dense_list = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.9,
-            },
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.7,
-            },
+            ScoredChunkId::new(1, 0.9),
+            ScoredChunkId::new(2, 0.7),
         ];
         let sparse_list = vec![
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 10.0,
-            },
-            ScoredChunkId {
-                chunk_id: 3,
-                score: 5.0,
-            },
+            ScoredChunkId::new(2, 10.0),
+            ScoredChunkId::new(3, 5.0),
         ];
 
         let result = rrf_fuse(&dense_list, &sparse_list, 60.0, &mixed_weights);
@@ -1492,18 +1390,9 @@ mod tests {
         #[test]
         fn test_grep_mode_sparse_only() {
             let sparse = vec![
-                ScoredChunkId {
-                    chunk_id: 1,
-                    score: 10.0,
-                },
-                ScoredChunkId {
-                    chunk_id: 2,
-                    score: 5.0,
-                },
-                ScoredChunkId {
-                    chunk_id: 3,
-                    score: 1.0,
-                },
+                ScoredChunkId::new(1, 10.0),
+                ScoredChunkId::new(2, 5.0),
+                ScoredChunkId::new(3, 1.0),
             ];
             let result = grep_mode_fuse(&sparse, &[]);
 
@@ -1520,14 +1409,8 @@ mod tests {
         #[test]
         fn test_grep_mode_exact_before_sparse() {
             let sparse = vec![
-                ScoredChunkId {
-                    chunk_id: 1,
-                    score: 100.0,
-                }, // very high BM25
-                ScoredChunkId {
-                    chunk_id: 2,
-                    score: 50.0,
-                },
+                ScoredChunkId::new(1, 100.0), // very high BM25
+                ScoredChunkId::new(2, 50.0),
             ];
             let exact = vec![3, 4]; // exact matches
 
@@ -1547,14 +1430,8 @@ mod tests {
         #[test]
         fn test_grep_mode_deduplicates() {
             let sparse = vec![
-                ScoredChunkId {
-                    chunk_id: 10,
-                    score: 5.0,
-                },
-                ScoredChunkId {
-                    chunk_id: 20,
-                    score: 3.0,
-                },
+                ScoredChunkId::new(10, 5.0),
+                ScoredChunkId::new(20, 3.0),
             ];
             // Chunk 10 appears in both exact and sparse
             let exact = vec![10, 30];

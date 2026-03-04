@@ -318,6 +318,9 @@ mod tests {
             },
             score,
             source: SearchSource::Hybrid,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
         }
     }
 

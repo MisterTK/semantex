@@ -729,18 +729,9 @@ fn test_rrf_fusion_correctness() -> Result<()> {
 
     // Case 1: Identical rankings should be preserved
     let dense = vec![
-        ScoredChunkId {
-            chunk_id: 1,
-            score: 0.9,
-        },
-        ScoredChunkId {
-            chunk_id: 2,
-            score: 0.8,
-        },
-        ScoredChunkId {
-            chunk_id: 3,
-            score: 0.7,
-        },
+        ScoredChunkId::new(1, 0.9),
+        ScoredChunkId::new(2, 0.8),
+        ScoredChunkId::new(3, 0.7),
     ];
     let sparse = dense.clone();
 
@@ -762,28 +753,13 @@ fn test_rrf_fusion_correctness() -> Result<()> {
 
     // Case 2: Complementary rankings should favor consensus
     let dense = vec![
-        ScoredChunkId {
-            chunk_id: 100,
-            score: 0.95,
-        }, // Only in dense
-        ScoredChunkId {
-            chunk_id: 200,
-            score: 0.75,
-        }, // In both
-        ScoredChunkId {
-            chunk_id: 300,
-            score: 0.60,
-        },
+        ScoredChunkId::new(100, 0.95), // Only in dense
+        ScoredChunkId::new(200, 0.75), // In both
+        ScoredChunkId::new(300, 0.60),
     ];
     let sparse = vec![
-        ScoredChunkId {
-            chunk_id: 200,
-            score: 12.5,
-        }, // In both
-        ScoredChunkId {
-            chunk_id: 400,
-            score: 8.3,
-        }, // Only in sparse
+        ScoredChunkId::new(200, 12.5), // In both
+        ScoredChunkId::new(400, 8.3), // Only in sparse
     ];
 
     let fused = rrf_fuse(
@@ -804,10 +780,7 @@ fn test_rrf_fusion_correctness() -> Result<()> {
 
     // Case 3: Empty lists
     let empty: Vec<ScoredChunkId> = vec![];
-    let non_empty = vec![ScoredChunkId {
-        chunk_id: 1,
-        score: 0.9,
-    }];
+    let non_empty = vec![ScoredChunkId::new(1, 0.9)];
 
     let fused = rrf_fuse(
         &non_empty,

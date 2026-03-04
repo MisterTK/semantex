@@ -1,106 +1,114 @@
-# semantex — Semantic Code Search
+# semantex — Semantic Code Search for AI Agents
 
-**Hybrid dense+sparse code search with ColBERT late interaction and BM25**
+**Cut your agent's token usage by 40%, context burden by 67%, and tool calls by 55% — with zero quality loss.**
 
-semantex is a fully local, production-grade semantic code search engine. It combines per-token neural embeddings (ColBERT/PLAID) with stemmed BM25 keyword search and intelligent fusion to find code by meaning, not just pattern matching.
+semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loops AI agents use to explore codebases. It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
 
-## Why semantex?
+## The Problem: Agents Waste Most of Their Tokens Searching
 
-Traditional grep tools match exact patterns. semantex understands **meaning**:
+When an AI coding agent needs to understand a codebase, it falls into a predictable pattern:
 
-```bash
-# Find authentication code, even if it doesn't contain "auth"
-semantex "verify user credentials" ./src
-
-# Understand intent, not just keywords
-semantex "database connection pool initialization" .
-
-# Search in natural language
-semantex "function that handles file uploads with progress tracking" .
+```
+Grep "authentication" → 15 files match
+Read file1.rs (lines 1-200) → not quite right
+Grep "verify.*token" → 8 files match
+Read file2.rs (lines 50-150) → getting warmer
+Read file3.rs (lines 1-300) → found it, but need callers
+Grep "calls verify_token" → ...
 ```
 
-## Key Features
+Each tool call adds content to the context window that **never goes away**. The agent re-reads this growing history on every subsequent turn. The cost isn't linear — it's **quadratic**:
 
-### Hybrid Retrieval Architecture
+```
+Context at turn k:  Cₖ = B + δ₁ + δ₂ + ... + δₖ₋₁     (monotonically growing)
 
-semantex uses a multi-stage search pipeline:
+Total cognitive load: CCB = Σ Cₖ ≈ N·B + δ·N·(N-1)/2   ← O(N²) in tool calls
+```
 
-1. **Dense search** (ColBERT/PLAID) — per-token late interaction with MaxSim scoring (48d embeddings)
-2. **Sparse search** (BM25 via Tantivy) — stemmed keyword matching with code-aware tokenization
-3. **Triple CC fusion** — query-adaptive convex combination of dense, sparse, and exact scores
-4. **File role boosting** — 11-class path heuristics (Service x1.15 to Test x0.70)
+An agent making 20 tool calls doesn't process 20× the content of one call — it processes closer to **200×**, because each call resends the entire accumulated history. And as context grows, attention degrades: information from early tool returns gets buried in the middle of a 70K+ token context, exactly where LLMs attend worst.
 
-### Search Quality
+**The result**: agents spend 60-80% of their tokens on search overhead, not on reasoning about your actual question.
 
-- **ColBERT LateOn-Code-edge**: Per-token embeddings purpose-built for code, 48-dimensional via PLAID index
-- **Snowball English stemmer**: BM25 pipeline stems both indexed content and queries for better NL recall
-- **Stemmed synonym expansion**: Bridges natural language to code identifiers (e.g., "encrypting" matches "encrypt", "cipher", "KMS")
-- **Query-adaptive fusion**: Auto-detects query type (identifier, keyword, semantic, mixed) and adjusts weights
-- **Code-aware tokenizer**: Splits camelCase/snake_case, emits sub-tokens + joined forms
+## The Solution: One Call, Complete Answer
 
-### Performance
+semantex collapses the search loop into a single tool call:
 
-- **16ms warm search** (daemon mode, no rerank)
-- **4x faster than grep** on average
-- **222x fewer tokens** in compact output mode (7 vs 1,555 tokens)
-- **Identifier recall**: 0.90+ on exact keyword queries
-- **F1 score**: 0.610 (beats grep's 0.454 on 30-query benchmark)
+```
+Agent → semantex_deep "how does authentication work"
+     ← Prose answer + source references           (1 call, done)
+```
+
+Instead of the agent iteratively searching and reading, semantex does it internally — semantic search, graph expansion, content reading, and extractive summarization — and returns a pre-digested answer the agent can immediately act on.
+
+### Measured Impact (Benchmark: 10 agents, 5 real-world tasks, Sonnet 4.6)
+
+| Metric | With semantex | Without (Grep/Glob/Read) | Improvement |
+|---|---|---|---|
+| **Total tokens** | 212K | 355K | **-40%** |
+| **Cumulative context burden** | 2.2M | 6.8M | **-67%** |
+| **Tool calls** | 39 | 86 | **-55%** |
+| **Peak context size** | 42K avg | 71K avg | **-40%** |
+| **Wall-clock time** | 513s | 609s | **-16%** |
+| **Answer quality** | Comprehensive | Comprehensive | **Tie** |
+
+The -40% token saving is the billing metric. The **-67% cumulative context burden** is the cognitive metric — how much the model actually had to attend to across all turns. Fewer turns × smaller context = quadratically less waste.
+
+> Full methodology, per-question data, and the mathematical framework: [docs/BENCHMARK-semantex-vs-builtin-tools.md](docs/BENCHMARK-semantex-vs-builtin-tools.md)
+
+## How It Works
+
+### For the Agent: Two Tools, Simple Routing
+
+| Question type | Tool | What happens |
+|---|---|---|
+| *"How does auth work?"* | `semantex_deep` | Search→triage→graph expand→read→summarize. One call, complete answer. |
+| *"Find the Config struct"* | `semantex_search` | Ranked results with file, lines, score, snippet. |
+
+`semantex_deep` replaces 5-10 Grep→Read iterations. `semantex_search` replaces Grep→Glob for lookups.
+
+### Under the Hood: Hybrid Search Pipeline
+
+```
+Query → Classification → Expansion (stemmed synonyms)
+                              |
+Query → ColBERT (48d) → PLAID MaxSim ──────┐
+                                            ├→ Triple CC Fusion → Results
+Query → Stemmed BM25 (Tantivy) ────────────┤
+                                            │
+Query → Exact string match ─────────────────┘
+```
+
+1. **Dense search** — ColBERT per-token embeddings with late interaction (MaxSim scoring via PLAID index)
+2. **Sparse search** — BM25 via Tantivy with Snowball stemming and code-aware tokenization
+3. **Fusion** — query-adaptive convex combination of dense, sparse, and exact match scores
+4. **Deep pipeline** — search → triage → call graph expansion → content read → extractive summary
 
 ### Fully Local & Private
 
-- **No cloud dependencies**: All processing runs locally on your machine
-- **No telemetry**: Your code never leaves your device
-- **Offline-first**: Works without internet after initial model download
-
-### Progressive Disclosure for AI Agents
-
-semantex implements a layered retrieval architecture that minimizes token usage:
-
-- **`--refs`** (default): Compact references — `file:line [kind] "summary"` (~200 tokens/10 results)
-- **`--peek`**: Refs + first 5 lines of code per result (~740 tokens/10 results)
-- **`--around <symbol>`**: Call graph walk — callers, callees, type refs for a named symbol
-- **`--deep`**: Internal search→read→summarize pipeline — returns a curated prose answer
-- **Batch queries**: `semantex --refs "q1" "q2" "q3"` runs multiple queries in one call
-- **MCP server**: 5 tools (`semantex_search`, `semantex_deep`, `semantex_index`, `semantex_status`, `semantex_health`)
-- **TCP daemon**: Persistent server for 10ms warm searches
+- All processing runs locally — your code never leaves your machine
+- No cloud APIs, no telemetry, no internet required after initial model download (~17MB)
+- Single ~17MB int8 ONNX model (ColBERT LateOn-Code-edge), cached and shared across projects
 
 ## Installation
 
-**macOS / Linux** — one command, no PATH changes needed:
+**macOS / Linux** — one command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
 ```
 
-Installs to `/usr/local/bin` (or `~/.local/bin` as fallback). `semantex` is ready immediately — no shell restart required.
+**Windows** — download from [GitHub Releases](https://github.com/MisterTK/semantex/releases/latest).
 
-**Windows** — download the `.zip` from [GitHub Releases](https://github.com/MisterTK/semantex/releases/latest) and add the binary to your PATH.
-
-**Build from source** (requires Rust 1.91+):
+**Build from source** (Rust 1.91+):
 
 ```bash
 git clone https://github.com/MisterTK/semantex.git
-cd semantex
-cargo install --path crates/semantex-cli
+cd semantex && cargo install --path crates/semantex-cli
 ```
 
-## Getting Started
+## Setup
 
-semantex has three integration modes. **Pick one** — they are independent and should not be combined.
-
-| Mode | Best for | Setup |
-|------|----------|-------|
-| [MCP Server](#mcp-server-cursor-windsurf-cline-and-others) | Cursor, Windsurf, Cline, any MCP client | Add to editor MCP config |
-| [Claude Code Skill](#claude-code-skill) | Claude Code | One command install |
-| [Standalone CLI](#standalone-cli) | Terminal, scripts, CI | Just run `semantex` |
-
----
-
-### MCP Server (Cursor, Windsurf, Cline, and others)
-
-semantex implements the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP 2025-03-26) over stdio. Any MCP-compatible editor or agent can use it.
-
-**Setup** — add to your editor's MCP configuration:
+semantex is an [MCP server](https://modelcontextprotocol.io/) (MCP 2025-03-26). Add it to your editor's MCP configuration:
 
 ```json
 {
@@ -113,308 +121,148 @@ semantex implements the [Model Context Protocol](https://modelcontextprotocol.io
 }
 ```
 
-Where to put this depends on your editor:
-
 | Editor | Config file |
 |--------|-------------|
+| **Claude Code** | `.mcp.json` in project root, or `~/.claude/settings.json` for global |
 | **Cursor** | `.cursor/mcp.json` in project root |
 | **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
 | **Cline** | VS Code settings → Cline MCP Servers |
 | **Continue** | `~/.continue/config.json` under `mcpServers` |
-| **Generic** | Wherever your client reads MCP server config |
+| **Codex** | `semantex install-codex` |
+| **OpenCode** | `semantex install-open-code` |
 
-Setup helpers for specific tools:
+That's it. semantex auto-indexes your project on first search — no manual indexing step required.
 
-```bash
-semantex install-codex       # OpenAI Codex CLI
-semantex install-open-code   # OpenCode
-```
+### Tools
 
-**What the client gets** — 5 tools, automatically discovered at startup:
+5 tools, automatically discovered by your editor at startup:
 
-| Tool | Purpose | Auto-approve |
-|------|---------|:------------:|
-| `semantex_search` | Semantic + keyword search with progressive disclosure | Yes |
-| `semantex_deep` | Search, triage, graph-expand, read, and summarize into a prose answer | Yes |
-| `semantex_index` | Trigger background indexing for a project | No |
-| `semantex_status` | Index metadata (file count, chunk count, freshness) | Yes |
-| `semantex_health` | Full system health check (model status, cache stats) | Yes |
+| Tool | Purpose |
+|------|---------|
+| `semantex_deep` | **Complex questions.** One call replaces 5-10 grep+read iterations. Returns prose answer with sources. |
+| `semantex_search` | Simple lookups: find definitions, list references, locate files. |
+| `semantex_index` | Trigger or rebuild the index for a project. |
+| `semantex_status` | Check index state (file count, chunk count, freshness). |
+| `semantex_health` | System health check (model status, cache stats). |
 
-Read-only tools are annotated with `readOnlyHint: true` so clients that support MCP tool annotations can auto-approve them without user confirmation.
+All read-only tools are annotated with `readOnlyHint: true` so editors that support [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-03-26/server/tools#annotations) can auto-approve them.
 
-**MCP features:**
+### MCP Features
 
-- **Structured output** — `semantex_search` and `semantex_deep` return machine-readable JSON in `structuredContent` alongside the text fallback, so clients can render results natively
-- **Progress notifications** — `semantex_deep` sends phase-by-phase progress (searching, triaging, graph-expanding, reading, summarizing) so the client can show a progress indicator
-- **Logging** — tool events are emitted as MCP log notifications; clients can set the log level via `logging/setLevel`
-- **Server instructions** — at initialization, semantex sends the LLM usage guidance for progressive disclosure (`search` first, then `deep` or `around` for complex questions)
-- **Auto-indexing** — first search auto-indexes the project; no manual `index` call needed
+- **Server instructions** — at initialization, semantex sends routing guidance to the LLM: use `deep` for complex questions, `search` for lookups
+- **Structured output** — `semantex_search` and `semantex_deep` return machine-readable JSON in `structuredContent` alongside text, so editors can render results natively
+- **Progress notifications** — `semantex_deep` sends phase-by-phase progress (searching, triaging, graph-expanding, reading, summarizing)
+- **Auto-indexing** — first search triggers background indexing; returns keyword (ripgrep) results immediately while the index builds
+- **Logging** — tool events emitted as MCP log notifications; clients can set level via `logging/setLevel`
 
----
+## Standalone CLI
 
-### Claude Code Skill
-
-For Claude Code specifically, semantex installs as a **skill + hooks** — not via MCP. This gives deeper integration: hooks nudge Claude and all sub-agents to prefer semantex over built-in Grep/Glob.
-
-> **Do not combine with MCP mode.** If you use `install-claude-code`, do not also add semantex to an MCP config. Pick one.
+semantex also works as a standalone CLI tool for terminal use, scripts, and CI:
 
 ```bash
-# Install skill + hooks (fully automated)
-semantex install-claude-code
+# Search semantically (auto-indexes on first run)
+semantex "authentication logic" /path/to/project
 
-# Restart Claude Code — semantex is now active
-```
+# Deep search — complete answer in one call
+semantex --deep "how does the auth flow work"
 
-That's it. semantex auto-indexes your project on first search, pre-warms a daemon for fast queries, and nudges Claude (and sub-agents) to prefer semantex over Grep/Glob. No manual indexing step required.
+# Compact references with signatures and metadata
+semantex --refs "database connection pool"
 
-**What gets installed:**
+# Call graph for a symbol (callers, callees, type refs)
+semantex --around handle_request
 
-- **Skill** (SKILL.md) — teaches Claude the progressive disclosure workflow: `--refs` → `--around` → `--deep` → `--peek` → Read
-- **Hooks** — intercept session start (pre-warm daemon) and tool calls (redirect to semantex when appropriate)
+# Code preview — refs + first 5 lines per result
+semantex --peek "error handling middleware"
 
----
-
-### Standalone CLI
-
-semantex works as a standalone CLI tool without any AI editor:
-
-```bash
-# Index your project (or let semantex auto-index on first search)
-semantex index /path/to/your/project
-
-# Search semantically
-semantex "authentication logic" /path/to/your/project
-```
-
-See [Usage](#usage) for the full CLI reference.
-
----
-
-### System Requirements
-
-- **Rust**: 1.91 or later (edition 2024)
-- **Platform**: macOS (ARM/Intel), Linux, Windows
-- **Memory**: 2GB+ RAM recommended
-- **Disk**: ~100MB for models (ColBERT ~17MB + optional reranker ~80MB) + index storage
-
-### Model Downloads
-
-On first index, semantex automatically downloads the ColBERT model to `~/.semantex/models/`:
-
-- **ColBERT model**: LateOn-Code-edge (~17MB int8 ONNX, 48d per-token embeddings)
-- **Reranker model**: JINA Reranker v1 Turbo (~80MB, optional via `--rerank`)
-
-Models are cached and shared across all semantex instances.
-
-## Usage
-
-### Basic Search
-
-```bash
-# Search current directory
-semantex "handle user authentication"
-
-# Search specific path
-semantex "database migration logic" ./backend/db
-
-# Limit results
-semantex --max-count 5 "error handling"
-
-# Show code snippets in results
-semantex --content "API endpoint for users"
-```
-
-### File-Type Filtering
-
-```bash
-# Search only Rust files
-semantex -t rs "error handling"
-
-# Search TypeScript and JavaScript
-semantex -t ts -t js "API endpoint"
-
-# Multiple types
-semantex -t rs -t py -t go "factory pattern"
-```
-
-### Compact Output Modes
-
-```bash
-# Grep-like one-line format (222x token reduction vs grep multi-iteration)
-semantex --grep "authentication"
-
-# JSON output for programmatic use
-semantex --json "database"
-
-# JSON without content (compact)
-semantex --json --no-content "error handling"
-```
-
-### Search Modes
-
-```bash
-# Default: Hybrid search (dense + sparse + fusion)
-semantex "authentication middleware"
-
-# Dense-only (semantic search only)
-semantex --dense-only "user verification"
-
-# Sparse-only (keyword search only)
-semantex --sparse-only "authenticate"
-
-# Grep mode (exact + BM25, no dense, exhaustive)
-semantex -G "authenticate"
-
-# Regex + semantic hybrid
-semantex -e "Promise\.allSettled" "parallel failure handling"
-```
-
-### Progressive Disclosure (Agent Workflow)
-
-```bash
-# Level 0: Compact refs — cheapest, ~200 tokens for 10 results
-semantex --refs "authentication flow"
-
-# Level 1: Peek — refs + 5-line code preview per result
-semantex --peek "authentication flow"
-
-# Level 1: Graph walk — callers, callees, type refs for a symbol
-semantex --around authenticate_user
-
-# Level 2: Deep — search, read, and summarize into a prose answer
-semantex --deep "how does the authentication flow work end-to-end"
-
-# Batch: multiple queries in one invocation
+# Batch multiple queries in one call
 semantex --refs "auth flow" "token validation" "session management"
 ```
 
-Most agent tasks complete at `--refs`. Use `--deep` for complex architectural questions.
-
-### Daemon Server
+### More CLI Options
 
 ```bash
-# Start daemon server (16ms warm search)
-semantex serve /path/to/project
+# Retrieval strategies
+semantex --dense-only "user verification"     # ColBERT only (semantic)
+semantex --sparse-only "authenticate"          # BM25 only (keyword)
+semantex -G "ConnectionFactory"               # Grep parity (exact + BM25)
+semantex --rerank "complex query"             # Cross-encoder reranking
+semantex -e "async fn" "database pool"        # Regex + semantic hybrid
 
-# Search via daemon (auto-detected)
-semantex "authentication" /path/to/project
+# Output formats
+semantex -v "query"                 # Verbose: full content, ANSI colors
+semantex -g "query"                 # Grep-like: one line per result
+semantex --json "query"             # JSON array
+semantex --json --no-content "q"    # JSON, metadata only
 
-# Stop daemon
-semantex stop /path/to/project
+# Filtering
+semantex -t rs "error handling"     # Only Rust files
+semantex -t ts -t js "API endpoint" # Multiple types
+semantex --code-only "factory"      # Exclude docs/config
+semantex -m 20 "database"           # Max 20 results
 
-# Auto-reindex on file changes
-semantex watch /path/to/project
+# Daemon
+semantex serve /path/to/project     # Start daemon (10ms warm search)
+semantex stop /path/to/project      # Stop daemon
+semantex watch /path/to/project     # Auto-reindex on file changes
 ```
 
-### MCP Server
+## Supported Languages
 
-Run `semantex mcp` to start the MCP server over stdio. See [MCP Server setup](#mcp-server-cursor-windsurf-cline-and-others) for editor configuration and the full list of tools.
+27 file types, including 23 with tree-sitter AST-aware chunking:
+
+- **AST-parsed (23):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte
+- **Text-chunked (4):** Markdown, JSON, TOML, YAML
+- Fallback text chunking for any other file type
 
 ## Architecture
-
-### Search Pipeline
-
-```
-Query -> Query Classification -> Query Expansion (stemmed synonyms)
-                                       |
-                                       v
-Query -> ColBERT Embedding -> PLAID Search ----+
-                                               |-> Triple CC Fusion -> File Role Boost -> Results
-Query -> Stemmed CodeTokenizer -> BM25 --------+
-                                               |
-Query -> Exact string match -------------------+
-```
 
 ### Deep Search Pipeline
 
 ```
-Agent → semantex --deep "query"
+Agent → semantex_deep "query"
           │
           ├─ Phase 1: Hybrid search (top-20 candidates)
           ├─ Phase 2: Triage (dedup, per-file cap, kind preference → top-8)
-          ├─ Phase 3: Graph expansion (callers/callees/types, 1 hop → up to 12 total)
-          ├─ Phase 4: Read full content from SQLite
+          ├─ Phase 3: Graph expansion (callers/callees/types, 1 hop → up to 12)
+          ├─ Phase 4: Read full content (32KB budget)
           └─ Phase 5: Extractive summarize → prose answer + source refs
 ```
-
-Output: `<answer>...</answer>` with `Sources:` listing. Typically <50ms.
-
-### Components
-
-- **Indexer**: tree-sitter AST parsing, intelligent chunking with 6-layer NL annotations
-- **Dense Embedder**: ColBERT LateOn-Code-edge via next-plaid (48d per-token, MaxSim)
-- **Sparse Index**: Tantivy BM25 with Snowball stemmer + CodeTokenizer
-- **Query Expander**: Stemmed synonym table bridging NL concepts to code tokens
-- **Fusion**: Triple CC (Convex Combination) with query-adaptive weights
-- **File Classifier**: 11-role path heuristics with semantic boost multipliers
 
 ### Project Structure
 
 ```
 semantex/
 ├── crates/
-│   ├── semantex-core/      # Core search engine (indexing, search, embeddings)
+│   ├── semantex-core/      # Search engine (indexing, search, embeddings, daemon)
 │   ├── semantex-cli/       # Command-line interface
-│   └── semantex-mcp/       # MCP server
-├── plugin/              # Claude Code plugin (skills, hooks)
-│   ├── .claude-plugin/  #   Plugin manifest
-│   ├── skills/          #   Agent skill definitions
-│   └── hooks/           #   Session and tool hooks
-├── benchmarks/          # Benchmark scripts and ground truth
-└── docs/                # Architecture and design documents
+│   └── semantex-mcp/       # MCP server (5 tools over stdio)
+├── benchmarks/              # Benchmark scripts and ground truth
+└── docs/                    # Architecture docs and benchmark data
 ```
 
-## Supported Languages
+### System Requirements
 
-semantex indexes 27 file types, including 23 with tree-sitter AST-aware chunking:
-
-- **AST-parsed (23):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte
-- **Text-chunked (4):** Markdown, JSON, TOML, YAML
-
-Plus fallback text chunking for any other file type.
-
-## Benchmarks
-
-On a 30-query benchmark (8 exact, 14 semantic, 8 architectural):
-
-| Metric | grep | semantex |
-|--------|------|-------|
-| **Overall F1** | 0.454 | **0.610** |
-| **Speed (warm)** | 64ms | **17ms** |
-| **Tokens (compact)** | 1,555 | **7** |
-| **Exact F1** | 0.606 | **0.645** |
-| **Semantic F1** | 0.463 | **0.568** |
-| **Architectural F1** | 0.285 | **0.650** |
+- **Platform**: macOS (ARM/Intel), Linux, Windows
+- **Memory**: 2GB+ RAM recommended
+- **Disk**: ~100MB for models + index storage
+- **Build**: Rust 1.91+ (if building from source)
 
 ## Development
 
-### Building from Source
-
 ```bash
-git clone https://github.com/MisterTK/semantex.git
-cd semantex
-cargo build --release
-```
-
-### Running Tests
-
-```bash
-cargo test --all
-cargo clippy --all
+cargo build --release          # Build
+cargo test --all               # Test
+cargo clippy --all             # Lint
 ```
 
 ### Environment Variables
 
 ```bash
-SEMANTEX_ORT_THREADS=4     # ONNX Runtime thread count (default: 4)
-SEMANTEX_COREML=1          # Enable CoreML acceleration on macOS
-SEMANTEX_MAX_RSS_MB=2048   # Daemon RSS hard limit in MB (default: 2048, 0=disabled)
-RUST_LOG=info              # Logging level (error, warn, info, debug, trace)
+SEMANTEX_ORT_THREADS=4         # ONNX Runtime threads (default: 4)
+SEMANTEX_COREML=1              # CoreML acceleration on macOS
+SEMANTEX_MAX_RSS_MB=2048       # Daemon RSS limit in MB (default: 2048)
 ```
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
@@ -422,9 +270,4 @@ Apache-2.0
 
 ## Credits
 
-Built with:
-- [next-plaid](https://github.com/lightonai/next-plaid) — ColBERT/PLAID late interaction search
-- [Tantivy](https://github.com/quickwit-oss/tantivy) — Full-text search with BM25
-- [fastembed-rs](https://github.com/Anush008/fastembed-rs) — Cross-encoder reranking
-- [tree-sitter](https://tree-sitter.github.io/) — Code parsing
-- [ONNX Runtime](https://onnxruntime.ai/) — Neural model inference
+Built with [next-plaid](https://github.com/lightonai/next-plaid) (ColBERT/PLAID), [Tantivy](https://github.com/quickwit-oss/tantivy) (BM25), [fastembed-rs](https://github.com/Anush008/fastembed-rs) (reranking), [tree-sitter](https://tree-sitter.github.io/) (AST parsing), [ONNX Runtime](https://onnxruntime.ai/) (inference).

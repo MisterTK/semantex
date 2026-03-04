@@ -25,11 +25,33 @@
         ]
       },
       {
-        "matcher": "Task",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "semantex --task-hook",
+            "command": "semantex --bash-hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "Explore",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "semantex --subagent-hook",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "general-purpose",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "semantex --subagent-hook",
             "timeout": 5
           }
         ]

@@ -121,10 +121,7 @@ impl SparseIndex {
             if let Some(chunk_id) = doc.get_first(self.chunk_id_field)
                 && let Some(id) = chunk_id.as_u64()
             {
-                results.push(ScoredChunkId {
-                    chunk_id: id,
-                    score,
-                });
+                results.push(ScoredChunkId::new(id, score));
             }
         }
 

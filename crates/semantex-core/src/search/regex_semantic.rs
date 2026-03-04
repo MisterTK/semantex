@@ -72,7 +72,7 @@ pub fn merge_regex_semantic(
 
     let mut merged: Vec<ScoredChunkId> = scores
         .into_iter()
-        .map(|(chunk_id, score)| ScoredChunkId { chunk_id, score })
+        .map(|(chunk_id, score)| ScoredChunkId::new(chunk_id, score))
         .collect();
     merged.sort_by(|a, b| {
         b.score
@@ -121,24 +121,12 @@ mod tests {
     #[test]
     fn merge_results_uses_max_score() {
         let regex = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.8,
-            },
-            ScoredChunkId {
-                chunk_id: 2,
-                score: 0.5,
-            },
+            ScoredChunkId::new(1, 0.8),
+            ScoredChunkId::new(2, 0.5),
         ];
         let semantic = vec![
-            ScoredChunkId {
-                chunk_id: 1,
-                score: 0.6,
-            },
-            ScoredChunkId {
-                chunk_id: 3,
-                score: 0.9,
-            },
+            ScoredChunkId::new(1, 0.6),
+            ScoredChunkId::new(3, 0.9),
         ];
 
         let merged = merge_regex_semantic(&regex, &semantic, 1.0, 1.0);
@@ -155,14 +143,8 @@ mod tests {
 
     #[test]
     fn merge_results_with_weights() {
-        let regex = vec![ScoredChunkId {
-            chunk_id: 1,
-            score: 1.0,
-        }];
-        let semantic = vec![ScoredChunkId {
-            chunk_id: 1,
-            score: 1.0,
-        }];
+        let regex = vec![ScoredChunkId::new(1, 1.0)];
+        let semantic = vec![ScoredChunkId::new(1, 1.0)];
 
         let merged = merge_regex_semantic(&regex, &semantic, 0.5, 0.8);
         let chunk1 = merged.iter().find(|s| s.chunk_id == 1).expect("chunk 1");

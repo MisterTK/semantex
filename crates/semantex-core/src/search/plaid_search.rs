@@ -80,7 +80,7 @@ impl PlaidSearcher {
                 let doc_idx = doc_id as usize;
                 self.doc_to_chunk
                     .get(doc_idx)
-                    .map(|&chunk_id| ScoredChunkId { chunk_id, score })
+                    .map(|&chunk_id| ScoredChunkId::new(chunk_id, score))
             })
             .collect();
 

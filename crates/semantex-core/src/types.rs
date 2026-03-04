@@ -86,6 +86,10 @@ pub struct SearchResult {
     pub chunk: Chunk,
     pub score: f32,
     pub source: SearchSource,
+    /// Per-channel scores from fusion (0.0 if not from fusion)
+    pub score_dense: f32,
+    pub score_sparse: f32,
+    pub score_exact: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,10 +128,27 @@ pub struct FileEntry {
 }
 
 /// Scored item for internal ranking operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScoredChunkId {
     pub chunk_id: u64,
     pub score: f32,
+    /// Per-channel normalized scores (populated by triple_cc_fuse, zeroed elsewhere)
+    pub score_dense: f32,
+    pub score_sparse: f32,
+    pub score_exact: f32,
+}
+
+impl ScoredChunkId {
+    /// Create a `ScoredChunkId` with per-channel scores defaulted to zero.
+    pub fn new(chunk_id: u64, score: f32) -> Self {
+        Self {
+            chunk_id,
+            score,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
+        }
+    }
 }
 
 /// File-type filter for scoping search results by extension

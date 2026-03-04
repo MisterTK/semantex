@@ -14,11 +14,9 @@ pub enum InstallScope {
     Local,
 }
 
-/// Get the semantex binary path for hook configuration.
-fn semantex_binary_path() -> Result<String> {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .context("Failed to determine semantex binary path")
+/// Binary name for hook commands — always bare so it resolves via PATH.
+fn semantex_binary_path() -> &'static str {
+    "semantex"
 }
 
 fn dirs_home() -> PathBuf {
@@ -109,7 +107,7 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
         None => prompt_scope()?,
     };
 
-    let binary = semantex_binary_path()?;
+    let binary = semantex_binary_path();
     let (claude_dir, settings_path) = scope_paths(&scope)?;
 
     // --- 1. Install hooks into the appropriate settings file ---
@@ -128,8 +126,51 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
 
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
 
-    // Remove legacy PreToolUse hooks (removed in favor of compact default output)
-    hooks_obj.remove("PreToolUse");
+    // PreToolUse hooks — nudge Grep/Glob and Bash search commands toward semantex
+    hooks_obj.insert(
+        "PreToolUse".to_string(),
+        serde_json::json!([
+            {
+                "matcher": "Grep|Glob",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{binary} --grep-hook"),
+                    "timeout": 5,
+                }]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{binary} --bash-hook"),
+                    "timeout": 5,
+                }]
+            }
+        ]),
+    );
+
+    // SubagentStart hooks — inject semantex context into Explore and general-purpose subagents
+    hooks_obj.insert(
+        "SubagentStart".to_string(),
+        serde_json::json!([
+            {
+                "matcher": "Explore",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{binary} --subagent-hook"),
+                    "timeout": 5,
+                }]
+            },
+            {
+                "matcher": "general-purpose",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{binary} --subagent-hook"),
+                    "timeout": 5,
+                }]
+            }
+        ]),
+    );
 
     // SessionStart hook — injects semantex context + pre-warms daemon
     hooks_obj.insert(
@@ -249,6 +290,7 @@ pub fn uninstall_claude_code() -> Result<()> {
             hooks.remove("SessionStart");
             hooks.remove("PreToolUse");
             hooks.remove("SessionEnd");
+            hooks.remove("SubagentStart");
             hooks.len() < before
         } else {
             false
@@ -293,13 +335,10 @@ pub fn uninstall_claude_code() -> Result<()> {
 pub fn install_opencode() -> Result<()> {
     println!("{}", "Installing OpenCode integration...".green().bold());
 
-    let semantex_path = std::env::current_exe()?;
-    let semantex_path_str = semantex_path.display();
-
     println!();
     println!("Add to your OpenCode configuration:");
     println!();
-    println!("  semantex_command: \"{semantex_path_str}\"");
+    println!("  semantex_command: \"semantex\"");
     println!();
     println!(
         "{}",
@@ -313,13 +352,10 @@ pub fn install_opencode() -> Result<()> {
 pub fn install_codex() -> Result<()> {
     println!("{}", "Installing Codex integration...".green().bold());
 
-    let semantex_path = std::env::current_exe()?;
-    let semantex_path_str = semantex_path.display();
-
     println!();
     println!("Add to your Codex configuration:");
     println!();
-    println!("  semantex_command: \"{semantex_path_str}\"");
+    println!("  semantex_command: \"semantex\"");
     println!();
     println!(
         "{}",
