@@ -48,10 +48,12 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
         Ok(searcher) => {
             let shutdown_clone = shutdown.clone();
             let port_file_clone = port_file.clone();
+            let project_path_clone = project_path.clone();
             std::thread::spawn(move || {
                 match Listener::bind(
                     &port_file_clone,
                     searcher,
+                    project_path_clone,
                     Duration::from_secs(86400), // 24h timeout (watch keeps it alive)
                     shutdown_clone,
                 ) {

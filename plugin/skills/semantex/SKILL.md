@@ -40,47 +40,27 @@ hooks:
           timeout: 10
 ---
 
-# semantex — Semantic Code Search
+# semantex — Intelligent Code Search
 
-**Primary search tool.** Finds code by meaning. Sub-agents should also use semantex.
+**Primary search tool.** Use `semantex_agent` for all code search queries.
 
-## Choose by question type
+## Default: semantex_agent
 
-**Understanding code (how/why/connect)?** → Start with `--deep`
-- `semantex --deep "how does the ranking pipeline work"` — searches, reads, and summarizes in one call.
-- **Trust the answer. Do not re-read source files listed in the response.**
-- Footer: confidence zone (`high`/`medium`/`low`) indicates result quality. `low` → rephrase query.
-- Replaces 5-10 grep+read iterations with a single call.
+`semantex_agent` automatically:
+- Detects if you're looking for a symbol, asking a question, or searching with regex/glob
+- Routes to the optimal strategy (semantic, deep, graph walk, exact, regex, file pattern)
+- Falls back to alternative strategies if the primary returns empty
+- Returns a budget-capped, pre-formatted answer
 
-**Finding references (where/what/lookup)?** → Use `--refs`
-- `semantex --refs "query"` — compact refs with signatures + metadata (~15 tokens/result).
-- Each result shows: signature, docstring, key calls, callers — usually enough to decide without reading.
-- Footer: `[high confidence]` → done; `[medium]` → escalate; `[low]` → rephrase.
-- Batch: `semantex --refs "q1" "q2" "q3"` — multiple queries, one call.
+Use this for everything. One call in, one answer out.
 
-**Exploring connections?** → Use `--around`
-- `semantex --around <name>` — callers, callees, type-refs for a symbol.
+## Direct tool access (structured JSON only)
 
-**Need code preview?** → Use `--peek`
-- `semantex --peek "query"` — 5-line code preview per result. Compare across results.
+Only use `semantex_search` or `semantex_deep` directly when you need structured JSON for programmatic use:
+- `semantex_search` — raw `SearchResultItem` JSON with scores and metadata
+- `semantex_deep` — raw `DeepSearchResponse` JSON with answer + sources
 
-**Last resort** → `Read file:start-end` — only 1-2 chunks you've confirmed are relevant.
-
-## Flags
-
-| Flag | Purpose |
-|------|---------|
-| `--deep` | Search+read+summarize (one call, complete answer) |
-| `--refs` | Compact refs for simple lookups |
-| `--around <name>` | Graph walk: callers/callees |
-| `--peek` | 5-line preview per result |
-| `--grep "literal"` | Exact string match (BM25) |
-| `-e "regex" "query"` | Hybrid regex + semantic |
-| `-m N` | Result count (default 10) |
-| `-t EXT` | Filter by extension |
-| `--code-only` | Exclude docs/config |
-
-## Fallbacks
+## Fallbacks (last resort)
 
 - **Grep**: exact regex on file content only
 - **Glob**: find files by name/path pattern only

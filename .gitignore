@@ -33,3 +33,5 @@ CLAUDE.md
 /scripts
 .semantex/
 settings.local.json
+.mcp.json
+/results

@@ -15,6 +15,7 @@ pub enum Request {
     GraphWalk(GraphWalkRequest),
     MultiSearch(MultiSearchRequest),
     DeepSearch(DeepSearchRequest),
+    Agent(AgentRequest),
 }
 
 /// Search request parameters
@@ -123,6 +124,7 @@ pub enum Response {
     GraphWalk(GraphWalkResponse),
     MultiSearch(MultiSearchResponse),
     DeepSearch(DeepSearchResponse),
+    Agent(AgentResponse),
 }
 
 /// Search results response
@@ -227,6 +229,7 @@ pub enum BinaryRequest {
     GraphWalk(GraphWalkRequest),
     MultiSearch(MultiSearchRequest),
     DeepSearch(DeepSearchRequest),
+    Agent(AgentRequest),
 }
 
 /// Binary response type for bincode.
@@ -239,6 +242,7 @@ pub enum BinaryResponse {
     GraphWalk(GraphWalkResponse),
     MultiSearch(MultiSearchResponse),
     DeepSearch(DeepSearchResponse),
+    Agent(AgentResponse),
 }
 
 impl From<BinaryRequest> for Request {
@@ -250,6 +254,7 @@ impl From<BinaryRequest> for Request {
             BinaryRequest::GraphWalk(g) => Request::GraphWalk(g),
             BinaryRequest::MultiSearch(m) => Request::MultiSearch(m),
             BinaryRequest::DeepSearch(d) => Request::DeepSearch(d),
+            BinaryRequest::Agent(a) => Request::Agent(a),
         }
     }
 }
@@ -264,6 +269,7 @@ impl From<Response> for BinaryResponse {
             Response::GraphWalk(g) => BinaryResponse::GraphWalk(g),
             Response::MultiSearch(m) => BinaryResponse::MultiSearch(m),
             Response::DeepSearch(d) => BinaryResponse::DeepSearch(d),
+            Response::Agent(a) => BinaryResponse::Agent(a),
         }
     }
 }
@@ -300,4 +306,106 @@ pub fn decode_binary_response(data: &[u8]) -> Result<BinaryResponse, bincode::er
 /// Decode a binary request from raw bytes (after stripping the magic+length frame).
 pub fn decode_binary_request(data: &[u8]) -> Result<BinaryRequest, bincode::error::DecodeError> {
     bincode::serde::decode_from_slice(data, bincode::config::standard()).map(|(v, _)| v)
+}
+
+// --- Agent types ---
+
+use crate::search::agent_classifier::AgentRoute;
+
+/// Request for agent-orchestrated search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRequest {
+    pub query: String,
+    /// Override automatic classification with a specific route.
+    #[serde(default)]
+    pub route: Option<AgentRoute>,
+    /// Response budget in bytes. Default: 12000 (~3K tokens).
+    #[serde(default)]
+    pub budget: Option<usize>,
+    /// Include full source code blocks (for analytical queries).
+    #[serde(default)]
+    pub full_code: bool,
+}
+
+/// Response from agent-orchestrated search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentResponse {
+    pub route: AgentRoute,
+    pub formatted: String,
+    pub metrics: AgentMetrics,
+}
+
+/// Performance metrics for agent queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMetrics {
+    pub classify_us: u64,
+    pub search_ms: u64,
+    pub format_ms: u64,
+    pub total_ms: u64,
+    pub fallback_used: bool,
+    pub result_count: usize,
+}
+
+#[cfg(test)]
+mod agent_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_request_json_roundtrip() {
+        let req = AgentRequest {
+            query: "how does auth work?".into(),
+            route: None,
+            budget: Some(8000),
+            full_code: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: AgentRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.query, "how does auth work?");
+        assert_eq!(parsed.budget, Some(8000));
+    }
+
+    #[test]
+    fn test_agent_request_with_route() {
+        use crate::search::agent_classifier::AgentRoute;
+        let json = r#"{"query":"AuthService","route":"exact_symbol"}"#;
+        let req: AgentRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.route, Some(AgentRoute::ExactSymbol));
+    }
+
+    #[test]
+    fn test_agent_response_json_roundtrip() {
+        use crate::search::agent_classifier::AgentRoute;
+        let resp = AgentResponse {
+            route: AgentRoute::Semantic,
+            formatted: "[route: semantic]\n\nresults here".into(),
+            metrics: AgentMetrics {
+                classify_us: 5,
+                search_ms: 17,
+                format_ms: 0,
+                total_ms: 18,
+                fallback_used: false,
+                result_count: 3,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: AgentResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.route, AgentRoute::Semantic);
+        assert!(parsed.formatted.contains("[route: semantic]"));
+    }
+
+    #[test]
+    fn test_agent_binary_roundtrip() {
+        let req = BinaryRequest::Agent(AgentRequest {
+            query: "test query".into(),
+            route: None,
+            budget: None,
+            full_code: false,
+        });
+        let encoded = encode_binary_request(&req);
+        let decoded = decode_binary_request(&encoded[5..]).unwrap(); // Skip magic + length
+        match decoded {
+            BinaryRequest::Agent(r) => assert_eq!(r.query, "test query"),
+            _ => panic!("Wrong variant"),
+        }
+    }
 }

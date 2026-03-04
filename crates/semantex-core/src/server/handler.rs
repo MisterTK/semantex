@@ -4,11 +4,13 @@ use crate::search::hybrid::HybridSearcher;
 use crate::types::{Chunk, ChunkType};
 
 use super::protocol::{
-    DeepResponseMetrics, DeepSearchRequest, DeepSearchResponse, DeepSearchSource, ErrorResponse,
-    GraphWalkRequest, GraphWalkResponse, HealthResponse, MultiSearchRequest, MultiSearchResponse,
-    Request, Response, SearchRequest, SearchResponse, SearchResultItem, ShutdownResponse,
+    AgentRequest, DeepResponseMetrics, DeepSearchRequest, DeepSearchResponse, DeepSearchSource,
+    ErrorResponse, GraphWalkRequest, GraphWalkResponse, HealthResponse, MultiSearchRequest,
+    MultiSearchResponse, Request, Response, SearchRequest, SearchResponse, SearchResultItem,
+    ShutdownResponse,
 };
 use crate::search::deep as deep_search_module;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -16,13 +18,19 @@ use std::time::Instant;
 pub struct Handler<'a> {
     searcher: &'a HybridSearcher,
     search_count: &'a AtomicU64,
+    project_root: PathBuf,
 }
 
 impl<'a> Handler<'a> {
-    pub fn new(searcher: &'a HybridSearcher, search_count: &'a AtomicU64) -> Self {
+    pub fn new(
+        searcher: &'a HybridSearcher,
+        search_count: &'a AtomicU64,
+        project_root: PathBuf,
+    ) -> Self {
         Self {
             searcher,
             search_count,
+            project_root,
         }
     }
 
@@ -36,7 +44,14 @@ impl<'a> Handler<'a> {
             Request::GraphWalk(req) => self.handle_graph_walk(&req),
             Request::MultiSearch(req) => self.handle_multi_search(req),
             Request::DeepSearch(ref req) => self.handle_deep_search(req),
+            Request::Agent(ref req) => self.handle_agent(req),
         }
+    }
+
+    fn handle_agent(&self, req: &AgentRequest) -> Response {
+        use crate::search::agent::AgentPipeline;
+        let pipeline = AgentPipeline::new(self.searcher, self.project_root.clone());
+        Response::Agent(pipeline.handle(req))
     }
 
     fn handle_search(&self, req: SearchRequest) -> Response {
@@ -406,6 +421,70 @@ pub(crate) fn chunk_to_item(chunk: &Chunk) -> SearchResultItem {
         name,
         language,
         content: None,
+        kind,
+        summary,
+    }
+}
+
+/// Convert a SearchResult to a SearchResultItem (with optional content).
+/// Used by the agent pipeline to convert search output to protocol items.
+pub(crate) fn search_result_to_item(
+    result: &crate::types::SearchResult,
+    include_content: bool,
+) -> SearchResultItem {
+    let (chunk_type_str, name, language, kind, summary) = match &result.chunk.chunk_type {
+        crate::types::ChunkType::AstNode {
+            name,
+            kind,
+            language,
+            structured_meta,
+            ..
+        } => {
+            let kind_str = Some(kind.to_string());
+            let summary_str = structured_meta
+                .as_ref()
+                .map(|meta| meta.display_summary())
+                .filter(|s| !s.is_empty());
+            (
+                "AstNode".to_string(),
+                Some(name.clone()),
+                Some(language.clone()),
+                kind_str,
+                summary_str,
+            )
+        }
+        crate::types::ChunkType::TextWindow { .. } => (
+            "TextWindow".to_string(),
+            None,
+            None,
+            Some("text".to_string()),
+            None,
+        ),
+        crate::types::ChunkType::PdfPage { .. } => (
+            "PdfPage".to_string(),
+            None,
+            None,
+            Some("pdf".to_string()),
+            None,
+        ),
+    };
+
+    let content = if include_content {
+        Some(result.chunk.content.clone())
+    } else {
+        None
+    };
+
+    SearchResultItem {
+        file: result.chunk.file_path.display().to_string(),
+        start_line: result.chunk.start_line,
+        end_line: result.chunk.end_line,
+        score: result.score,
+        source: format!("{:?}", result.source),
+        chunk_type: chunk_type_str,
+        name,
+        language,
+        content,
         kind,
         summary,
     }

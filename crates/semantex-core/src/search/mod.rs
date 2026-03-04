@@ -1,4 +1,7 @@
 pub mod adaptive;
+pub mod agent;
+pub mod agent_classifier;
+pub mod agent_formatter;
 pub mod code_tokenizer;
 pub mod deep;
 pub mod fastembed_reranker;

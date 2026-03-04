@@ -13,7 +13,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod client;
 mod commands;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -254,6 +254,31 @@ enum Commands {
         /// Path to validate (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Intelligent code search with automatic query routing and formatting.
+    Agent {
+        /// The search query
+        query: String,
+
+        /// Path to the project (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, file_pattern
+        #[arg(long)]
+        route: Option<String>,
+
+        /// Include full source code blocks
+        #[arg(long)]
+        full: bool,
+
+        /// Response budget in bytes (default: 12000)
+        #[arg(long)]
+        budget: Option<usize>,
+
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -503,6 +528,46 @@ fn main() -> Result<()> {
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
         Some(Commands::Validate { path }) => commands::validate::run(&path),
+        Some(Commands::Agent { query, path, route, full, budget, json }) => {
+            use semantex_core::server::protocol::AgentRequest;
+            use semantex_core::search::agent_classifier::AgentRoute;
+
+            let route_override = match route.as_deref() {
+                None => None,
+                Some(r) => Some(match r {
+                    "search" | "semantic" => AgentRoute::Semantic,
+                    "deep" => AgentRoute::Deep,
+                    "exact_symbol" | "exact" => AgentRoute::ExactSymbol,
+                    "structural" => AgentRoute::Structural,
+                    "regex" => AgentRoute::Regex,
+                    "analytical" => AgentRoute::Analytical,
+                    "file_pattern" | "files" => AgentRoute::FilePattern,
+                    other => anyhow::bail!("Unknown route: {other}. Valid: semantic, deep, exact_symbol, structural, regex, analytical, file_pattern"),
+                }),
+            };
+
+            let project_path = path.canonicalize()
+                .with_context(|| format!("Invalid path: {}", path.display()))?;
+            let port = semantex_core::server::read_daemon_port(&project_path)
+                .context("Daemon not running. Start it with: semantex serve <path>")?;
+
+            let request = AgentRequest {
+                query,
+                route: route_override,
+                budget,
+                full_code: full,
+            };
+
+            let response = semantex_core::server::daemon_agent_binary(port, request)
+                .context("Failed to send agent request to daemon")?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("{}", response.formatted);
+            }
+            Ok(())
+        }
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {

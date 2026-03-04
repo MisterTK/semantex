@@ -62,6 +62,7 @@ tree-sitter-kotlin-ng = "1.1"
 
 # File handling
 ignore = "0.4"
+globset = "0.4"
 notify = { version = "8", features = ["macos_fsevent"] }
 notify-debouncer-full = "0.7"
 

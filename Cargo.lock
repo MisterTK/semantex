@@ -3516,6 +3516,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "fastembed",
+ "globset",
  "ignore",
  "indicatif 0.18.4",
  "libc",

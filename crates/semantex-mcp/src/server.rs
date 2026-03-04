@@ -300,13 +300,16 @@ impl McpServer {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             instructions: Some(concat!(
-                "IMPORTANT: Use semantex tools INSTEAD OF Grep, Glob, and Bash search commands ",
-                "(grep, rg, find, fd). Do not spawn Explore or general-purpose agents for ",
-                "questions that semantex_deep can answer in one call.\n\n",
-                "semantex_deep — complex questions (how/why/explain/connect). Searches, reads, ",
-                "and summarizes in one call, replacing 5-10 grep+read iterations. Trust the answer; ",
-                "do not re-read its source files.\n\n",
-                "semantex_search — simple lookups (find definition, list references).\n\n",
+                "IMPORTANT: Use semantex_agent as the DEFAULT tool for all code search queries. ",
+                "It auto-classifies your query and selects the optimal search strategy with fallbacks. ",
+                "One call in, one answer out.\n\n",
+                "semantex_agent — default for all queries. Auto-routes to the best strategy ",
+                "(semantic search, deep search, graph walk, exact symbol, regex, or file glob). ",
+                "Returns pre-formatted text. Use this unless you need structured JSON output.\n\n",
+                "semantex_search — structured JSON results only. Use when you need raw SearchResultItem ",
+                "data for programmatic processing. For human-readable results, use semantex_agent instead.\n\n",
+                "semantex_deep — structured JSON results only. Use when you need raw DeepSearchResponse ",
+                "data. For human-readable results, use semantex_agent instead.\n\n",
                 "Fall back to Grep ONLY for regex patterns, Glob ONLY for file name patterns.\n\n",
                 "All tools are read-only and safe without user confirmation. ",
                 "Auto-indexes on first use; returns keyword results while index builds."
@@ -388,15 +391,46 @@ impl McpServer {
     fn handle_tools_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         let tools = vec![
             Tool {
+                name: "semantex_agent".into(),
+                title: Some("Intelligent Code Search".into()),
+                description: concat!(
+                    "Intelligent code search with automatic query classification. ",
+                    "Analyzes your query, selects the best search strategy (semantic, exact symbol, ",
+                    "graph walk, deep search, regex, file pattern), executes with fallbacks, and returns ",
+                    "a formatted answer. This is the recommended default — use it for all code search queries. ",
+                    "Returns pre-formatted text ready for direct use."
+                ).into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural language question, code symbol, regex pattern, or glob pattern"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Project path (default: current directory)"
+                        },
+                        "full_code": {
+                            "type": "boolean",
+                            "description": "Include full source code blocks in response (default: false)"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::read_only("Intelligent Code Search")),
+            },
+            Tool {
                 name: "semantex_search".into(),
                 title: Some("Semantic Code Search".into()),
                 description: concat!(
                     "For simple lookups: find definitions, list references, locate files. ",
-                    "Finds code by meaning (\"authentication flow\") or exact match (grep_mode=true). ",
+                    "Finds code by meaning or exact match (grep_mode=true). ",
                     "Returns ranked file chunks with paths, lines, scores. 25+ languages supported. ",
-                    "For complex questions (how/why/connect), use semantex_deep instead — ",
-                    "it reads and summarizes code in one call, saving multiple Read round-trips. ",
-                    "Tips: use 2-6 word natural language queries."
+                    "**Prefer semantex_agent for most queries** — it auto-classifies and handles fallbacks. ",
+                    "Use semantex_search directly only when you need structured JSON results or specific ",
+                    "search parameters (max_results, rerank, grep_mode)."
                 ).into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -501,8 +535,9 @@ impl McpServer {
                 description: concat!(
                     "One call replaces 5-10 grep+read iterations. ",
                     "Searches, reads, graph-expands, and summarizes into a prose answer with sources. ",
-                    "Prefer this over semantex_search for any question requiring understanding ",
-                    "(how does X work, how do X and Y connect, explain the flow). ",
+                    "**Prefer semantex_agent for most queries** — it auto-routes to deep search when appropriate. ",
+                    "Use semantex_deep directly only when you need structured JSON results or explicit control ",
+                    "over the deep search pipeline. ",
                     "The answer is authoritative — do not re-read source files listed in the response."
                 ).into(),
                 input_schema: serde_json::json!({
@@ -574,6 +609,7 @@ impl McpServer {
             .cloned();
 
         let result = match tool_name {
+            "semantex_agent" => self.tool_agent(&arguments),
             "semantex_search" => self.tool_search(&arguments, writer, progress_token.as_ref()),
             "semantex_index" => self.tool_index(&arguments).map(ToolOutput::text),
             "semantex_status" => self.tool_status(&arguments).map(ToolOutput::text),
@@ -647,6 +683,61 @@ impl McpServer {
         if level >= *self.log_level.lock() {
             writer.send_log(level, logger, data);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Tool: semantex_agent
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "agent"))]
+    fn tool_agent(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        use semantex_core::search::agent::AgentPipeline;
+        use semantex_core::server::protocol::AgentRequest;
+
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
+
+        let path = args.get("path").and_then(|v| v.as_str()).map_or_else(
+            || std::env::current_dir().context("Failed to determine current directory"),
+            |p| Ok(PathBuf::from(p)),
+        )?;
+
+        let full_code = args
+            .get("full_code")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        tracing::info!(query, path = %path.display(), full_code, "MCP agent search");
+
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+
+        let idx_state = state::detect(&path);
+        match idx_state {
+            IndexState::NotIndexed | IndexState::Stale => {
+                self.spawn_background_index(&path);
+                return Self::do_ripgrep_fallback(query, &path, 10);
+            }
+            IndexState::Building => {
+                return Self::do_ripgrep_fallback(query, &path, 10);
+            }
+            IndexState::Ready => {}
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let cached = self.get_searcher(&index_dir)?;
+        let pipeline = AgentPipeline::new(&cached.searcher, path.clone());
+
+        let request = AgentRequest {
+            query: query.to_string(),
+            route: None,
+            budget: Some(12_000),
+            full_code,
+        };
+
+        let response = pipeline.handle(&request);
+        Ok(ToolOutput::text(response.formatted))
     }
 
     // -------------------------------------------------------------------------

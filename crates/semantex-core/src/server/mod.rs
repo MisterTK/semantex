@@ -21,6 +21,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 /// The semantex search daemon
 pub struct SemantexServer {
     index_dir: PathBuf,
+    project_path: PathBuf,
     config: SemantexConfig,
     idle_timeout: Duration,
     shutdown: Arc<AtomicBool>,
@@ -32,6 +33,7 @@ impl SemantexServer {
         let index_dir = SemantexConfig::project_index_dir(project_path);
         Self {
             index_dir,
+            project_path: project_path.to_path_buf(),
             config: config.clone(),
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -82,6 +84,7 @@ impl SemantexServer {
         let listener = Listener::bind(
             &self.port_file_path(),
             searcher,
+            self.project_path.clone(),
             self.idle_timeout,
             self.shutdown.clone(),
         )?;
@@ -410,6 +413,51 @@ pub fn daemon_deep_search_binary(
 
     match bin_resp {
         protocol::BinaryResponse::DeepSearch(dr) => Ok(dr),
+        protocol::BinaryResponse::Error(e) => {
+            anyhow::bail!("Daemon error: {}", e.message)
+        }
+        other => anyhow::bail!("Unexpected response type: {other:?}"),
+    }
+}
+
+/// Send a binary agent request to the daemon at the given port.
+pub fn daemon_agent_binary(
+    port: u16,
+    request: protocol::AgentRequest,
+) -> Result<protocol::AgentResponse> {
+    use std::io::Read;
+
+    let bin_req = protocol::BinaryRequest::Agent(request);
+    let frame = protocol::encode_binary_request(&bin_req);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("Failed to connect to daemon at 127.0.0.1:{port}"))?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    stream.write_all(&frame)?;
+    stream.flush()?;
+
+    let mut magic = [0u8; 1];
+    stream.read_exact(&mut magic)?;
+    if magic[0] != protocol::BINARY_MAGIC {
+        anyhow::bail!("Expected binary response, got 0x{:02x}", magic[0]);
+    }
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+
+    let bin_resp = protocol::decode_binary_response(&payload)
+        .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))?;
+
+    match bin_resp {
+        protocol::BinaryResponse::Agent(ar) => Ok(ar),
         protocol::BinaryResponse::Error(e) => {
             anyhow::bail!("Daemon error: {}", e.message)
         }

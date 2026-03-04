@@ -54,6 +54,7 @@ pub struct Listener {
     start_time: Instant,
     idle_timeout: Duration,
     shutdown: Arc<AtomicBool>,
+    project_root: PathBuf,
 }
 
 impl Listener {
@@ -62,6 +63,7 @@ impl Listener {
     pub fn bind(
         port_file: &std::path::Path,
         searcher: HybridSearcher,
+        project_root: PathBuf,
         idle_timeout: Duration,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -91,6 +93,7 @@ impl Listener {
             start_time: Instant::now(),
             idle_timeout,
             shutdown,
+            project_root,
         })
     }
 
@@ -228,7 +231,7 @@ impl Listener {
             Ok(bin_req) => {
                 let request: Request = bin_req.into();
                 let is_shutdown = matches!(request, Request::Shutdown);
-                let handler = Handler::new(&self.searcher, &self.search_count);
+                let handler = Handler::new(&self.searcher, &self.search_count, self.project_root.clone());
                 let resp = handler.handle(request, self.start_time);
 
                 if is_shutdown {
@@ -282,7 +285,7 @@ impl Listener {
         let response = match serde_json::from_str::<Request>(line) {
             Ok(request) => {
                 let is_shutdown = matches!(request, Request::Shutdown);
-                let handler = Handler::new(&self.searcher, &self.search_count);
+                let handler = Handler::new(&self.searcher, &self.search_count, self.project_root.clone());
                 let response = handler.handle(request, self.start_time);
 
                 if is_shutdown {

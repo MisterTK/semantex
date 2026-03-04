@@ -103,7 +103,7 @@ pub fn classify(query: &str) -> QueryType {
 /// - Contains a dot separating segments (qualified.name)
 /// - Contains `::` (Rust path separator)
 /// - Contains `->` or `=>` (operator-like)
-fn is_identifier_like(token: &str) -> bool {
+pub(crate) fn is_identifier_like(token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
@@ -146,7 +146,7 @@ fn is_identifier_like(token: &str) -> bool {
 }
 
 /// Check if a string uses camelCase or PascalCase.
-fn is_camel_case(s: &str) -> bool {
+pub(crate) fn is_camel_case(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
     for i in 1..chars.len() {
         if chars[i - 1].is_lowercase() && chars[i].is_uppercase() {
