@@ -96,6 +96,9 @@ pub struct DeepResponseMetrics {
     pub total_ms: u64,
     pub chunks_searched: usize,
     pub chunks_read: usize,
+    /// Confidence zone: "high", "medium", "low", or "no_results"
+    #[serde(default)]
+    pub confidence_zone: String,
 }
 
 /// Deep search response: prose answer + source refs + metrics
@@ -104,6 +107,9 @@ pub struct DeepSearchResponse {
     pub answer: String,
     pub sources: Vec<DeepSearchSource>,
     pub metrics: DeepResponseMetrics,
+    /// Normalized confidence (0.0–1.0) for the overall result quality.
+    #[serde(default)]
+    pub confidence: f32,
 }
 
 /// Response sent from daemon to client

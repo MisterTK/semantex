@@ -450,7 +450,9 @@ fn run_direct(
                 total_ms: result.metrics.total_ms,
                 chunks_searched: result.metrics.chunks_searched,
                 chunks_read: result.metrics.chunks_read,
+                confidence_zone: result.metrics.confidence_zone,
             },
+            confidence: result.confidence,
         };
         if opts.verbose {
             let m = &response.metrics;
@@ -1328,9 +1330,16 @@ fn print_deep(resp: &semantex_core::server::protocol::DeepSearchResponse) -> Res
         unique_files.insert(&s.file);
     }
     writeln!(out)?;
+    let confidence_hint = match resp.metrics.confidence_zone.as_str() {
+        "high" => " [high confidence]",
+        "medium" => " [medium confidence]",
+        "low" => " [low confidence]",
+        "no_results" => " [no results]",
+        _ => "",
+    };
     writeln!(
         out,
-        "[Complete: {} chunks read across {} files — no further Read calls needed]",
+        "[Complete: {} chunks read across {} files — no further Read calls needed]{confidence_hint}",
         resp.metrics.chunks_read,
         unique_files.len()
     )?;
@@ -1350,14 +1359,16 @@ pub fn run_deep_via_binary_daemon(query: &str, port: u16, verbose: bool) -> Resu
     if verbose {
         let m = &response.metrics;
         eprintln!(
-            "Deep: {}ms total | {}ms search | {}ms triage | {}ms graph | {}ms read | {}ms summarize | {} chunks read",
+            "Deep: {}ms total | {}ms search | {}ms triage | {}ms graph | {}ms read | {}ms summarize | {} chunks read | confidence={:.2} zone={}",
             m.total_ms,
             m.search_ms,
             m.triage_ms,
             m.graph_ms,
             m.read_ms,
             m.summarize_ms,
-            m.chunks_read
+            m.chunks_read,
+            response.confidence,
+            m.confidence_zone,
         );
     }
     Ok(())

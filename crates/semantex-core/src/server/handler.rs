@@ -242,7 +242,9 @@ impl<'a> Handler<'a> {
                         total_ms: result.metrics.total_ms,
                         chunks_searched: result.metrics.chunks_searched,
                         chunks_read: result.metrics.chunks_read,
+                        confidence_zone: result.metrics.confidence_zone,
                     },
+                    confidence: result.confidence,
                 })
             }
             Err(e) => Response::Error(ErrorResponse {

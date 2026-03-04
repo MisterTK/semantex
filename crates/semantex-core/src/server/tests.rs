@@ -867,7 +867,9 @@ mod tests {
                 total_ms: 23,
                 chunks_searched: 20,
                 chunks_read: 6,
+                confidence_zone: "high".to_string(),
             },
+            confidence: 0.85,
         });
         let encoded = encode_binary_response(&resp);
         let decoded = decode_binary_response(&encoded[5..]).unwrap();
@@ -876,6 +878,8 @@ mod tests {
                 assert_eq!(d.sources.len(), 1);
                 assert_eq!(d.sources[0].file, "src/search/hybrid.rs");
                 assert_eq!(d.metrics.search_ms, 12);
+                assert_eq!(d.metrics.confidence_zone, "high");
+                assert!((d.confidence - 0.85).abs() < f32::EPSILON);
             }
             _ => panic!("Expected DeepSearch response"),
         }

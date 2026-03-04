@@ -49,6 +49,7 @@ hooks:
 **Understanding code (how/why/connect)?** → Start with `--deep`
 - `semantex --deep "how does the ranking pipeline work"` — searches, reads, and summarizes in one call.
 - **Trust the answer. Do not re-read source files listed in the response.**
+- Footer: confidence zone (`high`/`medium`/`low`) indicates result quality. `low` → rephrase query.
 - Replaces 5-10 grep+read iterations with a single call.
 
 **Finding references (where/what/lookup)?** → Use `--refs`
