@@ -1,6 +1,7 @@
 use crate::server::protocol::{
     DeepSearchResponse, GraphWalkResponse, SearchResponse, SearchResultItem,
 };
+use std::fmt::Write as _;
 
 /// Default response budget in bytes (~3K tokens).
 pub const DEFAULT_BUDGET: usize = 12_000;
@@ -16,7 +17,6 @@ pub enum FormatStyle {
 
 /// Format a single result item as a compact reference string: `file:start-end[ name][ [kind]]`.
 pub(crate) fn format_ref(item: &SearchResultItem) -> String {
-    use std::fmt::Write as _;
     let mut s = format!("{}:{}-{}", item.file, item.start_line, item.end_line);
     if let Some(name) = &item.name {
         s.push(' ');
@@ -76,19 +76,19 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
 
         let mut block = String::new();
 
-        // Line 1: file:start-end name [kind] (score)
-        block.push_str(&format!(
+        let _ = write!(
+            block,
             "{}:{}-{}",
             item.file, item.start_line, item.end_line
-        ));
+        );
         if let Some(name) = &item.name {
             block.push(' ');
             block.push_str(name);
         }
         if let Some(kind) = &item.kind {
-            block.push_str(&format!(" [{kind}]"));
+            let _ = write!(block, " [{kind}]");
         }
-        block.push_str(&format!(" ({:.2})", item.score));
+        let _ = write!(block, " ({:.2})", item.score);
         block.push('\n');
 
         // Line 2: summary or content (first 200 chars, newlines replaced with spaces)
@@ -119,7 +119,7 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
         // Budget check: stop if over budget and at least one result written
         if written > 0 && total_bytes + block_len > budget {
             let remaining = total_count - written;
-            parts.push(format!("... and {} more results", remaining));
+            parts.push(format!("... and {remaining} more results"));
             break;
         }
 
@@ -155,8 +155,7 @@ pub fn format_deep_results(response: &DeepSearchResponse, budget: usize) -> Stri
             // Find last '.' before the limit
             let truncate_at = response.answer[..budget]
                 .rfind('.')
-                .map(|i| i + 1)
-                .unwrap_or(budget);
+                .map_or(budget, |i| i + 1);
             out.push_str(&response.answer[..truncate_at]);
             out.push_str("\n\n[answer truncated]");
         } else {
@@ -171,16 +170,17 @@ pub fn format_deep_results(response: &DeepSearchResponse, budget: usize) -> Stri
         }
         out.push_str("Sources:\n");
         for src in &response.sources {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "  {}:{}-{}",
                 src.file, src.start_line, src.end_line
-            ));
+            );
             if let Some(name) = &src.name {
                 out.push(' ');
                 out.push_str(name);
             }
             if let Some(kind) = &src.kind {
-                out.push_str(&format!(" [{kind}]"));
+                let _ = write!(out, " [{kind}]");
             }
             out.push('\n');
         }
@@ -198,6 +198,27 @@ pub fn format_deep_results(response: &DeepSearchResponse, budget: usize) -> Stri
 }
 
 /// Format graph walk results.
+fn format_section(out: &mut String, title: &str, items: &[SearchResultItem]) {
+    if items.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let _ = writeln!(out, "{} ({}):", title, items.len());
+    let shown = items.len().min(MAX_GRAPH_SECTION);
+    for item in &items[..shown] {
+        let _ = writeln!(out, "  {}", format_ref(item));
+    }
+    if items.len() > MAX_GRAPH_SECTION {
+        let _ = writeln!(
+            out,
+            "  ... and {} more",
+            items.len() - MAX_GRAPH_SECTION
+        );
+    }
+}
+
 pub fn format_graph_results(response: &GraphWalkResponse) -> String {
     let all_empty = response.target.is_empty()
         && response.callers.is_empty()
@@ -211,32 +232,12 @@ pub fn format_graph_results(response: &GraphWalkResponse) -> String {
 
     let mut out = String::new();
 
-    fn format_section(out: &mut String, title: &str, items: &[SearchResultItem]) {
-        if items.is_empty() {
-            return;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("{} ({}):\n", title, items.len()));
-        let shown = items.len().min(MAX_GRAPH_SECTION);
-        for item in &items[..shown] {
-            out.push_str(&format!("  {}\n", format_ref(item)));
-        }
-        if items.len() > MAX_GRAPH_SECTION {
-            out.push_str(&format!(
-                "  ... and {} more\n",
-                items.len() - MAX_GRAPH_SECTION
-            ));
-        }
-    }
-
     // Target section (no count suffix if it's just the target)
     if !response.target.is_empty() {
         out.push_str("Target:\n");
         let shown = response.target.len().min(MAX_GRAPH_SECTION);
         for item in &response.target[..shown] {
-            out.push_str(&format!("  {}\n", format_ref(item)));
+            let _ = writeln!(out, "  {}", format_ref(item));
         }
     }
 
@@ -267,23 +268,24 @@ pub fn format_code_blocks(
 
         let mut block = String::new();
         // Header
-        block.push_str(&format!(
+        let _ = write!(
+            block,
             "### {}:{}-{}",
             item.file, item.start_line, item.end_line
-        ));
+        );
         if let Some(name) = &item.name {
-            block.push_str(&format!(" — {name}"));
+            let _ = write!(block, " — {name}");
         }
         if let Some(kind) = &item.kind {
-            block.push_str(&format!(" [{kind}]"));
+            let _ = write!(block, " [{kind}]");
         }
         block.push('\n');
 
         // Fenced code block with line numbers
-        block.push_str(&format!("```{lang}\n"));
+        let _ = writeln!(block, "```{lang}");
         let mut line_num = item.start_line;
         for line in code.lines() {
-            block.push_str(&format!("{line_num:4} | {line}\n"));
+            let _ = writeln!(block, "{line_num:4} | {line}");
             line_num += 1;
         }
         block.push_str("```\n");
@@ -556,6 +558,6 @@ mod tests {
         let code: Vec<String> = (0..10).map(|_| "x".repeat(2000)).collect();
         let out = format_code_blocks(&results, &code, 6000);
         let block_count = out.matches("###").count();
-        assert!(block_count >= 1 && block_count <= 4);
+        assert!((1..=4).contains(&block_count));
     }
 }

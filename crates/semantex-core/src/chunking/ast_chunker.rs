@@ -1252,12 +1252,12 @@ fn hello() {
     #[test]
     fn test_structured_meta_extracted_for_rust_function() {
         let chunker = AstChunker::new(256, 64);
-        let content = r#"
+        let content = r"
 /// Adds two numbers.
 fn add(a: i32, b: i32) -> i32 {
     a + b
 }
-"#;
+";
         let chunks = chunker.chunk(Path::new("test.rs"), content).unwrap();
         let ast_chunk = chunks
             .iter()

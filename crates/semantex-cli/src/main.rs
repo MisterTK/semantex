@@ -548,9 +548,10 @@ fn main() -> Result<()> {
                     "structural" => AgentRoute::Structural,
                     "regex" => AgentRoute::Regex,
                     "analytical" => AgentRoute::Analytical,
+                    "exhaustive" => AgentRoute::Exhaustive,
                     "file_pattern" | "files" => AgentRoute::FilePattern,
                     other => anyhow::bail!(
-                        "Unknown route: {other}. Valid: semantic, deep, exact_symbol, structural, regex, analytical, file_pattern"
+                        "Unknown route: {other}. Valid: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern"
                     ),
                 }),
             };

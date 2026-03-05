@@ -329,7 +329,7 @@ impl StructuredChunkMeta {
         } else if let Some(ref name) = self.name {
             let kind = self.kind.as_deref();
             let kind_prefix = match kind {
-                Some("fn" | "function" | "method") => "fn ",
+                Some("fn" | "function" | "method") | None => "fn ",
                 Some("class") => "class ",
                 Some("struct") => "struct ",
                 Some("enum") => "enum ",
@@ -339,7 +339,6 @@ impl StructuredChunkMeta {
                     parts.push(format!("{other} {name}"));
                     ""
                 }
-                None => "fn ",
             };
             if !kind_prefix.is_empty() {
                 let mut sig = format!("{kind_prefix}{name}");

@@ -736,8 +736,7 @@ impl McpServer {
         let budget = args
             .get("budget")
             .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(12_000);
+            .map_or(12_000, |v| v as usize);
 
         let request = AgentRequest {
             query: query.to_string(),

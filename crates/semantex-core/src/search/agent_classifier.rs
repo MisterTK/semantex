@@ -36,6 +36,7 @@ pub enum AgentRoute {
     Structural,
     Deep,
     Analytical,
+    Exhaustive,
     Semantic,
 }
 
@@ -48,6 +49,7 @@ impl std::fmt::Display for AgentRoute {
             Self::Structural => write!(f, "structural"),
             Self::Deep => write!(f, "deep"),
             Self::Analytical => write!(f, "analytical"),
+            Self::Exhaustive => write!(f, "exhaustive"),
             Self::Semantic => write!(f, "semantic"),
         }
     }
@@ -59,14 +61,13 @@ fn is_regex(query: &str) -> bool {
     // so byte iteration is safe and avoids allocating a Vec<char>.
     let bytes = query.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
-        if bytes[i] == b'\\' {
-            if matches!(
+        if bytes[i] == b'\\'
+            && matches!(
                 bytes[i + 1],
                 b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W'
             ) {
                 return true;
             }
-        }
     }
 
     // Pipe — unless entire query is quote-wrapped
@@ -79,11 +80,10 @@ fn is_regex(query: &str) -> bool {
     }
 
     // Character class [...]
-    if let Some(open) = query.find('[') {
-        if query[open..].contains(']') {
+    if let Some(open) = query.find('[')
+        && query[open..].contains(']') {
             return true;
         }
-    }
 
     // Group with quantifier (foo|bar), (foo?), (foo*), (foo+)
     if let Some(open) = query.find('(') {
@@ -145,16 +145,15 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
             (false, trimmed)
         };
 
-        if !stripped.is_empty() && !stripped.contains(char::is_whitespace) {
-            if was_wrapped
+        if !stripped.is_empty() && !stripped.contains(char::is_whitespace)
+            && (was_wrapped
                 || is_camel_case(stripped)
                 || has_caps_prefix_symbol(stripped)
                 || (stripped.contains('_') && stripped.len() > 2)
-                || (stripped.contains('.') && stripped.len() > 2)
+                || (stripped.contains('.') && stripped.len() > 2))
             {
                 return AgentRoute::ExactSymbol;
             }
-        }
     }
 
     // 4. Structural
@@ -225,7 +224,27 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
-    // 7. Semantic — default
+    // 7. Exhaustive — "list all X", "find all Y", "enumerate Z"
+    let exhaustive_markers = [
+        "list all",
+        "list every",
+        "find all",
+        "find every",
+        "show all",
+        "show every",
+        "what are all",
+        "where are all",
+        "enumerate all",
+        "enumerate every",
+        "enumerate ",
+    ];
+    for marker in &exhaustive_markers {
+        if lower.contains(marker) {
+            return AgentRoute::Exhaustive;
+        }
+    }
+
+    // 8. Semantic — default
     AgentRoute::Semantic
 }
 
@@ -427,6 +446,42 @@ mod tests {
         assert_eq!(
             classify_agent_query("review the error handling"),
             AgentRoute::Analytical
+        );
+    }
+
+    #[test]
+    fn test_exhaustive_list_all() {
+        assert_eq!(
+            classify_agent_query("List all configuration options and environment variables"),
+            AgentRoute::Exhaustive
+        );
+    }
+    #[test]
+    fn test_exhaustive_find_all() {
+        assert_eq!(
+            classify_agent_query("find all error types defined in this project"),
+            AgentRoute::Exhaustive
+        );
+    }
+    #[test]
+    fn test_exhaustive_enumerate() {
+        assert_eq!(
+            classify_agent_query("enumerate the CLI flags this project supports"),
+            AgentRoute::Exhaustive
+        );
+    }
+    #[test]
+    fn test_exhaustive_what_are_all() {
+        assert_eq!(
+            classify_agent_query("what are all the public API endpoints?"),
+            AgentRoute::Exhaustive
+        );
+    }
+    #[test]
+    fn test_exhaustive_show_all() {
+        assert_eq!(
+            classify_agent_query("show all middleware registered in the app"),
+            AgentRoute::Exhaustive
         );
     }
 

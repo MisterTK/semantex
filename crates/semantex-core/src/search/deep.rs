@@ -85,12 +85,12 @@ fn classify_query_preference(query: &str) -> PreferredKind {
 /// describes the queried concept above chunks that merely contain query terms as string
 /// literals in the code body.
 fn compute_docstring_boost(query: &str, chunk: &Chunk) -> f32 {
-    let meta = match &chunk.chunk_type {
-        ChunkType::AstNode {
-            structured_meta: Some(meta),
-            ..
-        } => meta,
-        _ => return 0.0,
+    let ChunkType::AstNode {
+        structured_meta: Some(meta),
+        ..
+    } = &chunk.chunk_type
+    else {
+        return 0.0;
     };
 
     // Extract query terms (reuse the same stop-word approach as the summarizer).
@@ -122,12 +122,12 @@ fn kind_matches_preference(kind: Option<&str>, pref: PreferredKind) -> bool {
     match pref {
         PreferredKind::Neutral => false,
         PreferredKind::FnMethod => {
-            matches!(kind, Some("fn") | Some("method") | Some("function"))
+            matches!(kind, Some("fn" | "method" | "function"))
         }
         PreferredKind::StructClassType => {
             matches!(
                 kind,
-                Some("struct") | Some("class") | Some("interface") | Some("enum")
+                Some("struct" | "class" | "interface" | "enum")
             )
         }
     }
@@ -265,16 +265,16 @@ fn expand_with_graph(
     let mut candidate_counts: HashMap<u64, usize> = HashMap::new();
 
     // Callees (functions this code calls).
-    let callee_edges = store.get_call_edges_from(selected_ids)?;
-    for (_, callee_id) in callee_edges {
+    let outgoing_calls = store.get_call_edges_from(selected_ids)?;
+    for (_, callee_id) in outgoing_calls {
         if !selected_set.contains(&callee_id) {
             *candidate_counts.entry(callee_id).or_insert(0) += 1;
         }
     }
 
     // Callers (functions that call into this code).
-    let caller_edges = store.get_call_edges_to(selected_ids)?;
-    for (_, caller_id) in caller_edges {
+    let incoming_calls = store.get_call_edges_to(selected_ids)?;
+    for (_, caller_id) in incoming_calls {
         if !selected_set.contains(&caller_id) {
             *candidate_counts.entry(caller_id).or_insert(0) += 1;
         }
@@ -312,8 +312,8 @@ fn expand_with_graph(
     let mut scored: Vec<(u64, f32)> = candidate_counts
         .into_iter()
         .map(|(id, count)| {
-            let score = 0.5 + (count.saturating_sub(1)) as f32 * 0.2;
-            (id, score)
+            let edge_score = 0.5 + (count.saturating_sub(1)) as f32 * 0.2;
+            (id, edge_score)
         })
         .collect();
 
@@ -557,10 +557,10 @@ fn deep_search_inner(
     // ---- Phase 4: Read ----
     report(3, 5, "Reading full chunk content...");
     let read_start = Instant::now();
-    let extra_chunks: Vec<crate::types::Chunk> = if !additional_ids.is_empty() {
-        searcher.with_store(|store| store.get_chunks(&additional_ids))?
-    } else {
+    let extra_chunks: Vec<crate::types::Chunk> = if additional_ids.is_empty() {
         Vec::new()
+    } else {
+        searcher.with_store(|store| store.get_chunks(&additional_ids))?
     };
 
     // Combine: selected chunks first, then additional (dedup by id).
@@ -650,7 +650,7 @@ mod tests {
     fn make_ast_result(file: &str, name: &str, start: u32, end: u32, score: f32) -> SearchResult {
         SearchResult {
             chunk: Chunk {
-                id: (start as u64) * 1000 + (end as u64),
+                id: u64::from(start) * 1000 + u64::from(end),
                 file_path: PathBuf::from(file),
                 start_line: start,
                 end_line: end,

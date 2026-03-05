@@ -56,6 +56,7 @@ impl<'a> AgentPipeline<'a> {
             AgentRoute::Analytical => {
                 self.handle_analytical(&request.query, budget, request.full_code)
             }
+            AgentRoute::Exhaustive => self.handle_exhaustive(&request.query, budget),
             AgentRoute::Semantic => self.handle_semantic(&request.query, budget, false),
         };
         let search_ms = search_start.elapsed().as_millis() as u64;
@@ -105,7 +106,13 @@ impl<'a> AgentPipeline<'a> {
                 }
             }
             _ => {
-                if !is_fallback {
+                if is_fallback {
+                    HandlerResult {
+                        formatted: format!("No results found for: {query}"),
+                        fallback_used: is_fallback,
+                        result_count: 0,
+                    }
+                } else {
                     // Fallback to deep search
                     match deep_search_module::deep_search(self.searcher, query, 20, true) {
                         Ok(result) if !result.answer.is_empty() => {
@@ -122,12 +129,6 @@ impl<'a> AgentPipeline<'a> {
                             fallback_used: is_fallback,
                             result_count: 0,
                         },
-                    }
-                } else {
-                    HandlerResult {
-                        formatted: format!("No results found for: {query}"),
-                        fallback_used: is_fallback,
-                        result_count: 0,
                     }
                 }
             }
@@ -146,14 +147,14 @@ impl<'a> AgentPipeline<'a> {
                 }
             }
             _ => {
-                if !is_fallback {
-                    self.handle_semantic(query, budget, true)
-                } else {
+                if is_fallback {
                     HandlerResult {
                         formatted: format!("No results found for: {query}"),
                         fallback_used: true,
                         result_count: 0,
                     }
+                } else {
+                    self.handle_semantic(query, budget, true)
                 }
             }
         }
@@ -162,8 +163,8 @@ impl<'a> AgentPipeline<'a> {
     fn handle_exact_symbol(&self, query: &str, budget: usize) -> HandlerResult {
         let symbol = query.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let sq = SearchQuery::new(symbol).max_results(5);
-        if let Ok(output) = self.searcher.search(&sq) {
-            if !output.results.is_empty() {
+        if let Ok(output) = self.searcher.search(&sq)
+            && !output.results.is_empty() {
                 let items: Vec<SearchResultItem> = output
                     .results
                     .iter()
@@ -186,7 +187,6 @@ impl<'a> AgentPipeline<'a> {
                     result_count: count,
                 };
             }
-        }
         // Fallback: grep mode
         let sq = SearchQuery::new(symbol).grep_mode().max_results(10);
         match self.searcher.search(&sq) {
@@ -294,6 +294,39 @@ impl<'a> AgentPipeline<'a> {
         }
     }
 
+    fn handle_exhaustive(&self, query: &str, budget: usize) -> HandlerResult {
+        // Exhaustive queries need broader coverage: more results and a larger budget to
+        // avoid truncation on large monorepos where relevant items are scattered.
+        let exhaustive_budget = budget * 3;
+        let sq = SearchQuery::new(query).max_results(20);
+        match self.searcher.search(&sq) {
+            Ok(output) if !output.results.is_empty() => {
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
+                    .map(|r| search_result_to_item(r, true))
+                    .collect();
+                let confidence = compute_confidence(&items);
+                let count = items.len();
+                let resp = SearchResponse {
+                    results: items,
+                    duration_ms: output.metrics.total_ms,
+                    dense_count: output.metrics.dense_count,
+                    sparse_count: output.metrics.sparse_count,
+                    fused_count: output.metrics.fused_count,
+                    metrics: None,
+                    confidence: Some(confidence),
+                };
+                HandlerResult {
+                    formatted: format_search_results(&resp, FormatStyle::Default, exhaustive_budget),
+                    fallback_used: false,
+                    result_count: count,
+                }
+            }
+            _ => self.handle_deep(query, exhaustive_budget, true),
+        }
+    }
+
     fn handle_regex(&self, query: &str, budget: usize) -> HandlerResult {
         let sq = SearchQuery::new(query).grep_mode().max_results(20);
         let (items, duration_ms, sparse_count, fused_count) = match self.searcher.search(&sq) {
@@ -379,9 +412,8 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
             continue;
         }
         // Get relative path
-        let rel = match path.strip_prefix(root) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
         };
         if glob_set.is_match(rel) {
             files.push(rel.display().to_string());

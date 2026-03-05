@@ -31,7 +31,7 @@ static STOP_WORDS: &[&str] = &[
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -119,6 +119,7 @@ fn first_n_sentences(text: &str, n: usize) -> String {
 /// Chunks are presented in input order (search relevance from the deep pipeline).
 /// Total output capped at ~3000 chars (~750 tokens).
 pub fn extractive_summarize(query: &str, chunks: &[ReadChunk]) -> String {
+    const MAX_LEN: usize = 3000;
     if chunks.is_empty() {
         return "No relevant code found for this query.".to_string();
     }
@@ -128,7 +129,6 @@ pub fn extractive_summarize(query: &str, chunks: &[ReadChunk]) -> String {
         return String::new();
     }
 
-    const MAX_LEN: usize = 3000;
     let mut output = String::new();
 
     for chunk in chunks {
@@ -232,8 +232,7 @@ fn clean_summary(summary: &str) -> Option<String> {
     let result = if truncated.len() > 200 {
         truncated[..200]
             .rfind(';')
-            .map(|pos| &truncated[..pos])
-            .unwrap_or(&truncated[..200])
+            .map_or(&truncated[..200], |pos| &truncated[..pos])
     } else {
         truncated
     };
@@ -265,12 +264,12 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
     }
 
     // --- NL summary (2-space indent, cleaned, skip if redundant with docstring) ---
-    if let Some(ref summary) = chunk.summary {
-        if let Some(cleaned) = clean_summary(summary) {
+    if let Some(ref summary) = chunk.summary
+        && let Some(cleaned) = clean_summary(summary) {
             let already_shown = chunk
                 .docstring
                 .as_deref()
-                .map(|d| d.to_lowercase())
+                .map(str::to_lowercase)
                 .unwrap_or_default();
             let cleaned_lower = cleaned.to_lowercase();
             // Skip if the summary is a substring of the docstring (avoid redundancy)
@@ -279,7 +278,6 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
                 has_content = true;
             }
         }
-    }
 
     // --- Key content lines (4-space indent, top 3 by query term score) ---
     let mut matching_lines: Vec<(usize, String, usize)> = Vec::new();
