@@ -265,19 +265,20 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
 
     // --- NL summary (2-space indent, cleaned, skip if redundant with docstring) ---
     if let Some(ref summary) = chunk.summary
-        && let Some(cleaned) = clean_summary(summary) {
-            let already_shown = chunk
-                .docstring
-                .as_deref()
-                .map(str::to_lowercase)
-                .unwrap_or_default();
-            let cleaned_lower = cleaned.to_lowercase();
-            // Skip if the summary is a substring of the docstring (avoid redundancy)
-            if !already_shown.contains(&cleaned_lower) {
-                let _ = writeln!(block, "  {cleaned}");
-                has_content = true;
-            }
+        && let Some(cleaned) = clean_summary(summary)
+    {
+        let already_shown = chunk
+            .docstring
+            .as_deref()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let cleaned_lower = cleaned.to_lowercase();
+        // Skip if the summary is a substring of the docstring (avoid redundancy)
+        if !already_shown.contains(&cleaned_lower) {
+            let _ = writeln!(block, "  {cleaned}");
+            has_content = true;
         }
+    }
 
     // --- Key content lines (4-space indent, top 3 by query term score) ---
     let mut matching_lines: Vec<(usize, String, usize)> = Vec::new();

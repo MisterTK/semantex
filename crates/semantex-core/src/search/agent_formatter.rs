@@ -76,11 +76,7 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
 
         let mut block = String::new();
 
-        let _ = write!(
-            block,
-            "{}:{}-{}",
-            item.file, item.start_line, item.end_line
-        );
+        let _ = write!(block, "{}:{}-{}", item.file, item.start_line, item.end_line);
         if let Some(name) = &item.name {
             block.push(' ');
             block.push_str(name);
@@ -170,11 +166,7 @@ pub fn format_deep_results(response: &DeepSearchResponse, budget: usize) -> Stri
         }
         out.push_str("Sources:\n");
         for src in &response.sources {
-            let _ = write!(
-                out,
-                "  {}:{}-{}",
-                src.file, src.start_line, src.end_line
-            );
+            let _ = write!(out, "  {}:{}-{}", src.file, src.start_line, src.end_line);
             if let Some(name) = &src.name {
                 out.push(' ');
                 out.push_str(name);
@@ -211,11 +203,7 @@ fn format_section(out: &mut String, title: &str, items: &[SearchResultItem]) {
         let _ = writeln!(out, "  {}", format_ref(item));
     }
     if items.len() > MAX_GRAPH_SECTION {
-        let _ = writeln!(
-            out,
-            "  ... and {} more",
-            items.len() - MAX_GRAPH_SECTION
-        );
+        let _ = writeln!(out, "  ... and {} more", items.len() - MAX_GRAPH_SECTION);
     }
 }
 

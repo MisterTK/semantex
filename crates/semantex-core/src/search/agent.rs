@@ -164,29 +164,30 @@ impl<'a> AgentPipeline<'a> {
         let symbol = query.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let sq = SearchQuery::new(symbol).max_results(5);
         if let Ok(output) = self.searcher.search(&sq)
-            && !output.results.is_empty() {
-                let items: Vec<SearchResultItem> = output
-                    .results
-                    .iter()
-                    .map(|r| search_result_to_item(r, true))
-                    .collect();
-                let confidence = compute_confidence(&items);
-                let count = items.len();
-                let resp = SearchResponse {
-                    results: items,
-                    duration_ms: output.metrics.total_ms,
-                    dense_count: output.metrics.dense_count,
-                    sparse_count: output.metrics.sparse_count,
-                    fused_count: output.metrics.fused_count,
-                    metrics: None,
-                    confidence: Some(confidence),
-                };
-                return HandlerResult {
-                    formatted: format_search_results(&resp, FormatStyle::Default, budget),
-                    fallback_used: false,
-                    result_count: count,
-                };
-            }
+            && !output.results.is_empty()
+        {
+            let items: Vec<SearchResultItem> = output
+                .results
+                .iter()
+                .map(|r| search_result_to_item(r, true))
+                .collect();
+            let confidence = compute_confidence(&items);
+            let count = items.len();
+            let resp = SearchResponse {
+                results: items,
+                duration_ms: output.metrics.total_ms,
+                dense_count: output.metrics.dense_count,
+                sparse_count: output.metrics.sparse_count,
+                fused_count: output.metrics.fused_count,
+                metrics: None,
+                confidence: Some(confidence),
+            };
+            return HandlerResult {
+                formatted: format_search_results(&resp, FormatStyle::Default, budget),
+                fallback_used: false,
+                result_count: count,
+            };
+        }
         // Fallback: grep mode
         let sq = SearchQuery::new(symbol).grep_mode().max_results(10);
         match self.searcher.search(&sq) {
@@ -318,7 +319,11 @@ impl<'a> AgentPipeline<'a> {
                     confidence: Some(confidence),
                 };
                 HandlerResult {
-                    formatted: format_search_results(&resp, FormatStyle::Default, exhaustive_budget),
+                    formatted: format_search_results(
+                        &resp,
+                        FormatStyle::Default,
+                        exhaustive_budget,
+                    ),
                     fallback_used: false,
                     result_count: count,
                 }

@@ -125,10 +125,7 @@ fn kind_matches_preference(kind: Option<&str>, pref: PreferredKind) -> bool {
             matches!(kind, Some("fn" | "method" | "function"))
         }
         PreferredKind::StructClassType => {
-            matches!(
-                kind,
-                Some("struct" | "class" | "interface" | "enum")
-            )
+            matches!(kind, Some("struct" | "class" | "interface" | "enum"))
         }
     }
 }

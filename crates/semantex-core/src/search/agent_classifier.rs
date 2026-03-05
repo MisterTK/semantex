@@ -65,9 +65,10 @@ fn is_regex(query: &str) -> bool {
             && matches!(
                 bytes[i + 1],
                 b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W'
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
+        }
     }
 
     // Pipe — unless entire query is quote-wrapped
@@ -81,9 +82,10 @@ fn is_regex(query: &str) -> bool {
 
     // Character class [...]
     if let Some(open) = query.find('[')
-        && query[open..].contains(']') {
-            return true;
-        }
+        && query[open..].contains(']')
+    {
+        return true;
+    }
 
     // Group with quantifier (foo|bar), (foo?), (foo*), (foo+)
     if let Some(open) = query.find('(') {
@@ -145,15 +147,16 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
             (false, trimmed)
         };
 
-        if !stripped.is_empty() && !stripped.contains(char::is_whitespace)
+        if !stripped.is_empty()
+            && !stripped.contains(char::is_whitespace)
             && (was_wrapped
                 || is_camel_case(stripped)
                 || has_caps_prefix_symbol(stripped)
                 || (stripped.contains('_') && stripped.len() > 2)
                 || (stripped.contains('.') && stripped.len() > 2))
-            {
-                return AgentRoute::ExactSymbol;
-            }
+        {
+            return AgentRoute::ExactSymbol;
+        }
     }
 
     // 4. Structural
