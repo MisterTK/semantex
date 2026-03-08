@@ -410,7 +410,7 @@ impl McpServer {
                         "queries": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Multiple queries to run in one call. Results are merged and deduplicated. Use instead of 'query' when you need to search for 2-3 related concepts at once."
+                            "description": "Multiple queries to run in one call. Results are merged. Use instead of 'query' when you need to search for 2-3 related concepts at once."
                         },
                         "path": {
                             "type": "string",
@@ -808,7 +808,7 @@ impl McpServer {
         let mut combined = if is_batch {
             let n = parts.len();
             format!(
-                "[Batch results for {} queries — deduplicated]\n\n{}",
+                "[Batch results for {} queries — merged]\n\n{}",
                 n,
                 parts.join("\n\n---\n\n")
             )
@@ -1412,5 +1412,75 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
             format!("[focus: patterns]\n\n{text}")
         }
         _ => text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_focus;
+
+    #[test]
+    fn test_apply_focus_none_passthrough() {
+        let text = "some result".to_string();
+        assert_eq!(apply_focus(text.clone(), None), text);
+    }
+
+    #[test]
+    fn test_apply_focus_unknown_passthrough() {
+        let text = "some result".to_string();
+        assert_eq!(apply_focus(text.clone(), Some("unknown")), text);
+    }
+
+    #[test]
+    fn test_apply_focus_implementation_prepends_marker() {
+        let out = apply_focus("body".to_string(), Some("implementation"));
+        assert!(out.starts_with("[focus: implementation — full code included]"));
+        assert!(out.contains("body"));
+    }
+
+    #[test]
+    fn test_apply_focus_callers_wraps() {
+        let out = apply_focus("body".to_string(), Some("callers"));
+        assert!(out.starts_with("[focus: callers]"));
+        assert!(out.contains("body"));
+        assert!(out.contains("call graph"));
+    }
+
+    #[test]
+    fn test_apply_focus_patterns_prepends_marker() {
+        let out = apply_focus("body".to_string(), Some("patterns"));
+        assert!(out.starts_with("[focus: patterns]"));
+        assert!(out.contains("body"));
+    }
+
+    #[test]
+    fn test_apply_focus_signatures_strips_body() {
+        let input = "header\n```rust\nfn foo(x: i32) -> i32 {\n    x + 1\n}\n```\nfooter\n";
+        let out = apply_focus(input.to_string(), Some("signatures"));
+        assert!(out.starts_with("[focus: signatures]"));
+        // Signature line kept
+        assert!(out.contains("fn foo(x: i32) -> i32 {"));
+        // Body line stripped
+        assert!(!out.contains("x + 1"));
+        // Closing fence and footer kept
+        assert!(out.contains("footer"));
+    }
+
+    #[test]
+    fn test_apply_focus_signatures_empty_block() {
+        let input = "before\n```\n```\nafter\n";
+        let out = apply_focus(input.to_string(), Some("signatures"));
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn test_apply_focus_signatures_multiple_blocks() {
+        let input = "```\nfn a() {}\n    body_a\n```\n```\nfn b() {}\n    body_b\n```\n";
+        let out = apply_focus(input.to_string(), Some("signatures"));
+        assert!(out.contains("fn a() {}"));
+        assert!(!out.contains("body_a"));
+        assert!(out.contains("fn b() {}"));
+        assert!(!out.contains("body_b"));
     }
 }

@@ -314,9 +314,20 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String], include_full: bool) ->
 
     if include_full {
         // --- Full content (4-space indent, all lines) ---
+        // Cap at 8000 chars to prevent a single large chunk consuming the whole budget.
+        const FULL_CODE_CAP: usize = 8_000;
         let _ = writeln!(block, "```");
-        for line in chunk.content.lines() {
-            let _ = writeln!(block, "    {line}");
+        if chunk.content.len() > FULL_CODE_CAP {
+            let truncated = &chunk.content[..FULL_CODE_CAP];
+            for line in truncated.lines() {
+                let _ = writeln!(block, "    {line}");
+            }
+            let remaining = chunk.content.len() - FULL_CODE_CAP;
+            let _ = writeln!(block, "    // ... ({remaining} more chars) ...");
+        } else {
+            for line in chunk.content.lines() {
+                let _ = writeln!(block, "    {line}");
+            }
         }
         let _ = writeln!(block, "```");
         has_content = true;

@@ -89,8 +89,8 @@ code is already in the response. The `[COMPLETE]` marker confirms this.**
 }
 ```
 
-Use `queries` (array) instead of calling `semantex_agent` twice. Results are merged and
-deduplicated. Use for 2-3 related concepts that you would otherwise search separately.
+Use `queries` (array) instead of calling `semantex_agent` twice. Results are merged.
+Use for 2-3 related concepts that you would otherwise search separately.
 
 ## Focus: tell semantex what you need
 

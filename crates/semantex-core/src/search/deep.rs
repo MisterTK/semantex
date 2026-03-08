@@ -578,8 +578,8 @@ fn decompose_query(query: &str) -> Option<Vec<String>> {
                 .trim();
             if feature.len() > 3 {
                 return Some(vec![
-                    format!("existing {feature} patterns"),
-                    "entry points request handling middleware".to_string(),
+                    format!("existing {feature} implementation patterns"),
+                    "main entry points and initialization".to_string(),
                 ]);
             }
         }
@@ -1291,5 +1291,86 @@ mod tests {
         assert!(result.is_some());
         let parts = result.unwrap();
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn test_decompose_interact_with() {
+        let result = decompose_query("how does authentication interact with session management");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("authentication"));
+        assert!(parts[1].contains("session management"));
+    }
+
+    #[test]
+    fn test_decompose_from_pattern() {
+        let result = decompose_query("data flow from request parsing to database write");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("request parsing"));
+        assert!(parts[1].contains("database write"));
+    }
+
+    #[test]
+    fn test_decompose_between_pattern() {
+        let result = decompose_query("error propagation between service layer and handler");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn test_decompose_implement_pattern() {
+        let result = decompose_query("implement rate limiting");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("rate limiting"));
+        assert!(parts[1].contains("entry points"));
+    }
+
+    #[test]
+    fn test_decompose_where_to_add_pattern() {
+        let result = decompose_query("where to add request validation");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("request validation"));
+    }
+
+    #[test]
+    fn test_decompose_no_match_keyword_query() {
+        // Short keyword queries should not decompose
+        assert!(decompose_query("authentication").is_none());
+        assert!(decompose_query("search").is_none());
+    }
+
+    #[test]
+    fn test_decompose_feature_too_short() {
+        // Feature name too short (≤3 chars) should not decompose
+        assert!(decompose_query("add foo").is_none());
+    }
+
+    #[test]
+    fn test_decompose_feature_second_query_generic() {
+        // "logging" is 7 chars, so it decomposes successfully
+        let result = decompose_query("add logging");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        // Second query should be generic, not HTTP-specific
+        assert!(parts[1].contains("entry points"));
+        assert!(!parts[1].contains("middleware")); // must NOT contain HTTP-specific term
+        assert!(!parts[1].contains("request handling")); // must NOT contain HTTP-specific term
+
+        let result = decompose_query("add structured logging");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        // Second query should be generic, not HTTP-specific
+        assert!(parts[1].contains("entry points"));
+        assert!(!parts[1].contains("middleware")); // must NOT contain HTTP-specific term
+        assert!(!parts[1].contains("request handling")); // must NOT contain HTTP-specific term
     }
 }
