@@ -1026,6 +1026,7 @@ fn test_recall_at_k() -> Result<()> {
 }
 
 #[test]
+#[ignore] // Requires ONNX runtime (builds full index)
 fn test_edge_case_empty_query() -> Result<()> {
     let fixture = TestFixture::new()?;
     fixture.create_test_files()?;

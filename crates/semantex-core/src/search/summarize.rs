@@ -186,11 +186,7 @@ fn chunk_header(chunk: &ReadChunk) -> String {
     } else {
         chunk.full_path.as_str()
     };
-    let _ = write!(
-        header,
-        "{}:{}-{}",
-        path, chunk.start_line, chunk.end_line
-    );
+    let _ = write!(header, "{}:{}-{}", path, chunk.start_line, chunk.end_line);
     if let Some(ref name) = chunk.name {
         let _ = write!(header, " {name}");
     }
@@ -318,7 +314,10 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String], include_full: bool) ->
         const FULL_CODE_CAP: usize = 8_000;
         // Walk back to a valid char boundary to avoid panicking on multi-byte chars.
         let cap = chunk.content.len().min(FULL_CODE_CAP);
-        let cap = (0..=cap).rev().find(|&i| chunk.content.is_char_boundary(i)).unwrap_or(0);
+        let cap = (0..=cap)
+            .rev()
+            .find(|&i| chunk.content.is_char_boundary(i))
+            .unwrap_or(0);
         let display = &chunk.content[..cap];
         let remaining = chunk.content.len() - cap;
         let _ = writeln!(block, "```");
@@ -339,7 +338,9 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String], include_full: bool) ->
                 continue;
             }
             // Skip pure comments (but keep doc comments — they have useful content)
-            if (trimmed.starts_with("//") && !trimmed.starts_with("///")) || trimmed.starts_with('#') {
+            if (trimmed.starts_with("//") && !trimmed.starts_with("///"))
+                || trimmed.starts_with('#')
+            {
                 continue;
             }
 

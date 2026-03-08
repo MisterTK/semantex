@@ -714,7 +714,8 @@ impl McpServer {
         use semantex_core::server::protocol::AgentRequest;
 
         // Support both single `query` and batch `queries` parameters.
-        let queries: Vec<String> = if let Some(arr) = args.get("queries").and_then(|v| v.as_array()) {
+        let queries: Vec<String> = if let Some(arr) = args.get("queries").and_then(|v| v.as_array())
+        {
             let qs: Vec<String> = arr
                 .iter()
                 .filter_map(|v| v.as_str())
@@ -745,10 +746,7 @@ impl McpServer {
             .unwrap_or(false);
 
         // Parse the optional `depth` parameter and map it to an AgentRoute override.
-        let depth_route: Option<AgentRoute> = match args
-            .get("depth")
-            .and_then(|v| v.as_str())
-        {
+        let depth_route: Option<AgentRoute> = match args.get("depth").and_then(|v| v.as_str()) {
             Some("quick") => Some(AgentRoute::ExactSymbol),
             Some("search") => Some(AgentRoute::Semantic),
             Some("deep") => Some(AgentRoute::Deep),

@@ -410,16 +410,14 @@ fn chunk_to_read_chunk(chunk: &crate::types::Chunk) -> ReadChunk {
                 .as_ref()
                 .and_then(|meta| meta.docstring.clone());
 
-            let graph_ctx = structured_meta
-                .as_ref()
-                .map_or(
-                    GraphContext {
-                        callers: Vec::new(),
-                        callees: Vec::new(),
-                        type_refs: Vec::new(),
-                    },
-                    |meta| parse_graph_context(&meta.nl_summary),
-                );
+            let graph_ctx = structured_meta.as_ref().map_or(
+                GraphContext {
+                    callers: Vec::new(),
+                    callees: Vec::new(),
+                    type_refs: Vec::new(),
+                },
+                |meta| parse_graph_context(&meta.nl_summary),
+            );
 
             ReadChunk {
                 file: full_path.clone(),
@@ -565,17 +563,9 @@ fn decompose_query(query: &str) -> Option<Vec<String>> {
     // Pattern: feature/implementation planning
     // "add X to this project" / "implement X" / "where would I add X"
     // Decompose into: "existing X patterns" + "entry points and boundaries"
-    for prefix in [
-        "add ",
-        "implement ",
-        "where would i add ",
-        "where to add ",
-    ] {
+    for prefix in ["add ", "implement ", "where would i add ", "where to add "] {
         if let Some(stripped) = q.strip_prefix(prefix) {
-            let feature = stripped
-                .trim()
-                .trim_end_matches(" to this project")
-                .trim();
+            let feature = stripped.trim().trim_end_matches(" to this project").trim();
             if feature.len() > 3 {
                 return Some(vec![
                     format!("existing {feature} implementation patterns"),
@@ -661,9 +651,7 @@ fn deep_search_inner(
             | crate::search::query_classifier::QueryType::Mixed
     );
 
-    let output = if should_decompose
-        && let Some(sub_queries) = decompose_query(query)
-    {
+    let output = if should_decompose && let Some(sub_queries) = decompose_query(query) {
         // Run a sub-search for each decomposed query, then merge results.
         let mut merged_results: Vec<crate::types::SearchResult> = Vec::new();
         let mut seen_chunk_ids: HashSet<u64> = HashSet::new();
