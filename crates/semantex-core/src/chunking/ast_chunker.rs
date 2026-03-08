@@ -839,8 +839,11 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "enum_declaration",
             "mixin_declaration",
             "extension_declaration",
+            "extension_type_declaration",
             "function_signature",
             "getter_signature",
+            "setter_signature",
+            "constructor_signature",
             "type_alias",
         ]),
         FileType::CSharp => Some(&[
@@ -901,6 +904,34 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
     }
 }
 
+/// For Dart: `function_signature`, `getter_signature`, and `setter_signature` nodes
+/// only cover the declaration line — the body is a separate sibling `function_body`
+/// node. Walk forward through siblings to find and include it so that the full
+/// function implementation is captured in the chunk.
+fn extend_to_function_body(node: &Node) -> Option<(usize, usize)> {
+    let mut cursor = node.next_sibling();
+    while let Some(sib) = cursor {
+        match sib.kind() {
+            "function_body" => {
+                return Some((sib.end_byte(), sib.end_position().row));
+            }
+            // Skip anonymous/punctuation siblings (whitespace tokens, "native" keyword, etc.)
+            k if !sib.is_named() || k == "native" => {
+                cursor = sib.next_sibling();
+            }
+            // Hit a different named node — stop searching
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Node kinds whose span must be extended to include a following `function_body`
+/// sibling. Applies only to Dart, where signature and body are separate grammar
+/// nodes with no named parent wrapper.
+const DART_SIGNATURE_KINDS: &[&str] =
+    &["function_signature", "getter_signature", "setter_signature"];
+
 /// Recursively walk the AST and collect definition nodes with structured metadata.
 fn collect_definitions(node: Node, source: &[u8], kinds: &[&str], out: &mut Vec<AstSpan>) {
     let node_kind = node.kind();
@@ -916,11 +947,19 @@ fn collect_definitions(node: Node, source: &[u8], kinds: &[&str], out: &mut Vec<
         meta.semantic_role =
             crate::chunking::semantic_role::classify_semantic_role(&meta, node_text);
 
+        // Dart: signature nodes don't include the function body — extend span.
+        let (end_byte, end_row) = if DART_SIGNATURE_KINDS.contains(&node_kind) {
+            extend_to_function_body(&node)
+                .unwrap_or((node.end_byte(), node.end_position().row))
+        } else {
+            (node.end_byte(), node.end_position().row)
+        };
+
         out.push(AstSpan {
             start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
+            end_byte,
             start_row: node.start_position().row,
-            end_row: node.end_position().row,
+            end_row,
             name,
             kind,
             meta,
@@ -972,10 +1011,13 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "function_signature"
         | "local_function_declaration"
         | "function"
-        | "getter_signature" => AstNodeKind::Function,
-        "method_definition" | "method_declaration" | "method" | "method_signature" => {
-            AstNodeKind::Method
-        }
+        | "getter_signature"
+        | "setter_signature" => AstNodeKind::Function,
+        "method_definition"
+        | "method_declaration"
+        | "method"
+        | "method_signature"
+        | "constructor_signature" => AstNodeKind::Method,
         "class_definition" | "class_declaration" | "class_specifier" | "class" => {
             AstNodeKind::Class
         }
@@ -1224,6 +1266,61 @@ void topLevelFunction() {
             _ => false,
         });
         assert!(has_class, "Should find a class definition");
+    }
+
+    /// Verify that top-level Dart function bodies are included in the chunk text,
+    /// not just the signature line. Regression test for the `function_signature`
+    /// body-capture fix (extend_to_function_body).
+    #[test]
+    fn test_dart_function_body_captured() {
+        let chunker = AstChunker::new(512, 64);
+        let content = "void refreshToken(String userId) {\n  final token = fetchFromVault(userId);\n  return token;\n}\n\nString getSecret() {\n  return 'hunter2';\n}\n";
+        let chunks = chunker.chunk(Path::new("lib/auth.dart"), content).unwrap();
+
+        // Find the function chunk for refreshToken
+        let fn_chunk = chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "refreshToken" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(fn_chunk.is_some(), "Should find refreshToken as an AstNode chunk");
+        // The chunk content must include the body, not just the signature
+        assert!(
+            fn_chunk.unwrap().content.contains("fetchFromVault"),
+            "refreshToken chunk must contain body content, got: {}",
+            fn_chunk.unwrap().content
+        );
+
+        // Same check for getSecret
+        let secret_chunk = chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "getSecret",
+            _ => false,
+        });
+        assert!(secret_chunk.is_some(), "Should find getSecret as an AstNode chunk");
+        assert!(
+            secret_chunk.unwrap().content.contains("hunter2"),
+            "getSecret chunk must contain body, got: {}",
+            secret_chunk.unwrap().content
+        );
+    }
+
+    /// Verify setter_signature is captured with its body.
+    #[test]
+    fn test_dart_setter_captured() {
+        let chunker = AstChunker::new(512, 64);
+        let content = "class Cache {\n  int _size = 0;\n  set size(int val) {\n    _size = val.clamp(0, 1024);\n  }\n}\n";
+        let chunks = chunker.chunk(Path::new("lib/cache.dart"), content).unwrap();
+        // The class chunk should contain the setter body
+        let class_chunk = chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { kind, .. } => matches!(kind, AstNodeKind::Class),
+            _ => false,
+        });
+        assert!(class_chunk.is_some(), "Should find Cache class");
+        assert!(
+            class_chunk.unwrap().content.contains("clamp"),
+            "Class chunk should contain setter body"
+        );
     }
 
     #[test]
