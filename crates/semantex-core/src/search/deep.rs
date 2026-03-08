@@ -1319,7 +1319,6 @@ mod tests {
         assert!(result.is_some());
         let parts = result.unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts.len(), 2);
     }
 
     #[test]
