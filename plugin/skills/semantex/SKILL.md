@@ -92,6 +92,26 @@ code is already in the response. The `[COMPLETE]` marker confirms this.**
 Use `queries` (array) instead of calling `semantex_agent` twice. Results are merged.
 Use for 2-3 related concepts that you would otherwise search separately.
 
+## Exhaustive inventory queries ("list all X")
+
+For "list all config options / env vars / CLI flags / error codes" questions, issue
+**one broad call** covering the key terms rather than multiple narrow calls:
+
+```json
+{
+  "queries": ["configuration options", "environment variables", "CLI flags"],
+  "depth": "search"
+}
+```
+
+semantex covers all indexed files in one pass — no need to grep after unless you need
+exact string matches (e.g., every literal `os.Getenv` call). In that case:
+1. One `semantex_agent` call with `depth="search"` for semantic discovery
+2. One targeted `Grep` for the specific literal pattern if completeness is critical
+
+Do **not** issue 5+ separate semantex calls for different config subsystems — that
+multiplies context O(N²) and gives worse results than one merged query.
+
 ## Focus: tell semantex what you need
 
 ```json
