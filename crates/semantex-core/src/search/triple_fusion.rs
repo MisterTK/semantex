@@ -116,6 +116,37 @@ fn top_score_normalize(list: &[ScoredChunkId]) -> Vec<(u64, f32)> {
     list.iter().map(|s| (s.chunk_id, s.score / max)).collect()
 }
 
+/// Adjust fusion weights based on the relative confidence of each retrieval channel.
+/// If one channel has a very strong top result, boost that channel's weight.
+fn adapt_weights(
+    weights: TripleFusionWeights,
+    dense_top: f32,
+    sparse_top: f32,
+    exact_top: f32,
+) -> TripleFusionWeights {
+    let mut w = weights;
+
+    // If exact match is very strong (near-exact symbol/string hit), boost it significantly
+    if exact_top > 0.8 {
+        w.w_exact *= 1.5;
+    }
+
+    // If sparse is dominant vs dense (BM25 much stronger), lean more on sparse
+    if sparse_top > 0.0 && dense_top > 0.0 {
+        let ratio = sparse_top / dense_top;
+        if ratio > 2.5 {
+            w.w_sparse *= 1.3;
+            w.w_dense *= 0.8;
+        } else if ratio < 0.4 {
+            // Dense much stronger: lean on dense
+            w.w_dense *= 1.3;
+            w.w_sparse *= 0.8;
+        }
+    }
+
+    w
+}
+
 /// Triple Convex Combination fusion: merge dense + sparse + exact results
 /// using weighted normalized scores.
 ///
@@ -145,10 +176,31 @@ pub fn triple_cc_fuse(
         exact: f32,
     }
 
+    // Pre-compute normalized scores for each channel so we can inspect top values
+    // before choosing the final weights.
+    let dense_normalized = top_score_normalize(dense_list);
+    let sparse_normalized = top_score_normalize(sparse_list);
+
+    // Top-1 normalized score per channel (used by DAT-lite weight adaptation).
+    // Dense and sparse are already normalized to [0,1] by top_score_normalize.
+    // Exact is binary: 1.0 if any exact hits exist, 0.0 otherwise.
+    let dense_top = dense_normalized
+        .iter()
+        .map(|&(_, s)| s)
+        .fold(0.0_f32, f32::max);
+    let sparse_top = sparse_normalized
+        .iter()
+        .map(|&(_, s)| s)
+        .fold(0.0_f32, f32::max);
+    let exact_top = if exact_ids.is_empty() { 0.0 } else { 1.0 };
+
+    // DAT-lite: dynamically adjust weights based on per-channel confidence.
+    let weights = adapt_weights(*weights, dense_top, sparse_top, exact_top);
+
     let mut scores: HashMap<u64, ChannelScores> = HashMap::new();
 
-    // Normalize and accumulate dense scores
-    for (chunk_id, norm_score) in top_score_normalize(dense_list) {
+    // Accumulate dense scores (already normalized)
+    for (chunk_id, norm_score) in dense_normalized {
         let entry = scores.entry(chunk_id).or_insert(ChannelScores {
             total: 0.0,
             dense: 0.0,
@@ -159,8 +211,8 @@ pub fn triple_cc_fuse(
         entry.total += weights.w_dense * norm_score;
     }
 
-    // Normalize and accumulate sparse scores
-    for (chunk_id, norm_score) in top_score_normalize(sparse_list) {
+    // Accumulate sparse scores (already normalized)
+    for (chunk_id, norm_score) in sparse_normalized {
         let entry = scores.entry(chunk_id).or_insert(ChannelScores {
             total: 0.0,
             dense: 0.0,
@@ -289,11 +341,15 @@ mod tests {
         let dense = vec![s(1, 0.9), s(2, 0.8)];
         let result = triple_cc_fuse(&dense, &[], &[2], &weights);
 
+        // DAT-lite: dense_top=1.0, sparse_top=0.0, exact_top=1.0.
+        // exact_top > 0.8 → w_exact *= 1.5 = 3.0.
+        // sparse_top=0.0 → no ratio adjustment.
+        // Effective weights: dense=0.5, sparse=0.5, exact=3.0.
         // Top-score norm: dense max=0.9
         // Chunk 1: dense=0.9/0.9=1.0, score = 0.5*1.0 = 0.5
-        // Chunk 2: dense=0.8/0.9≈0.889, exact=1.0, score = 0.5*0.889 + 2.0*1.0 ≈ 2.444
+        // Chunk 2: dense=0.8/0.9≈0.889, exact=1.0, score = 0.5*0.889 + 3.0*1.0 ≈ 3.444
         assert_eq!(result[0].chunk_id, 2);
-        let expected_chunk2 = 0.5 * (0.8_f32 / 0.9) + 2.0;
+        let expected_chunk2 = 0.5 * (0.8_f32 / 0.9) + 3.0;
         assert!((result[0].score - expected_chunk2).abs() < 1e-5);
         assert_eq!(result[1].chunk_id, 1);
         assert!((result[1].score - 0.5).abs() < f32::EPSILON);
@@ -313,12 +369,15 @@ mod tests {
 
         let result = triple_cc_fuse(&dense, &sparse, &[5], &weights);
 
+        // DAT-lite: dense_top=1.0, sparse_top=1.0, exact_top=1.0.
+        // exact_top > 0.8 → w_exact *= 1.5 = 1.5.
+        // ratio = 1.0 → no dense/sparse adjustment.
         // Top-score norm:
-        // Chunk 5: dense=0.9/0.9=1.0 + sparse=10/10=1.0 + exact=1.0 = 3.0
-        // Chunk 10: dense=0.5/0.9≈0.556
-        // Chunk 20: sparse=5/10=0.5
+        // Chunk 5: dense=0.9/0.9=1.0 + sparse=10/10=1.0 + exact=1.0 → 1.0*1.0 + 1.0*1.0 + 1.5*1.0 = 3.5
+        // Chunk 10: dense=0.5/0.9≈0.556 → 1.0*0.556
+        // Chunk 20: sparse=5/10=0.5 → 1.0*0.5
         assert_eq!(result[0].chunk_id, 5);
-        assert!((result[0].score - 3.0).abs() < f32::EPSILON);
+        assert!((result[0].score - 3.5).abs() < 1e-5);
 
         // Per-channel scores: chunk 5 should have all three > 0
         assert!(result[0].score_dense > 0.0, "chunk 5 should have dense > 0");
@@ -345,9 +404,11 @@ mod tests {
         assert!(result.is_empty());
 
         // Only exact
+        // DAT-lite: dense_top=0.0, sparse_top=0.0, exact_top=1.0.
+        // exact_top > 0.8 → w_exact *= 1.5 = 1.5.
         let result = triple_cc_fuse(&[], &[], &[10, 20], &weights);
         assert_eq!(result.len(), 2);
-        assert!((result[0].score - 1.0).abs() < f32::EPSILON);
+        assert!((result[0].score - 1.5).abs() < f32::EPSILON);
 
         // Only dense
         let result = triple_cc_fuse(&[s(1, 0.5)], &[], &[], &weights);
@@ -487,5 +548,94 @@ mod tests {
             (mp - 1.7).abs() < f32::EPSILON,
             "Semantic max_possible should be 1.7, got {mp}"
         );
+    }
+
+    // --- adapt_weights tests ---
+
+    #[test]
+    fn test_adapt_weights_high_exact_boosts_exact() {
+        let base = TripleFusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+        // exact_top > 0.8 → w_exact *= 1.5
+        let adapted = adapt_weights(base, 0.5, 0.5, 0.9);
+        assert!(
+            (adapted.w_exact - 1.2).abs() < 1e-5,
+            "w_exact should be boosted to 1.2, got {}",
+            adapted.w_exact
+        );
+        // dense and sparse unchanged (ratio = 1.0)
+        assert!((adapted.w_dense - 0.4).abs() < 1e-5);
+        assert!((adapted.w_sparse - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_adapt_weights_low_exact_no_boost() {
+        let base = TripleFusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+        // exact_top = 0.0 → no boost
+        let adapted = adapt_weights(base, 0.5, 0.5, 0.0);
+        assert!((adapted.w_exact - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_adapt_weights_sparse_dominant_boosts_sparse() {
+        let base = TripleFusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+        // sparse_top / dense_top = 0.9 / 0.3 = 3.0 > 2.5 → boost sparse, dampen dense
+        let adapted = adapt_weights(base, 0.3, 0.9, 0.0);
+        assert!(
+            (adapted.w_sparse - 0.5 * 1.3).abs() < 1e-5,
+            "w_sparse should be boosted, got {}",
+            adapted.w_sparse
+        );
+        assert!(
+            (adapted.w_dense - 0.4 * 0.8).abs() < 1e-5,
+            "w_dense should be dampened, got {}",
+            adapted.w_dense
+        );
+    }
+
+    #[test]
+    fn test_adapt_weights_dense_dominant_boosts_dense() {
+        let base = TripleFusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+        // sparse_top / dense_top = 0.1 / 0.9 ≈ 0.11 < 0.4 → boost dense, dampen sparse
+        let adapted = adapt_weights(base, 0.9, 0.1, 0.0);
+        assert!(
+            (adapted.w_dense - 0.4 * 1.3).abs() < 1e-5,
+            "w_dense should be boosted, got {}",
+            adapted.w_dense
+        );
+        assert!(
+            (adapted.w_sparse - 0.5 * 0.8).abs() < 1e-5,
+            "w_sparse should be dampened, got {}",
+            adapted.w_sparse
+        );
+    }
+
+    #[test]
+    fn test_adapt_weights_balanced_no_adjustment() {
+        let base = TripleFusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+        // ratio = 0.6 / 0.6 = 1.0 → no adjustment
+        let adapted = adapt_weights(base, 0.6, 0.6, 0.0);
+        assert!((adapted.w_dense - 0.4).abs() < 1e-5);
+        assert!((adapted.w_sparse - 0.5).abs() < 1e-5);
+        assert!((adapted.w_exact - 0.8).abs() < 1e-5);
     }
 }

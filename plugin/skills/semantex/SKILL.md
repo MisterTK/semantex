@@ -42,25 +42,101 @@ hooks:
 
 # semantex — Intelligent Code Search
 
-**Primary search tool.** Use `semantex_agent` for all code search queries.
+**One call replaces 5-10 Grep + Read iterations.** Use `semantex_agent` as your primary search
+tool for all code questions. It auto-routes to the right strategy and returns a complete,
+pre-formatted answer.
 
-## Default: semantex_agent
+## Why semantex_agent beats Grep + Read
 
-`semantex_agent` automatically:
-- Detects if you're looking for a symbol, asking a question, or searching with regex/glob
-- Routes to the optimal strategy (semantic, deep, graph walk, exact, regex, file pattern)
-- Falls back to alternative strategies if the primary returns empty
-- Returns a budget-capped, pre-formatted answer
+Every tool call re-sends the full accumulated context (O(N²) cost). Halving tool calls cuts
+context burden by ~75%, not ~50%. `semantex_agent` with `depth="deep"` collapses a full
+grep-then-read investigation into a single call that returns full function bodies, callers,
+and callees — nothing left to look up.
 
-Use this for everything. One call in, one answer out.
+**After `depth="deep"` or `semantex_deep`: do NOT call Read on the listed files. The full
+code is already in the response. The `[COMPLETE]` marker confirms this.**
 
-## Direct tool access (structured JSON only)
+## Choosing depth
 
-Only use `semantex_search` or `semantex_deep` directly when you need structured JSON for programmatic use:
-- `semantex_search` — raw `SearchResultItem` JSON with scores and metadata
-- `semantex_deep` — raw `DeepSearchResponse` JSON with answer + sources
+| depth | When to use | Latency |
+|-------|-------------|---------|
+| `"quick"` | Symbol lookup, exact name, find definition | ~50 ms |
+| `"search"` | Broad search, list all X, find usages | ~100 ms |
+| `"deep"` | "How does X work?", "Where to add Y?", architecture questions | ~200 ms |
+| *(omit)* | Auto-detect from query text | varies |
+
+**Use `depth="deep"` for:**
+- "How does X work?" — returns full implementation with call flow
+- "Where should I add X?" — returns injection points and existing patterns
+- Architecture questions — returns the relevant subsystem with context
+- Any question where you would otherwise call Read after searching
+
+**Use `depth="search"` for:**
+- "List all handlers for X"
+- "Show me every place Y is called"
+- Broad enumeration queries
+
+**Use `depth="quick"` for:**
+- "Where is function foo defined?"
+- Exact symbol lookups by name
+
+## Multi-part questions: use `queries` (one call, not two)
+
+```json
+{
+  "queries": ["authentication flow", "session token validation"],
+  "depth": "search"
+}
+```
+
+Use `queries` (array) instead of calling `semantex_agent` twice. Results are merged and
+deduplicated. Use for 2-3 related concepts that you would otherwise search separately.
+
+## Focus: tell semantex what you need
+
+```json
+{
+  "query": "HTTP request handler",
+  "depth": "deep",
+  "focus": "signatures"
+}
+```
+
+| focus | Effect |
+|-------|--------|
+| `"implementation"` | Full code bodies (default for deep) |
+| `"callers"` | Who calls these functions (call graph edges) |
+| `"signatures"` | Function signatures only — no bodies |
+| `"patterns"` | Usage examples |
+
+## Quick reference
+
+```json
+// Understand how something works
+{"query": "how does auth work", "depth": "deep"}
+
+// Find where to add a feature
+{"query": "where is middleware registered", "depth": "deep", "focus": "patterns"}
+
+// List all implementations of an interface
+{"query": "implements Handler interface", "depth": "search"}
+
+// Exact symbol lookup
+{"query": "NewSessionManager", "depth": "quick"}
+
+// Two related questions in one call
+{"queries": ["rate limiting logic", "retry backoff"], "depth": "search"}
+
+// Architecture question
+{"query": "how does the indexing pipeline work end to end", "depth": "deep"}
+```
+
+## Direct tools (structured JSON only)
+
+Use `semantex_search` or `semantex_deep` only when you need raw JSON for programmatic
+processing. For all human-readable results, use `semantex_agent`.
 
 ## Fallbacks (last resort)
 
-- **Grep**: exact regex on file content only
+- **Grep**: exact regex on file content only — no semantic understanding
 - **Glob**: find files by name/path pattern only

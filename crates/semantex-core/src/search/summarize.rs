@@ -18,6 +18,14 @@ pub struct ReadChunk {
     /// NL summary from StructuredChunkMeta (pre-generated, rule-based).
     pub summary: Option<String>,
     pub docstring: Option<String>,
+    /// Names of functions that call this chunk.
+    pub callers: Vec<String>,
+    /// Names of functions this chunk calls.
+    pub callees: Vec<String>,
+    /// Type names referenced by this chunk.
+    pub type_refs: Vec<String>,
+    /// Full relative file path (not just filename).
+    pub full_path: String,
 }
 
 /// Stop words filtered out before query term matching.
@@ -112,14 +120,19 @@ fn first_n_sentences(text: &str, n: usize) -> String {
 ///
 /// Produces structured, chunk-level blocks. Each block contains:
 /// - Header: `file:start-end name [kind]`
+/// - Graph context (Calls/Called by/Types) when available
 /// - Docstring excerpt (2-space indent, first 2 sentences)
 /// - NL summary (2-space indent)
-/// - Top 3 query-matching content lines (4-space indent)
+/// - Top 3 query-matching content lines (4-space indent), or full content if `full_code` is true
+///   for the top 5 chunks
 ///
 /// Chunks are presented in input order (search relevance from the deep pipeline).
-/// Total output capped at ~3000 chars (~750 tokens).
-pub fn extractive_summarize(query: &str, chunks: &[ReadChunk]) -> String {
-    const MAX_LEN: usize = 3000;
+/// Total output capped at ~16000 chars (~4000 tokens).
+///
+/// When `full_code` is true, the first 5 chunks include the ENTIRE `content` field
+/// (all lines, indented 4 spaces). Remaining chunks use the normal 3-line compressed format.
+pub fn extractive_summarize(query: &str, chunks: &[ReadChunk], full_code: bool) -> String {
+    const MAX_LEN: usize = 16_000;
     if chunks.is_empty() {
         return "No relevant code found for this query.".to_string();
     }
@@ -131,8 +144,9 @@ pub fn extractive_summarize(query: &str, chunks: &[ReadChunk]) -> String {
 
     let mut output = String::new();
 
-    for chunk in chunks {
-        let block = build_chunk_block(chunk, &terms);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let include_full = full_code && i < 5;
+        let block = build_chunk_block(chunk, &terms, include_full);
         if block.is_empty() {
             continue;
         }
@@ -163,18 +177,19 @@ pub fn extractive_summarize(query: &str, chunks: &[ReadChunk]) -> String {
     result
 }
 
-/// Build the header line for a chunk: `file:start-end name [kind]`
+/// Build the header line for a chunk: `full_path:start-end name [kind]`
 fn chunk_header(chunk: &ReadChunk) -> String {
     let mut header = String::new();
-    // Use short filename for readability
-    let short_file = std::path::Path::new(&chunk.file)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(&chunk.file);
+    // Use the full relative path for context
+    let path = if chunk.full_path.is_empty() {
+        chunk.file.as_str()
+    } else {
+        chunk.full_path.as_str()
+    };
     let _ = write!(
         header,
         "{}:{}-{}",
-        short_file, chunk.start_line, chunk.end_line
+        path, chunk.start_line, chunk.end_line
     );
     if let Some(ref name) = chunk.name {
         let _ = write!(header, " {name}");
@@ -245,7 +260,10 @@ fn clean_summary(summary: &str) -> Option<String> {
 }
 
 /// Build a structured block for a single chunk.
-fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
+///
+/// When `include_full` is true, the entire content is included (all lines, 4-space indent)
+/// instead of the top 3 query-matching lines.
+fn build_chunk_block(chunk: &ReadChunk, terms: &[String], include_full: bool) -> String {
     let mut block = String::new();
 
     // --- Header ---
@@ -253,6 +271,20 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
     block.push('\n');
 
     let mut has_content = false;
+
+    // --- Graph context (Calls / Called by / Types) ---
+    if !chunk.callees.is_empty() || !chunk.callers.is_empty() || !chunk.type_refs.is_empty() {
+        if !chunk.callees.is_empty() {
+            let _ = writeln!(block, "  Calls: {}", chunk.callees.join(", "));
+        }
+        if !chunk.callers.is_empty() {
+            let _ = writeln!(block, "  Called by: {}", chunk.callers.join(", "));
+        }
+        if !chunk.type_refs.is_empty() {
+            let _ = writeln!(block, "  Types: {}", chunk.type_refs.join(", "));
+        }
+        has_content = true;
+    }
 
     // --- Docstring (first 2 sentences, 2-space indent) ---
     if let Some(ref docstring) = chunk.docstring {
@@ -280,44 +312,54 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String]) -> String {
         }
     }
 
-    // --- Key content lines (4-space indent, top 3 by query term score) ---
-    let mut matching_lines: Vec<(usize, String, usize)> = Vec::new();
-    for (idx, line) in chunk.content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.len() < 3 {
-            continue;
+    if include_full {
+        // --- Full content (4-space indent, all lines) ---
+        let _ = writeln!(block, "```");
+        for line in chunk.content.lines() {
+            let _ = writeln!(block, "    {line}");
         }
-        // Skip pure comments (but keep doc comments — they have useful content)
-        if (trimmed.starts_with("//") && !trimmed.starts_with("///")) || trimmed.starts_with('#') {
-            continue;
-        }
-
-        let term_count = count_query_terms(trimmed, terms);
-        let is_sig = is_signature_line(trimmed);
-
-        if term_count == 0 && !is_sig {
-            continue;
-        }
-
-        // Signature bonus so fn headers appear even if fewer query terms
-        let score = term_count + if is_sig { 2 } else { 0 };
-        matching_lines.push((idx, trimmed.to_string(), score));
-    }
-
-    // Sort by score descending, take top 3, then restore source order
-    matching_lines.sort_by(|a, b| b.2.cmp(&a.2));
-    matching_lines.truncate(3);
-    matching_lines.sort_by_key(|(idx, _, _)| *idx);
-
-    for (_, line, _) in &matching_lines {
-        // Truncate very long lines
-        let display = if line.len() > 120 {
-            &line[..120]
-        } else {
-            line.as_str()
-        };
-        let _ = writeln!(block, "    {display}");
+        let _ = writeln!(block, "```");
         has_content = true;
+    } else {
+        // --- Key content lines (4-space indent, top 3 by query term score) ---
+        let mut matching_lines: Vec<(usize, String, usize)> = Vec::new();
+        for (idx, line) in chunk.content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.len() < 3 {
+                continue;
+            }
+            // Skip pure comments (but keep doc comments — they have useful content)
+            if (trimmed.starts_with("//") && !trimmed.starts_with("///")) || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let term_count = count_query_terms(trimmed, terms);
+            let is_sig = is_signature_line(trimmed);
+
+            if term_count == 0 && !is_sig {
+                continue;
+            }
+
+            // Signature bonus so fn headers appear even if fewer query terms
+            let score = term_count + if is_sig { 2 } else { 0 };
+            matching_lines.push((idx, trimmed.to_string(), score));
+        }
+
+        // Sort by score descending, take top 3, then restore source order
+        matching_lines.sort_by(|a, b| b.2.cmp(&a.2));
+        matching_lines.truncate(3);
+        matching_lines.sort_by_key(|(idx, _, _)| *idx);
+
+        for (_, line, _) in &matching_lines {
+            // Truncate very long lines
+            let display = if line.len() > 120 {
+                &line[..120]
+            } else {
+                line.as_str()
+            };
+            let _ = writeln!(block, "    {display}");
+            has_content = true;
+        }
     }
 
     // Only return the block if we found something useful beyond the header
@@ -338,6 +380,10 @@ mod tests {
             content: content.to_string(),
             summary: None,
             docstring: None,
+            callers: Vec::new(),
+            callees: Vec::new(),
+            type_refs: Vec::new(),
+            full_path: file.to_string(),
         }
     }
 
@@ -351,13 +397,17 @@ mod tests {
             content: content.to_string(),
             summary: None,
             docstring: None,
+            callers: Vec::new(),
+            callees: Vec::new(),
+            type_refs: Vec::new(),
+            full_path: file.to_string(),
         }
     }
 
     #[test]
     fn test_empty_chunks_returns_empty() {
         assert_eq!(
-            extractive_summarize("search query", &[]),
+            extractive_summarize("search query", &[], false),
             "No relevant code found for this query."
         );
     }
@@ -365,7 +415,7 @@ mod tests {
     #[test]
     fn test_empty_query_terms_returns_empty() {
         let chunk = make_chunk("foo.rs", "fn example() {}");
-        assert_eq!(extractive_summarize("the a an", &[chunk]), "");
+        assert_eq!(extractive_summarize("the a an", &[chunk], false), "");
     }
 
     #[test]
@@ -374,7 +424,7 @@ mod tests {
             "lib.rs",
             "pub fn search_index(query: &str) -> Vec<Result> { }",
         );
-        let result = extractive_summarize("search index query", &[chunk]);
+        let result = extractive_summarize("search index query", &[chunk], false);
         assert!(
             !result.is_empty(),
             "Should produce output for signature line"
@@ -389,7 +439,7 @@ mod tests {
     fn test_summary_field_included() {
         let mut chunk = make_chunk("lib.rs", "fn foo() {}");
         chunk.summary = Some("searches the index by query term".to_string());
-        let result = extractive_summarize("search query", &[chunk]);
+        let result = extractive_summarize("search query", &[chunk], false);
         assert!(
             result.contains("searches the index"),
             "Should include summary field: {result:?}"
@@ -405,7 +455,7 @@ mod tests {
             "pub fn search_index(query: &str) {}",
         );
         chunk.docstring = Some("Search the index using hybrid dense+sparse scoring.".to_string());
-        let result = extractive_summarize("search index", &[chunk]);
+        let result = extractive_summarize("search index", &[chunk], false);
         assert!(
             result.contains("Search the index"),
             "Should include docstring: {result:?}"
@@ -426,7 +476,7 @@ mod tests {
             "fn",
             "pub fn search_posts(query: &str) {}",
         );
-        let result = extractive_summarize("search query", &[chunk_a, chunk_b]);
+        let result = extractive_summarize("search query", &[chunk_a, chunk_b], false);
         // Should have separate blocks with file headers
         assert!(
             result.contains("a.rs:") && result.contains("b.rs:"),
@@ -439,13 +489,13 @@ mod tests {
         let chunk = make_named_chunk("src/lib.rs", "authenticate", "fn", "fn authenticate() {}");
         let header = chunk_header(&chunk);
         assert!(
-            header.contains("lib.rs:1-10 authenticate [fn]"),
-            "Header should have short file, range, name, kind: {header:?}"
+            header.contains("src/lib.rs:1-10 authenticate [fn]"),
+            "Header should have full path, range, name, kind: {header:?}"
         );
     }
 
     #[test]
-    fn test_long_output_capped_at_3000_chars() {
+    fn test_long_output_capped_at_16000_chars() {
         let chunks: Vec<ReadChunk> = (0..50)
             .map(|i| {
                 let mut c = make_named_chunk(
@@ -462,10 +512,10 @@ mod tests {
                 c
             })
             .collect();
-        let result = extractive_summarize("search query item", &chunks);
+        let result = extractive_summarize("search query item", &chunks, false);
         assert!(
-            result.len() <= 3200, // small buffer for final block
-            "Output should be roughly capped at 3000 chars, got {}",
+            result.len() <= 16_500, // small buffer for final block
+            "Output should be roughly capped at 16000 chars, got {}",
             result.len()
         );
     }
@@ -475,7 +525,7 @@ mod tests {
         let mut chunk = make_named_chunk("lib.rs", "search", "fn", "pub fn search(q: &str) {}");
         chunk.docstring = Some("Search the index for matching results.".to_string());
         chunk.summary = Some("search the index for matching results".to_string());
-        let result = extractive_summarize("search index", &[chunk]);
+        let result = extractive_summarize("search index", &[chunk], false);
         // The summary is a lowercased version of the docstring — should appear only once
         let count = result.to_lowercase().matches("search the index").count();
         assert!(
@@ -490,7 +540,7 @@ mod tests {
             "x.rs",
             "pub fn authenticate_user(token: &str) -> bool { true }",
         );
-        let result = extractive_summarize("authenticate token", &[chunk]);
+        let result = extractive_summarize("authenticate token", &[chunk], false);
         // Code lines should be 4-space indented
         assert!(
             result.contains("    pub fn authenticate_user"),
@@ -543,6 +593,78 @@ mod tests {
         assert_eq!(
             clean_summary(summary),
             Some("Run the full pipeline".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_full_code_includes_all_lines() {
+        let content = "pub fn example(x: u32) -> u32 {\n    let y = x + 1;\n    y\n}";
+        let chunk = make_chunk("src/lib.rs", content);
+        let result = extractive_summarize("example function", &[chunk], true);
+        // Full content should appear in the output
+        assert!(
+            result.contains("let y = x + 1;"),
+            "Full code mode should include all lines: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_full_code_only_top_5() {
+        // When full_code=true, only the first 5 chunks get full content; rest get compressed
+        let chunks: Vec<ReadChunk> = (0..8)
+            .map(|i| {
+                make_named_chunk(
+                    &format!("file_{i}.rs"),
+                    &format!("search_fn_{i}"),
+                    "fn",
+                    &format!("pub fn search_fn_{i}(q: &str) {{\n    let unique_line_{i} = q;\n}}"),
+                )
+            })
+            .collect();
+        let result = extractive_summarize("search function", &chunks, true);
+        // First 5 should have the unique interior lines
+        for i in 0..5 {
+            assert!(
+                result.contains(&format!("unique_line_{i}")),
+                "Chunk {i} should have full code in output: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_context_in_output() {
+        let mut chunk = make_named_chunk("lib.rs", "do_search", "fn", "pub fn do_search() {}");
+        chunk.callees = vec!["tokenize".to_string(), "score".to_string()];
+        chunk.callers = vec!["main_handler".to_string()];
+        chunk.type_refs = vec!["SearchResult".to_string()];
+        let result = extractive_summarize("search", &[chunk], false);
+        assert!(
+            result.contains("Calls: tokenize, score"),
+            "Should show callees: {result:?}"
+        );
+        assert!(
+            result.contains("Called by: main_handler"),
+            "Should show callers: {result:?}"
+        );
+        assert!(
+            result.contains("Types: SearchResult"),
+            "Should show type refs: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_full_path_in_header() {
+        let mut chunk = make_named_chunk(
+            "crates/semantex-core/src/search/deep.rs",
+            "deep_search_inner",
+            "fn",
+            "fn deep_search_inner() {}",
+        );
+        chunk.full_path = "crates/semantex-core/src/search/deep.rs".to_string();
+        let result = extractive_summarize("deep search", &[chunk], false);
+        assert!(
+            result.contains("crates/semantex-core/src/search/deep.rs:"),
+            "Should use full path in header: {result:?}"
         );
     }
 }

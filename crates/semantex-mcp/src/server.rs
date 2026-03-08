@@ -405,7 +405,12 @@ impl McpServer {
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Natural language question, code symbol, regex pattern, or glob pattern"
+                            "description": "Natural language question, code symbol, regex pattern, or glob pattern. Use instead of 'queries' for a single query."
+                        },
+                        "queries": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Multiple queries to run in one call. Results are merged and deduplicated. Use instead of 'query' when you need to search for 2-3 related concepts at once."
                         },
                         "path": {
                             "type": "string",
@@ -418,9 +423,18 @@ impl McpServer {
                         "budget": {
                             "type": "integer",
                             "description": "Response size budget in bytes (default: 12000, ~3K tokens)"
+                        },
+                        "depth": {
+                            "type": "string",
+                            "enum": ["quick", "search", "deep"],
+                            "description": "Search depth. 'quick'=symbol lookup (~50ms), 'search'=hybrid with snippets (~100ms), 'deep'=full implementations with call graphs (~200ms). Omit to auto-detect."
+                        },
+                        "focus": {
+                            "type": "string",
+                            "enum": ["implementation", "callers", "signatures", "patterns"],
+                            "description": "What to emphasize in results. 'implementation'=full code bodies, 'callers'=who calls these functions, 'signatures'=function signatures only, 'patterns'=usage examples."
                         }
-                    },
-                    "required": ["query"]
+                    }
                 }),
                 output_schema: None,
                 annotations: Some(ToolAnnotations::read_only("Intelligent Code Search")),
@@ -696,12 +710,29 @@ impl McpServer {
     #[tracing::instrument(skip(self, args), fields(tool = "agent"))]
     fn tool_agent(&self, args: &serde_json::Value) -> Result<ToolOutput> {
         use semantex_core::search::agent::AgentPipeline;
+        use semantex_core::search::agent_classifier::AgentRoute;
         use semantex_core::server::protocol::AgentRequest;
 
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
+        // Support both single `query` and batch `queries` parameters.
+        let queries: Vec<String> = if let Some(arr) = args.get("queries").and_then(|v| v.as_array()) {
+            let qs: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+                .collect();
+            if qs.is_empty() {
+                return Err(anyhow::anyhow!("'queries' array is empty"));
+            }
+            qs
+        } else {
+            let q = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'query' or 'queries' parameter"))?;
+            vec![q.to_string()]
+        };
+
+        let is_batch = queries.len() > 1;
 
         let path = args.get("path").and_then(|v| v.as_str()).map_or_else(
             || std::env::current_dir().context("Failed to determine current directory"),
@@ -713,7 +744,28 @@ impl McpServer {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        tracing::info!(query, path = %path.display(), full_code, "MCP agent search");
+        // Parse the optional `depth` parameter and map it to an AgentRoute override.
+        let depth_route: Option<AgentRoute> = match args
+            .get("depth")
+            .and_then(|v| v.as_str())
+        {
+            Some("quick") => Some(AgentRoute::ExactSymbol),
+            Some("search") => Some(AgentRoute::Semantic),
+            Some("deep") => Some(AgentRoute::Deep),
+            _ => None,
+        };
+
+        // Parse the optional `focus` parameter.
+        let focus: Option<&str> = args.get("focus").and_then(|v| v.as_str());
+
+        tracing::info!(
+            queries = ?queries,
+            path = %path.display(),
+            full_code,
+            ?depth_route,
+            focus,
+            "MCP agent search"
+        );
 
         let path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
@@ -721,10 +773,11 @@ impl McpServer {
         match idx_state {
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
-                return Self::do_ripgrep_fallback(query, &path, 10);
+                // For batch queries, fall back using the first query.
+                return Self::do_ripgrep_fallback(&queries[0], &path, 10);
             }
             IndexState::Building => {
-                return Self::do_ripgrep_fallback(query, &path, 10);
+                return Self::do_ripgrep_fallback(&queries[0], &path, 10);
             }
             IndexState::Ready => {}
         }
@@ -738,15 +791,35 @@ impl McpServer {
             .and_then(serde_json::Value::as_u64)
             .map_or(12_000, |v| v as usize);
 
-        let request = AgentRequest {
-            query: query.to_string(),
-            route: None,
-            budget: Some(budget),
-            full_code,
+        // Run each query and collect formatted results.
+        let mut parts: Vec<String> = Vec::with_capacity(queries.len());
+        for q in &queries {
+            let request = AgentRequest {
+                query: q.clone(),
+                route: depth_route,
+                budget: Some(budget),
+                full_code,
+            };
+            let response = pipeline.handle(&request);
+            parts.push(response.formatted);
+        }
+
+        // Combine results.
+        let mut combined = if is_batch {
+            let n = parts.len();
+            format!(
+                "[Batch results for {} queries — deduplicated]\n\n{}",
+                n,
+                parts.join("\n\n---\n\n")
+            )
+        } else {
+            parts.remove(0)
         };
 
-        let response = pipeline.handle(&request);
-        Ok(ToolOutput::text(response.formatted))
+        // Apply focus formatting to the result.
+        combined = apply_focus(combined, focus);
+
+        Ok(ToolOutput::text(combined))
     }
 
     // -------------------------------------------------------------------------
@@ -1136,7 +1209,7 @@ impl McpServer {
 
         let _ = write!(
             output,
-            "\n[Complete: {} chunks read across {} files — no further Read calls needed]\n\
+            "\n[COMPLETE: Full function implementations included for {} functions across {} files. Callers, callees, and type dependencies shown above. Do NOT call Read on these files — the code is complete.]\n\
              [semantex_deep_metrics: total_ms={} search_ms={} triage_ms={} graph_ms={} read_ms={} summarize_ms={} chunks_read={} coverage={} confidence={:.2} confidence_zone={}]",
             m.chunks_read,
             unique_file_count,
@@ -1266,5 +1339,78 @@ fn truncate_lines_mcp(content: &str, n: usize) -> String {
         format!("{}...", lines[..n].join("\n"))
     } else {
         lines.join("\n")
+    }
+}
+
+/// Apply `focus` formatting to a pre-formatted agent result string.
+///
+/// - `"signatures"`: Strip code block bodies, keeping only the first content line (signature) of
+///   each fenced code block. Prepends `[focus: signatures]`.
+/// - `"callers"`: Prepends `[focus: callers]` and appends a note about call graph edges.
+/// - `"implementation"`: Prepends `[focus: implementation — full code included]`.
+/// - `"patterns"`: Prepends `[focus: patterns]`.
+/// - `None` or unrecognised value: returns text unchanged.
+fn apply_focus(text: String, focus: Option<&str>) -> String {
+    match focus {
+        Some("signatures") => {
+            // Collapse each fenced code block to only its first (signature) line.
+            // State: outside block, inside block before first content, inside block after first.
+            #[derive(PartialEq)]
+            enum State {
+                Outside,
+                InsideBeforeFirst,
+                InsideAfterFirst,
+            }
+
+            let mut out = String::from("[focus: signatures]\n\n");
+            let mut state = State::Outside;
+
+            for line in text.lines() {
+                match state {
+                    State::Outside => {
+                        out.push_str(line);
+                        out.push('\n');
+                        if line.starts_with("```") {
+                            state = State::InsideBeforeFirst;
+                        }
+                    }
+                    State::InsideBeforeFirst => {
+                        if line.starts_with("```") {
+                            // Empty block — closing fence immediately.
+                            out.push_str(line);
+                            out.push('\n');
+                            state = State::Outside;
+                        } else {
+                            // First content line = the function signature.
+                            out.push_str(line);
+                            out.push('\n');
+                            state = State::InsideAfterFirst;
+                        }
+                    }
+                    State::InsideAfterFirst => {
+                        if line.starts_with("```") {
+                            // Closing fence — emit it and return outside.
+                            out.push_str(line);
+                            out.push('\n');
+                            state = State::Outside;
+                        }
+                        // All other body lines are skipped.
+                    }
+                }
+            }
+            out
+        }
+        Some("callers") => {
+            format!(
+                "[focus: callers]\n\n{text}\n\n[focus: callers — check the call graph edges shown above]"
+            )
+        }
+        Some("implementation") => {
+            format!("[focus: implementation — full code included]\n\n{text}")
+        }
+        Some("patterns") => {
+            format!("[focus: patterns]\n\n{text}")
+        }
+        _ => text,
     }
 }

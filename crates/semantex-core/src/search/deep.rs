@@ -327,8 +327,71 @@ fn expand_with_graph(
     Ok(additional)
 }
 
+/// Parse a list of comma-separated names from a text segment.
+fn parse_name_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Graph context extracted from an NL summary string.
+struct GraphContext {
+    /// Functions that call this chunk.
+    callers: Vec<String>,
+    /// Functions that this chunk calls.
+    callees: Vec<String>,
+    /// Type names referenced.
+    type_refs: Vec<String>,
+}
+
+/// Extract graph context from an NL summary string.
+///
+/// NL summaries contain sections like:
+///   `"; calls fn_a, fn_b; called by fn_x; uses types TypeA; imports SomeModule"`
+#[allow(clippy::similar_names)]
+fn parse_graph_context(nl_summary: &str) -> GraphContext {
+    // Extract "; calls <list>" section
+    let callees = nl_summary
+        .find("; calls ")
+        .map(|pos| {
+            let after = &nl_summary[pos + "; calls ".len()..];
+            let end = after.find(';').unwrap_or(after.len());
+            parse_name_list(&after[..end])
+        })
+        .unwrap_or_default();
+
+    // Extract "; called by <list>" section
+    let callers = nl_summary
+        .find("; called by ")
+        .map(|pos| {
+            let after = &nl_summary[pos + "; called by ".len()..];
+            let end = after.find(';').unwrap_or(after.len());
+            parse_name_list(&after[..end])
+        })
+        .unwrap_or_default();
+
+    // Extract "; uses types <list>" section
+    let type_refs = nl_summary
+        .find("; uses types ")
+        .map(|pos| {
+            let after = &nl_summary[pos + "; uses types ".len()..];
+            let end = after.find(';').unwrap_or(after.len());
+            parse_name_list(&after[..end])
+        })
+        .unwrap_or_default();
+
+    GraphContext {
+        callers,
+        callees,
+        type_refs,
+    }
+}
+
 /// Convert a `Chunk` to a `ReadChunk` for summarization.
 fn chunk_to_read_chunk(chunk: &crate::types::Chunk) -> ReadChunk {
+    let full_path = chunk.file_path.display().to_string();
     match &chunk.chunk_type {
         ChunkType::AstNode {
             name,
@@ -346,8 +409,20 @@ fn chunk_to_read_chunk(chunk: &crate::types::Chunk) -> ReadChunk {
             let docstring = structured_meta
                 .as_ref()
                 .and_then(|meta| meta.docstring.clone());
+
+            let graph_ctx = structured_meta
+                .as_ref()
+                .map_or(
+                    GraphContext {
+                        callers: Vec::new(),
+                        callees: Vec::new(),
+                        type_refs: Vec::new(),
+                    },
+                    |meta| parse_graph_context(&meta.nl_summary),
+                );
+
             ReadChunk {
-                file: chunk.file_path.display().to_string(),
+                file: full_path.clone(),
                 start_line: chunk.start_line,
                 end_line: chunk.end_line,
                 name: Some(name.clone()),
@@ -355,10 +430,14 @@ fn chunk_to_read_chunk(chunk: &crate::types::Chunk) -> ReadChunk {
                 content: chunk.content.clone(),
                 summary,
                 docstring,
+                callers: graph_ctx.callers,
+                callees: graph_ctx.callees,
+                type_refs: graph_ctx.type_refs,
+                full_path,
             }
         }
         ChunkType::TextWindow { .. } | ChunkType::PdfPage { .. } => ReadChunk {
-            file: chunk.file_path.display().to_string(),
+            file: full_path.clone(),
             start_line: chunk.start_line,
             end_line: chunk.end_line,
             name: None,
@@ -366,6 +445,10 @@ fn chunk_to_read_chunk(chunk: &crate::types::Chunk) -> ReadChunk {
             content: chunk.content.clone(),
             summary: None,
             docstring: None,
+            callers: Vec::new(),
+            callees: Vec::new(),
+            type_refs: Vec::new(),
+            full_path,
         },
     }
 }
@@ -392,7 +475,7 @@ fn try_symbol_shortcut(
 
     // Build ReadChunks and summarize
     let read_chunks: Vec<ReadChunk> = chunks.iter().map(chunk_to_read_chunk).collect();
-    let answer = summarize::extractive_summarize(query, &read_chunks);
+    let answer = summarize::extractive_summarize(query, &read_chunks, true);
 
     let sources: Vec<DeepSource> = chunks
         .iter()
@@ -431,6 +514,78 @@ fn try_symbol_shortcut(
         },
         confidence: 1.0, // exact match
     }))
+}
+
+/// Detect if a query is compound and decompose it into sub-queries.
+/// Returns None if the query is simple, Some(vec) with 2 sub-queries if compound.
+fn decompose_query(query: &str) -> Option<Vec<String>> {
+    let q = query.to_lowercase();
+
+    // Pattern: "how does X use Y" or "how does X interact with Y"
+    if let Some(rest) = q.strip_prefix("how does ")
+        && let Some(pos) = rest.find(" use ").or_else(|| rest.find(" interact with "))
+    {
+        let x = rest[..pos].trim().to_string();
+        let sep_len = if rest[pos..].starts_with(" use ") {
+            5
+        } else {
+            14
+        };
+        let y = rest[pos + sep_len..].trim().to_string();
+        if !x.is_empty() && !y.is_empty() && x.len() > 2 && y.len() > 2 {
+            return Some(vec![x, y]);
+        }
+    }
+
+    // Pattern: "X across A and B" or "X from A to B"
+    // (cross-cutting concerns like "error handling across backend and mobile")
+    for sep in [" across ", " from ", " between "] {
+        if let Some(main_pos) = q.find(sep) {
+            let subject = q[..main_pos].trim();
+            let rest = &q[main_pos + sep.len()..];
+            // Look for "and" or "to" to split the second part
+            if let Some(and_pos) = rest.find(" and ").or_else(|| rest.find(" to ")) {
+                let part_a = rest[..and_pos].trim();
+                let and_len = if rest[and_pos..].starts_with(" and ") {
+                    5
+                } else {
+                    4
+                };
+                let part_b = rest[and_pos + and_len..].trim();
+                if !part_a.is_empty() && !part_b.is_empty() {
+                    return Some(vec![
+                        format!("{subject} {part_a}"),
+                        format!("{subject} {part_b}"),
+                    ]);
+                }
+            }
+        }
+    }
+
+    // Pattern: feature/implementation planning
+    // "add X to this project" / "implement X" / "where would I add X"
+    // Decompose into: "existing X patterns" + "entry points and boundaries"
+    for prefix in [
+        "add ",
+        "implement ",
+        "where would i add ",
+        "where to add ",
+    ] {
+        if let Some(stripped) = q.strip_prefix(prefix) {
+            let feature = stripped
+                .trim()
+                .trim_end_matches(" to this project")
+                .trim();
+            if feature.len() > 3 {
+                return Some(vec![
+                    format!("existing {feature} patterns"),
+                    "entry points request handling middleware".to_string(),
+                ]);
+            }
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -496,10 +651,68 @@ fn deep_search_inner(
     report(0, 5, "Searching code index...");
     let search_start = Instant::now();
     let effective_max = max_results.max(20);
-    let search_query = crate::search::SearchQuery::new(query)
-        .max_results(effective_max)
-        .code_only();
-    let output = searcher.search(&search_query)?;
+
+    // Query decomposition: for Semantic/Mixed compound queries, issue targeted
+    // sub-searches and merge results before the normal triage phase.
+    let query_type_pre = crate::search::query_classifier::classify(query);
+    let should_decompose = matches!(
+        query_type_pre,
+        crate::search::query_classifier::QueryType::Semantic
+            | crate::search::query_classifier::QueryType::Mixed
+    );
+
+    let output = if should_decompose
+        && let Some(sub_queries) = decompose_query(query)
+    {
+        // Run a sub-search for each decomposed query, then merge results.
+        let mut merged_results: Vec<crate::types::SearchResult> = Vec::new();
+        let mut seen_chunk_ids: HashSet<u64> = HashSet::new();
+
+        for sub_q in &sub_queries {
+            let sub_search_query = crate::search::SearchQuery::new(sub_q)
+                .max_results(effective_max)
+                .code_only();
+            if let Ok(sub_output) = searcher.search(&sub_search_query) {
+                for result in sub_output.results {
+                    if seen_chunk_ids.insert(result.chunk.id) {
+                        merged_results.push(result);
+                    }
+                }
+            }
+        }
+
+        // Sort merged results by score descending.
+        merged_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        crate::search::SearchOutput {
+            results: merged_results,
+            metrics: crate::search::SearchMetrics {
+                total_ms: 0,
+                dense_ms: None,
+                sparse_ms: None,
+                exact_ms: None,
+                fusion_ms: None,
+                rerank_ms: None,
+                dense_count: 0,
+                sparse_count: 0,
+                exact_count: 0,
+                fused_count: 0,
+                result_count: 0,
+                query_type: "decomposed".to_string(),
+                response_bytes: None,
+            },
+        }
+    } else {
+        let search_query = crate::search::SearchQuery::new(query)
+            .max_results(effective_max)
+            .code_only();
+        searcher.search(&search_query)?
+    };
+
     metrics.search_ms = search_start.elapsed().as_millis() as u64;
     metrics.chunks_searched = output.results.len();
 
@@ -531,7 +744,14 @@ fn deep_search_inner(
     // ---- Phase 2: Triage ----
     report(1, 5, "Triaging results...");
     let triage_start = Instant::now();
-    let selected_indices = triage_results(query, &output.results, 8, max_possible);
+    let triage_cap = if confidence > 0.7 {
+        5 // high confidence: fewer, more focused results with full code
+    } else if confidence > 0.3 {
+        8 // medium: current behavior
+    } else {
+        14 // low: cast wider net
+    };
+    let selected_indices = triage_results(query, &output.results, triage_cap, max_possible);
     let selected_results: Vec<&SearchResult> = selected_indices
         .iter()
         .map(|&i| &output.results[i])
@@ -589,7 +809,7 @@ fn deep_search_inner(
     report(4, 5, "Synthesizing answer...");
     let summarize_start = Instant::now();
     let read_chunks: Vec<ReadChunk> = combined_chunks.iter().map(chunk_to_read_chunk).collect();
-    let answer = summarize::extractive_summarize(query, &read_chunks);
+    let answer = summarize::extractive_summarize(query, &read_chunks, true);
     metrics.summarize_ms = summarize_start.elapsed().as_millis() as u64;
 
     metrics.total_ms = total_start.elapsed().as_millis() as u64;
@@ -1045,5 +1265,31 @@ mod tests {
         // This is tested by construction: the function checks `if symbol_hits.is_empty()`.
         let empty_hits: Vec<(i64, String, String)> = vec![];
         assert!(empty_hits.is_empty()); // confirms the guard condition triggers Ok(None)
+    }
+
+    // --- decompose_query tests ---
+
+    #[test]
+    fn test_decompose_query_how_does_use() {
+        let result = decompose_query("how does authentication use sessions");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "authentication");
+        assert_eq!(parts[1], "sessions");
+    }
+
+    #[test]
+    fn test_decompose_query_simple_returns_none() {
+        let result = decompose_query("search index BM25");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_decompose_query_across_pattern() {
+        let result = decompose_query("error handling across frontend and backend");
+        assert!(result.is_some());
+        let parts = result.unwrap();
+        assert_eq!(parts.len(), 2);
     }
 }
