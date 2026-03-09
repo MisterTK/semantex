@@ -49,6 +49,21 @@ pub fn detect(project_path: &Path) -> IndexState {
     IndexState::Ready
 }
 
+/// Returns the age of the index in seconds since its last update, or `None` if
+/// no index exists or the timestamp cannot be parsed.
+pub fn index_age_secs(project_path: &Path) -> Option<u64> {
+    let meta_path = project_path.join(".semantex").join("meta.json");
+    let content = std::fs::read_to_string(meta_path).ok()?;
+    let meta: crate::types::IndexMeta = serde_json::from_str(&content).ok()?;
+    // updated_at is stored as Unix epoch seconds (plain integer string)
+    let updated_epoch: u64 = meta.updated_at.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(updated_epoch))
+}
+
 /// Check if the index has an outdated schema version.
 fn is_stale(meta_path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(meta_path) else {

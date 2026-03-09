@@ -14,9 +14,24 @@ use semantex_core::search::hybrid::HybridSearcher;
 use semantex_core::search::ripgrep_fallback;
 use std::collections::HashMap;
 use std::io::{BufRead, BufWriter, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+use semantex_core::index::registry;
+
+/// Format seconds into a human-readable age string.
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
 
 // =============================================================================
 // Notification writer — sends JSON-RPC notifications to stdout during execution
@@ -359,6 +374,9 @@ impl McpServer {
             states.insert(canonical.clone(), IndexingStatus::Building);
         }
 
+        // Register this project in the global registry so tool_status can list all repos.
+        registry::register(&canonical);
+
         let config = self.config.clone();
         let states = Arc::clone(&self.index_states);
         std::thread::spawn(move || {
@@ -381,6 +399,34 @@ impl McpServer {
                 }
             }
         });
+    }
+
+    /// Trigger a background refresh if the index is older than `SEMANTEX_REFRESH_SECS`
+    /// (default: 3600 s). Returns `true` if a refresh was actually triggered.
+    fn maybe_trigger_refresh(&self, path: &std::path::Path) -> bool {
+        let threshold: u64 = std::env::var("SEMANTEX_REFRESH_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+
+        let Some(age) = state::index_age_secs(path) else {
+            return false;
+        };
+        if age < threshold {
+            return false;
+        }
+
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if matches!(
+            self.index_states.lock().get(&canonical),
+            Some(IndexingStatus::Building)
+        ) {
+            return false; // already in progress
+        }
+
+        tracing::info!(path = %path.display(), age_secs = age, "Triggering background refresh (index stale)");
+        self.spawn_background_index(path);
+        true
     }
 
     // -------------------------------------------------------------------------
@@ -777,7 +823,10 @@ impl McpServer {
             IndexState::Building => {
                 return Self::do_ripgrep_fallback(&queries[0], &path, 10);
             }
-            IndexState::Ready => {}
+            IndexState::Ready => {
+                // Silently refresh if index is older than threshold.
+                self.maybe_trigger_refresh(&path);
+            }
         }
 
         let index_dir = SemantexConfig::project_index_dir(&path);
@@ -857,6 +906,7 @@ impl McpServer {
         let idx_state = state::detect(&path);
         match idx_state {
             IndexState::Ready => {
+                self.maybe_trigger_refresh(&path);
                 self.do_semantex_search(query, &path, max_results, rerank, grep_mode)
             }
             IndexState::NotIndexed | IndexState::Stale => {
@@ -984,27 +1034,104 @@ impl McpServer {
     // Tool: semantex_status
     // -------------------------------------------------------------------------
 
-    #[allow(clippy::unused_self)]
     #[tracing::instrument(skip(self, args), fields(tool = "status"))]
     fn tool_status(&self, args: &serde_json::Value) -> Result<String> {
-        let path = args.get("path").and_then(|v| v.as_str()).map_or_else(
-            || std::env::current_dir().context("Failed to determine current directory"),
-            |p| Ok(PathBuf::from(p)),
-        )?;
+        let explicit_path = args.get("path").and_then(|v| v.as_str()).map(PathBuf::from);
 
-        let index_dir = SemantexConfig::project_index_dir(&path);
+        if let Some(path) = explicit_path {
+            // Single-repo detailed status
+            Ok(self.repo_status_detail(&path))
+        } else {
+            // All-repos overview from registry + current directory
+            let mut repos: Vec<PathBuf> = registry::read_all();
+            // Always include CWD
+            if let Ok(cwd) = std::env::current_dir() {
+                let cwd = cwd.canonicalize().unwrap_or(cwd);
+                if !repos.contains(&cwd) {
+                    repos.push(cwd);
+                }
+            }
+            if repos.is_empty() {
+                return Ok("No indexed projects found. Run 'semantex_index' on a project first.".into());
+            }
+
+            let mut lines = vec![
+                "Index Status — All Tracked Repos".to_string(),
+                "=".repeat(50),
+            ];
+
+            for repo in &repos {
+                lines.push(String::new());
+                lines.push(self.repo_status_detail(repo));
+            }
+
+            Ok(lines.join("\n"))
+        }
+    }
+
+    /// Build a human-readable status block for a single repository.
+    fn repo_status_detail(&self, path: &Path) -> String {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let display = canonical.display();
+
+        let idx_state = state::detect(&canonical);
+        let state_label = match idx_state {
+            IndexState::NotIndexed => "NOT INDEXED",
+            IndexState::Building => "BUILDING",
+            IndexState::Stale => "STALE (schema mismatch)",
+            IndexState::Ready => "READY",
+        };
+
+        // Check if our in-process tracker says building (covers the window where
+        // the lock file hasn't been created yet)
+        let in_process_building = matches!(
+            self.index_states.lock().get(&canonical),
+            Some(IndexingStatus::Building)
+        );
+        let state_label = if in_process_building && idx_state != IndexState::Building {
+            "BUILDING"
+        } else {
+            state_label
+        };
+
+        let index_dir = SemantexConfig::project_index_dir(&canonical);
         let meta_path = index_dir.join("meta.json");
 
-        if meta_path.exists() {
-            let content = std::fs::read_to_string(&meta_path)?;
-            let meta: semantex_core::types::IndexMeta = serde_json::from_str(&content)?;
-            Ok(format!(
-                "Index exists:\n  Files: {}\n  Chunks: {}\n  Model: {}\n  Updated: {}",
-                meta.file_count, meta.chunk_count, meta.embedding_model, meta.updated_at
-            ))
-        } else {
-            Ok("No index found for this project. Run 'semantex index' first.".into())
+        if !meta_path.exists() {
+            // Trigger indexing if truly not indexed
+            if idx_state == IndexState::NotIndexed && !in_process_building {
+                self.spawn_background_index(&canonical);
+                return format!("{display}\n  State: {state_label} — indexing started automatically");
+            }
+            return format!("{display}\n  State: {state_label}");
         }
+
+        let Ok(content) = std::fs::read_to_string(&meta_path) else {
+            return format!("{display}\n  State: unreadable meta.json");
+        };
+        let Ok(meta) = serde_json::from_str::<semantex_core::types::IndexMeta>(&content) else {
+            return format!("{display}\n  State: corrupted meta.json — re-indexing");
+        };
+
+        let age_str = state::index_age_secs(&canonical)
+            .map(format_age)
+            .unwrap_or_else(|| "unknown".into());
+
+        // Trigger background refresh if index is old and ready
+        let refresh_note = if idx_state == IndexState::Ready && !in_process_building {
+            if self.maybe_trigger_refresh(&canonical) {
+                "  (background refresh triggered)\n"
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+
+        format!(
+            "{display}\n  State: {state_label}{refresh_note}\n  Age:   {age_str}\n  Files: {}\n  Chunks: {}\n  Model: {}",
+            meta.file_count, meta.chunk_count, meta.embedding_model
+        )
     }
 
     // -------------------------------------------------------------------------
@@ -1154,7 +1281,9 @@ impl McpServer {
             IndexState::Building => {
                 return Ok(ToolOutput::text("Index is currently building. Deep search requires a complete index. Try again in a moment.".to_string()));
             }
-            IndexState::Ready => {}
+            IndexState::Ready => {
+                self.maybe_trigger_refresh(&path);
+            }
         }
 
         let index_dir = SemantexConfig::project_index_dir(&path);

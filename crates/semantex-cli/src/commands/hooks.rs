@@ -9,6 +9,7 @@
 //!   { "hookSpecificOutput": { "hookEventName": "...", "additionalContext": "..." } }
 
 use anyhow::Result;
+use semantex_core::index::registry;
 use semantex_core::index::state::{self, IndexState};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -85,6 +86,9 @@ pub fn cmd_session_hook() -> Result<()> {
 
     // Fire-and-forget incremental reindex to pick up changes since last session
     super::spawn_background_index(project_dir);
+
+    // Refresh any other registered repos whose index is older than SEMANTEX_REFRESH_SECS.
+    refresh_stale_registry_repos(project_dir);
 
     let additional_context = format!(
         "semantex semantic code search is available (index: {}).\n\
@@ -238,6 +242,37 @@ pub fn cmd_bash_hook(deny: bool) -> Result<()> {
 
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
+}
+
+/// Read the global project registry and trigger a background reindex for any repo
+/// whose index is older than `SEMANTEX_REFRESH_SECS` (default: 3600 s), skipping
+/// `current_dir` which has already been handled by the caller.
+fn refresh_stale_registry_repos(current_dir: &std::path::Path) {
+    let threshold: u64 = std::env::var("SEMANTEX_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+
+    for repo in registry::read_all() {
+        let canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        if canonical == current_dir {
+            continue; // already handled
+        }
+        let idx_state = state::detect(&canonical);
+        if idx_state == IndexState::Building {
+            continue; // already in progress
+        }
+        let age = state::index_age_secs(&canonical).unwrap_or(0);
+        if idx_state == IndexState::NotIndexed || idx_state == IndexState::Stale || age >= threshold
+        {
+            tracing::debug!(
+                path = %canonical.display(),
+                age_secs = age,
+                "Session hook: refreshing stale registry repo"
+            );
+            super::spawn_background_index(&canonical);
+        }
+    }
 }
 
 /// Check if a shell command is a search operation that semantex should replace.

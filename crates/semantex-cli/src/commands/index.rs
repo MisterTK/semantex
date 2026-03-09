@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use semantex_core::config::SemantexConfig;
 use semantex_core::index::builder::IndexBuilder;
+use semantex_core::index::registry;
 use std::path::Path;
 
 pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
@@ -13,6 +14,9 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
 
     let builder = IndexBuilder::new(config)?;
     let stats = builder.build(&project_path)?;
+
+    // Register project in global registry for cross-repo status tracking.
+    registry::register(&project_path);
 
     println!();
     println!("{}", "Index complete!".green().bold());
