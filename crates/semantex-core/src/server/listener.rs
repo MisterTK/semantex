@@ -9,40 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// ─── RSS helpers ────────────────────────────────────────────────────────────
-
-/// Returns the process RSS in bytes, or `None` if unavailable.
-/// On macOS, returns peak RSS (monotonically increasing but good enough for a hard cap).
-/// On Linux, returns current VmRSS from /proc/self/status.
-#[cfg(target_os = "macos")]
-fn current_rss_bytes() -> Option<u64> {
-    // SAFETY: getrusage is a standard POSIX call; zeroing the struct is valid.
-    unsafe {
-        let mut usage: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) == 0 {
-            Some(usage.ru_maxrss as u64) // bytes on macOS
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> Option<u64> {
-    let content = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn current_rss_bytes() -> Option<u64> {
-    None
-}
+use crate::memory::current_rss_bytes;
 
 /// TCP localhost listener for the semantex daemon
 #[allow(clippy::struct_field_names)]
@@ -112,7 +79,7 @@ impl Listener {
         let rss_limit_mb: u64 = std::env::var("SEMANTEX_MAX_RSS_MB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
+            .unwrap_or(1024);
 
         tracing::info!(
             port = self.port(),

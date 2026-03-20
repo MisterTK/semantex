@@ -123,6 +123,8 @@ pub struct McpServer {
     /// LRU cache of `HybridSearcher` instances keyed by canonical index directory.
     cache: Mutex<HashMap<PathBuf, Arc<CachedSearcher>>>,
     max_cached: usize,
+    /// RSS limit in MB. When exceeded, all cached searchers are evicted.
+    rss_limit_mb: u64,
     /// Per-project indexing status — prevents double-spawning background index builds.
     index_states: Arc<Mutex<HashMap<PathBuf, IndexingStatus>>>,
     /// Current MCP logging level — only messages at or above this level are sent.
@@ -134,11 +136,16 @@ impl McpServer {
         let max_cached = std::env::var("SEMANTEX_MCP_CACHE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(1);
+        let rss_limit_mb = std::env::var("SEMANTEX_MAX_RSS_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
             max_cached,
+            rss_limit_mb,
             index_states: Arc::new(Mutex::new(HashMap::new())),
             log_level: Mutex::new(LogLevel::default()),
         }
@@ -160,27 +167,56 @@ impl McpServer {
             return Ok(Arc::clone(entry));
         }
 
+        // Evict BEFORE allocating the new searcher to keep peak memory bounded.
+        while cache.len() >= self.max_cached {
+            if let Some(lru_key) = cache
+                .iter()
+                .min_by_key(|(_, v)| *v.last_used.lock())
+                .map(|(k, _)| k.clone())
+            {
+                tracing::info!(evicted = %lru_key.display(), "Evicting cached searcher (cache full)");
+                cache.remove(&lru_key);
+            } else {
+                break;
+            }
+        }
+
+        // Drop the lock while opening the searcher (I/O + model load is slow).
+        drop(cache);
         let searcher = HybridSearcher::open(index_dir, &self.config)?;
         let entry = Arc::new(CachedSearcher {
             searcher,
             last_used: Mutex::new(now),
         });
 
-        if cache.len() >= self.max_cached
-            && let Some(lru_key) = cache
-                .iter()
-                .min_by_key(|(_, v)| *v.last_used.lock())
-                .map(|(k, _)| k.clone())
-        {
-            cache.remove(&lru_key);
-        }
-
+        let mut cache = self.cache.lock();
         cache.insert(index_dir.to_path_buf(), Arc::clone(&entry));
         Ok(entry)
     }
 
     fn invalidate_cache(&self, index_dir: &std::path::Path) {
         self.cache.lock().remove(index_dir);
+    }
+
+    /// Check process RSS and evict all cached searchers if over limit.
+    /// Called after each tool invocation to prevent runaway memory growth.
+    fn check_rss_and_evict(&self) {
+        if self.rss_limit_mb == 0 {
+            return;
+        }
+        if let Some(rss_mb) = semantex_core::memory::current_rss_mb() {
+            if rss_mb > self.rss_limit_mb {
+                let mut cache = self.cache.lock();
+                let evicted = cache.len();
+                cache.clear();
+                tracing::warn!(
+                    rss_mb,
+                    limit_mb = self.rss_limit_mb,
+                    evicted,
+                    "RSS limit exceeded — evicted all cached searchers to free memory"
+                );
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -372,6 +408,25 @@ impl McpServer {
                 return;
             }
             states.insert(canonical.clone(), IndexingStatus::Building);
+        }
+
+        // Skip background indexing if RSS is already over 50% of the limit —
+        // indexing is very memory-intensive and could push us over the edge.
+        if self.rss_limit_mb > 0 {
+            if let Some(rss_mb) = semantex_core::memory::current_rss_mb() {
+                if rss_mb > self.rss_limit_mb / 2 {
+                    tracing::warn!(
+                        rss_mb,
+                        limit_mb = self.rss_limit_mb,
+                        "Skipping background index — RSS already at {}% of limit",
+                        rss_mb * 100 / self.rss_limit_mb
+                    );
+                    self.index_states
+                        .lock()
+                        .insert(canonical, IndexingStatus::Failed("Memory pressure".into()));
+                    return;
+                }
+            }
         }
 
         // Register this project in the global registry so tool_status can list all repos.
@@ -682,6 +737,9 @@ impl McpServer {
             "semantex_deep" => self.tool_deep_search(&arguments, writer, progress_token.as_ref()),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
+
+        // Check RSS after every tool call and evict caches if over limit.
+        self.check_rss_and_evict();
 
         match result {
             Ok(output) => {
