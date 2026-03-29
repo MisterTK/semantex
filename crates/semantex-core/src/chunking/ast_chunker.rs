@@ -949,8 +949,7 @@ fn collect_definitions(node: Node, source: &[u8], kinds: &[&str], out: &mut Vec<
 
         // Dart: signature nodes don't include the function body — extend span.
         let (end_byte, end_row) = if DART_SIGNATURE_KINDS.contains(&node_kind) {
-            extend_to_function_body(&node)
-                .unwrap_or((node.end_byte(), node.end_position().row))
+            extend_to_function_body(&node).unwrap_or((node.end_byte(), node.end_position().row))
         } else {
             (node.end_byte(), node.end_position().row)
         };
@@ -1284,7 +1283,10 @@ void topLevelFunction() {
             }
             _ => false,
         });
-        assert!(fn_chunk.is_some(), "Should find refreshToken as an AstNode chunk");
+        assert!(
+            fn_chunk.is_some(),
+            "Should find refreshToken as an AstNode chunk"
+        );
         // The chunk content must include the body, not just the signature
         assert!(
             fn_chunk.unwrap().content.contains("fetchFromVault"),
@@ -1297,7 +1299,10 @@ void topLevelFunction() {
             ChunkType::AstNode { name, .. } => name == "getSecret",
             _ => false,
         });
-        assert!(secret_chunk.is_some(), "Should find getSecret as an AstNode chunk");
+        assert!(
+            secret_chunk.is_some(),
+            "Should find getSecret as an AstNode chunk"
+        );
         assert!(
             secret_chunk.unwrap().content.contains("hunter2"),
             "getSecret chunk must contain body, got: {}",

@@ -12,8 +12,20 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod client;
 mod commands;
+mod telemetry;
 
 use anyhow::{Context, Result};
+
+unsafe extern "C" {
+    /// `mi_collect(force: bool)` — force mimalloc to return freed pages to the OS.
+    /// Linked automatically because mimalloc is the global allocator.
+    safe fn mi_collect(force: bool);
+}
+
+/// Force mimalloc to return freed pages to the OS.
+fn mimalloc_purge() {
+    mi_collect(true);
+}
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -311,6 +323,9 @@ fn find_ort_dylib() -> Option<&'static str> {
 }
 
 fn main() -> Result<()> {
+    // Register mimalloc purge so memory module can force page return to OS.
+    semantex_core::memory::register_purge_fn(mimalloc_purge);
+
     // Enable ANSI escape codes on Windows Terminal / PowerShell
     #[cfg(windows)]
     {
@@ -513,18 +528,40 @@ fn main() -> Result<()> {
     config.context_lines = cli.context;
 
     match cli.command {
-        Some(Commands::Index { path }) => commands::index::run(&path, &config),
-        Some(Commands::Watch { path }) => commands::watch::run(&path, &config),
-        Some(Commands::Serve { path }) => commands::serve::run(&path, &config),
+        Some(Commands::Index { path }) => {
+            telemetry::track("index");
+            commands::index::run(&path, &config)
+        }
+        Some(Commands::Watch { path }) => {
+            telemetry::track("watch");
+            commands::watch::run(&path, &config)
+        }
+        Some(Commands::Serve { path }) => {
+            telemetry::track("serve");
+            commands::serve::run(&path, &config)
+        }
         Some(Commands::Stop { path }) => commands::stop::run(&path),
-        Some(Commands::DownloadModels) => commands::download::run(&config),
+        Some(Commands::DownloadModels) => {
+            telemetry::track("download_models");
+            commands::download::run(&config)
+        }
         Some(Commands::Status { path }) => commands::status::run(&path, &config),
-        Some(Commands::Mcp) => commands::mcp::run(&config),
+        Some(Commands::Mcp) => {
+            telemetry::track("mcp");
+            commands::mcp::run(&config)
+        }
         Some(Commands::InstallClaudeCode { scope }) => {
+            telemetry::track("install_claude_code");
             commands::install::install_claude_code(scope)
         }
-        Some(Commands::InstallCodex) => commands::install::install_codex(),
-        Some(Commands::InstallOpenCode) => commands::install::install_opencode(),
+        Some(Commands::InstallCodex) => {
+            telemetry::track("install_codex");
+            commands::install::install_codex()
+        }
+        Some(Commands::InstallOpenCode) => {
+            telemetry::track("install_opencode");
+            commands::install::install_opencode()
+        }
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
         Some(Commands::Validate { path }) => commands::validate::run(&path),
@@ -536,6 +573,7 @@ fn main() -> Result<()> {
             budget,
             json,
         }) => {
+            telemetry::track("agent");
             use semantex_core::search::agent_classifier::AgentRoute;
             use semantex_core::server::protocol::AgentRequest;
 
@@ -593,6 +631,7 @@ fn main() -> Result<()> {
                 println!();
                 Ok(())
             } else {
+                telemetry::track("search");
                 let search_opts = commands::search::SearchOpts {
                     queries: cli.queries,
                     path: cli.path.unwrap_or_else(|| PathBuf::from(".")),

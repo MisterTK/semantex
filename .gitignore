@@ -13,7 +13,7 @@
 .env
 
 # Runtime index data
-.sage/
+.semantex/
 
 # Model cache
 .fastembed_cache/
@@ -24,6 +24,7 @@ CLAUDE.md
 
 # Internal dev docs
 /docs
+/examples
 /FASTEMBED_INTEGRATION.md
 
 # Benchmarks (contain hardcoded local paths and dev-only scripts)
@@ -31,7 +32,8 @@ CLAUDE.md
 /benches
 /bench_results
 /scripts
-.semantex/
+/results
+
+# Local settings
 settings.local.json
 .mcp.json
-/results

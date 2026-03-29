@@ -8,8 +8,10 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.91"
 repository = "https://github.com/MisterTK/semantex"
-homepage = "https://github.com/MisterTK/semantex"
+homepage = "https://semantex.dev"
 description = "Semantex — semantic code search — hybrid ColBERT + BM25 retrieval engine"
+keywords = ["search", "semantic", "code", "embedding", "colbert"]
+categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
 semantex-core = { path = "crates/semantex-core" }

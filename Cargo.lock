@@ -3504,6 +3504,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "ureq 3.2.0",
 ]
 
 [[package]]
@@ -3568,6 +3569,7 @@ dependencies = [
  "tree-sitter-zig",
  "ureq 3.2.0",
  "walkdir",
+ "windows-sys 0.59.0",
  "xxhash-rust",
 ]
 

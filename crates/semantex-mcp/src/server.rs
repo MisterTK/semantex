@@ -111,8 +111,10 @@ enum IndexingStatus {
     Failed(String),
 }
 
-/// Idle eviction timeout: entries unused for this duration are dropped
-const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+/// Idle eviction timeout: entries unused for this duration are dropped.
+/// Kept short (2 min) so that MCP processes sitting idle between queries
+/// release searcher memory quickly — critical when multiple sessions run.
+const IDLE_TIMEOUT_SECS: u64 = 120; // 2 minutes
 
 // =============================================================================
 // MCP Server
@@ -133,6 +135,14 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(config: SemantexConfig) -> Self {
+        // MCP processes should use minimal ONNX threads — queries are short and
+        // multiple sessions may run in parallel. Default to 1 thread unless
+        // the user explicitly sets SEMANTEX_ORT_THREADS.
+        if std::env::var("SEMANTEX_ORT_THREADS").is_err() {
+            // SAFETY: called at MCP init before any ONNX session is created.
+            unsafe { std::env::set_var("SEMANTEX_ORT_THREADS", "1") };
+        }
+
         let max_cached = std::env::var("SEMANTEX_MCP_CACHE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -140,7 +150,7 @@ impl McpServer {
         let rss_limit_mb = std::env::var("SEMANTEX_MAX_RSS_MB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
+            .unwrap_or(512);
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
@@ -198,22 +208,44 @@ impl McpServer {
         self.cache.lock().remove(index_dir);
     }
 
-    /// Check process RSS and evict all cached searchers if over limit.
+    /// Check process RSS and apply graduated memory pressure relief.
     /// Called after each tool invocation to prevent runaway memory growth.
+    ///
+    /// - Over 75% of limit: evict all cached searchers + purge allocator
+    /// - Over limit: same + log a hard warning
     fn check_rss_and_evict(&self) {
         if self.rss_limit_mb == 0 {
             return;
         }
-        if let Some(rss_mb) = semantex_core::memory::current_rss_mb() {
+        let Some(rss_mb) = semantex_core::memory::current_rss_mb() else {
+            return;
+        };
+        let threshold_75 = self.rss_limit_mb * 3 / 4;
+        if rss_mb > threshold_75 {
+            let mut cache = self.cache.lock();
+            let evicted = cache.len();
+            cache.clear();
+            drop(cache);
+            // Also clear the index_states map (small but unbounded)
+            self.index_states
+                .lock()
+                .retain(|_, s| matches!(s, IndexingStatus::Building));
+            // Force mimalloc to return freed pages to the OS
+            semantex_core::memory::purge_allocator();
+
             if rss_mb > self.rss_limit_mb {
-                let mut cache = self.cache.lock();
-                let evicted = cache.len();
-                cache.clear();
                 tracing::warn!(
                     rss_mb,
                     limit_mb = self.rss_limit_mb,
                     evicted,
-                    "RSS limit exceeded — evicted all cached searchers to free memory"
+                    "RSS limit exceeded — evicted all cached searchers and purged allocator"
+                );
+            } else {
+                tracing::info!(
+                    rss_mb,
+                    threshold_mb = threshold_75,
+                    evicted,
+                    "RSS at 75% of limit — proactively evicted cached searchers"
                 );
             }
         }
@@ -727,6 +759,8 @@ impl McpServer {
             .and_then(|m| m.get("progressToken"))
             .cloned();
 
+        let rss_before = semantex_core::memory::current_rss_mb();
+
         let result = match tool_name {
             "semantex_agent" => self.tool_agent(&arguments),
             "semantex_search" => self.tool_search(&arguments, writer, progress_token.as_ref()),
@@ -740,6 +774,18 @@ impl McpServer {
 
         // Check RSS after every tool call and evict caches if over limit.
         self.check_rss_and_evict();
+
+        if let (Some(before), Some(after)) = (rss_before, semantex_core::memory::current_rss_mb()) {
+            let cached = self.cache.lock().len();
+            tracing::debug!(
+                tool = tool_name,
+                rss_before_mb = before,
+                rss_after_mb = after,
+                cached_searchers = cached,
+                limit_mb = self.rss_limit_mb,
+                "Memory after tool call"
+            );
+        }
 
         match result {
             Ok(output) => {
@@ -1110,7 +1156,9 @@ impl McpServer {
                 }
             }
             if repos.is_empty() {
-                return Ok("No indexed projects found. Run 'semantex_index' on a project first.".into());
+                return Ok(
+                    "No indexed projects found. Run 'semantex_index' on a project first.".into(),
+                );
             }
 
             let mut lines = vec![
@@ -1159,7 +1207,9 @@ impl McpServer {
             // Trigger indexing if truly not indexed
             if idx_state == IndexState::NotIndexed && !in_process_building {
                 self.spawn_background_index(&canonical);
-                return format!("{display}\n  State: {state_label} — indexing started automatically");
+                return format!(
+                    "{display}\n  State: {state_label} — indexing started automatically"
+                );
             }
             return format!("{display}\n  State: {state_label}");
         }

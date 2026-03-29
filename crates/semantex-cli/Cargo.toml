@@ -25,6 +25,7 @@ colored = "3"
 bincode = { workspace = true }
 dirs = "6"
 mimalloc = "0.1"
+ureq = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

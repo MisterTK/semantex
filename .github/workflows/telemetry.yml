@@ -1,0 +1,106 @@
+name: GitHub Stats → PostHog
+
+# Runs daily and after every release to track GitHub-level metrics.
+# Pushes stars, forks, watchers, and per-release download counts to PostHog
+# so you can see them alongside CLI usage events in one dashboard.
+#
+# Setup:
+#   Add POSTHOG_KEY to repository secrets (Settings → Secrets → Actions).
+#   The same key you put in telemetry.rs and install.sh/install.ps1.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"    # daily at 08:00 UTC
+  release:
+    types: [published]
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  push-stats:
+    name: Push GitHub stats to PostHog
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Fetch repo & release stats, send to PostHog
+        env:
+          POSTHOG_KEY: "phc_UEenKOEhH6eTI11OwQgo5qxOumaPRHiBSgnqXBy5o6V"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ── Repo-level metrics ────────────────────────────────────────────
+          repo=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO")
+
+          stars=$(echo "$repo"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stargazers_count',0))")
+          forks=$(echo "$repo"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('forks_count',0))")
+          watchers=$(echo "$repo"| python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('subscribers_count',0))")
+          open_issues=$(echo "$repo" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('open_issues_count',0))")
+
+          echo "stars=$stars forks=$forks watchers=$watchers open_issues=$open_issues"
+
+          # ── Per-release download totals ───────────────────────────────────
+          releases=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases")
+
+          total_downloads=$(echo "$releases" | python3 -c "
+          import sys, json
+          releases = json.load(sys.stdin)
+          total = sum(
+              asset.get('download_count', 0)
+              for r in releases
+              for asset in r.get('assets', [])
+          )
+          print(total)
+          ")
+
+          echo "total_downloads=$total_downloads"
+
+          # ── Traffic (clones + views) — requires push access ───────────────
+          clones_14d=0
+          views_14d=0
+          traffic_clones=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/traffic/clones" 2>/dev/null || echo '{}')
+          clones_14d=$(echo "$traffic_clones" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('count',0))" 2>/dev/null || echo 0)
+
+          traffic_views=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/traffic/views" 2>/dev/null || echo '{}')
+          views_14d=$(echo "$traffic_views" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('count',0))" 2>/dev/null || echo 0)
+
+          echo "clones_14d=$clones_14d views_14d=$views_14d"
+
+          # ── Send to PostHog ───────────────────────────────────────────────
+          payload=$(python3 -c "
+          import json
+          print(json.dumps({
+              'api_key': '$POSTHOG_KEY',
+              'event': 'github_stats',
+              'distinct_id': 'github-repo-${{ github.repository_id }}',
+              'properties': {
+                  'stars': $stars,
+                  'forks': $forks,
+                  'watchers': $watchers,
+                  'open_issues': $open_issues,
+                  'total_downloads': $total_downloads,
+                  'clones_14d': $clones_14d,
+                  'views_14d': $views_14d,
+                  '\$lib': 'semantex-github-actions',
+              }
+          }))
+          ")
+
+          curl -fsSL --max-time 10 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "https://app.posthog.com/capture/"
+
+          echo "Stats pushed to PostHog."

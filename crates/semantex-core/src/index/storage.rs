@@ -46,9 +46,8 @@ impl ChunkStore {
         Ok(store)
     }
 
-    /// Open the chunk store in search mode with tuned PRAGMAs.
-    /// Uses 16MB cache and 64MB mmap because search_exact() performs
-    /// LIKE '%pattern%' full table scans that benefit from OS page cache.
+    /// Open the chunk store in search mode with minimal memory footprint.
+    /// Search queries are short-lived; we rely on OS page cache for mmap.
     pub fn open_for_search(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
 
@@ -56,9 +55,8 @@ impl ChunkStore {
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
-            PRAGMA cache_size = -16000;
-            PRAGMA mmap_size = 67108864;
-            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -2000;
+            PRAGMA mmap_size = 8388608;
             ",
         )?;
 

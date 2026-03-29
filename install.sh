@@ -1,18 +1,26 @@
 #!/bin/sh
 # semantex installer — downloads pre-built binary from GitHub Releases
 # Usage: curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
+#
+# Options:
+#   SEMANTEX_VERSION=v0.1.2  — pin a specific version
+#   SEMANTEX_NO_TELEMETRY=1  — opt out of anonymous install telemetry
 set -eu
 
 REPO="MisterTK/semantex"
+POSTHOG_KEY="phc_UEenKOEhH6eTI11OwQgo5qxOumaPRHiBSgnqXBy5o6V"
 
 info() { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
 err()  { printf '  \033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+# Windows users: use install.ps1 instead.
+# Run in PowerShell: irm https://raw.githubusercontent.com/MisterTK/semantex/main/install.ps1 | iex
 
 # Detect OS
 case "$(uname -s)" in
   Darwin) os="apple-darwin" ;;
   Linux)  os="unknown-linux-gnu" ;;
-  *)      err "Unsupported OS: $(uname -s). Download manually from https://github.com/${REPO}/releases" ;;
+  *)      err "Unsupported OS: $(uname -s). On Windows use install.ps1; otherwise download from https://github.com/${REPO}/releases" ;;
 esac
 
 # Detect architecture
@@ -112,6 +120,37 @@ if [ "$INSTALL_DIR" != "/usr/local/bin" ]; then
   export PATH="${INSTALL_DIR}:$PATH"
 fi
 
+# Telemetry: fire-and-forget install event (opt-out via SEMANTEX_NO_TELEMETRY=1 or DO_NOT_TRACK=1)
+send_telemetry() {
+  [ -n "${SEMANTEX_NO_TELEMETRY:-}" ] && return 0
+  [ "${DO_NOT_TRACK:-}" = "1" ] && return 0
+  [ -n "${CI:-}" ] && return 0
+  [ "$POSTHOG_KEY" = "YOUR_POSTHOG_KEY" ] && return 0
+  ! command -v curl >/dev/null 2>&1 && return 0
+
+  # Stable anonymous ID
+  id_file="${HOME}/.semantex/telemetry_id"
+  if [ -f "$id_file" ]; then
+    machine_id=$(cat "$id_file")
+  else
+    mkdir -p "${HOME}/.semantex"
+    machine_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
+      || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null \
+      || uuidgen 2>/dev/null \
+      || echo "$(date +%s)-$$")
+    printf '%s' "$machine_id" > "$id_file"
+  fi
+
+  os_name="linux"
+  [ "$(uname -s)" = "Darwin" ] && os_name="macos"
+
+  payload="{\"api_key\":\"${POSTHOG_KEY}\",\"event\":\"command_run\",\"distinct_id\":\"${machine_id}\",\"properties\":{\"command\":\"install\",\"version\":\"${version}\",\"os\":\"${os_name}\",\"arch\":\"${arch}\",\"\$lib\":\"semantex\"}}"
+  curl -fsSL --max-time 3 -d "$payload" \
+    -H "Content-Type: application/json" \
+    "https://app.posthog.com/capture/" >/dev/null 2>&1 &
+}
+send_telemetry
+
 echo ""
 info "Done!" "semantex ${version} is ready"
 echo ""
@@ -121,4 +160,6 @@ echo "  Next: install into your AI coding tool:"
 echo "    semantex install-claude-code   # Claude Code"
 echo "    semantex install-codex         # Codex CLI"
 echo "    semantex install-open-code     # OpenCode"
+echo ""
+echo "  Disable telemetry anytime: export SEMANTEX_NO_TELEMETRY=1"
 echo ""

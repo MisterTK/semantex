@@ -111,6 +111,31 @@ jobs:
             ${{ steps.archive.outputs.name }}.zip.sha256
           if-no-files-found: ignore
 
+  publish-crates:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      # Publish in dependency order: core → mcp → cli
+      - name: Publish semantex-core
+        run: cargo publish -p semantex-core --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish semantex-mcp
+        run: cargo publish -p semantex-mcp --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish semantex-cli
+        run: cargo publish -p semantex-cli --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   release:
     name: Publish Release
     needs: build
@@ -141,4 +166,73 @@ jobs:
           body_path: release/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew tap
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          # Extract per-platform SHA256s from downloaded artifacts
+          get_sha() {
+            local file="release/${1}.sha256"
+            [ -f "$file" ] && awk '{print $1}' "$file" || echo "CHECKSUM_UNAVAILABLE"
+          }
+
+          aarch64_darwin=$(get_sha "semantex-v${version}-aarch64-apple-darwin.tar.gz")
+          x86_64_darwin=$(get_sha  "semantex-v${version}-x86_64-apple-darwin.tar.gz")
+          aarch64_linux=$(get_sha  "semantex-v${version}-aarch64-unknown-linux-gnu.tar.gz")
+          x86_64_linux=$(get_sha   "semantex-v${version}-x86_64-unknown-linux-gnu.tar.gz")
+
+          # Clone the tap repo, update the formula, push
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/MisterTK/homebrew-semantex.git" tap
+          cd tap
+
+          sed -i "s/version \".*\"/version \"${version}\"/" Formula/semantex.rb
+          sed -i "s/AARCH64_APPLE_DARWIN_SHA256/${aarch64_darwin}/"  Formula/semantex.rb
+          sed -i "s/X86_64_APPLE_DARWIN_SHA256/${x86_64_darwin}/"    Formula/semantex.rb
+          sed -i "s/AARCH64_LINUX_SHA256/${aarch64_linux}/"           Formula/semantex.rb
+          sed -i "s/X86_64_LINUX_SHA256/${x86_64_linux}/"             Formula/semantex.rb
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add Formula/semantex.rb
+          git diff --staged --quiet || git commit -m "semantex ${version}"
+          git push
+
+      - name: Update Scoop manifest
+        if: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sha=$(awk '{print $1}' "release/semantex-v${version}-x86_64-pc-windows-msvc.zip.sha256" 2>/dev/null || echo "CHECKSUM_UNAVAILABLE")
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/MisterTK/scoop-semantex.git" bucket
+          cd bucket
+
+          python3 - <<PYEOF
+          import json, sys
+          with open("bucket/semantex.json") as f:
+              m = json.load(f)
+          m["version"] = "${version}"
+          m["architecture"]["64bit"]["url"] = \
+              f"https://github.com/MisterTK/semantex/releases/download/v${version}/semantex-v${version}-x86_64-pc-windows-msvc.zip"
+          m["architecture"]["64bit"]["hash"] = "${sha}"
+          m["architecture"]["64bit"]["extract_dir"] = f"semantex-v${version}-x86_64-pc-windows-msvc"
+          with open("bucket/semantex.json", "w") as f:
+              json.dump(m, f, indent=4)
+              f.write("\n")
+          PYEOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add bucket/semantex.json
+          git diff --staged --quiet || git commit -m "semantex ${version}"
+          git push
 
