@@ -4,6 +4,40 @@
 
 semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loops AI agents use to explore codebases. It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
 
+### Quick Start
+
+Install and add to your editor in under a minute:
+
+```bash
+# Install
+curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
+
+# Add to your editor's MCP config (Claude Code, Cursor, Windsurf, etc.)
+```
+
+```json
+{
+  "mcpServers": {
+    "semantex": {
+      "command": "semantex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+| Editor | Where to add it |
+|--------|----------------|
+| **Claude Code** | `.mcp.json` in project root, or `~/.claude/settings.json` globally |
+| **Cursor** | `.cursor/mcp.json` in project root |
+| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
+| **Cline** | VS Code settings → Cline MCP Servers |
+| **Continue** | `~/.continue/config.json` under `mcpServers` |
+
+No manual indexing needed — semantex auto-indexes on first search.
+
+---
+
 ## The Problem: Agents Waste Most of Their Tokens Searching
 
 When an AI coding agent needs to understand a codebase, it falls into a predictable pattern:
@@ -53,7 +87,7 @@ Instead of the agent iteratively searching and reading, semantex does it interna
 
 The -40% token saving is the billing metric. The **-67% cumulative context burden** is the cognitive metric — how much the model actually had to attend to across all turns. Fewer turns × smaller context = quadratically less waste.
 
-> Full methodology, per-question data, and the mathematical framework: [docs/BENCHMARK-semantex-vs-builtin-tools.md](docs/BENCHMARK-semantex-vs-builtin-tools.md)
+> Full methodology and per-question data available in the benchmark suite.
 
 ## How It Works
 
@@ -86,8 +120,9 @@ Query → Exact string match ─────────────────
 ### Fully Local & Private
 
 - All processing runs locally — your code never leaves your machine
-- No cloud APIs, no telemetry, no internet required after initial model download (~17MB)
+- No cloud APIs, no internet required after initial model download (~17MB)
 - Single ~17MB int8 ONNX model (ColBERT LateOn-Code-edge), cached and shared across projects
+- Anonymous usage telemetry (command name, OS, arch) is opt-out: `export SEMANTEX_NO_TELEMETRY=1`
 
 ## Installation
 

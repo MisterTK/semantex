@@ -23,7 +23,7 @@ jobs:
     steps:
       - name: Fetch repo & release stats, send to PostHog
         env:
-          POSTHOG_KEY: "phc_UEenKOEhH6eTI11OwQgo5qxOumaPRHiBSgnqXBy5o6V"
+          POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |

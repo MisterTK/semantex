@@ -30,10 +30,10 @@ cargo test --package semantex-core --test search_accuracy_test -- --ignored --te
 
 **Test**: `test_ast_chunking_all_languages`
 
-Validates that all 12 language parsers correctly extract AST nodes:
+Validates that language parsers correctly extract AST nodes:
 
-- Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby (AST-based)
-- Markdown, JSON, TOML (text-based fallback)
+- Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, and more (23 AST-based total)
+- Markdown, JSON, TOML, YAML (text-based fallback)
 
 ```bash
 cargo test --package semantex-core --test search_accuracy_test test_ast_chunking_all_languages
