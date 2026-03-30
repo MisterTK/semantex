@@ -1220,10 +1220,8 @@ impl McpServer {
             return format!("{display}\n  State: corrupted meta.json — re-indexing");
         };
 
-        let age_str = state::index_age_secs(&canonical).map_or_else(
-            || "unknown".into(),
-            format_age,
-        );
+        let age_str =
+            state::index_age_secs(&canonical).map_or_else(|| "unknown".into(), format_age);
 
         // Trigger background refresh if index is old and ready
         let refresh_note = if idx_state == IndexState::Ready && !in_process_building {
