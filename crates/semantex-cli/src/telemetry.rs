@@ -40,9 +40,6 @@ pub fn is_opted_out() -> bool {
     if std::env::var("CI").is_ok() {
         return true;
     }
-    if POSTHOG_KEY.is_empty() {
-        return true;
-    }
     false
 }
 
