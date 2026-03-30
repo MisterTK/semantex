@@ -54,12 +54,12 @@ fn anonymous_id() -> String {
     let id_path = dirs::home_dir().map(|h| h.join(".semantex").join("telemetry_id"));
 
     // Try to read an existing ID
-    if let Some(path) = &id_path {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            let id = contents.trim().to_string();
-            if id.len() >= 8 {
-                return id;
-            }
+    if let Some(path) = &id_path
+        && let Ok(contents) = std::fs::read_to_string(path)
+    {
+        let id = contents.trim().to_string();
+        if id.len() >= 8 {
+            return id;
         }
     }
 
@@ -77,11 +77,13 @@ fn generate_id() -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let pid = std::process::id() as u64;
+    let nanos = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    );
+    let pid = u64::from(std::process::id());
 
     // Mix host info to make IDs less correlated across simultaneous installs
     let mut hasher = DefaultHasher::new();
@@ -133,13 +135,7 @@ pub fn track(command: &'static str) {
 
     // Build the PostHog capture payload
     let body = format!(
-        r#"{{"api_key":"{key}","event":"command_run","distinct_id":"{did}","properties":{{"command":"{cmd}","version":"{ver}","os":"{os}","arch":"{arch}","$lib":"semantex"}}}}"#,
-        key = POSTHOG_KEY,
-        did = distinct_id,
-        cmd = command,
-        ver = version,
-        os = os,
-        arch = arch,
+        r#"{{"api_key":"{POSTHOG_KEY}","event":"command_run","distinct_id":"{distinct_id}","properties":{{"command":"{command}","version":"{version}","os":"{os}","arch":"{arch}","$lib":"semantex"}}}}"#,
     );
 
     thread::spawn(move || {

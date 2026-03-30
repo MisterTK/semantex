@@ -573,9 +573,9 @@ fn main() -> Result<()> {
             budget,
             json,
         }) => {
-            telemetry::track("agent");
             use semantex_core::search::agent_classifier::AgentRoute;
             use semantex_core::server::protocol::AgentRequest;
+            telemetry::track("agent");
 
             let route_override = match route.as_deref() {
                 None => None,

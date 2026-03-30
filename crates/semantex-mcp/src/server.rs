@@ -444,21 +444,20 @@ impl McpServer {
 
         // Skip background indexing if RSS is already over 50% of the limit —
         // indexing is very memory-intensive and could push us over the edge.
-        if self.rss_limit_mb > 0 {
-            if let Some(rss_mb) = semantex_core::memory::current_rss_mb() {
-                if rss_mb > self.rss_limit_mb / 2 {
-                    tracing::warn!(
-                        rss_mb,
-                        limit_mb = self.rss_limit_mb,
-                        "Skipping background index — RSS already at {}% of limit",
-                        rss_mb * 100 / self.rss_limit_mb
-                    );
-                    self.index_states
-                        .lock()
-                        .insert(canonical, IndexingStatus::Failed("Memory pressure".into()));
-                    return;
-                }
-            }
+        if self.rss_limit_mb > 0
+            && let Some(rss_mb) = semantex_core::memory::current_rss_mb()
+            && rss_mb > self.rss_limit_mb / 2
+        {
+            tracing::warn!(
+                rss_mb,
+                limit_mb = self.rss_limit_mb,
+                "Skipping background index — RSS already at {}% of limit",
+                rss_mb * 100 / self.rss_limit_mb
+            );
+            self.index_states
+                .lock()
+                .insert(canonical, IndexingStatus::Failed("Memory pressure".into()));
+            return;
         }
 
         // Register this project in the global registry so tool_status can list all repos.
@@ -1221,9 +1220,10 @@ impl McpServer {
             return format!("{display}\n  State: corrupted meta.json — re-indexing");
         };
 
-        let age_str = state::index_age_secs(&canonical)
-            .map(format_age)
-            .unwrap_or_else(|| "unknown".into());
+        let age_str = state::index_age_secs(&canonical).map_or_else(
+            || "unknown".into(),
+            format_age,
+        );
 
         // Trigger background refresh if index is old and ready
         let refresh_note = if idx_state == IndexState::Ready && !in_process_building {
