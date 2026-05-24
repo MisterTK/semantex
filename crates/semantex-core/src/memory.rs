@@ -93,6 +93,358 @@ pub fn purge_allocator() {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// System-RAM-aware hard memory caps
+//
+// semantex must NEVER be able to OOM the host system, regardless of how
+// runaway any single allocation gets. We enforce that via two layers:
+//
+//   1. Kernel-level address-space cap via setrlimit(RLIMIT_AS) at process
+//      start. If our code allocates past this, mmap()/brk() returns ENOMEM,
+//      the allocator panics, and the process dies cleanly — but the OS
+//      never goes into swap thrash and never kills other processes.
+//
+//   2. Application-level RSS polling in hot paths (indexer batches, MCP
+//      loops). If RSS exceeds the soft cap we abort cleanly with a message
+//      pointing at SEMANTEX_MAX_RSS_MB.
+//
+// Both layers honor the same SEMANTEX_MAX_RSS_MB env var. Default is derived
+// from system RAM so we behave sensibly on any machine without configuration.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Returns total system RAM in bytes, or `None` if unavailable.
+#[cfg(target_os = "macos")]
+pub fn system_ram_bytes() -> Option<u64> {
+    // SAFETY: sysctlbyname is a documented BSD API.
+    unsafe {
+        let mut size: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = c"hw.memsize";
+        let rc = libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut size).cast::<libc::c_void>(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        );
+        if rc == 0 { Some(size) } else { None }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn system_ram_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+pub fn system_ram_bytes() -> Option<u64> {
+    use std::mem::MaybeUninit;
+    // SAFETY: GlobalMemoryStatusEx zeroes its output struct after setting cbSize.
+    unsafe {
+        let mut status =
+            MaybeUninit::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>::zeroed();
+        let p = status.as_mut_ptr();
+        (*p).dwLength = std::mem::size_of_val(&status) as u32;
+        let ok = windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(p);
+        if ok != 0 {
+            Some(status.assume_init().ullTotalPhys)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn system_ram_bytes() -> Option<u64> {
+    None
+}
+
+/// Returns total system RAM in megabytes (rounded down), or `None`.
+pub fn system_ram_mb() -> Option<u64> {
+    system_ram_bytes().map(|b| b / (1024 * 1024))
+}
+
+/// Absolute floor: never let the cap drop below this. A tiny cap would render
+/// the indexer non-functional (the ColBERT model alone is ~17 MB, the embedder
+/// session can spike to a few hundred MB, Tantivy's write buffer defaults to
+/// 50 MB). 1024 MB is the smallest cap at which semantex actually works.
+pub const ABSOLUTE_FLOOR_MB: u64 = 1024;
+
+/// Absolute ceiling: even on huge servers, don't claim more than this without
+/// an explicit override. Prevents one daemon from leaving no headroom for other
+/// processes on shared boxes.
+pub const ABSOLUTE_CEILING_MB: u64 = 12 * 1024;
+
+/// Returns the soft RSS limit in MB, honoring `SEMANTEX_MAX_RSS_MB` if set,
+/// otherwise computing a safe default from system RAM.
+///
+/// Default policy:
+///   * 50% of system RAM, clamped to `[ABSOLUTE_FLOOR_MB, ABSOLUTE_CEILING_MB]`.
+///   * If system RAM cannot be detected, fall back to 2048 MB.
+///
+/// Explicit `SEMANTEX_MAX_RSS_MB=0` means "no app-level cap" — the kernel
+/// `RLIMIT_AS` cap (installed at startup) still applies.
+pub fn soft_rss_limit_mb() -> u64 {
+    if let Ok(env) = std::env::var("SEMANTEX_MAX_RSS_MB")
+        && let Ok(n) = env.trim().parse::<u64>()
+    {
+        return n;
+    }
+    let detected = system_ram_mb().unwrap_or(4 * 1024);
+    (detected / 2).clamp(ABSOLUTE_FLOOR_MB, ABSOLUTE_CEILING_MB)
+}
+
+/// Returns the kernel `RLIMIT_AS` (address space) cap in bytes.
+///
+/// Default: 75% of system RAM, clamped to `[ABSOLUTE_FLOOR_MB,
+/// 2 × ABSOLUTE_CEILING_MB]`. The kernel cap is intentionally higher than
+/// the application-level soft cap so the app cap fires first with a clean
+/// error message; the kernel cap is the last-resort failsafe.
+pub fn kernel_rss_cap_bytes() -> u64 {
+    if let Ok(env) = std::env::var("SEMANTEX_MAX_RSS_MB")
+        && let Ok(n) = env.trim().parse::<u64>()
+        && n > 0
+    {
+        // Honour user override; give 1.5× headroom so the soft cap can fire
+        // before the kernel kills us.
+        return (n * 3 / 2) * 1024 * 1024;
+    }
+    let detected = system_ram_mb().unwrap_or(4 * 1024);
+    let mb = (detected * 3 / 4).clamp(ABSOLUTE_FLOOR_MB, 2 * ABSOLUTE_CEILING_MB);
+    mb * 1024 * 1024
+}
+
+/// Result of attempting to install a kernel-level address-space cap.
+///
+/// Outcomes vary by platform:
+///   * Linux: `Installed(bytes)` — setrlimit(RLIMIT_AS) is honoured.
+///   * macOS: `UnsupportedPlatform` — no userspace API for hard caps.
+///     setrlimit(RLIMIT_AS) returns EINVAL; `task_set_phys_footprint_limit`
+///     returns KERN_NOT_PERMITTED for normal processes. Only the App Sandbox
+///     and launchd-managed daemons can enforce memory limits via system
+///     configuration. The soft cap (RSS polling) is the only available
+///     guard.
+///   * Windows: `UnsupportedPlatform` — would need Job Objects.
+///   * Any: `Disabled` if `SEMANTEX_NO_RLIMIT=1`.
+///   * Linux: `Failed(errno)` if setrlimit fails for any other reason.
+#[derive(Debug, Clone, Copy)]
+pub enum KernelCapResult {
+    Installed(u64),
+    UnsupportedPlatform,
+    Disabled,
+    Failed(i32),
+}
+
+/// Install a kernel-level address-space cap via `setrlimit(RLIMIT_AS, …)`.
+///
+/// Call ONCE at process start, before any heavy allocation. On Linux this
+/// makes runaway allocations get `ENOMEM` from the kernel; on macOS the call
+/// is a no-op (the platform doesn't expose a usable per-process memory cap)
+/// and the soft cap is the only guard — so the indexer's per-batch RSS
+/// polling is mandatory.
+///
+/// `SEMANTEX_NO_RLIMIT=1` disables installation (escape hatch for CI or
+/// containers that handle their own cgroup limits).
+#[cfg(target_os = "linux")]
+pub fn install_kernel_rss_cap() -> KernelCapResult {
+    if std::env::var("SEMANTEX_NO_RLIMIT").as_deref() == Ok("1") {
+        return KernelCapResult::Disabled;
+    }
+    let bytes = kernel_rss_cap_bytes();
+    // SAFETY: setrlimit is a standard POSIX call. We pass a properly-sized
+    // struct and a valid resource identifier.
+    unsafe {
+        let rlim = libc::rlimit {
+            rlim_cur: bytes,
+            rlim_max: bytes,
+        };
+        if libc::setrlimit(libc::RLIMIT_AS, &raw const rlim) == 0 {
+            KernelCapResult::Installed(bytes)
+        } else {
+            KernelCapResult::Failed(*libc::__errno_location())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_kernel_rss_cap() -> KernelCapResult {
+    if std::env::var("SEMANTEX_NO_RLIMIT").as_deref() == Ok("1") {
+        KernelCapResult::Disabled
+    } else {
+        KernelCapResult::UnsupportedPlatform
+    }
+}
+
+/// Counter for how many consecutive `check_rss_or_abort` calls have observed
+/// a soft-cap overshoot. After enough consecutive overshoots we hard-abort
+/// the process to prevent unbounded allocation from continuing.
+static OVERSHOOT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// After this many consecutive overshoots, call `std::process::abort()` to
+/// kill the process immediately (no unwinding, no destructors). The runaway
+/// allocator should not be given more chances.
+const ABORT_AFTER_CONSECUTIVE_OVERSHOOTS: u32 = 3;
+
+/// Check whether current RSS exceeds the soft cap. If so, log a warning,
+/// purge the allocator, and re-check. If still over, return `Err` with a
+/// caller-actionable message AND increment the overshoot counter. After
+/// `ABORT_AFTER_CONSECUTIVE_OVERSHOOTS` consecutive overshoots the process
+/// hard-aborts via `std::process::abort()` — no unwinding, no destructors,
+/// no further allocation. This is the ONLY guard on macOS where the kernel
+/// has no equivalent failsafe.
+///
+/// Call at hot-path boundaries (per batch, per phase) — NOT in tight loops.
+pub fn check_rss_or_abort(label: &str) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+
+    let limit_mb = soft_rss_limit_mb();
+    if limit_mb == 0 {
+        return Ok(()); // explicitly disabled
+    }
+    let Some(rss_mb) = current_rss_mb() else {
+        return Ok(()); // can't measure → don't block
+    };
+    if rss_mb <= limit_mb {
+        // Reset the consecutive-overshoot counter on any clean check.
+        OVERSHOOT_COUNT.store(0, Ordering::Relaxed);
+        return Ok(());
+    }
+    tracing::warn!(
+        label,
+        rss_mb,
+        limit_mb,
+        "RSS exceeded soft cap — purging allocator and re-checking"
+    );
+    purge_allocator();
+    let after = current_rss_mb().unwrap_or(rss_mb);
+    if after <= limit_mb {
+        tracing::info!(
+            label,
+            before_mb = rss_mb,
+            after_mb = after,
+            limit_mb,
+            "RSS recovered after purge"
+        );
+        OVERSHOOT_COUNT.store(0, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    // Still over after purge. Bump the counter and, if we've overshot enough
+    // times in a row, hard-abort the process so we can NEVER take down the
+    // host. This is the macOS failsafe (no kernel RLIMIT_AS available there).
+    let prev = OVERSHOOT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let count = prev + 1;
+    if count >= ABORT_AFTER_CONSECUTIVE_OVERSHOOTS {
+        eprintln!(
+            "\n[semantex FATAL] RSS {after} MB exceeded SEMANTEX_MAX_RSS_MB={limit_mb} \
+             for {count} consecutive checks (last: {label}). \
+             Aborting process to protect host memory.\n\
+             To raise the cap, set `SEMANTEX_MAX_RSS_MB=<bigger>` (e.g. 8192). \
+             To opt out (NOT recommended), set `SEMANTEX_MAX_RSS_MB=0`.\n"
+        );
+        // std::process::abort() bypasses Drop and panic handlers entirely —
+        // we cannot rely on graceful shutdown when the allocator is already
+        // out of control. The kernel reaps us; the host is unaffected.
+        std::process::abort();
+    }
+
+    Err(format!(
+        "RSS {after} MB exceeds SEMANTEX_MAX_RSS_MB={limit_mb} (at {label}, \
+         consecutive overshoot {count}/{ABORT_AFTER_CONSECUTIVE_OVERSHOOTS}). \
+         Operation aborted. Raise the cap via `SEMANTEX_MAX_RSS_MB=<larger>` \
+         (e.g. 8192) or reindex a smaller subset. After \
+         {ABORT_AFTER_CONSECUTIVE_OVERSHOOTS} consecutive overshoots the \
+         process will hard-abort to protect host memory."
+    ))
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn system_ram_is_reasonable() {
+        if let Some(mb) = system_ram_mb() {
+            // Any machine running this test has at least 1 GB and less than 4 TB.
+            assert!(mb >= 1024, "system RAM too small: {mb} MB");
+            assert!(
+                mb < 4 * 1024 * 1024,
+                "system RAM implausibly large: {mb} MB"
+            );
+        }
+    }
+
+    /// All env-mutating tests run serially inside this single test function.
+    /// Cargo runs different `#[test]` functions in parallel; without
+    /// serialisation they race on `SEMANTEX_MAX_RSS_MB` and read each other's
+    /// transient values. Combining them avoids needing a global lock.
+    #[test]
+    fn env_cap_behaviour_serial() {
+        let orig = std::env::var("SEMANTEX_MAX_RSS_MB").ok();
+        let restore = |v: &Option<String>| match v {
+            Some(s) => unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", s) },
+            None => unsafe { std::env::remove_var("SEMANTEX_MAX_RSS_MB") },
+        };
+
+        // (1) No env var → limit is inside [floor, ceiling].
+        unsafe { std::env::remove_var("SEMANTEX_MAX_RSS_MB") };
+        let limit = soft_rss_limit_mb();
+        assert!(limit >= ABSOLUTE_FLOOR_MB, "limit {limit} below floor");
+        assert!(limit <= ABSOLUTE_CEILING_MB, "limit {limit} above ceiling");
+
+        // (2) Kernel cap ≥ soft cap so the soft cap can fire first.
+        let soft_bytes = soft_rss_limit_mb() * 1024 * 1024;
+        let kernel_bytes = kernel_rss_cap_bytes();
+        assert!(
+            kernel_bytes >= soft_bytes,
+            "kernel cap {kernel_bytes} bytes < soft cap {soft_bytes} bytes — soft cap would never fire"
+        );
+
+        // (3) Explicit override → exact value, kernel cap is 1.5× the soft cap.
+        unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "2000") };
+        assert_eq!(soft_rss_limit_mb(), 2000);
+        assert_eq!(kernel_rss_cap_bytes(), 3000 * 1024 * 1024);
+
+        // (4) `=0` disables the soft cap; kernel cap returns to its default.
+        unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "0") };
+        assert_eq!(soft_rss_limit_mb(), 0);
+
+        // (5) check_rss_or_abort returns Ok when the limit is large enough.
+        unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "100000") };
+        assert!(check_rss_or_abort("test").is_ok());
+
+        // (6) Soft cap below current RSS → first overshoot returns Err.
+        //     (We avoid hitting the abort threshold by only checking once.)
+        let current = current_rss_mb().expect("RSS available on test platform");
+        assert!(current > 1, "RSS must be at least 1 MB to test");
+        // Set cap to 1 MB — definitely below current.
+        unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "1") };
+        // Reset counter so prior tests don't poison this call.
+        OVERSHOOT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let result = check_rss_or_abort("forced overshoot");
+        assert!(
+            result.is_err(),
+            "expected Err when current RSS ({current} MB) > cap (1 MB), got {result:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("exceeds SEMANTEX_MAX_RSS_MB"),
+            "error message should reference the env var, got: {msg}"
+        );
+        // Counter should now be 1. Reset before leaving so other tests aren't poisoned.
+        OVERSHOOT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        restore(&orig);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

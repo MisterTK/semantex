@@ -459,6 +459,49 @@ mod arg_peek_tests {
 }
 
 fn main() -> Result<()> {
+    // ── HARDEST POSSIBLE FAILSAFE: memory caps installed at process start ──
+    //
+    // MUST be the first thing main() does. On Linux this installs
+    // setrlimit(RLIMIT_AS, …) so any allocation past the cap returns ENOMEM
+    // from the kernel (allocator panics → process exits cleanly). On macOS
+    // there is NO equivalent userspace API — the soft RSS cap (polled by
+    // `semantex_core::memory::check_rss_or_abort`) is the only failsafe, and
+    // it hard-aborts the process after a few consecutive overshoots.
+    //
+    // The cap is derived from system RAM (50% soft, 75% kernel, clamped to
+    // sane bounds). Override via `SEMANTEX_MAX_RSS_MB`. Set
+    // `SEMANTEX_NO_RLIMIT=1` to skip the kernel cap (containers with cgroup
+    // limits). Set `SEMANTEX_QUIET_LIMITS=1` to suppress the startup line.
+    {
+        use semantex_core::memory::{
+            KernelCapResult, install_kernel_rss_cap, soft_rss_limit_mb, system_ram_mb,
+        };
+        let kernel = install_kernel_rss_cap();
+        let soft_mb = soft_rss_limit_mb();
+        if std::env::var("SEMANTEX_QUIET_LIMITS").is_err() {
+            let ram = system_ram_mb().map_or_else(|| "unknown".to_string(), |n| format!("{n} MB"));
+            let kernel_desc = match kernel {
+                KernelCapResult::Installed(b) => {
+                    format!("kernel hard={} MB", b / (1024 * 1024))
+                }
+                KernelCapResult::UnsupportedPlatform => {
+                    "kernel hard=N/A (macOS/Windows: no userspace API; soft cap is the only guard)"
+                        .to_string()
+                }
+                KernelCapResult::Disabled => {
+                    "kernel hard=disabled (SEMANTEX_NO_RLIMIT=1)".to_string()
+                }
+                KernelCapResult::Failed(e) => {
+                    format!("kernel hard=install failed (errno={e})")
+                }
+            };
+            eprintln!(
+                "[semantex] memory caps: app soft={soft_mb} MB, {kernel_desc}; system RAM={ram}. \
+                 Override via SEMANTEX_MAX_RSS_MB; suppress via SEMANTEX_QUIET_LIMITS=1."
+            );
+        }
+    }
+
     // Register mimalloc purge so memory module can force page return to OS.
     semantex_core::memory::register_purge_fn(mimalloc_purge);
 

@@ -206,8 +206,21 @@ impl IndexBuilder {
 
         // Streaming file processing: chunk → SQLite → BM25
         let mut total_chunks = 0usize;
+        // Memory failsafe: check RSS every N files. Some repos have very large
+        // individual files (vendored deps, generated code) that can blow the
+        // cap inside the chunk loop on a single file, so we check on a tight
+        // cadence rather than per-batch.
+        const RSS_CHECK_EVERY_N_FILES: usize = 64;
+        let mut files_since_rss_check: usize = 0;
 
         for file_path in &files {
+            files_since_rss_check += 1;
+            if files_since_rss_check >= RSS_CHECK_EVERY_N_FILES {
+                files_since_rss_check = 0;
+                if let Err(e) = crate::memory::check_rss_or_abort("indexer file loop") {
+                    anyhow::bail!("Indexing aborted: {e}");
+                }
+            }
             let rel_path = file_path.strip_prefix(&project_path).unwrap_or(file_path);
 
             // Hash the file for incremental indexing
@@ -504,7 +517,17 @@ impl IndexBuilder {
         let colbert_model_dir = model_manager::ensure_colbert_model(&self.config.models_dir())?;
         match (|| -> Result<()> {
             use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
-            const PLAID_BATCH: usize = 512;
+            // PLAID batch size: 128 chunks per update_or_create call.
+            //
+            // Every call rewrites a portion of the on-disk index; smaller
+            // batches mean more disk I/O but bound peak memory. For a 35k-chunk
+            // repo the index can be 100-500 MB, and update_or_create appears
+            // to hold the entire index plus a working copy in memory during
+            // each rewrite. With 128 we cap the per-batch peak at roughly
+            // 2× index size + 128 embeddings (~150 MB peak above baseline),
+            // keeping the OS far from OOM territory even on memory-constrained
+            // hosts. Previous value (512) was the OOM trigger on a 48 GB host.
+            const PLAID_BATCH: usize = 128;
 
             let embedder = ColbertEmbedder::new(&colbert_model_dir)?;
             let plaid_dir = index_dir.join("plaid");
@@ -530,6 +553,12 @@ impl IndexBuilder {
 
                 let mut full_mapping: Vec<u64> = Vec::with_capacity(all_ids.len());
                 for batch in all_ids.chunks(PLAID_BATCH) {
+                    // Memory failsafe: abort cleanly if RSS exceeds the soft cap
+                    // before queuing the next batch. Without this, a runaway
+                    // PLAID build can OOM the host.
+                    if let Err(e) = crate::memory::check_rss_or_abort("PLAID full-rebuild batch") {
+                        anyhow::bail!("Indexing aborted: {e}");
+                    }
                     let chunks = store.get_chunks(batch)?;
                     if chunks.is_empty() {
                         continue;
@@ -592,6 +621,11 @@ impl IndexBuilder {
                 // Encode only new chunks and add them to the existing PLAID index.
                 if !new_chunk_ids.is_empty() {
                     for batch in new_chunk_ids.chunks(PLAID_BATCH) {
+                        // Memory failsafe — same rationale as the full-rebuild path.
+                        if let Err(e) = crate::memory::check_rss_or_abort("PLAID incremental batch")
+                        {
+                            anyhow::bail!("Indexing aborted: {e}");
+                        }
                         let chunks = store.get_chunks(batch)?;
                         if chunks.is_empty() {
                             continue;
