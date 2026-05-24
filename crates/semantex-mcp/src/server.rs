@@ -8,17 +8,25 @@ use parking_lot::Mutex;
 use semantex_core::config::SemantexConfig;
 use semantex_core::index::builder::IndexBuilder;
 use semantex_core::index::state::{self, IndexState};
+use semantex_core::index::storage::ChunkStore;
 use semantex_core::search::SearchQuery;
 use semantex_core::search::deep as deep_search;
 use semantex_core::search::hybrid::HybridSearcher;
 use semantex_core::search::ripgrep_fallback;
-use std::collections::HashMap;
+use semantex_core::server::listener::warm_state_ready;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use semantex_core::index::registry;
+
+/// Default toolset bundle: exposes the full surface (all 13 tools).
+pub const DEFAULT_TOOLSET: &str = "all";
+
+/// Valid toolset names: `core`, `structural`, `all`.
+pub const TOOLSETS: &[&str] = &["core", "structural", "all"];
 
 /// Format seconds into a human-readable age string.
 fn format_age(secs: u64) -> String {
@@ -131,17 +139,27 @@ pub struct McpServer {
     index_states: Arc<Mutex<HashMap<PathBuf, IndexingStatus>>>,
     /// Current MCP logging level — only messages at or above this level are sent.
     log_level: Mutex<LogLevel>,
+    /// Active toolset bundle name (`core`, `structural`, or `all`).
+    /// Controls which tools are visible to `tools/list` and callable via
+    /// `tools/call`. Defaults to `all`.
+    toolset: String,
 }
 
 impl McpServer {
     pub fn new(config: SemantexConfig) -> Self {
-        // MCP processes should use minimal ONNX threads — queries are short and
-        // multiple sessions may run in parallel. Default to 1 thread unless
-        // the user explicitly sets SEMANTEX_ORT_THREADS.
-        if std::env::var("SEMANTEX_ORT_THREADS").is_err() {
-            // SAFETY: called at MCP init before any ONNX session is created.
-            unsafe { std::env::set_var("SEMANTEX_ORT_THREADS", "1") };
-        }
+        Self::with_toolset(config, DEFAULT_TOOLSET)
+    }
+
+    /// Construct an MCP server restricted to a specific toolset bundle.
+    /// Unknown toolset names fall back to `all` (the full surface) so that
+    /// callers don't accidentally lock themselves out of the tool list.
+    pub fn with_toolset(config: SemantexConfig, toolset: &str) -> Self {
+        // Note: `SEMANTEX_ORT_THREADS` (and the derived OMP/MKL/BLAS thread
+        // caps) is set in `semantex-cli`'s `main()` before any threads spawn —
+        // the only safe time to mutate the environment. Setting it here would
+        // be UB because mimalloc and tracing have already started workers, so
+        // the previous `unsafe { set_var(...) }` block was removed (Finding 5a).
+        // Tests that bypass `main` get the fastembed default, which is fine.
 
         let max_cached = std::env::var("SEMANTEX_MCP_CACHE_SIZE")
             .ok()
@@ -151,6 +169,15 @@ impl McpServer {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(512);
+        let toolset = if TOOLSETS.contains(&toolset) {
+            toolset.to_string()
+        } else {
+            tracing::warn!(
+                requested = toolset,
+                "Unknown toolset name; falling back to 'all'"
+            );
+            DEFAULT_TOOLSET.to_string()
+        };
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
@@ -158,7 +185,13 @@ impl McpServer {
             rss_limit_mb,
             index_states: Arc::new(Mutex::new(HashMap::new())),
             log_level: Mutex::new(LogLevel::default()),
+            toolset,
         }
+    }
+
+    /// Returns the active toolset name.
+    pub fn toolset(&self) -> &str {
+        &self.toolset
     }
 
     // -------------------------------------------------------------------------
@@ -487,6 +520,49 @@ impl McpServer {
         });
     }
 
+    /// Detect the index state, using the warm-state sentinel as a fast-path
+    /// (E8(d)). The fast path is the common case: warm daemon, no concurrent
+    /// rebuild, current schema. To preserve correctness it still validates the
+    /// two invariants that `state::detect` would catch beyond plain presence:
+    ///
+    /// 1. **`.semantex.lock`** — held by an in-progress indexer. If we returned
+    ///    `Ready` while the lock is held, callers would query a half-built
+    ///    `chunks.db`. A single `flock` syscall is sub-microsecond on warm
+    ///    cache (Finding 1).
+    /// 2. **Schema staleness** — `meta.json::schema_version` vs.
+    ///    `IndexMeta::CURRENT_SCHEMA_VERSION`. One bounded JSON parse
+    ///    (~100 µs) — still vastly cheaper than full `state::detect` which
+    ///    additionally stat's siblings and parses chunk_count, etc.
+    ///
+    /// Performance-vs-correctness tradeoff: we keep the sentinel-presence
+    /// short-circuit (avoiding ~700 µs of `detect()` work in the warm-and-clean
+    /// case), but add ~100 µs of lock+schema re-validation so the fast path
+    /// cannot return `Ready` under a concurrent reindex or after a schema bump.
+    ///
+    /// Callers that need a fully detailed state (e.g. `tool_status` for
+    /// reporting) should still use `state::detect` directly; this helper is
+    /// intended only for the search-path tool handlers (`tool_agent`,
+    /// `tool_search`, `tool_deep_search`, and the M1-M6 structural tools).
+    fn detect_state_fast(path: &std::path::Path) -> IndexState {
+        let index_dir = path.join(".semantex");
+        if warm_state_ready(&index_dir) {
+            // Even with a hot sentinel, an indexer can be rebuilding right
+            // now (rebuild-while-running). One flock syscall catches that.
+            let lock_path = index_dir.join(".semantex.lock");
+            if state::is_locked(&lock_path) {
+                return IndexState::Building;
+            }
+            // A schema bump invalidates the sentinel-implied "Ready" claim.
+            let meta_path = index_dir.join("meta.json");
+            if state::is_stale(&meta_path) {
+                return IndexState::Stale;
+            }
+            IndexState::Ready
+        } else {
+            state::detect(path)
+        }
+    }
+
     /// Trigger a background refresh if the index is older than `SEMANTEX_REFRESH_SECS`
     /// (default: 3600 s). Returns `true` if a refresh was actually triggered.
     fn maybe_trigger_refresh(&self, path: &std::path::Path) -> bool {
@@ -516,12 +592,61 @@ impl McpServer {
     }
 
     // -------------------------------------------------------------------------
-    // tools/list — all tool definitions with annotations + output schemas
+    // tools/list — toolset-filtered tool definitions with annotations + output
+    // schemas. The full set is constructed in `all_tools()` and filtered
+    // through `tools_for_toolset()` according to the active bundle.
     // -------------------------------------------------------------------------
 
-    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn handle_tools_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        let tools = vec![
+        let tools = self.tools_for_toolset(&self.toolset);
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "tools": serde_json::to_value(&tools).expect("tools serialization") }),
+        )
+    }
+
+    /// Return the list of tool definitions for the given toolset bundle.
+    ///
+    /// Bundles (per spec I3):
+    /// - `core`: 4 tools — `semantex_search`, `semantex_deep`, `semantex_agent`, `semantex_symbol`.
+    /// - `structural`: 5 tools — `semantex_symbol`, `semantex_callers`, `semantex_callees`,
+    ///   `semantex_implementations`, `semantex_architecture`.
+    /// - `all` (default): every tool registered with the server (13 total).
+    ///
+    /// Unknown toolset names fall back to `all` so callers (e.g. W7's HTTP
+    /// transport) cannot accidentally lock themselves out of the surface.
+    /// Exposed publicly so HTTP transports can call it without going through
+    /// the JSON-RPC layer.
+    #[must_use]
+    pub fn tools_for_toolset(&self, toolset: &str) -> Vec<Tool> {
+        let all = Self::all_tools();
+        let allow: &[&str] = match toolset {
+            "core" => &[
+                "semantex_search",
+                "semantex_deep",
+                "semantex_agent",
+                "semantex_symbol",
+            ],
+            "structural" => &[
+                "semantex_symbol",
+                "semantex_callers",
+                "semantex_callees",
+                "semantex_implementations",
+                "semantex_architecture",
+            ],
+            _ => return all, // `all` or unknown — return the full surface
+        };
+        let allow_set: HashSet<&str> = allow.iter().copied().collect();
+        all.into_iter()
+            .filter(|t| allow_set.contains(t.name.as_str()))
+            .collect()
+    }
+
+    /// Build the full tool catalog (all 13 tools). Single source of truth used
+    /// by both `tools/list` (filtered by toolset) and `tool_call` (dispatch).
+    #[allow(clippy::too_many_lines)]
+    fn all_tools() -> Vec<Tool> {
+        vec![
             Tool {
                 name: "semantex_agent".into(),
                 title: Some("Intelligent Code Search".into()),
@@ -728,12 +853,268 @@ impl McpServer {
                 })),
                 annotations: Some(ToolAnnotations::read_only("Deep Code Search")),
             },
-        ];
-
-        JsonRpcResponse::success(
-            id,
-            serde_json::json!({ "tools": serde_json::to_value(&tools).expect("tools serialization") }),
-        )
+            // -------------------------------------------------------------
+            // M1 — semantex_symbol
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_symbol".into(),
+                title: Some("Exact Symbol Lookup".into()),
+                description: concat!(
+                    "Exact symbol lookup backed by the indexed symbol table. ",
+                    "One call returns the symbol's location, signature, docstring, ",
+                    "semantic role, and the count of callers/callees. ",
+                    "Replaces 3-5 grep+read iterations for a single named symbol. ",
+                    "Use when you know the symbol name; use semantex_search for ",
+                    "fuzzy / natural-language queries."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Symbol name to look up (case-sensitive)" },
+                        "kind": { "type": "string", "description": "Optional kind filter (function, method, class, struct, enum, interface, trait)" },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["name"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "matches": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "location": { "type": "object" },
+                                    "signature": { "type": "string" },
+                                    "docstring": { "type": "string" },
+                                    "semantic_role": { "type": "string" },
+                                    "callers_count": { "type": "integer" },
+                                    "callees_count": { "type": "integer" },
+                                    "confidence": { "type": "string" }
+                                },
+                                "required": ["location"]
+                            }
+                        }
+                    },
+                    "required": ["matches"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Exact Symbol Lookup")),
+            },
+            // -------------------------------------------------------------
+            // M2 — semantex_callers
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_callers".into(),
+                title: Some("Reverse Call Graph".into()),
+                description: concat!(
+                    "Reverse call-graph walk: list all chunks that call a given symbol. ",
+                    "Default depth=1 (direct callers); depth=2 also includes callers-of-callers. ",
+                    "Replaces 5-15 grep iterations when finding usages of an API. ",
+                    "Returns one entry per caller with location, signature, and edge_kind."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol name to find callers of" },
+                        "depth": { "type": "integer", "description": "Walk depth: 1 (direct) or 2 (transitive). Default 1.", "default": 1 },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["symbol"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "callers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "caller_location": { "type": "object" },
+                                    "caller_signature": { "type": "string" },
+                                    "edge_kind": { "type": "string" }
+                                },
+                                "required": ["caller_location", "edge_kind"]
+                            }
+                        }
+                    },
+                    "required": ["callers"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Reverse Call Graph")),
+            },
+            // -------------------------------------------------------------
+            // M3 — semantex_callees
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_callees".into(),
+                title: Some("Forward Call Graph".into()),
+                description: concat!(
+                    "Forward call-graph walk: list all symbols invoked by a given function. ",
+                    "Default depth=1 (direct callees); depth=2 also includes callees-of-callees. ",
+                    "Use when tracing what a function does. Same shape as semantex_callers ",
+                    "but outbound edges."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol name to find callees of" },
+                        "depth": { "type": "integer", "description": "Walk depth: 1 (direct) or 2 (transitive). Default 1.", "default": 1 },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["symbol"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "callees": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "callee_location": { "type": "object" },
+                                    "callee_signature": { "type": "string" },
+                                    "edge_kind": { "type": "string" }
+                                },
+                                "required": ["callee_location", "edge_kind"]
+                            }
+                        }
+                    },
+                    "required": ["callees"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Forward Call Graph")),
+            },
+            // -------------------------------------------------------------
+            // M4 — semantex_implementations
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_implementations".into(),
+                title: Some("Trait/Interface Implementations".into()),
+                description: concat!(
+                    "Find all implementations of a trait, interface, or protocol. ",
+                    "Backed by the indexed type-hierarchy edges. ",
+                    "Returns one entry per impl with the impl location, concrete type, ",
+                    "and the list of method names physically defined inside the impl block ",
+                    "(`methods_defined_in_impl`). This is a strict subset of the trait's ",
+                    "methods — to compute true overrides, intersect this list against the ",
+                    "trait declaration via `semantex_symbol`."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "trait_or_interface": { "type": "string", "description": "Trait, interface, or abstract base class name" },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["trait_or_interface"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "implementations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "impl_location": { "type": "object" },
+                                    "type_name": { "type": "string" },
+                                    "methods_defined_in_impl": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Method names physically declared inside this impl block (queried from symbol_defs). NOT the trait's declared method set — intersect against the trait declaration to compute true overrides."
+                                    }
+                                },
+                                "required": ["impl_location", "type_name"]
+                            }
+                        }
+                    },
+                    "required": ["implementations"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Trait/Interface Implementations")),
+            },
+            // -------------------------------------------------------------
+            // M5 — semantex_examples
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_examples".into(),
+                title: Some("Pattern Exemplars".into()),
+                description: concat!(
+                    "Find structurally-confirmed exemplars of a programming pattern ",
+                    "(e.g. 'rust.drop_impl', 'rust.tokio_spawn', 'ts.try_catch'). ",
+                    "Returns 3 pre-curated examples instead of 10 grep results. ",
+                    "Backed by the pattern catalog mined at index time."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Pattern name (e.g. 'rust.drop_impl'). Use semantex_search to discover available patterns." },
+                        "language": { "type": "string", "description": "Optional language filter (rust, typescript)" },
+                        "max": { "type": "integer", "description": "Max exemplars to return (default 3)", "default": 3 },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["pattern"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "examples": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "location": { "type": "object" },
+                                    "snippet": { "type": "string" },
+                                    "pattern": { "type": "string" },
+                                    "language": { "type": "string" }
+                                },
+                                "required": ["location", "snippet"]
+                            }
+                        }
+                    },
+                    "required": ["examples"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Pattern Exemplars")),
+            },
+            // -------------------------------------------------------------
+            // M6 — semantex_architecture
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_architecture".into(),
+                title: Some("Architectural Primer".into()),
+                description: concat!(
+                    "Session-start architectural primer for a codebase. ",
+                    "Returns a compact LLM-optimized JSON document with: ",
+                    "(1) god_nodes — the top symbols by PageRank centrality, ",
+                    "(2) communities — clusters of related chunks with entry points, ",
+                    "(3) boundaries — directory-level coupling counts. ",
+                    "One call gives an architectural overview without exploring the tree manually. ",
+                    "This is the single biggest context-window win for unfamiliar codebases."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "focus": {
+                            "type": "string",
+                            "enum": ["god_nodes", "communities", "boundaries"],
+                            "description": "Restrict output to one section. Omit for all three."
+                        },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    }
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "god_nodes": { "type": "array" },
+                        "communities": { "type": "array" },
+                        "boundaries": { "type": "array" }
+                    }
+                })),
+                annotations: Some(ToolAnnotations::read_only("Architectural Primer")),
+            },
+        ]
     }
 
     // -------------------------------------------------------------------------
@@ -760,6 +1141,34 @@ impl McpServer {
 
         let rss_before = semantex_core::memory::current_rss_mb();
 
+        // Enforce toolset gating: tools outside the active bundle return
+        // a clear error rather than running silently, so HTTP transports
+        // (W7) and the CLI's `--toolset` flag give identical behaviour.
+        let visible: HashSet<String> = self
+            .tools_for_toolset(&self.toolset)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        if !visible.contains(tool_name) {
+            return JsonRpcResponse::success(
+                id,
+                serde_json::to_value(ToolCallResult {
+                    content: vec![ToolContent {
+                        content_type: "text".into(),
+                        text: format!(
+                            "Tool '{tool_name}' is not available in toolset '{}'. \
+                             Available tools: {}",
+                            self.toolset,
+                            visible.iter().cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                    }],
+                    is_error: Some(true),
+                    structured_content: None,
+                })
+                .expect("ToolCallResult serialization"),
+            );
+        }
+
         let result = match tool_name {
             "semantex_agent" => self.tool_agent(&arguments),
             "semantex_search" => self.tool_search(&arguments, writer, progress_token.as_ref()),
@@ -768,6 +1177,12 @@ impl McpServer {
             "semantex_health" => self.tool_health(&arguments).map(ToolOutput::text),
             "semantex_validate" => self.tool_validate(&arguments).map(ToolOutput::text),
             "semantex_deep" => self.tool_deep_search(&arguments, writer, progress_token.as_ref()),
+            "semantex_symbol" => self.tool_symbol(&arguments),
+            "semantex_callers" => self.tool_callers(&arguments),
+            "semantex_callees" => self.tool_callees(&arguments),
+            "semantex_implementations" => self.tool_implementations(&arguments),
+            "semantex_examples" => self.tool_examples(&arguments),
+            "semantex_architecture" => self.tool_architecture(&arguments),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 
@@ -916,7 +1331,7 @@ impl McpServer {
 
         let path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
-        let idx_state = state::detect(&path);
+        let idx_state = Self::detect_state_fast(&path);
         match idx_state {
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
@@ -1006,7 +1421,7 @@ impl McpServer {
 
         tracing::info!(query, path = %path.display(), max_results, rerank, grep_mode, "MCP search");
 
-        let idx_state = state::detect(&path);
+        let idx_state = Self::detect_state_fast(&path);
         match idx_state {
             IndexState::Ready => {
                 self.maybe_trigger_refresh(&path);
@@ -1378,7 +1793,7 @@ impl McpServer {
 
         tracing::info!(query, path = %path.display(), "MCP deep search");
 
-        let idx_state = state::detect(&path);
+        let idx_state = Self::detect_state_fast(&path);
         match idx_state {
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
@@ -1501,6 +1916,915 @@ impl McpServer {
             structured: Some(structured),
         })
     }
+
+    // -------------------------------------------------------------------------
+    // M1 — semantex_symbol
+    //
+    // Exact symbol lookup backed by `symbol_defs` + chunk fan-in/out counts.
+    // Returns one entry per matching symbol with location, signature, docstring,
+    // semantic role and the count of callers/callees. Optional `kind` argument
+    // filters symbol_kind (function, method, class, struct, enum, trait, …).
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "symbol"))]
+    fn tool_symbol(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: name"))?;
+        let kind_filter = args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string);
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let store = ChunkStore::open_for_search(&index_dir.join("chunks.db"))
+            .context("Failed to open chunk store for semantex_symbol")?;
+
+        let mut matches = store.lookup_symbol_exact(name)?;
+        if let Some(ref k) = kind_filter {
+            matches.retain(|(_, _, sk)| sk == k);
+        }
+
+        if matches.is_empty() {
+            let structured = serde_json::json!({ "matches": [] });
+            return Ok(ToolOutput {
+                text: format!("No symbol named '{name}' found."),
+                structured: Some(structured),
+            });
+        }
+
+        let mut out_matches: Vec<serde_json::Value> = Vec::with_capacity(matches.len());
+        for (chunk_id_i64, _file_path, sym_kind) in &matches {
+            let chunk_id = *chunk_id_i64 as u64;
+            let chunk = store.get_chunk(chunk_id)?;
+            let meta = store.get_structured_meta(chunk_id)?;
+
+            let location = serde_json::json!({
+                "file": chunk.file_path.display().to_string(),
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "symbol_kind": sym_kind,
+            });
+
+            let signature = meta
+                .as_ref()
+                .and_then(|m| m.signature.clone())
+                .unwrap_or_default();
+            let docstring = meta
+                .as_ref()
+                .and_then(|m| m.docstring.clone())
+                .unwrap_or_default();
+            let semantic_role = meta
+                .as_ref()
+                .and_then(|m| m.semantic_role.as_ref().map(|r| r.as_label().to_string()))
+                .unwrap_or_default();
+
+            let callers_count = store.get_call_edges_to(&[chunk_id])?.len();
+            let callees_count = store.get_call_edges_from(&[chunk_id])?.len();
+
+            // Confidence: Extracted when we got both signature and at least one
+            // graph edge; Inferred otherwise. Single-match results promote to
+            // Extracted so callers can trust an unambiguous lookup.
+            let conf = if matches.len() == 1
+                || (!signature.is_empty() && (callers_count + callees_count) > 0)
+            {
+                semantex_core::types::Confidence::Extracted
+            } else {
+                semantex_core::types::Confidence::Inferred
+            };
+
+            out_matches.push(serde_json::json!({
+                "location": location,
+                "signature": signature,
+                "docstring": docstring,
+                "semantic_role": semantic_role,
+                "callers_count": callers_count,
+                "callees_count": callees_count,
+                "confidence": conf.label(),
+            }));
+        }
+
+        let structured = serde_json::json!({ "matches": out_matches });
+        let text = serde_json::to_string_pretty(&structured)?;
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // M2 — semantex_callers
+    //
+    // Reverse call-graph walk over `call_graph` edges. Depth 1 = direct callers;
+    // depth 2 = callers-of-callers (depth capped at 2 to bound cost).
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "callers"))]
+    fn tool_callers(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let symbol = args
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: symbol"))?;
+        let depth = args
+            .get("depth")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(1u8, |d| d.clamp(1, 2) as u8);
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let store = ChunkStore::open_for_search(&index_dir.join("chunks.db"))
+            .context("Failed to open chunk store for semantex_callers")?;
+
+        let seeds = store.lookup_symbol_exact(symbol)?;
+        if seeds.is_empty() {
+            return Ok(ToolOutput {
+                text: format!("No symbol named '{symbol}' found."),
+                structured: Some(serde_json::json!({ "callers": [] })),
+            });
+        }
+        let seed_ids: Vec<u64> = seeds.iter().map(|(id, _, _)| *id as u64).collect();
+
+        // Walk one hop.
+        let mut caller_ids: HashSet<u64> = HashSet::new();
+        let hop1 = store.get_call_edges_to(&seed_ids)?;
+        for (_, caller_id) in &hop1 {
+            caller_ids.insert(*caller_id);
+        }
+        // Optional second hop.
+        if depth >= 2 {
+            let hop1_vec: Vec<u64> = caller_ids.iter().copied().collect();
+            if !hop1_vec.is_empty() {
+                let hop2 = store.get_call_edges_to(&hop1_vec)?;
+                for (_, caller_id) in &hop2 {
+                    // Don't include the seed symbols themselves.
+                    if !seed_ids.contains(caller_id) {
+                        caller_ids.insert(*caller_id);
+                    }
+                }
+            }
+        }
+        // Don't include the seed itself.
+        for sid in &seed_ids {
+            caller_ids.remove(sid);
+        }
+        let ids_vec: Vec<u64> = caller_ids.into_iter().collect();
+        let chunks = store.get_chunks(&ids_vec)?;
+        let callers = chunks_to_graph_entries(
+            &store,
+            &chunks,
+            "caller_location",
+            "caller_signature",
+            "call",
+        )?;
+        let structured = serde_json::json!({ "callers": callers });
+        let text = serde_json::to_string_pretty(&structured)?;
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // M3 — semantex_callees
+    //
+    // Forward call-graph walk over `call_graph` edges. Mirrors `tool_callers`.
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "callees"))]
+    fn tool_callees(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let symbol = args
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: symbol"))?;
+        let depth = args
+            .get("depth")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(1u8, |d| d.clamp(1, 2) as u8);
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let store = ChunkStore::open_for_search(&index_dir.join("chunks.db"))
+            .context("Failed to open chunk store for semantex_callees")?;
+
+        let seeds = store.lookup_symbol_exact(symbol)?;
+        if seeds.is_empty() {
+            return Ok(ToolOutput {
+                text: format!("No symbol named '{symbol}' found."),
+                structured: Some(serde_json::json!({ "callees": [] })),
+            });
+        }
+        let seed_ids: Vec<u64> = seeds.iter().map(|(id, _, _)| *id as u64).collect();
+
+        let mut callee_ids: HashSet<u64> = HashSet::new();
+        let hop1 = store.get_call_edges_from(&seed_ids)?;
+        for (_, callee_id) in &hop1 {
+            callee_ids.insert(*callee_id);
+        }
+        if depth >= 2 {
+            let hop1_vec: Vec<u64> = callee_ids.iter().copied().collect();
+            if !hop1_vec.is_empty() {
+                let hop2 = store.get_call_edges_from(&hop1_vec)?;
+                for (_, callee_id) in &hop2 {
+                    if !seed_ids.contains(callee_id) {
+                        callee_ids.insert(*callee_id);
+                    }
+                }
+            }
+        }
+        for sid in &seed_ids {
+            callee_ids.remove(sid);
+        }
+        let ids_vec: Vec<u64> = callee_ids.into_iter().collect();
+        let chunks = store.get_chunks(&ids_vec)?;
+        let callees = chunks_to_graph_entries(
+            &store,
+            &chunks,
+            "callee_location",
+            "callee_signature",
+            "call",
+        )?;
+        let structured = serde_json::json!({ "callees": callees });
+        let text = serde_json::to_string_pretty(&structured)?;
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // M4 — semantex_implementations
+    //
+    // Find all impls of a trait/interface/protocol via `type_hierarchy`.
+    // A trait's children (impls) are stored as `child_chunk -> parent_chunk`
+    // edges; we resolve all chunks whose `parent_name` matches the trait.
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "implementations"))]
+    fn tool_implementations(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let trait_name = args
+            .get("trait_or_interface")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: trait_or_interface"))?;
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let db_path = index_dir.join("chunks.db");
+        let store = ChunkStore::open_for_search(&db_path)
+            .context("Failed to open chunk store for semantex_implementations")?;
+
+        // First locate trait definition chunks to anchor the hierarchy walk.
+        let trait_defs = store.lookup_symbol_exact(trait_name)?;
+        let trait_chunk_ids: Vec<u64> = trait_defs.iter().map(|(id, _, _)| *id as u64).collect();
+
+        // Direct SQL on `type_hierarchy`: pull impls by parent_name OR by
+        // parent_chunk membership in trait_chunk_ids (covers post-resolve case).
+        let impl_chunk_ids = query_implementations(&db_path, trait_name, &trait_chunk_ids)?;
+
+        if impl_chunk_ids.is_empty() {
+            return Ok(ToolOutput {
+                text: format!("No implementations of '{trait_name}' found."),
+                structured: Some(serde_json::json!({ "implementations": [] })),
+            });
+        }
+
+        let chunks = store.get_chunks(&impl_chunk_ids)?;
+        let mut entries: Vec<serde_json::Value> = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let meta = store.get_structured_meta(chunk.id)?;
+            let type_name = meta
+                .as_ref()
+                .and_then(|m| m.name.clone())
+                .unwrap_or_default();
+
+            // Methods physically defined inside this impl block. Derived from
+            // `symbol_defs` rows whose chunk falls within the impl chunk's
+            // line range in the same file. This is narrower than "trait
+            // method overrides" — pairing this list against the trait's
+            // declared methods (to compute true overrides) requires loading
+            // the trait declaration, which is left to a follow-up. The
+            // previous implementation used `meta.calls` which is the set of
+            // *outgoing call targets* inside the impl (helpers, log macros,
+            // …) — semantically unrelated to overridden methods (Finding 11).
+            let methods_defined_in_impl = query_methods_in_impl(
+                &db_path,
+                &chunk.file_path.to_string_lossy(),
+                chunk.start_line,
+                chunk.end_line,
+            )
+            .unwrap_or_default();
+
+            entries.push(serde_json::json!({
+                "impl_location": {
+                    "file": chunk.file_path.display().to_string(),
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                },
+                "type_name": type_name,
+                "methods_defined_in_impl": methods_defined_in_impl,
+            }));
+        }
+
+        let structured = serde_json::json!({ "implementations": entries });
+        let text = serde_json::to_string_pretty(&structured)?;
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // M5 — semantex_examples
+    //
+    // Pattern-catalog-backed exemplar finder. Queries the `pattern_matches`
+    // table for chunks that fired the given pattern; returns up to `max` with
+    // chunk snippets. The catalog is mined at index time so results are
+    // structurally confirmed, not raw grep hits.
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "examples"))]
+    fn tool_examples(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: pattern"))?;
+        let language = args
+            .get("language")
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string);
+        let max = args
+            .get("max")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(3usize, |m| m.clamp(1, 20) as usize);
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let db_path = index_dir.join("chunks.db");
+        let store = ChunkStore::open_for_search(&db_path)
+            .context("Failed to open chunk store for semantex_examples")?;
+
+        let example_rows = query_pattern_examples(&db_path, pattern, language.as_deref(), max)?;
+        if example_rows.is_empty() {
+            return Ok(ToolOutput {
+                text: format!("No exemplars for pattern '{pattern}' found."),
+                structured: Some(serde_json::json!({ "examples": [] })),
+            });
+        }
+
+        let chunk_ids: Vec<u64> = example_rows.iter().map(|(id, _, _)| *id).collect();
+        let chunks = store.get_chunks(&chunk_ids)?;
+        let chunk_by_id: HashMap<u64, &semantex_core::types::Chunk> =
+            chunks.iter().map(|c| (c.id, c)).collect();
+
+        let mut entries: Vec<serde_json::Value> = Vec::with_capacity(example_rows.len());
+        for (cid, pat_name, lang) in &example_rows {
+            let Some(chunk) = chunk_by_id.get(cid) else {
+                continue;
+            };
+            let snippet = make_snippet_mcp(&chunk.content, &chunk.chunk_type);
+            entries.push(serde_json::json!({
+                "location": {
+                    "file": chunk.file_path.display().to_string(),
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                },
+                "snippet": snippet,
+                "pattern": pat_name,
+                "language": lang,
+            }));
+        }
+
+        let structured = serde_json::json!({ "examples": entries });
+        let text = serde_json::to_string_pretty(&structured)?;
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // M6 — semantex_architecture
+    //
+    // Compact LLM-optimized architectural primer combining PageRank, simple
+    // connected-component community detection, and directory-level boundary
+    // edge counts. One call replaces the manual exploration loop at the
+    // start of an unfamiliar codebase. Optional `focus` arg restricts output
+    // to one section: god_nodes | communities | boundaries.
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "architecture"))]
+    fn tool_architecture(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let focus = args
+            .get("focus")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let db_path = index_dir.join("chunks.db");
+        let store = ChunkStore::open_for_search(&db_path)
+            .context("Failed to open chunk store for semantex_architecture")?;
+
+        // 1. God nodes — top-N chunks by PageRank centrality.
+        let god_nodes = if focus.as_deref().is_none_or(|f| f == "god_nodes") {
+            let top = query_top_centrality(&db_path, 10)?;
+            let mut entries: Vec<serde_json::Value> = Vec::new();
+            for (chunk_id, centrality) in &top {
+                let Ok(chunk) = store.get_chunk(*chunk_id) else {
+                    continue;
+                };
+                let meta = store.get_structured_meta(*chunk_id)?;
+                let (symbol, role) = if let Some(ref m) = meta {
+                    let name = m
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| chunk.file_path.display().to_string());
+                    let role_str = m.semantic_role.as_ref().map_or_else(
+                        || m.kind.clone().unwrap_or_default(),
+                        |r| r.as_label().to_string(),
+                    );
+                    (name, role_str)
+                } else {
+                    (chunk.file_path.display().to_string(), "module".to_string())
+                };
+                entries.push(serde_json::json!({
+                    "symbol": symbol,
+                    "centrality": centrality,
+                    "role": role,
+                    "location": {
+                        "file": chunk.file_path.display().to_string(),
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                    },
+                }));
+            }
+            entries
+        } else {
+            Vec::new()
+        };
+
+        // 2. Communities — connected components over call + import edges.
+        let communities = if focus.as_deref().is_none_or(|f| f == "communities") {
+            compute_communities(&store, &db_path)?
+        } else {
+            Vec::new()
+        };
+
+        // 3. Boundaries — directory-level coupling: count cross-dir edges.
+        let boundaries = if focus.as_deref().is_none_or(|f| f == "boundaries") {
+            compute_boundaries_from_path(&db_path)?
+        } else {
+            Vec::new()
+        };
+
+        let mut structured = serde_json::Map::new();
+        if focus.as_deref().is_none_or(|f| f == "god_nodes") {
+            structured.insert("god_nodes".into(), serde_json::Value::Array(god_nodes));
+        }
+        if focus.as_deref().is_none_or(|f| f == "communities") {
+            structured.insert("communities".into(), serde_json::Value::Array(communities));
+        }
+        if focus.as_deref().is_none_or(|f| f == "boundaries") {
+            structured.insert("boundaries".into(), serde_json::Value::Array(boundaries));
+        }
+        let structured = serde_json::Value::Object(structured);
+        let text = serde_json::to_string_pretty(&structured)?;
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
+    }
+}
+
+// =============================================================================
+// Helpers for the new M1-M6 tools
+// =============================================================================
+
+/// Resolve `path` from a JSON args object, defaulting to the current directory
+/// and canonicalizing where possible.
+fn resolve_project_path(args: &serde_json::Value) -> Result<PathBuf> {
+    let raw = args.get("path").and_then(|v| v.as_str()).map_or_else(
+        || std::env::current_dir().context("Failed to determine current directory"),
+        |p| Ok(PathBuf::from(p)),
+    )?;
+    Ok(raw.canonicalize().unwrap_or(raw))
+}
+
+/// Gate every M1-M6 handler behind a warm-state-aware readiness check.
+/// Returns true iff the index is Ready (warm or detected).
+fn require_index_ready(path: &Path) -> bool {
+    McpServer::detect_state_fast(path) == IndexState::Ready
+}
+
+/// Convert a list of chunks into a uniform graph-entry shape used by M2/M3.
+fn chunks_to_graph_entries(
+    store: &ChunkStore,
+    chunks: &[semantex_core::types::Chunk],
+    location_key: &str,
+    signature_key: &str,
+    edge_kind: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let meta = store.get_structured_meta(chunk.id)?;
+        let signature = meta
+            .as_ref()
+            .and_then(|m| m.signature.clone())
+            .unwrap_or_default();
+        let location = serde_json::json!({
+            "file": chunk.file_path.display().to_string(),
+            "start_line": chunk.start_line,
+            "end_line": chunk.end_line,
+        });
+        out.push(serde_json::json!({
+            location_key: location,
+            signature_key: signature,
+            "edge_kind": edge_kind,
+        }));
+    }
+    Ok(out)
+}
+
+/// Pull implementation chunk IDs for a trait/interface from `type_hierarchy`.
+///
+/// Two paths:
+/// 1. By parent_name (string match) — works even when hierarchy resolution
+///    hasn't connected `parent_chunk` yet.
+/// 2. By parent_chunk membership — works post-resolve.
+fn query_implementations(
+    db_path: &Path,
+    trait_name: &str,
+    trait_chunk_ids: &[u64],
+) -> Result<Vec<u64>> {
+    use rusqlite::Connection;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
+
+    let mut ids: HashSet<u64> = HashSet::new();
+
+    // Path 1: parent_name match.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT child_chunk FROM type_hierarchy
+             WHERE parent_name = ?1 AND child_chunk IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([trait_name], |row| row.get::<_, i64>(0))?;
+        for r in rows {
+            ids.insert(r? as u64);
+        }
+    }
+    // Path 2: parent_chunk membership.
+    if !trait_chunk_ids.is_empty() {
+        let placeholders: String = trait_chunk_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT child_chunk FROM type_hierarchy \
+             WHERE parent_chunk IN ({placeholders}) AND child_chunk IS NOT NULL"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let id_params: Vec<rusqlite::types::Value> = trait_chunk_ids
+            .iter()
+            .map(|id| rusqlite::types::Value::Integer(*id as i64))
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = id_params
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+        for r in rows {
+            ids.insert(r? as u64);
+        }
+    }
+
+    Ok(ids.into_iter().collect())
+}
+
+/// Return the names of methods physically defined inside an impl block.
+///
+/// Backs Finding 11's accurate replacement for the old `method_overrides`
+/// field. Strategy: join `symbol_defs` with `chunks` and select rows whose
+/// chunk lives in the same file as the impl and whose `[start_line, end_line]`
+/// range is fully contained within the impl chunk's range. The `symbol_kind`
+/// filter (`'method'`) excludes nested helper functions / type aliases / etc.
+///
+/// We intentionally return method names only (not a fully-qualified path) —
+/// callers seeking the method's source can issue `semantex_symbol(name)` and
+/// scope to the impl's file.
+fn query_methods_in_impl(
+    db_path: &Path,
+    impl_file_path: &str,
+    impl_start_line: u32,
+    impl_end_line: u32,
+) -> Result<Vec<String>> {
+    use rusqlite::Connection;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT sd.symbol_name
+         FROM symbol_defs sd
+         JOIN chunks c ON c.id = sd.chunk_id
+         WHERE sd.symbol_kind = 'method'
+           AND c.file_path = ?1
+           AND c.start_line >= ?2
+           AND c.end_line <= ?3
+         ORDER BY c.start_line ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            impl_file_path,
+            i64::from(impl_start_line),
+            i64::from(impl_end_line)
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+
+    let mut out: Vec<String> = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Pull (chunk_id, pattern_name, language) rows from `pattern_matches`.
+/// Optional `language` filter scopes results to one catalog.
+fn query_pattern_examples(
+    db_path: &Path,
+    pattern: &str,
+    language: Option<&str>,
+    max: usize,
+) -> Result<Vec<(u64, String, String)>> {
+    use rusqlite::Connection;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
+
+    let mut out: Vec<(u64, String, String)> = Vec::new();
+    if let Some(lang) = language {
+        let mut stmt = conn.prepare(
+            "SELECT chunk_id, pattern_name, language FROM pattern_matches \
+             WHERE pattern_name = ?1 AND language = ?2 LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, lang, max as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            out.push(r?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT chunk_id, pattern_name, language FROM pattern_matches \
+             WHERE pattern_name = ?1 LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, max as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
+/// Top-N chunks ordered by `structural_centrality` desc.
+fn query_top_centrality(db_path: &Path, n: usize) -> Result<Vec<(u64, f64)>> {
+    use rusqlite::Connection;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, structural_centrality FROM chunk_centrality \
+         ORDER BY structural_centrality DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([n as i64], |row| {
+        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?))
+    })?;
+    let mut out = Vec::with_capacity(n);
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Detect simple communities via BFS over call edges from the top-centrality
+/// seed set. Returns up to 5 largest components, each as
+/// `{label, size, members, entry_points}`. Members are file-path samples.
+fn compute_communities(store: &ChunkStore, db_path: &Path) -> Result<Vec<serde_json::Value>> {
+    // Seeds: top 200 chunks by PageRank centrality. Bounded so we don't walk
+    // the whole graph in giant repos.
+    let seeds = match query_top_centrality(db_path, 200) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Ok(Vec::new()),
+    };
+    let seed_ids: Vec<u64> = seeds.iter().map(|(id, _)| *id).collect();
+
+    // Pull edges incident to seed_ids.
+    let call_out = store.get_call_edges_from(&seed_ids)?;
+    let call_in = store.get_call_edges_to(&seed_ids)?;
+    let mut adj: HashMap<u64, HashSet<u64>> = HashMap::new();
+    let add_edge = |a: u64, b: u64, adj: &mut HashMap<u64, HashSet<u64>>| {
+        adj.entry(a).or_default().insert(b);
+        adj.entry(b).or_default().insert(a);
+    };
+    for sid in &seed_ids {
+        adj.entry(*sid).or_default();
+    }
+    for (a, b) in &call_out {
+        add_edge(*a, *b, &mut adj);
+    }
+    for (a, b) in &call_in {
+        add_edge(*a, *b, &mut adj);
+    }
+
+    // BFS to enumerate components.
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut components: Vec<Vec<u64>> = Vec::new();
+    for &node in adj.keys() {
+        if visited.contains(&node) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            if !visited.insert(n) {
+                continue;
+            }
+            component.push(n);
+            if let Some(neighbors) = adj.get(&n) {
+                for &nb in neighbors {
+                    if !visited.contains(&nb) {
+                        stack.push(nb);
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    // Sort by size, keep top 5.
+    components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    components.truncate(5);
+
+    // Score map for picking entry points (top-centrality member).
+    let score_by_id: HashMap<u64, f64> = seeds.iter().copied().collect();
+
+    let mut out = Vec::with_capacity(components.len());
+    for (idx, component) in components.iter().enumerate() {
+        if component.is_empty() {
+            continue;
+        }
+        // Sample up to 8 members for the response (file paths).
+        let mut member_paths: Vec<String> = Vec::new();
+        let mut member_seen: HashSet<String> = HashSet::new();
+        let mut entry_points: Vec<serde_json::Value> = Vec::new();
+
+        // Sort component members by centrality desc; pick top 3 as entry points.
+        let mut sorted: Vec<u64> = component.clone();
+        sorted.sort_by(|a, b| {
+            score_by_id
+                .get(b)
+                .partial_cmp(&score_by_id.get(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for &cid in sorted.iter().take(component.len().min(20)) {
+            if let Ok(chunk) = store.get_chunk(cid) {
+                let p = chunk.file_path.display().to_string();
+                if member_seen.insert(p.clone()) {
+                    member_paths.push(p);
+                }
+                if entry_points.len() < 3 {
+                    let meta = store.get_structured_meta(cid).ok().flatten();
+                    let name = meta
+                        .and_then(|m| m.name)
+                        .unwrap_or_else(|| chunk.file_path.display().to_string());
+                    entry_points.push(serde_json::json!({
+                        "symbol": name,
+                        "location": {
+                            "file": chunk.file_path.display().to_string(),
+                            "start_line": chunk.start_line,
+                            "end_line": chunk.end_line,
+                        },
+                    }));
+                }
+            }
+            if member_paths.len() >= 8 {
+                break;
+            }
+        }
+
+        out.push(serde_json::json!({
+            "label": format!("community-{}", idx + 1),
+            "size": component.len(),
+            "members": member_paths,
+            "entry_points": entry_points,
+        }));
+    }
+
+    Ok(out)
+}
+
+/// Count edges that cross top-level directory boundaries. Returns up to 25
+/// `{from, to, edge_count}` entries sorted by edge_count desc.
+fn compute_boundaries_from_path(db_path: &Path) -> Result<Vec<serde_json::Value>> {
+    use rusqlite::Connection;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
+
+    let mut counts: HashMap<(String, String), u64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT importer_path, imported_path FROM module_edges")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (a, b) = r?;
+            let da = top_level_dir(&a);
+            let db = top_level_dir(&b);
+            if da == db {
+                continue; // intra-directory edge
+            }
+            *counts.entry((da, db)).or_insert(0) += 1;
+        }
+    }
+
+    let mut sorted: Vec<((String, String), u64)> = counts.into_iter().collect();
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    sorted.truncate(25);
+
+    Ok(sorted
+        .into_iter()
+        .map(|((from, to), n)| {
+            serde_json::json!({
+                "from": from,
+                "to": to,
+                "edge_count": n,
+            })
+        })
+        .collect())
+}
+
+/// First path component (top-level directory). For `crates/foo/bar.rs` → `crates`.
+/// Empty for files at the root.
+fn top_level_dir(p: &str) -> String {
+    let path = Path::new(p);
+    path.components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 // =============================================================================
@@ -1650,7 +2974,9 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_focus;
+    use super::{DEFAULT_TOOLSET, McpServer, TOOLSETS, apply_focus, top_level_dir};
+    use semantex_core::config::SemantexConfig;
+    use semantex_core::index::state::IndexState;
 
     #[test]
     fn test_apply_focus_none_passthrough() {
@@ -1715,5 +3041,721 @@ mod tests {
         assert!(!out.contains("body_a"));
         assert!(out.contains("fn b() {}"));
         assert!(!out.contains("body_b"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // I3 — toolset bundle tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn make_server(toolset: &str) -> McpServer {
+        let config = SemantexConfig::default();
+        McpServer::with_toolset(config, toolset)
+    }
+
+    #[test]
+    fn toolsets_constants_present() {
+        assert_eq!(DEFAULT_TOOLSET, "all");
+        assert!(TOOLSETS.contains(&"core"));
+        assert!(TOOLSETS.contains(&"structural"));
+        assert!(TOOLSETS.contains(&"all"));
+        assert_eq!(TOOLSETS.len(), 3);
+    }
+
+    #[test]
+    fn toolset_all_exposes_thirteen_tools() {
+        let server = make_server("all");
+        let tools = server.tools_for_toolset("all");
+        assert_eq!(
+            tools.len(),
+            13,
+            "toolset 'all' must expose 13 tools, got {}",
+            tools.len()
+        );
+    }
+
+    #[test]
+    fn toolset_core_exposes_four_tools() {
+        let server = make_server("core");
+        let tools = server.tools_for_toolset("core");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tools.len(), 4, "core bundle must have 4 tools: {names:?}");
+        assert!(names.contains(&"semantex_search"));
+        assert!(names.contains(&"semantex_deep"));
+        assert!(names.contains(&"semantex_agent"));
+        assert!(names.contains(&"semantex_symbol"));
+    }
+
+    #[test]
+    fn toolset_structural_exposes_five_tools() {
+        let server = make_server("structural");
+        let tools = server.tools_for_toolset("structural");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            tools.len(),
+            5,
+            "structural bundle must have 5 tools: {names:?}"
+        );
+        for required in &[
+            "semantex_symbol",
+            "semantex_callers",
+            "semantex_callees",
+            "semantex_implementations",
+            "semantex_architecture",
+        ] {
+            assert!(
+                names.contains(required),
+                "structural bundle missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_toolset_falls_back_to_all() {
+        let server = make_server("nonsense");
+        assert_eq!(server.toolset(), "all");
+        let tools = server.tools_for_toolset("nonsense");
+        // Filter falls through to `all` (which returns the full surface).
+        assert_eq!(tools.len(), 13);
+    }
+
+    #[test]
+    fn new_tools_registered_with_required_schemas() {
+        let server = make_server("all");
+        let tools = server.tools_for_toolset("all");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for required in &[
+            "semantex_symbol",
+            "semantex_callers",
+            "semantex_callees",
+            "semantex_implementations",
+            "semantex_examples",
+            "semantex_architecture",
+        ] {
+            assert!(
+                names.contains(required),
+                "M1-M6 tool {required} missing from registry"
+            );
+            let tool = tools.iter().find(|t| t.name == *required).unwrap();
+            // Each new tool must declare an input schema with `type: object`.
+            assert_eq!(
+                tool.input_schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "{required} should have type:object input schema"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // M6 helper test — top_level_dir
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn top_level_dir_extracts_first_component() {
+        assert_eq!(top_level_dir("crates/semantex-mcp/src/server.rs"), "crates");
+        assert_eq!(top_level_dir("src/main.rs"), "src");
+        assert_eq!(top_level_dir("README.md"), "README.md");
+        assert_eq!(top_level_dir(""), "");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // M1-M5 — handler behaviour against an in-memory test index
+    // ─────────────────────────────────────────────────────────────────────
+
+    use semantex_core::index::storage::ChunkStore;
+    use semantex_core::types::{AstNodeKind, Chunk, ChunkType};
+    use std::path::PathBuf;
+
+    fn make_test_chunk(id: u64, file: &str, name: &str, kind: AstNodeKind, content: &str) -> Chunk {
+        let _ = id;
+        Chunk {
+            id: 0,
+            file_path: PathBuf::from(file),
+            start_line: 1,
+            end_line: content.lines().count() as u32,
+            content: content.to_string(),
+            chunk_type: ChunkType::AstNode {
+                name: name.to_string(),
+                kind,
+                language: "rust".to_string(),
+                structured_meta: None,
+            },
+        }
+    }
+
+    fn build_minimal_index() -> (tempfile::TempDir, PathBuf) {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+
+        // Open via ChunkStore::open to run init_schema, then close.
+        {
+            let store = ChunkStore::open(&db_path).expect("open store");
+            let _ = store
+                .insert_chunk(
+                    &make_test_chunk(1, "src/a.rs", "foo", AstNodeKind::Function, "fn foo() {}"),
+                    1234,
+                    0,
+                )
+                .expect("insert foo");
+            let _ = store
+                .insert_chunk(
+                    &make_test_chunk(
+                        2,
+                        "src/b.rs",
+                        "bar",
+                        AstNodeKind::Function,
+                        "fn bar() { foo(); }",
+                    ),
+                    5678,
+                    0,
+                )
+                .expect("insert bar");
+            store
+                .insert_symbol_def(1, "foo", "function", "src/a.rs")
+                .expect("symbol_defs foo");
+            store
+                .insert_symbol_def(2, "bar", "function", "src/b.rs")
+                .expect("symbol_defs bar");
+            store
+                .store_call_graph_edge(2, "foo", Some(1))
+                .expect("call_graph bar→foo");
+        }
+
+        // Required aux tables for M5/M6 — create them manually.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pattern_matches (
+                    chunk_id INTEGER NOT NULL,
+                    pattern_name TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    PRIMARY KEY (chunk_id, pattern_name)
+                );
+                CREATE TABLE IF NOT EXISTS chunk_centrality (
+                    chunk_id INTEGER PRIMARY KEY,
+                    structural_centrality REAL NOT NULL
+                );
+                INSERT INTO pattern_matches(chunk_id, pattern_name, language, description, file_path)
+                    VALUES (1, 'rust.toy_pattern', 'rust', 'toy pattern for test', 'src/a.rs');
+                INSERT INTO chunk_centrality(chunk_id, structural_centrality)
+                    VALUES (1, 0.9), (2, 0.1);
+                ",
+            )
+            .unwrap();
+        }
+
+        // Write a valid meta.json so state::detect returns Ready.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let meta = semantex_core::types::IndexMeta {
+            schema_version: semantex_core::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: dir.path().to_path_buf(),
+            created_at: now_secs.to_string(),
+            updated_at: now_secs.to_string(),
+            file_count: 2,
+            chunk_count: 2,
+            embedding_model: "test".to_string(),
+            embedding_dim: 96,
+        };
+        std::fs::write(
+            semantex_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let project = dir.path().to_path_buf();
+        (dir, project)
+    }
+
+    #[test]
+    fn tool_symbol_missing_argument_errors() {
+        let server = make_server("all");
+        let result = server.tool_symbol(&serde_json::json!({}));
+        assert!(result.is_err(), "missing 'name' should error");
+    }
+
+    #[test]
+    fn tool_symbol_not_found_returns_empty_matches() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_symbol(&serde_json::json!({
+                "name": "no_such_symbol_anywhere",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let matches = s["matches"].as_array().expect("matches array");
+        assert!(matches.is_empty(), "should have no matches: {matches:?}");
+    }
+
+    #[test]
+    fn tool_symbol_finds_known_symbol() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_symbol(&serde_json::json!({
+                "name": "foo",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let matches = s["matches"].as_array().expect("matches array");
+        assert_eq!(matches.len(), 1, "should find foo once: {matches:?}");
+        let m = &matches[0];
+        assert_eq!(m["location"]["file"].as_str(), Some("src/a.rs"));
+        // bar calls foo, so callers_count should be >= 1
+        assert!(m["callers_count"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn tool_callers_finds_caller() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_callers(&serde_json::json!({
+                "symbol": "foo",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let callers = s["callers"].as_array().expect("callers array");
+        assert!(
+            !callers.is_empty(),
+            "bar should appear as a caller of foo: {callers:?}"
+        );
+    }
+
+    #[test]
+    fn tool_callees_finds_callee() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_callees(&serde_json::json!({
+                "symbol": "bar",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let callees = s["callees"].as_array().expect("callees array");
+        assert!(
+            !callees.is_empty(),
+            "foo should appear as a callee of bar: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn tool_examples_returns_pattern_match() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_examples(&serde_json::json!({
+                "pattern": "rust.toy_pattern",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let examples = s["examples"].as_array().expect("examples array");
+        assert!(
+            !examples.is_empty(),
+            "toy_pattern should yield examples: {examples:?}"
+        );
+        assert_eq!(examples[0]["pattern"].as_str(), Some("rust.toy_pattern"));
+    }
+
+    #[test]
+    fn tool_examples_unknown_pattern_returns_empty() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_examples(&serde_json::json!({
+                "pattern": "rust.no_such_pattern_at_all",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let examples = s["examples"].as_array().expect("examples array");
+        assert!(examples.is_empty());
+    }
+
+    #[test]
+    fn tool_architecture_full_response_has_three_sections() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_architecture(&serde_json::json!({
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        // With no focus, every section must be present.
+        assert!(s.get("god_nodes").is_some(), "god_nodes missing: {s}");
+        assert!(s.get("communities").is_some(), "communities missing: {s}");
+        assert!(s.get("boundaries").is_some(), "boundaries missing: {s}");
+    }
+
+    #[test]
+    fn tool_architecture_focus_limits_to_one_section() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_architecture(&serde_json::json!({
+                "path": project.display().to_string(),
+                "focus": "god_nodes",
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        assert!(s.get("god_nodes").is_some());
+        assert!(
+            s.get("communities").is_none(),
+            "communities should be filtered out when focus=god_nodes"
+        );
+        assert!(s.get("boundaries").is_none());
+    }
+
+    #[test]
+    fn tool_architecture_god_nodes_ranked_by_centrality() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_architecture(&serde_json::json!({
+                "path": project.display().to_string(),
+                "focus": "god_nodes",
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let gods = s["god_nodes"].as_array().unwrap();
+        assert!(
+            !gods.is_empty(),
+            "should have god nodes when centrality table populated"
+        );
+        // foo (centrality 0.9) should come before bar (centrality 0.1).
+        // The test fixture has no structured_meta, so god_node.symbol falls back
+        // to the file path — chunk 1 (foo) lives at src/a.rs, chunk 2 at src/b.rs.
+        let first_centrality = gods[0]["centrality"].as_f64().unwrap_or(0.0);
+        let last_centrality = gods[gods.len() - 1]["centrality"].as_f64().unwrap_or(1.0);
+        assert!(
+            first_centrality >= last_centrality,
+            "god_nodes must be sorted by centrality desc: first={first_centrality}, last={last_centrality}"
+        );
+        // First entry should be the chunk that maps to centrality 0.9 (chunk 1 → src/a.rs).
+        assert_eq!(
+            gods[0]["location"]["file"].as_str(),
+            Some("src/a.rs"),
+            "highest centrality node should map to src/a.rs"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Finding 1 — detect_state_fast must respect concurrent rebuild lock
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// When a warm-state sentinel is present but `.semantex.lock` is held by
+    /// an indexer, the fast path must return `Building` (not `Ready`) so the
+    /// MCP query handlers fall back instead of racing with a half-built DB.
+    #[test]
+    fn detect_state_fast_returns_building_when_lock_held() {
+        let (dir, project) = build_minimal_index();
+        let semantex_dir = project.join(".semantex");
+
+        // Plant a warm-state sentinel pointing at the current process so
+        // `warm_state_ready` short-circuits to the fast path.
+        let sentinel = semantex_dir.join("warm_state.lock");
+        std::fs::write(&sentinel, std::process::id().to_string()).expect("write sentinel");
+
+        // Create and exclusively lock the build-coordination file. While the
+        // lock is held the index is mid-rebuild and is NOT safe to query.
+        let lock_path = semantex_dir.join(".semantex.lock");
+        let lock_file = std::fs::File::create(&lock_path).expect("create .semantex.lock");
+        lock_file.lock().expect("acquire exclusive flock");
+
+        let state = McpServer::detect_state_fast(&project);
+        assert_eq!(
+            state,
+            IndexState::Building,
+            "fast path returned {state:?} while .semantex.lock was held — would race with indexer"
+        );
+
+        // Lock released on drop.
+        drop(lock_file);
+        drop(dir);
+    }
+
+    /// The fast path must still return `Ready` for the common case (sentinel
+    /// present, no concurrent rebuild, current schema). This guards against
+    /// over-tightening the validation in `detect_state_fast`.
+    #[test]
+    fn detect_state_fast_returns_ready_when_warm_and_clean() {
+        let (_dir, project) = build_minimal_index();
+        let semantex_dir = project.join(".semantex");
+        let sentinel = semantex_dir.join("warm_state.lock");
+        std::fs::write(&sentinel, std::process::id().to_string()).expect("write sentinel");
+
+        let state = McpServer::detect_state_fast(&project);
+        assert_eq!(
+            state,
+            IndexState::Ready,
+            "fast path should return Ready when sentinel is live and no rebuild lock is held"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Finding 11 — tool_implementations returns methods, NOT call edges
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an in-memory index that simulates:
+    ///
+    /// ```ignore
+    /// trait Foo { fn bar(&self); fn baz(&self); }
+    /// impl Foo for X {                        // chunk 10: lines 1..30
+    ///     fn bar(&self) { self.helper(); }    // chunk 11: lines 5..10
+    ///     fn baz(&self) { log!("..."); }      // chunk 12: lines 15..20
+    /// }
+    /// fn helper(...) { ... }                  // chunk 13: lines 35..40
+    /// ```
+    ///
+    /// The impl chunk's `meta.calls` contains the OUTGOING call targets
+    /// (`self.helper`, `log`) — the bug had us reporting those as the impl's
+    /// "method overrides", which is the wrong concept entirely.
+    fn build_index_with_impl_block() -> (tempfile::TempDir, PathBuf) {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+
+        let impl_file = "src/x.rs";
+        let trait_file = "src/foo.rs";
+
+        // 1) Insert chunks. Important: AUTOINCREMENT assigns sequential IDs
+        //    starting at 1 in insertion order — we rely on that to know
+        //    which chunk_id refers to which entity below.
+        let trait_id = {
+            let store = ChunkStore::open(&db_path).expect("open store");
+            // chunk 1: the trait declaration itself
+            let trait_chunk = Chunk {
+                id: 0,
+                file_path: PathBuf::from(trait_file),
+                start_line: 1,
+                end_line: 4,
+                content: "trait Foo { fn bar(&self); fn baz(&self); }".to_string(),
+                chunk_type: ChunkType::AstNode {
+                    name: "Foo".to_string(),
+                    kind: AstNodeKind::Other("trait".to_string()),
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            };
+            let trait_id = store
+                .insert_chunk(&trait_chunk, 100, 0)
+                .expect("insert trait");
+            // chunk 2: the impl block (covers lines 1..30 in x.rs)
+            let impl_chunk = Chunk {
+                id: 0,
+                file_path: PathBuf::from(impl_file),
+                start_line: 1,
+                end_line: 30,
+                content: "impl Foo for X { ... }".to_string(),
+                chunk_type: ChunkType::AstNode {
+                    name: "X".to_string(),
+                    kind: AstNodeKind::Other("impl".to_string()),
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            };
+            let impl_id = store
+                .insert_chunk(&impl_chunk, 200, 0)
+                .expect("insert impl");
+            // chunk 3: fn bar(&self) inside the impl (lines 5..10)
+            let bar_chunk = Chunk {
+                id: 0,
+                file_path: PathBuf::from(impl_file),
+                start_line: 5,
+                end_line: 10,
+                content: "fn bar(&self) { self.helper(); }".to_string(),
+                chunk_type: ChunkType::AstNode {
+                    name: "bar".to_string(),
+                    kind: AstNodeKind::Method,
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            };
+            let bar_id = store.insert_chunk(&bar_chunk, 200, 0).expect("insert bar");
+            // chunk 4: fn baz(&self) inside the impl (lines 15..20)
+            let baz_chunk = Chunk {
+                id: 0,
+                file_path: PathBuf::from(impl_file),
+                start_line: 15,
+                end_line: 20,
+                content: "fn baz(&self) { log!(\"...\"); }".to_string(),
+                chunk_type: ChunkType::AstNode {
+                    name: "baz".to_string(),
+                    kind: AstNodeKind::Method,
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            };
+            let baz_id = store.insert_chunk(&baz_chunk, 200, 0).expect("insert baz");
+            // chunk 5: a free helper function OUTSIDE the impl block (lines 35..40)
+            let helper_chunk = Chunk {
+                id: 0,
+                file_path: PathBuf::from(impl_file),
+                start_line: 35,
+                end_line: 40,
+                content: "fn helper() -> () { /* outside impl */ }".to_string(),
+                chunk_type: ChunkType::AstNode {
+                    name: "helper".to_string(),
+                    kind: AstNodeKind::Function,
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            };
+            let helper_id = store
+                .insert_chunk(&helper_chunk, 200, 0)
+                .expect("insert helper");
+
+            // Symbol defs — kind matters for the query
+            store
+                .insert_symbol_def(trait_id, "Foo", "trait", trait_file)
+                .expect("symbol_defs Foo");
+            store
+                .insert_symbol_def(impl_id, "X", "impl", impl_file)
+                .expect("symbol_defs X");
+            store
+                .insert_symbol_def(bar_id, "bar", "method", impl_file)
+                .expect("symbol_defs bar");
+            store
+                .insert_symbol_def(baz_id, "baz", "method", impl_file)
+                .expect("symbol_defs baz");
+            // helper is a free fn — must NOT appear in methods_defined_in_impl
+            store
+                .insert_symbol_def(helper_id, "helper", "function", impl_file)
+                .expect("symbol_defs helper");
+
+            // Outgoing call edges from the impl block itself. The OLD
+            // (Finding 11) behaviour returned THIS list. We assert below
+            // that the new field does NOT contain these tokens.
+            store
+                .store_call_graph_edge(impl_id, "self.helper", Some(helper_id))
+                .expect("call edge self.helper");
+            store
+                .store_call_graph_edge(impl_id, "log", None)
+                .expect("call edge log");
+            trait_id
+        };
+
+        // 2) type_hierarchy: impl X → trait Foo. We need child_chunk and
+        //    parent_chunk set so `query_implementations` can find them via
+        //    parent_chunk membership (the chunk-ID path).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            // Required aux tables (per build_minimal_index)
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pattern_matches (
+                    chunk_id INTEGER NOT NULL,
+                    pattern_name TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    PRIMARY KEY (chunk_id, pattern_name)
+                );
+                CREATE TABLE IF NOT EXISTS chunk_centrality (
+                    chunk_id INTEGER PRIMARY KEY,
+                    structural_centrality REAL NOT NULL
+                );",
+            )
+            .unwrap();
+            // The impl is chunk 2 (impl_id); the trait is chunk 1 (trait_id).
+            conn.execute(
+                "INSERT INTO type_hierarchy (child_name, parent_name, relation, child_chunk, parent_chunk)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["X", "Foo", "implements", 2_i64, trait_id as i64],
+            ).unwrap();
+        }
+
+        // 3) Write meta.json so detect_state_fast returns Ready.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let meta = semantex_core::types::IndexMeta {
+            schema_version: semantex_core::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: dir.path().to_path_buf(),
+            created_at: now_secs.to_string(),
+            updated_at: now_secs.to_string(),
+            file_count: 2,
+            chunk_count: 5,
+            embedding_model: "test".to_string(),
+            embedding_dim: 96,
+        };
+        std::fs::write(
+            semantex_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let project = dir.path().to_path_buf();
+        (dir, project)
+    }
+
+    /// `semantex_implementations` must return the methods physically defined
+    /// inside the impl block — NOT the outgoing call edges (which was the
+    /// pre-Finding-11 bug, where helpers and macro names leaked into the
+    /// "method overrides" field).
+    #[test]
+    fn tool_implementations_returns_methods_not_call_edges() {
+        let (_dir, project) = build_index_with_impl_block();
+        let server = make_server("all");
+        let out = server
+            .tool_implementations(&serde_json::json!({
+                "trait_or_interface": "Foo",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let impls = s["implementations"].as_array().expect("implementations");
+        assert_eq!(impls.len(), 1, "expected one impl of Foo, got {impls:?}");
+        let entry = &impls[0];
+
+        // Old (broken) field name must be gone — schema migration sanity check.
+        assert!(
+            entry.get("method_overrides").is_none(),
+            "old `method_overrides` field must be removed: {entry}"
+        );
+
+        let methods = entry["methods_defined_in_impl"]
+            .as_array()
+            .expect("methods_defined_in_impl array");
+        let names: Vec<&str> = methods.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            names.contains(&"bar"),
+            "bar should be a method defined in the impl: {names:?}"
+        );
+        assert!(
+            names.contains(&"baz"),
+            "baz should be a method defined in the impl: {names:?}"
+        );
+        // The free helper fn lives OUTSIDE the impl's [1..30] line range and
+        // has kind=function — must not appear.
+        assert!(
+            !names.contains(&"helper"),
+            "helper is a free fn outside the impl, not a method: {names:?}"
+        );
+        // Outgoing call targets must NOT leak in — this was the Finding 11 bug.
+        assert!(
+            !names.iter().any(|n| n.contains("self.helper")),
+            "outgoing call target self.helper leaked into methods list: {names:?}"
+        );
+        assert!(
+            !names.contains(&"log"),
+            "outgoing macro/call target `log` leaked into methods list: {names:?}"
+        );
     }
 }

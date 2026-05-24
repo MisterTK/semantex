@@ -1,6 +1,8 @@
 pub mod builder;
 pub mod file_classifier;
 pub mod global_graph;
+pub mod page_rank;
+pub mod pattern_catalog;
 pub mod registry;
 pub mod state;
 pub mod storage;

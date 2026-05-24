@@ -183,8 +183,7 @@ fn check_stale_files(index_dir: &Path, project_path: &Path) -> CheckResult {
         {
             let fs_mtime_secs = fs_mtime
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs() as i64);
             if fs_mtime_secs != *stored_mtime {
                 stale_count += 1;
             }
@@ -248,9 +247,7 @@ fn check_dense_index(index_dir: &Path) -> CheckResult {
     }
 
     if issues.is_empty() {
-        let mapping_size = std::fs::metadata(&mapping_file)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let mapping_size = std::fs::metadata(&mapping_file).map_or(0, |m| m.len());
         CheckResult {
             name,
             passed: true,

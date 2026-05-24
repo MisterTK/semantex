@@ -54,7 +54,7 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
                     &port_file_clone,
                     searcher,
                     project_path_clone,
-                    Duration::from_secs(86400), // 24h timeout (watch keeps it alive)
+                    Duration::from_hours(24), // 24h timeout (watch keeps it alive)
                     shutdown_clone,
                 ) {
                     Ok(listener) => {

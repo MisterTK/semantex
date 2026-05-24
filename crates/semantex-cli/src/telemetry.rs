@@ -30,10 +30,7 @@ pub fn is_opted_out() -> bool {
     if std::env::var("SEMANTEX_NO_TELEMETRY").is_ok() {
         return true;
     }
-    if std::env::var("DO_NOT_TRACK")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if std::env::var("DO_NOT_TRACK").is_ok_and(|v| v == "1") {
         return true;
     }
     // Suppress in CI environments

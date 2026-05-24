@@ -357,7 +357,7 @@ fn build_chunk_block(chunk: &ReadChunk, terms: &[String], include_full: bool) ->
         }
 
         // Sort by score descending, take top 3, then restore source order
-        matching_lines.sort_by(|a, b| b.2.cmp(&a.2));
+        matching_lines.sort_by_key(|(_, _, score)| std::cmp::Reverse(*score));
         matching_lines.truncate(3);
         matching_lines.sort_by_key(|(idx, _, _)| *idx);
 

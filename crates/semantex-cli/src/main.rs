@@ -12,6 +12,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod client;
 mod commands;
+mod skills;
 mod telemetry;
 
 use anyhow::{Context, Result};
@@ -241,8 +242,26 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Run as MCP server (stdio transport)
-    Mcp,
+    /// Run as MCP server (stdio by default; `--http` for HTTP transport)
+    Mcp {
+        /// Serve over HTTP instead of stdio. Bound to 127.0.0.1 by default.
+        #[arg(long)]
+        http: bool,
+
+        /// HTTP port (default: 5050). Only used with --http.
+        #[arg(long, default_value_t = 5050, requires = "http")]
+        port: u16,
+
+        /// Allow binding to 0.0.0.0 (any interface). Off by default — only
+        /// loopback is safe without auth. Prints a stderr warning when enabled.
+        #[arg(long, requires = "http")]
+        allow_remote: bool,
+
+        /// Named toolset bundle to expose: `core` (4 tools), `structural` (5 tools),
+        /// or `all` (13 tools, default).
+        #[arg(long, value_name = "NAME", default_value = "all")]
+        toolset: String,
+    },
     /// Install Claude Code integration
     InstallClaudeCode {
         /// Installation scope: user (all projects), project (shared via git), or local (this repo, gitignored)
@@ -266,6 +285,25 @@ enum Commands {
         /// Path to validate (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Generate per-platform skill files describing semantex's MCP tools.
+    ///
+    /// Emits one file per supported agent platform (Claude Code, Cursor, Codex,
+    /// Aider, Gemini CLI, Copilot CLI, OpenCode, Windsurf, Trae) from a single
+    /// canonical tool registry.
+    SkillsGenerate {
+        /// Output directory (default: ./.semantex-skills/)
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+
+        /// Restrict to a single platform id, e.g. `claude-code`, `cursor`, ...
+        /// Use `all` (the default) for every supported platform.
+        #[arg(long, value_name = "NAME", default_value = "all")]
+        platform: String,
+
+        /// Overwrite existing files in the output directory.
+        #[arg(long)]
+        force: bool,
     },
     /// Intelligent code search with automatic query routing and formatting.
     Agent {
@@ -322,6 +360,104 @@ fn find_ort_dylib() -> Option<&'static str> {
         .copied()
 }
 
+/// Peek at `std::env::args()` to detect whether the user is invoking the
+/// `mcp` subcommand. Used to set `SEMANTEX_ORT_THREADS=1` BEFORE threads
+/// spawn (i.e. before the tracing subscriber and clap parsing).
+///
+/// MCP processes should use minimal ONNX threads — queries are short and
+/// multiple sessions may run in parallel; 1 thread keeps the per-process
+/// inference memory footprint low. The old `McpServer::with_toolset` set
+/// this env var, but by then tracing + mimalloc threads were already
+/// running, which is real UB on platforms with strict env-var thread rules.
+fn mcp_mode_requested() -> bool {
+    // argv[0] is the binary name, so skip it.
+    mcp_mode_from_args(std::env::args().skip(1))
+}
+
+/// Inner helper for `mcp_mode_requested` so we can unit-test the parse logic
+/// without touching `std::env::args()`.
+///
+/// Known limitation: this is a deliberately simple "first non-flag token"
+/// scanner — it doesn't know which flags consume values. In practice the
+/// supported MCP invocations are `semantex mcp [--http] [--port N]
+/// [--toolset NAME]`, all of which start with `mcp` directly after the
+/// binary name. The fallback when this misclassifies (e.g. for the unusual
+/// `semantex --max-count 5 mcp --http`) is benign: SEMANTEX_ORT_THREADS
+/// stays at its default of 4 instead of being lowered to 1, which only
+/// affects memory/perf, not correctness.
+fn mcp_mode_from_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            return false; // everything after `--` is a positional arg
+        }
+        if !arg.starts_with('-') {
+            return arg == "mcp";
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod arg_peek_tests {
+    use super::mcp_mode_from_args;
+
+    #[test]
+    fn detects_mcp_subcommand_plain() {
+        assert!(mcp_mode_from_args(["mcp"]));
+    }
+
+    #[test]
+    fn detects_mcp_subcommand_with_flags() {
+        assert!(mcp_mode_from_args(["mcp", "--http", "--port", "5050"]));
+    }
+
+    #[test]
+    fn detects_mcp_with_global_flag_before() {
+        // global flags (start with `-`) are skipped to find the subcommand
+        assert!(mcp_mode_from_args(["-v", "mcp"]));
+    }
+
+    #[test]
+    fn rejects_other_subcommands() {
+        assert!(!mcp_mode_from_args(["index", "."]));
+        assert!(!mcp_mode_from_args(["serve"]));
+        assert!(!mcp_mode_from_args(["status"]));
+    }
+
+    #[test]
+    fn rejects_no_subcommand() {
+        assert!(!mcp_mode_from_args(Vec::<&str>::new()));
+        // Search-mode invocation: positional query, not `mcp`.
+        assert!(!mcp_mode_from_args(["how does auth work"]));
+    }
+
+    #[test]
+    fn stops_at_double_dash() {
+        // Anything after `--` is a positional arg to the previous command —
+        // not a subcommand.
+        assert!(!mcp_mode_from_args(["--", "mcp"]));
+    }
+
+    #[test]
+    fn handles_mcp_after_pure_flags() {
+        // Pure flags (no flag-takes-value form) before the subcommand work.
+        assert!(mcp_mode_from_args(["--json", "mcp", "--http"]));
+    }
+
+    #[test]
+    fn known_limitation_flag_with_value_misclassifies() {
+        // Documented limitation: a flag that takes a value followed by an
+        // arg looks indistinguishable from "subcommand here". Acceptable
+        // because the worst outcome is SEMANTEX_ORT_THREADS=4 instead of 1.
+        assert!(!mcp_mode_from_args(["--max-count", "5", "mcp"]));
+    }
+}
+
 fn main() -> Result<()> {
     // Register mimalloc purge so memory module can force page return to OS.
     semantex_core::memory::register_purge_fn(mimalloc_purge);
@@ -363,6 +499,22 @@ fn main() -> Result<()> {
                 if std::env::var(var).is_err() {
                     std::env::set_var(var, &ort_threads);
                 }
+            }
+
+            // SEMANTEX_ORT_THREADS=1 for MCP subprocesses.
+            //
+            // Previously set inside `McpServer::with_toolset` (server.rs), but
+            // by the time that constructor ran, mimalloc + tracing threads had
+            // already been spawned — which is real UB per Rust's strict
+            // env-var thread rules on Linux/Apple. Moving it here guarantees
+            // the env var is set BEFORE any thread (mimalloc init, tracing
+            // subscriber, tokio runtime, ORT session) reads it.
+            //
+            // Only applied when the user invoked `semantex mcp` so non-MCP
+            // commands keep the higher default (currently 4) for other ORT
+            // workloads.
+            if mcp_mode_requested() && std::env::var("SEMANTEX_ORT_THREADS").is_err() {
+                std::env::set_var("SEMANTEX_ORT_THREADS", "1");
             }
         }
     }
@@ -546,9 +698,14 @@ fn main() -> Result<()> {
             commands::download::run(&config)
         }
         Some(Commands::Status { path }) => commands::status::run(&path, &config),
-        Some(Commands::Mcp) => {
+        Some(Commands::Mcp {
+            http,
+            port,
+            allow_remote,
+            toolset,
+        }) => {
             telemetry::track("mcp");
-            commands::mcp::run(&config)
+            commands::mcp::run(&config, http, port, allow_remote, &toolset)
         }
         Some(Commands::InstallClaudeCode { scope }) => {
             telemetry::track("install_claude_code");
@@ -565,6 +722,19 @@ fn main() -> Result<()> {
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
         Some(Commands::Validate { path }) => commands::validate::run(&path),
+        Some(Commands::SkillsGenerate {
+            out,
+            platform,
+            force,
+        }) => {
+            telemetry::track("skills_generate");
+            let platform_filter = if platform == "all" {
+                None
+            } else {
+                Some(platform.as_str())
+            };
+            commands::skills_generate::run(out, platform_filter, force)
+        }
         Some(Commands::Agent {
             query,
             path,

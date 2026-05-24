@@ -10,11 +10,10 @@ use crate::search::graph_propagation::{self, GraphPropagationConfig};
 use crate::search::plaid_search::PlaidSearcher;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
 use crate::search::sparse_search::SparseIndex;
-use crate::search::triple_fusion;
+use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
 use crate::search::{query_expander, regex_semantic};
-use crate::types::{ScoredChunkId, SearchResult, SearchSource};
+use crate::types::{Confidence, ScoredChunkId, SearchResult, SearchSource};
 use anyhow::{Context, Result};
-use fastembed::RerankerModel;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -223,128 +222,259 @@ impl HybridSearcher {
         // for future use when symbol coverage improves.
         let symbol_exact_hits: Vec<ScoredChunkId> = Vec::new();
 
-        // Stage 1: Candidate retrieval — run dense, sparse, and exact in parallel
-        let (dense_results, sparse_results, exact_ids, dense_ms, sparse_ms, exact_ms) =
-            std::thread::scope(|s| {
-                let dense_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
-                    if !query.use_dense {
-                        return (Vec::new(), 0);
-                    }
-                    let dense_start = std::time::Instant::now();
-                    let results = if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert)
-                    {
-                        match plaid.search(colbert, &effective_text, retrieval_candidates) {
-                            Ok(results) => {
-                                tracing::debug!(
-                                    results_count = results.len(),
-                                    duration_ms = dense_start.elapsed().as_millis() as u64,
-                                    "PLAID (ColBERT) search complete"
-                                );
-                                results
-                            }
-                            Err(e) => {
-                                tracing::warn!("PLAID search failed: {}", e);
-                                Vec::new()
-                            }
+        // E2 + E4: choose fusion strategy (RRF default; CC preserved for one release
+        // behind SEMANTEX_FUSION=cc). RRF mode unlocks the Exp4Fuse dual-route
+        // (original AND expanded query through both dense and sparse channels).
+        let fusion_mode = triple_fusion::active_fusion_mode();
+
+        // Generate the deterministic expansion once (E4). Only consumed by the
+        // dual-route path when RRF is active and the expansion produced tokens.
+        let expanded_text = if matches!(fusion_mode, FusionMode::Rrf)
+            && matches!(
+                query_type,
+                QueryType::Semantic | QueryType::Mixed | QueryType::Keyword
+            ) {
+            query_expander::expand_query(&effective_text)
+        } else {
+            None
+        };
+
+        // Stage 1: Candidate retrieval — run dense, sparse, exact, and (in RRF mode)
+        // the expanded-query dense + sparse channels in parallel.
+        let (
+            dense_results,
+            sparse_results,
+            exact_ids,
+            exp_dense_results,
+            exp_sparse_results,
+            dense_ms,
+            sparse_ms,
+            exact_ms,
+        ) = std::thread::scope(|s| {
+            let dense_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
+                if !query.use_dense {
+                    return (Vec::new(), 0);
+                }
+                let dense_start = std::time::Instant::now();
+                let results = if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                    match plaid.search(colbert, &effective_text, retrieval_candidates) {
+                        Ok(results) => {
+                            tracing::debug!(
+                                results_count = results.len(),
+                                duration_ms = dense_start.elapsed().as_millis() as u64,
+                                "PLAID (ColBERT) search complete"
+                            );
+                            results
                         }
-                    } else {
-                        Vec::new()
-                    };
-                    (results, dense_start.elapsed().as_millis() as u64)
-                });
-
-                let sparse_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
-                    if !query.use_sparse {
-                        return (Vec::new(), 0);
-                    }
-                    let sparse_start = std::time::Instant::now();
-                    let results = if let Some(ref sparse) = self.sparse {
-                        let safe_query = sanitize_tantivy_query(&effective_text);
-                        let mut results = sparse
-                            .search(&safe_query, retrieval_candidates)
-                            .unwrap_or_default();
-                        tracing::debug!(
-                            results_count = results.len(),
-                            duration_ms = sparse_start.elapsed().as_millis() as u64,
-                            "Sparse search complete"
-                        );
-
-                        #[allow(clippy::collapsible_if)]
-                        if matches!(query_type, QueryType::Semantic | QueryType::Mixed) {
-                            if let Some(expanded) = query_expander::expand_query(&effective_text) {
-                                let safe_expanded = sanitize_tantivy_query(&expanded);
-                                if let Ok(expanded_results) =
-                                    sparse.search(&safe_expanded, retrieval_candidates)
-                                {
-                                    tracing::debug!(
-                                        expanded_count = expanded_results.len(),
-                                        "Dual-route BM25 expansion"
-                                    );
-                                    results =
-                                        dual_route_fuse(&results, &expanded_results, 1.0, 0.5);
-                                }
-                            }
+                        Err(e) => {
+                            tracing::warn!("PLAID search failed: {}", e);
+                            Vec::new()
                         }
-
-                        results
-                    } else {
-                        Vec::new()
-                    };
-                    (results, sparse_start.elapsed().as_millis() as u64)
-                });
-
-                let exact_handle = s.spawn(|| -> (Vec<u64>, u64) {
-                    let exact_start = std::time::Instant::now();
-                    let store = self.store.lock();
-                    let ids = store
-                        .search_exact(&effective_text, retrieval_candidates)
-                        .unwrap_or_default();
-                    tracing::debug!(
-                        results_count = ids.len(),
-                        duration_ms = exact_start.elapsed().as_millis() as u64,
-                        "Exact substring search complete (SQLite)"
-                    );
-                    (ids, exact_start.elapsed().as_millis() as u64)
-                });
-
-                let (dense_results, d_ms) = dense_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
-                let (sparse_results, s_ms) =
-                    sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
-                let (exact_ids, e_ms) = exact_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
-
-                (dense_results, sparse_results, exact_ids, d_ms, s_ms, e_ms)
+                    }
+                } else {
+                    Vec::new()
+                };
+                (results, dense_start.elapsed().as_millis() as u64)
             });
 
-        // Stage 2: Query-adaptive weighted Triple CC Fusion
+            let sparse_handle = s.spawn(|| -> (Vec<ScoredChunkId>, u64) {
+                if !query.use_sparse {
+                    return (Vec::new(), 0);
+                }
+                let sparse_start = std::time::Instant::now();
+                let results = if let Some(ref sparse) = self.sparse {
+                    let safe_query = sanitize_tantivy_query(&effective_text);
+                    let mut results = sparse
+                        .search(&safe_query, retrieval_candidates)
+                        .unwrap_or_default();
+                    tracing::debug!(
+                        results_count = results.len(),
+                        duration_ms = sparse_start.elapsed().as_millis() as u64,
+                        "Sparse search complete"
+                    );
+
+                    // CC-mode legacy expansion: a single weighted fold of expanded
+                    // BM25 into the original sparse list. RRF mode handles expansion
+                    // via the dedicated exp_sparse channel below — keep this branch
+                    // CC-only so we don't double-count expansion contributions.
+                    if matches!(fusion_mode, FusionMode::Cc)
+                        && matches!(query_type, QueryType::Semantic | QueryType::Mixed)
+                        && let Some(expanded) = query_expander::expand_query(&effective_text)
+                    {
+                        let safe_expanded = sanitize_tantivy_query(&expanded);
+                        if let Ok(expanded_results) =
+                            sparse.search(&safe_expanded, retrieval_candidates)
+                        {
+                            tracing::debug!(
+                                expanded_count = expanded_results.len(),
+                                "Dual-route BM25 expansion (CC mode)"
+                            );
+                            results = dual_route_fuse(&results, &expanded_results, 1.0, 0.5);
+                        }
+                    }
+
+                    results
+                } else {
+                    Vec::new()
+                };
+                (results, sparse_start.elapsed().as_millis() as u64)
+            });
+
+            let exact_handle = s.spawn(|| -> (Vec<u64>, u64) {
+                let exact_start = std::time::Instant::now();
+                let store = self.store.lock();
+                let ids = store
+                    .search_exact(&effective_text, retrieval_candidates)
+                    .unwrap_or_default();
+                tracing::debug!(
+                    results_count = ids.len(),
+                    duration_ms = exact_start.elapsed().as_millis() as u64,
+                    "Exact substring search complete (SQLite)"
+                );
+                (ids, exact_start.elapsed().as_millis() as u64)
+            });
+
+            // E4 dual-route channels (only fire in RRF mode with a non-empty expansion).
+            let expanded_ref = expanded_text.as_deref();
+            let exp_dense_handle = s.spawn(move || -> Vec<ScoredChunkId> {
+                let Some(text) = expanded_ref else {
+                    return Vec::new();
+                };
+                if !query.use_dense {
+                    return Vec::new();
+                }
+                if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                    match plaid.search(colbert, text, retrieval_candidates) {
+                        Ok(r) => {
+                            tracing::debug!(
+                                expanded_dense_count = r.len(),
+                                "Exp4Fuse: expanded-dense channel complete"
+                            );
+                            r
+                        }
+                        Err(e) => {
+                            tracing::debug!("Expanded PLAID search failed: {}", e);
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                }
+            });
+
+            let exp_sparse_handle = s.spawn(move || -> Vec<ScoredChunkId> {
+                let Some(text) = expanded_ref else {
+                    return Vec::new();
+                };
+                if !query.use_sparse {
+                    return Vec::new();
+                }
+                if let Some(ref sparse) = self.sparse {
+                    let safe = sanitize_tantivy_query(text);
+                    let r = sparse
+                        .search(&safe, retrieval_candidates)
+                        .unwrap_or_default();
+                    tracing::debug!(
+                        expanded_sparse_count = r.len(),
+                        "Exp4Fuse: expanded-sparse channel complete"
+                    );
+                    r
+                } else {
+                    Vec::new()
+                }
+            });
+
+            let (dense_results, d_ms) = dense_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+            let (sparse_results, s_ms) = sparse_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+            let (exact_ids, e_ms) = exact_handle.join().unwrap_or_else(|_| (Vec::new(), 0));
+            let exp_dense = exp_dense_handle.join().unwrap_or_default();
+            let exp_sparse = exp_sparse_handle.join().unwrap_or_default();
+
+            (
+                dense_results,
+                sparse_results,
+                exact_ids,
+                exp_dense,
+                exp_sparse,
+                d_ms,
+                s_ms,
+                e_ms,
+            )
+        });
+
+        // Stage 2: Fusion. E2 selects RRF or CC via SEMANTEX_FUSION (default RRF).
+        // E4 routes through the 5-channel Exp4Fuse helper when RRF is active and
+        // the expanded query produced any results. E6 derives per-result confidence
+        // labels from channel-agreement counts emitted by RRF.
         let fusion_start = std::time::Instant::now();
-        let triple_weights = query_type.triple_fusion_weights();
-        tracing::debug!(
-            ?query_type,
-            ?triple_weights,
-            "Query classified (triple fusion)"
-        );
 
         let dense_count = dense_results.len();
         let sparse_count = sparse_results.len();
         let exact_count = exact_ids.len();
 
-        let has_any_results =
-            !dense_results.is_empty() || !sparse_results.is_empty() || !exact_ids.is_empty();
+        let has_any_results = !dense_results.is_empty()
+            || !sparse_results.is_empty()
+            || !exact_ids.is_empty()
+            || !exp_dense_results.is_empty()
+            || !exp_sparse_results.is_empty();
 
-        let fused = if has_any_results {
-            let fused = triple_fusion::triple_cc_fuse(
-                &dense_results,
-                &sparse_results,
-                &exact_ids,
-                &triple_weights,
-            );
-            tracing::debug!(
-                fused_count = fused.len(),
-                exact_count = exact_ids.len(),
-                duration_ms = fusion_start.elapsed().as_millis() as u64,
-                "Triple CC fusion complete"
-            );
-            fused
+        // confidence_map: chunk_id -> (label, score) populated only by RRF path.
+        // CC path derives confidence from per-channel scores at result-build time.
+        let mut confidence_map: HashMap<u64, (Confidence, f32)> = HashMap::new();
+
+        let fused: Vec<ScoredChunkId> = if has_any_results {
+            match fusion_mode {
+                FusionMode::Rrf => {
+                    let rrf_results: Vec<RrfFusedResult> = if !exp_dense_results.is_empty()
+                        || !exp_sparse_results.is_empty()
+                    {
+                        triple_fusion::exp4_rrf_fuse(
+                            &dense_results,
+                            &sparse_results,
+                            &exp_dense_results,
+                            &exp_sparse_results,
+                            &exact_ids,
+                        )
+                    } else {
+                        triple_fusion::triple_rrf_fuse(&dense_results, &sparse_results, &exact_ids)
+                    };
+                    // Derive per-result confidence labels (gap-aware) from RRF output.
+                    let labels = triple_fusion::assign_confidence(&rrf_results);
+                    for (rr, (conf, score)) in rrf_results.iter().zip(labels.iter()) {
+                        confidence_map.insert(rr.scored.chunk_id, (*conf, *score));
+                    }
+                    tracing::debug!(
+                        fused_count = rrf_results.len(),
+                        exact_count = exact_ids.len(),
+                        duration_ms = fusion_start.elapsed().as_millis() as u64,
+                        dual_route =
+                            !exp_dense_results.is_empty() || !exp_sparse_results.is_empty(),
+                        "Triple RRF fusion complete (E2 + E4)"
+                    );
+                    rrf_results.into_iter().map(|r| r.scored).collect()
+                }
+                FusionMode::Cc => {
+                    let triple_weights = query_type.triple_fusion_weights();
+                    tracing::debug!(
+                        ?query_type,
+                        ?triple_weights,
+                        "Query classified (CC fusion legacy path)"
+                    );
+                    let fused = triple_fusion::triple_cc_fuse(
+                        &dense_results,
+                        &sparse_results,
+                        &exact_ids,
+                        &triple_weights,
+                    );
+                    tracing::debug!(
+                        fused_count = fused.len(),
+                        exact_count = exact_ids.len(),
+                        duration_ms = fusion_start.elapsed().as_millis() as u64,
+                        "Triple CC fusion complete"
+                    );
+                    fused
+                }
+            }
         } else {
             Vec::new()
         };
@@ -656,6 +786,9 @@ impl HybridSearcher {
 
         // Build results in score order, applying file filter if set.
         // Chunks discovered via graph propagation get tagged with GraphExpanded source.
+        // E6: populate per-result confidence labels — RRF results carry channel-agreement
+        // metadata via `confidence_map`; CC results derive confidence from per-channel
+        // score fields (treating non-zero score as "channel hit").
         let graph_expanded_ids: HashSet<u64> = new_ids.iter().copied().collect();
         let mut results: Vec<SearchResult> = fused
             .iter()
@@ -667,6 +800,10 @@ impl HybridSearcher {
                     } else {
                         source
                     };
+                    let (confidence, confidence_score) = confidence_map
+                        .get(&scored.chunk_id)
+                        .copied()
+                        .unwrap_or_else(|| derive_cc_confidence(scored));
                     SearchResult {
                         chunk,
                         score: scored.score,
@@ -674,6 +811,8 @@ impl HybridSearcher {
                         score_dense: scored.score_dense,
                         score_sparse: scored.score_sparse,
                         score_exact: scored.score_exact,
+                        confidence,
+                        confidence_score,
                     }
                 })
             })
@@ -700,10 +839,13 @@ impl HybridSearcher {
             let rerank_start = std::time::Instant::now();
             let mut reranker_guard = self.reranker.lock();
 
-            // Lazy-load reranker on first use
+            // Lazy-load reranker on first use. v0.3: use new_default() which
+            // selects the v0.3 cross-encoder (BGE Reranker v2 M3) and is gated
+            // by SEMANTEX_RERANKER. The model only loads when the env var
+            // enables it; when disabled, rerank() is an identity pass-through.
             if reranker_guard.is_none() {
                 tracing::info!("Loading reranker model (first use)...");
-                match FastembedReranker::new(RerankerModel::JINARerankerV1TurboEn, false) {
+                match FastembedReranker::new_default(false) {
                     Ok(r) => *reranker_guard = Some(r),
                     Err(e) => {
                         tracing::warn!("Failed to initialize reranker: {}", e);
@@ -902,6 +1044,7 @@ impl HybridSearcher {
             .as_ref()
             .is_some_and(super::super::types::FileFilter::is_active);
 
+        // Grep-mode does not run fusion; confidence defaults to Inferred.
         let mut results: Vec<SearchResult> = fused
             .iter()
             .take(fetch_limit)
@@ -915,6 +1058,8 @@ impl HybridSearcher {
                         score_dense: scored.score_dense,
                         score_sparse: scored.score_sparse,
                         score_exact: scored.score_exact,
+                        confidence: Confidence::Inferred,
+                        confidence_score: 0.0,
                     })
             })
             .filter(|result| {
@@ -1137,6 +1282,29 @@ fn dual_route_fuse(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     fused
+}
+
+/// CC-mode confidence derivation: count how many of the three channels
+/// produced a non-zero score for this chunk.
+///
+/// - 3/3 channels → `Extracted`, score 1.0
+/// - 2/3 channels → `Inferred`, score 0.667
+/// - 1/3 channels → `Inferred`, score 0.333
+/// - 0/3 (unreachable here) → `Inferred`, score 0.0
+///
+/// CC mode lacks the rank-based ambiguity signal that RRF emits, so
+/// `Ambiguous` is not produced here — only RRF results carry it.
+fn derive_cc_confidence(scored: &ScoredChunkId) -> (Confidence, f32) {
+    let channels = u32::from(scored.score_dense > 0.0)
+        + u32::from(scored.score_sparse > 0.0)
+        + u32::from(scored.score_exact > 0.0);
+    let confidence = if channels >= 3 {
+        Confidence::Extracted
+    } else {
+        Confidence::Inferred
+    };
+    let score = (channels as f32) / 3.0;
+    (confidence, score)
 }
 
 /// Sanitize a query string for tantivy's query parser
@@ -1574,6 +1742,53 @@ mod tests {
             assert!(!filter.matches(Path::new("settings.toml")));
             assert!(!filter.matches(Path::new("notes.txt")));
             assert!(!filter.matches(Path::new("Cargo.lock")));
+        }
+    }
+
+    mod confidence_derivation_tests {
+        use super::super::*;
+        use crate::types::Confidence;
+
+        #[test]
+        fn test_cc_confidence_three_channels_extracted() {
+            let scored = ScoredChunkId {
+                chunk_id: 1,
+                score: 1.0,
+                score_dense: 0.5,
+                score_sparse: 0.5,
+                score_exact: 1.0,
+            };
+            let (c, s) = derive_cc_confidence(&scored);
+            assert_eq!(c, Confidence::Extracted);
+            assert!((s - 1.0).abs() < f32::EPSILON);
+        }
+
+        #[test]
+        fn test_cc_confidence_two_channels_inferred() {
+            let scored = ScoredChunkId {
+                chunk_id: 1,
+                score: 1.0,
+                score_dense: 0.5,
+                score_sparse: 0.0,
+                score_exact: 1.0,
+            };
+            let (c, s) = derive_cc_confidence(&scored);
+            assert_eq!(c, Confidence::Inferred);
+            assert!((s - 2.0 / 3.0).abs() < 1e-5);
+        }
+
+        #[test]
+        fn test_cc_confidence_one_channel_inferred() {
+            let scored = ScoredChunkId {
+                chunk_id: 1,
+                score: 1.0,
+                score_dense: 0.5,
+                score_sparse: 0.0,
+                score_exact: 0.0,
+            };
+            let (c, s) = derive_cc_confidence(&scored);
+            assert_eq!(c, Confidence::Inferred);
+            assert!((s - 1.0 / 3.0).abs() < 1e-5);
         }
     }
 }

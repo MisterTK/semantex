@@ -74,6 +74,18 @@ impl SemantexServer {
         // Install signal handler
         install_signal_handler(self.shutdown.clone())?;
 
+        // E8(b): page-cache prefetch — fan out reads for SQLite, Tantivy, and
+        // PLAID files in parallel via rayon::join3 so the subsequent
+        // `HybridSearcher::open` does cache-warm sequential reads. Best-effort.
+        let _prefetch = listener::prefetch_index(&self.index_dir);
+
+        // E8(c): kick off the background ColBERT warm thread BEFORE opening
+        // the searcher. The warm thread materializes the ONNX session in the
+        // global ColbertEmbedder singleton, so the first user query (which
+        // arrives after `Listener::run` starts accepting) doesn't pay the
+        // session-build cost. Fire-and-forget — we drop the JoinHandle.
+        let _warm_handle = listener::spawn_colbert_warm_thread(&self.config);
+
         // Open searcher (loads all models into memory)
         tracing::info!("Loading search index...");
         let searcher = HybridSearcher::open(&self.index_dir, &self.config)

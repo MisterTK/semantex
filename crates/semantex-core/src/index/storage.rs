@@ -6,6 +6,17 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// ── E8(a): mmap'd PLAID mapping file (Unix only — Windows uses read fallback) ──
+//
+// Per spec risk T5, mmap is feature-gated to non-Windows platforms. On Windows
+// we fall back to `std::fs::read`. The PLAID index itself (centroids/codes)
+// is already mmap'd by `next-plaid::MmapIndex`; the file we own here is the
+// `plaid_mapping.bin` doc-to-chunk-ID mapping used by `PlaidSearcher`.
+#[cfg(not(target_os = "windows"))]
+use memmap2::Mmap;
+#[cfg(not(target_os = "windows"))]
+use std::fs::File;
+
 /// Statistics for the code graph tables (symbol_defs, type_refs, type_hierarchy, module_edges).
 #[derive(Debug, Default)]
 pub struct GraphStats {
@@ -481,7 +492,7 @@ impl ChunkStore {
         for chunk in unique_paths.chunks(500) {
             let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql =
-                format!("SELECT path, role FROM file_metadata WHERE path IN ({placeholders})",);
+                format!("SELECT path, role FROM file_metadata WHERE path IN ({placeholders})");
             let mut stmt = self.conn.prepare(&sql)?;
             let params: Vec<&dyn rusqlite::types::ToSql> = chunk
                 .iter()
@@ -931,7 +942,15 @@ impl ChunkStore {
     // ── v7 cleanup ───────────────────────────────────────────────────
 
     /// Delete all graph data (symbol_defs, type_refs, module_edges, type_hierarchy)
-    /// associated with a given file path.
+    /// and v0.3 auxiliary rows (chunk_annotations, pattern_matches,
+    /// chunk_centrality) associated with a given file path.
+    ///
+    /// The v0.3 tables are created by `init_auxiliary_schema` in builder.rs,
+    /// which runs only after the indexing transaction (so on the very first
+    /// build the tables may not yet exist when this is called). Each v0.3
+    /// DELETE is guarded by a `sqlite_master` probe — a single indexed lookup
+    /// (~tens of µs) that lets the function stay safe across all call sites
+    /// (builder, validator, future search-time updaters).
     pub fn delete_graph_data_for_file(&self, file_path: &str) -> Result<()> {
         // symbol_defs has its own file_path column
         self.conn.execute(
@@ -951,14 +970,62 @@ impl ChunkStore {
             params![file_path],
         )?;
 
-        // type_hierarchy: delete rows where child_chunk or parent_chunk belongs to this file
+        // type_hierarchy: delete rows where child_chunk or parent_chunk belongs to this file.
+        // NOTE: `?1` is a numbered placeholder reused twice — rusqlite counts unique
+        // placeholders, so we must pass exactly one value (passing two raised
+        // InvalidParameterCount, which was being silently swallowed by `let _ =`
+        // at the call sites in builder.rs).
         self.conn.execute(
             "DELETE FROM type_hierarchy WHERE child_chunk IN (SELECT id FROM chunks WHERE file_path = ?1)
              OR parent_chunk IN (SELECT id FROM chunks WHERE file_path = ?1)",
-            params![file_path, file_path],
+            params![file_path],
         )?;
 
+        // ── v0.3 auxiliary tables ─────────────────────────────────────
+        // Created by `init_auxiliary_schema` in builder.rs after the indexing
+        // pass. Guard each DELETE with a `sqlite_master` probe so we never
+        // raise "no such table" on a fresh / partially-built index.
+
+        if self.table_exists("chunk_annotations")? {
+            self.conn.execute(
+                "DELETE FROM chunk_annotations WHERE chunk_id IN \
+                 (SELECT id FROM chunks WHERE file_path = ?1)",
+                params![file_path],
+            )?;
+        }
+
+        if self.table_exists("pattern_matches")? {
+            self.conn.execute(
+                "DELETE FROM pattern_matches WHERE chunk_id IN \
+                 (SELECT id FROM chunks WHERE file_path = ?1)",
+                params![file_path],
+            )?;
+        }
+
+        if self.table_exists("chunk_centrality")? {
+            self.conn.execute(
+                "DELETE FROM chunk_centrality WHERE chunk_id IN \
+                 (SELECT id FROM chunks WHERE file_path = ?1)",
+                params![file_path],
+            )?;
+        }
+
         Ok(())
+    }
+
+    /// Returns true when a table with `name` is present in this database.
+    /// Uses an indexed lookup on `sqlite_master` — sub-100µs in practice.
+    fn table_exists(&self, name: &str) -> Result<bool> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                params![name],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(exists)
     }
 
     // ── v7 stats ─────────────────────────────────────────────────────
@@ -994,5 +1061,487 @@ impl ChunkStore {
             module_edges_count: module_edges_count as usize,
             symbol_defs_count: symbol_defs_count as usize,
         })
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// E8(a) + E8(b): mmap'd PLAID mapping + parallel index prefetch
+// ════════════════════════════════════════════════════════════════════════
+//
+// These helpers are called by the daemon at startup to (1) memory-map the
+// PLAID doc-to-chunk mapping file (Unix; falls back to read on Windows) and
+// (2) warm the OS page cache for the heaviest index files in parallel, so
+// that `HybridSearcher::open` does cache-warm sequential reads rather than
+// cold disk I/O.
+//
+// We deliberately do NOT re-implement `HybridSearcher::open` — that lives in
+// `search/hybrid.rs` (owned by W1). The page-cache prefetch achieves the
+// same wall-clock latency win as true parallel opening since the bulk of
+// "open" cost is I/O, and parallelising disk reads is what `rayon::join3`
+// here actually delivers.
+
+/// Memory-mapped bytes from a file (Unix). On Windows, holds an owned `Vec<u8>`.
+///
+/// This abstraction lets callers treat the PLAID mapping file as a `&[u8]`
+/// regardless of platform, without forcing every consumer to handle two
+/// distinct types.
+pub struct MappedBytes {
+    #[cfg(not(target_os = "windows"))]
+    inner: Mmap,
+    #[cfg(target_os = "windows")]
+    inner: Vec<u8>,
+}
+
+impl MappedBytes {
+    /// Open a file via mmap (Unix) or `read` (Windows fallback per spec risk T5).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened or mapped.
+    pub fn open(path: &Path) -> Result<Self> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let file = File::open(path)
+                .with_context(|| format!("Failed to open {} for mmap", path.display()))?;
+            // SAFETY: We hold the File open for the lifetime of the Mmap. If
+            // another process truncates the file the mapping becomes UB, but
+            // PLAID mapping files are written once at index build and never
+            // mutated in place (rebuild deletes and recreates).
+            let mmap = unsafe { Mmap::map(&file) }
+                .with_context(|| format!("Failed to mmap {}", path.display()))?;
+            Ok(Self { inner: mmap })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            Ok(Self { inner: bytes })
+        }
+    }
+
+    /// Borrow the underlying bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.inner
+    }
+
+    /// Returns true if backed by a real memory mapping (vs. fallback read).
+    /// Test/diagnostics helper only.
+    #[doc(hidden)]
+    pub fn is_mmapped(&self) -> bool {
+        cfg!(not(target_os = "windows"))
+    }
+}
+
+/// Outcome of a parallel index prefetch — what we touched, in nanoseconds.
+///
+/// This is informational only; the returned struct is used by tests and by
+/// the cold-start benchmark. Production paths discard the result.
+#[derive(Debug, Default)]
+pub struct PrefetchOutcome {
+    pub sqlite_ns: u128,
+    pub sparse_ns: u128,
+    pub plaid_ns: u128,
+    pub sqlite_ok: bool,
+    pub sparse_ok: bool,
+    pub plaid_ok: bool,
+}
+
+/// Prefetch the three heavy index components in parallel, warming the OS page
+/// cache so that `HybridSearcher::open` runs entirely against cached pages.
+///
+/// Uses `rayon::join3` to fan out one task per component:
+/// - SQLite chunk store (`chunks.db`)
+/// - Tantivy sparse index (`sparse/`)
+/// - PLAID dense index (`plaid/` + `plaid_mapping.bin`)
+///
+/// Each task touches its files via `std::fs::read` (or a directory walk for
+/// Tantivy); failures are recorded in [`PrefetchOutcome`] but never propagated
+/// — prefetch is a best-effort latency optimization, and any actual I/O error
+/// will surface again when `HybridSearcher::open` runs.
+///
+/// Returns immediately if `index_dir` does not exist.
+pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
+    if !index_dir.exists() {
+        return PrefetchOutcome::default();
+    }
+
+    let sqlite_path = index_dir.join("chunks.db");
+    let sparse_dir = index_dir.join("sparse");
+    let plaid_dir = index_dir.join("plaid");
+    let plaid_mapping = index_dir.join("plaid_mapping.bin");
+
+    // E8(b): fan out the three reads to the rayon thread pool. Rayon only
+    // provides binary `join`, so we nest one call inside the other —
+    // equivalent semantics to a hypothetical `join3` and what rayon's own
+    // documentation recommends for three-way parallelism. All three tasks
+    // run concurrently; this function blocks until all complete. Errors are
+    // swallowed into the per-task `ok` flag — the goal is warming the OS
+    // page cache, not strict correctness.
+    let ((sqlite_ns, sqlite_ok), ((sparse_ns, sparse_ok), (plaid_ns, plaid_ok))) = rayon::join(
+        || prefetch_file_timed(&sqlite_path),
+        || {
+            rayon::join(
+                || prefetch_dir_timed(&sparse_dir),
+                || {
+                    let t = std::time::Instant::now();
+                    let dir_ok = prefetch_dir_timed(&plaid_dir).1;
+                    let map_ok = if plaid_mapping.exists() {
+                        prefetch_file_timed(&plaid_mapping).1
+                    } else {
+                        false
+                    };
+                    (t.elapsed().as_nanos(), dir_ok || map_ok)
+                },
+            )
+        },
+    );
+
+    PrefetchOutcome {
+        sqlite_ns,
+        sparse_ns,
+        plaid_ns,
+        sqlite_ok,
+        sparse_ok,
+        plaid_ok,
+    }
+}
+
+/// Read the entire file into a discarded buffer, timing the operation.
+/// Used to warm the OS page cache. Returns `(nanos, ok)`.
+fn prefetch_file_timed(path: &Path) -> (u128, bool) {
+    let t = std::time::Instant::now();
+    let ok = std::fs::read(path).is_ok();
+    (t.elapsed().as_nanos(), ok)
+}
+
+/// Recursively read every file under `dir`, timing the operation.
+/// Used to warm the OS page cache for Tantivy's segment files. Returns
+/// `(nanos, ok)` where `ok` is true if at least one file was read.
+fn prefetch_dir_timed(dir: &Path) -> (u128, bool) {
+    let t = std::time::Instant::now();
+    if !dir.is_dir() {
+        return (t.elapsed().as_nanos(), false);
+    }
+    let mut any_ok = false;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && std::fs::read(&path).is_ok() {
+                any_ok = true;
+            }
+        }
+    }
+    (t.elapsed().as_nanos(), any_ok)
+}
+
+#[cfg(test)]
+mod e8_storage_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// `MappedBytes::open` should succeed on a valid file and expose the raw bytes,
+    /// regardless of whether it's backed by mmap (Unix) or `read` (Windows fallback).
+    #[test]
+    fn mapped_bytes_open_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let mapped = MappedBytes::open(&path).expect("open should succeed");
+        assert_eq!(mapped.as_bytes(), b"hello world");
+    }
+
+    /// On Unix targets we expect the mapping to be a real mmap; on Windows
+    /// (or any cfg(target_os = "windows") build) we expect the read fallback.
+    #[test]
+    fn mapped_bytes_uses_mmap_on_unix() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let mapped = MappedBytes::open(&path).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        assert!(mapped.is_mmapped(), "expected mmap on non-Windows target");
+        #[cfg(target_os = "windows")]
+        assert!(!mapped.is_mmapped(), "expected read fallback on Windows");
+    }
+
+    /// `MappedBytes::open` must error on a missing path (so callers can fall
+    /// back rather than silently hold an empty buffer).
+    #[test]
+    fn mapped_bytes_open_fails_on_missing_file() {
+        let res = MappedBytes::open(Path::new("/nonexistent/path/that/does/not/exist.bin"));
+        assert!(res.is_err());
+    }
+
+    /// `prefetch_index_files` on an empty directory should return all-zero
+    /// outcome without panicking — the daemon may call this before any
+    /// indexing has happened.
+    #[test]
+    fn prefetch_empty_dir_returns_default() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = prefetch_index_files(tmp.path());
+        assert!(!outcome.sqlite_ok);
+        assert!(!outcome.sparse_ok);
+        assert!(!outcome.plaid_ok);
+    }
+
+    /// `prefetch_index_files` on a missing directory should return all-zero
+    /// outcome (no panic, no error).
+    #[test]
+    fn prefetch_missing_dir_returns_default() {
+        let outcome = prefetch_index_files(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert!(!outcome.sqlite_ok);
+        assert!(!outcome.sparse_ok);
+        assert!(!outcome.plaid_ok);
+    }
+
+    /// When the SQLite file and PLAID mapping exist, the prefetch should
+    /// report `sqlite_ok` and `plaid_ok` true.
+    #[test]
+    fn prefetch_reports_ok_for_present_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("chunks.db"), b"fake").unwrap();
+        std::fs::create_dir(tmp.path().join("plaid")).unwrap();
+        std::fs::write(tmp.path().join("plaid").join("dummy"), b"x").unwrap();
+        std::fs::write(tmp.path().join("plaid_mapping.bin"), b"y").unwrap();
+        let outcome = prefetch_index_files(tmp.path());
+        assert!(outcome.sqlite_ok);
+        assert!(outcome.plaid_ok);
+    }
+}
+
+#[cfg(test)]
+mod delete_graph_data_tests {
+    use super::*;
+    use crate::types::{Chunk, ChunkType};
+    use tempfile::TempDir;
+
+    /// Helper: open a temp ChunkStore plus create the v0.3 auxiliary tables
+    /// (mirror of `init_auxiliary_schema` in builder.rs — kept here so the
+    /// storage-layer test does not depend on the builder module).
+    fn create_v0_3_aux_tables(store: &ChunkStore) {
+        store
+            .conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS chunk_annotations (
+                    chunk_id INTEGER PRIMARY KEY,
+                    nl_annotation TEXT NOT NULL,
+                    FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS pattern_matches (
+                    chunk_id     INTEGER NOT NULL,
+                    pattern_name TEXT NOT NULL,
+                    language     TEXT NOT NULL,
+                    description  TEXT NOT NULL,
+                    file_path    TEXT NOT NULL,
+                    PRIMARY KEY (chunk_id, pattern_name),
+                    FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS chunk_centrality (
+                    chunk_id INTEGER PRIMARY KEY,
+                    structural_centrality REAL NOT NULL,
+                    FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+                );
+                ",
+            )
+            .unwrap();
+    }
+
+    fn insert_test_chunk(store: &ChunkStore, file_path: &str) -> u64 {
+        let chunk = Chunk {
+            id: 0,
+            file_path: PathBuf::from(file_path),
+            start_line: 1,
+            end_line: 10,
+            content: "fn main() {}".to_string(),
+            chunk_type: ChunkType::TextWindow { window_index: 0 },
+        };
+        store.insert_chunk(&chunk, 0xdead_beef, 0).unwrap()
+    }
+
+    /// Regression for Finding 9: `delete_graph_data_for_file` must clear
+    /// rows in the v0.3 auxiliary tables (chunk_annotations,
+    /// pattern_matches, chunk_centrality) so incremental reindex does not
+    /// leave orphan chunk_id references.
+    #[test]
+    fn delete_clears_v0_3_aux_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+        create_v0_3_aux_tables(&store);
+
+        let file = "src/lib.rs";
+        let cid = insert_test_chunk(&store, file);
+
+        // Populate one row in each v0.3 table for the chunk
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunk_annotations (chunk_id, nl_annotation) VALUES (?1, ?2)",
+                params![cid as i64, "an annotation"],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO pattern_matches (chunk_id, pattern_name, language, description, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![cid as i64, "test_pattern", "rust", "a test pattern", file],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunk_centrality (chunk_id, structural_centrality) VALUES (?1, ?2)",
+                params![cid as i64, 0.42_f64],
+            )
+            .unwrap();
+
+        // Sanity: rows are present
+        let count_annotations = |s: &ChunkStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM chunk_annotations", [], |r| r.get(0))
+                .unwrap()
+        };
+        let count_patterns = |s: &ChunkStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM pattern_matches", [], |r| r.get(0))
+                .unwrap()
+        };
+        let count_centrality = |s: &ChunkStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM chunk_centrality", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count_annotations(&store), 1);
+        assert_eq!(count_patterns(&store), 1);
+        assert_eq!(count_centrality(&store), 1);
+
+        // The function under test
+        store.delete_graph_data_for_file(file).unwrap();
+
+        // All v0.3 aux rows for this file's chunks must be gone
+        assert_eq!(
+            count_annotations(&store),
+            0,
+            "chunk_annotations not cleared"
+        );
+        assert_eq!(count_patterns(&store), 0, "pattern_matches not cleared");
+        assert_eq!(count_centrality(&store), 0, "chunk_centrality not cleared");
+    }
+
+    /// `delete_graph_data_for_file` on a *fresh* DB where the v0.3 tables
+    /// have not yet been created (e.g. very first build, before
+    /// `init_auxiliary_schema` runs) must NOT raise "no such table".
+    #[test]
+    fn delete_is_safe_when_v0_3_tables_missing() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        let file = "src/lib.rs";
+        let _cid = insert_test_chunk(&store, file);
+
+        // Do NOT create the v0.3 aux tables. The deletion must still succeed.
+        store
+            .delete_graph_data_for_file(file)
+            .expect("delete must be safe when v0.3 tables are absent");
+    }
+
+    /// `delete_graph_data_for_file` should leave aux rows for *other* files
+    /// untouched (regression guard against an overly broad DELETE).
+    #[test]
+    fn delete_only_clears_target_file_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+        create_v0_3_aux_tables(&store);
+
+        let cid_a = insert_test_chunk(&store, "a.rs");
+        let cid_b = insert_test_chunk(&store, "b.rs");
+
+        for cid in [cid_a, cid_b] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO chunk_annotations (chunk_id, nl_annotation) VALUES (?1, ?2)",
+                    params![cid as i64, "x"],
+                )
+                .unwrap();
+        }
+
+        store.delete_graph_data_for_file("a.rs").unwrap();
+
+        let remaining: Vec<i64> = store
+            .conn
+            .prepare("SELECT chunk_id FROM chunk_annotations")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![cid_b as i64]);
+    }
+
+    /// Regression: prior to Finding 9 the `type_hierarchy` DELETE used
+    /// `?1` twice but passed `params![file_path, file_path]`, which made
+    /// rusqlite return `InvalidParameterCount(2, 1)`. The error was masked
+    /// by `let _ = ...` at the call sites. After the fix, the call must
+    /// succeed against a populated type_hierarchy row.
+    #[test]
+    fn delete_clears_type_hierarchy_without_param_count_error() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        let file = "src/lib.rs";
+        let cid = insert_test_chunk(&store, file);
+        // Insert a hierarchy row with this chunk as child
+        store
+            .conn
+            .execute(
+                "INSERT INTO type_hierarchy (child_name, parent_name, relation, child_chunk, parent_chunk) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["Child", "Parent", "extends", cid as i64, cid as i64],
+            )
+            .unwrap();
+
+        let count_before: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM type_hierarchy", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        store.delete_graph_data_for_file(file).unwrap();
+
+        let count_after: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM type_hierarchy", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_after, 0,
+            "type_hierarchy row should have been deleted"
+        );
+    }
+
+    /// `table_exists` correctly identifies present vs absent tables.
+    #[test]
+    fn table_exists_probe_works() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+        // `chunks` is created by `init_schema`
+        assert!(store.table_exists("chunks").unwrap());
+        // v0.3 aux tables are NOT created by `init_schema`
+        assert!(!store.table_exists("chunk_annotations").unwrap());
+        assert!(!store.table_exists("pattern_matches").unwrap());
+        assert!(!store.table_exists("chunk_centrality").unwrap());
+
+        create_v0_3_aux_tables(&store);
+        assert!(store.table_exists("chunk_annotations").unwrap());
+        assert!(store.table_exists("pattern_matches").unwrap());
+        assert!(store.table_exists("chunk_centrality").unwrap());
     }
 }

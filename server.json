@@ -1,0 +1,96 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.MisterTK/semantex",
+  "title": "Semantex — Semantic Code Search",
+  "description": "Fully local semantic code search: ColBERT dense + BM25 sparse + optional reranking, exposed as MCP tools.",
+  "version": "0.1.2",
+  "websiteUrl": "https://semantex.dev",
+  "repository": {
+    "url": "https://github.com/MisterTK/semantex",
+    "source": "github",
+    "subfolder": "crates/semantex-mcp"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/mistertk/semantex",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "description": "Run as MCP server over stdio."
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "SEMANTEX_MAX_RSS_MB",
+          "description": "Soft cap on resident memory (MB) for the MCP server cache (default: 512). When exceeded, cached searchers are evicted.",
+          "default": "512",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SEMANTEX_MCP_CACHE_SIZE",
+          "description": "Maximum number of cached searcher instances (default: 1). Each instance holds one project's open index in memory.",
+          "default": "1",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SEMANTEX_REFRESH_SECS",
+          "description": "Trigger an automatic background reindex when the index is older than this many seconds (default: 3600).",
+          "default": "3600",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:{port}/mcp/{toolset}",
+      "headers": [
+        {
+          "name": "content-type",
+          "value": "application/json",
+          "description": "JSON-RPC over HTTP requires application/json."
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "supportedToolsets": ["core", "structural", "all"],
+      "defaultToolset": "all",
+      "transports": {
+        "stdio": {
+          "command": "semantex mcp",
+          "description": "Standard local MCP transport. Pass --toolset to scope the exposed tools."
+        },
+        "http": {
+          "command": "semantex mcp --http --port 5050",
+          "description": "HTTP/SSE transport. Binds 127.0.0.1 by default; --allow-remote to listen on all interfaces (no authentication — only use on trusted networks).",
+          "routes": {
+            "POST /mcp/{toolset}": "Streamable HTTP — JSON-RPC body in, JSON-RPC body out.",
+            "GET /mcp/{toolset}/events": "Server-Sent Events stream for notifications.",
+            "GET /healthz": "Liveness probe."
+          }
+        }
+      },
+      "tools": [
+        "semantex_search",
+        "semantex_deep",
+        "semantex_agent",
+        "semantex_index",
+        "semantex_status",
+        "semantex_health",
+        "semantex_validate"
+      ]
+    }
+  }
+}

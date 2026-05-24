@@ -271,10 +271,8 @@ pub fn format_code_blocks(
 
         // Fenced code block with line numbers
         let _ = writeln!(block, "```{lang}");
-        let mut line_num = item.start_line;
-        for line in code.lines() {
+        for (line_num, line) in (item.start_line..).zip(code.lines()) {
             let _ = writeln!(block, "{line_num:4} | {line}");
-            line_num += 1;
         }
         block.push_str("```\n");
 

@@ -1,7 +1,53 @@
 use crate::search::query_classifier::QueryType;
-use crate::types::ScoredChunkId;
+use crate::types::{Confidence, ScoredChunkId};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+/// RRF rank-decay constant (E2). The named value in the spec — do not invent
+/// a different k. The standard 60 chosen by Cormack/Clarke/Buettcher (2009) is
+/// robust across query types and corpus sizes.
+pub const RRF_K: f32 = 60.0;
+
+/// Score-gap threshold for tagging a result as `Confidence::Ambiguous` (E6).
+/// If `(score - next_score) / score < AMBIGUOUS_GAP_THRESHOLD` the result is
+/// considered too close to its neighbour to discriminate confidently.
+pub const AMBIGUOUS_GAP_THRESHOLD: f32 = 0.05;
+
+/// Selectable fusion strategy.
+///
+/// RRF is the v0.3 default per spec E2. CC is preserved behind
+/// `SEMANTEX_FUSION=cc` for one release; removed in v0.4.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FusionMode {
+    /// Reciprocal Rank Fusion (default, parameter-free).
+    #[default]
+    Rrf,
+    /// Triple Convex Combination (legacy, weighted normalized scores).
+    Cc,
+}
+
+impl FusionMode {
+    /// Parse a fusion mode from an env-var value.
+    /// Anything unrecognised (or empty) falls back to the default (RRF).
+    pub fn from_env_value(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cc" | "convex" | "weighted" => Self::Cc,
+            // Accept "rrf" or anything unrecognised → default RRF.
+            _ => Self::Rrf,
+        }
+    }
+}
+
+static FUSION_MODE: LazyLock<FusionMode> = LazyLock::new(|| {
+    std::env::var("SEMANTEX_FUSION")
+        .ok()
+        .map_or(FusionMode::default(), |v| FusionMode::from_env_value(&v))
+});
+
+/// Return the active fusion mode (cached via LazyLock; reads SEMANTEX_FUSION once).
+pub fn active_fusion_mode() -> FusionMode {
+    *FUSION_MODE
+}
 
 /// Per-source weights for triple CC fusion (dense + sparse + exact).
 #[derive(Debug, Clone, Copy)]
@@ -25,31 +71,55 @@ struct CachedWeightOverrides {
     mixed: Option<TripleFusionWeights>,
 }
 
-static WEIGHT_OVERRIDES: LazyLock<CachedWeightOverrides> = LazyLock::new(|| {
-    fn parse_weights(env_key: &str) -> Option<TripleFusionWeights> {
-        let val = std::env::var(env_key).ok()?;
-        let parts: Vec<f32> = val
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
-        if parts.len() == 3 {
-            Some(TripleFusionWeights {
-                w_dense: parts[0],
-                w_sparse: parts[1],
-                w_exact: parts[2],
-            })
-        } else {
-            None
+/// Parse a comma-separated weight triple from the given env var.
+///
+/// Finding 15 mitigation: `str::parse::<f32>` accepts "NaN", "inf", "-inf"
+/// verbatim. Allowing those into fusion weights propagates NaN into result
+/// scores, and the descending-score sort previously used
+/// `partial_cmp(...).unwrap_or(Equal)` which violates total-order on NaN
+/// pairs. Since Rust 1.81, `slice::sort_by` panics in debug builds when the
+/// comparator is non-total. Filter non-finite values so the override either
+/// takes a clean 3-element vector or is rejected entirely. Emits a
+/// `tracing::warn!` when at least one value was rejected so a user who set
+/// the env var with `NaN`/`inf` can see why their override was dropped.
+fn parse_weight_override(env_key: &str) -> Option<TripleFusionWeights> {
+    let val = std::env::var(env_key).ok()?;
+    let raw: Vec<&str> = val.split(',').map(str::trim).collect();
+    let mut parts: Vec<f32> = Vec::with_capacity(raw.len());
+    let mut rejected = 0usize;
+    for token in &raw {
+        match token.parse::<f32>() {
+            Ok(x) if x.is_finite() => parts.push(x),
+            Ok(_) | Err(_) => rejected += 1,
         }
     }
-
-    CachedWeightOverrides {
-        identifier: parse_weights("SEMANTEX_WEIGHTS_IDENTIFIER"),
-        keyword: parse_weights("SEMANTEX_WEIGHTS_KEYWORD"),
-        semantic: parse_weights("SEMANTEX_WEIGHTS_SEMANTIC"),
-        mixed: parse_weights("SEMANTEX_WEIGHTS_MIXED"),
+    if rejected > 0 {
+        tracing::warn!(
+            env_var = env_key,
+            value = %val,
+            rejected,
+            "ignoring non-finite or unparseable values in fusion weight override; \
+             falling back to defaults unless exactly 3 finite values remain"
+        );
     }
-});
+    if parts.len() == 3 {
+        Some(TripleFusionWeights {
+            w_dense: parts[0],
+            w_sparse: parts[1],
+            w_exact: parts[2],
+        })
+    } else {
+        None
+    }
+}
+
+static WEIGHT_OVERRIDES: LazyLock<CachedWeightOverrides> =
+    LazyLock::new(|| CachedWeightOverrides {
+        identifier: parse_weight_override("SEMANTEX_WEIGHTS_IDENTIFIER"),
+        keyword: parse_weight_override("SEMANTEX_WEIGHTS_KEYWORD"),
+        semantic: parse_weight_override("SEMANTEX_WEIGHTS_SEMANTIC"),
+        mixed: parse_weight_override("SEMANTEX_WEIGHTS_MIXED"),
+    });
 
 impl QueryType {
     /// Return recommended weights for triple CC fusion (dense + sparse + exact).
@@ -247,12 +317,296 @@ pub fn triple_cc_fuse(
         })
         .collect();
 
-    fused.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Defensive against Finding 15: even though parse_weights now filters
+    // non-finite env values, NaN can still slip in via channel score inputs.
+    // `f32::total_cmp` is a total order on all f32 values (including NaN) and
+    // never panics — strictly safer than `partial_cmp(...).unwrap_or(Equal)`.
+    fused.sort_by(|a, b| b.score.total_cmp(&a.score));
     fused
+}
+
+// =====================================================================
+// E2 — Reciprocal Rank Fusion (RRF)
+// E4 — Exp4Fuse dual-route variant (5 channels)
+// E6 — Per-result confidence labels
+// =====================================================================
+
+/// Fused result enriched with channel-agreement metadata.
+///
+/// `channels_hit` counts how many input channels surfaced this chunk_id.
+/// `channels_fired` is the total number of channels that produced any results
+/// in this fusion call (used to derive the confidence label downstream).
+#[derive(Debug, Clone)]
+pub struct RrfFusedResult {
+    pub scored: ScoredChunkId,
+    /// How many channels surfaced this chunk.
+    pub channels_hit: u32,
+    /// How many channels produced any results in this fusion call.
+    pub channels_fired: u32,
+}
+
+impl RrfFusedResult {
+    /// Derive the per-result confidence label using channel-agreement +
+    /// score-gap rules (E6). The next-result score is required to determine
+    /// `Ambiguous`; pass `None` for the last result in the list.
+    ///
+    /// Rules:
+    /// - **Extracted**: all fired channels found this result (channels_hit == channels_fired,
+    ///   and at least 2 channels fired so consensus is meaningful)
+    /// - **Ambiguous**: score gap to next result < 5% of this score (when next score is provided)
+    /// - **Inferred**: otherwise (single-channel hit, or partial multi-channel agreement
+    ///   without an ambiguous gap)
+    pub fn confidence(&self, next_score: Option<f32>) -> Confidence {
+        let extracted = self.channels_fired >= 2 && self.channels_hit == self.channels_fired;
+
+        // Ambiguous overrides Inferred but is overridden by Extracted —
+        // a result with full channel agreement is high-confidence regardless of gap.
+        if !extracted
+            && let Some(next) = next_score
+            && self.scored.score > 0.0
+        {
+            let gap = (self.scored.score - next).abs() / self.scored.score;
+            if gap < AMBIGUOUS_GAP_THRESHOLD {
+                return Confidence::Ambiguous;
+            }
+        }
+
+        if extracted {
+            Confidence::Extracted
+        } else {
+            Confidence::Inferred
+        }
+    }
+
+    /// Numeric confidence in [0.0, 1.0] — channels-hit / channels-fired.
+    /// Returns 0.0 when no channels fired (guards divide-by-zero).
+    pub fn confidence_score(&self) -> f32 {
+        if self.channels_fired == 0 {
+            0.0
+        } else {
+            self.channels_hit as f32 / self.channels_fired as f32
+        }
+    }
+}
+
+/// Per-chunk RRF accumulator.
+struct RrfAccum {
+    total: f32,
+    dense: f32,
+    sparse: f32,
+    exact: f32,
+    /// Bitset of channels that surfaced this chunk (one bit per channel).
+    /// Lower bits are reserved for original-query channels (dense, sparse, exact),
+    /// higher bits for expanded-query channels in Exp4Fuse mode.
+    channels_hit_mask: u32,
+}
+
+impl RrfAccum {
+    fn new() -> Self {
+        Self {
+            total: 0.0,
+            dense: 0.0,
+            sparse: 0.0,
+            exact: 0.0,
+            channels_hit_mask: 0,
+        }
+    }
+}
+
+/// Accumulate RRF rank-decayed contributions from one channel into a score map.
+/// `channel_bit` marks the channel for agreement-tracking (E6).
+fn accumulate_rrf_channel(
+    scores: &mut HashMap<u64, RrfAccum>,
+    ranked: &[ScoredChunkId],
+    channel_bit: u32,
+    score_field: ChannelKind,
+) {
+    for (rank, item) in ranked.iter().enumerate() {
+        let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
+        let entry = scores.entry(item.chunk_id).or_insert_with(RrfAccum::new);
+        entry.total += contribution;
+        entry.channels_hit_mask |= channel_bit;
+        match score_field {
+            ChannelKind::Dense => entry.dense += contribution,
+            ChannelKind::Sparse => entry.sparse += contribution,
+        }
+    }
+}
+
+/// Accumulate RRF contributions from an exact-id list (no score, rank by list order).
+fn accumulate_rrf_exact(scores: &mut HashMap<u64, RrfAccum>, ids: &[u64], channel_bit: u32) {
+    for (rank, &id) in ids.iter().enumerate() {
+        let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
+        let entry = scores.entry(id).or_insert_with(RrfAccum::new);
+        entry.total += contribution;
+        entry.exact += contribution;
+        entry.channels_hit_mask |= channel_bit;
+    }
+}
+
+/// Internal: which per-channel field receives a rank contribution.
+/// The `Exact` channel uses a dedicated `accumulate_rrf_exact` path because
+/// exact-id lists have no scores; only `Dense` and `Sparse` flow through
+/// `accumulate_rrf_channel`.
+#[derive(Debug, Clone, Copy)]
+enum ChannelKind {
+    Dense,
+    Sparse,
+}
+
+/// Triple Reciprocal Rank Fusion (E2): merge dense + sparse + exact results.
+///
+/// RRF score: `Σ 1/(RRF_K + rank_c + 1)` across channels, where `rank_c` is the
+/// 0-based rank of the chunk in channel `c`. `RRF_K = 60` is the spec-named
+/// constant (Cormack/Clarke/Buettcher 2009).
+///
+/// Properties:
+/// - **Parameter-free**: No per-channel weights. The spec requires this — RRF
+///   preserves the channel-weighting concept via rank position alone.
+/// - **Scale-invariant**: Mixes cosine, BM25, and binary exact scores without
+///   normalisation.
+/// - **Consensus-seeking**: Chunks surfaced by multiple channels rise to the top.
+///
+/// The returned `RrfFusedResult` carries channel-agreement counts so the caller
+/// can derive per-result confidence labels (E6).
+pub fn triple_rrf_fuse(
+    dense_list: &[ScoredChunkId],
+    sparse_list: &[ScoredChunkId],
+    exact_ids: &[u64],
+) -> Vec<RrfFusedResult> {
+    let mut scores: HashMap<u64, RrfAccum> = HashMap::new();
+
+    // Bits 0/1/2 represent dense/sparse/exact respectively.
+    let dense_fired = !dense_list.is_empty();
+    let sparse_fired = !sparse_list.is_empty();
+    let exact_fired = !exact_ids.is_empty();
+
+    if dense_fired {
+        accumulate_rrf_channel(&mut scores, dense_list, 0b001, ChannelKind::Dense);
+    }
+    if sparse_fired {
+        accumulate_rrf_channel(&mut scores, sparse_list, 0b010, ChannelKind::Sparse);
+    }
+    if exact_fired {
+        accumulate_rrf_exact(&mut scores, exact_ids, 0b100);
+    }
+
+    let channels_fired = u32::from(dense_fired) + u32::from(sparse_fired) + u32::from(exact_fired);
+
+    let mut fused: Vec<RrfFusedResult> = scores
+        .into_iter()
+        .map(|(chunk_id, acc)| {
+            let channels_hit = acc.channels_hit_mask.count_ones();
+            RrfFusedResult {
+                scored: ScoredChunkId {
+                    chunk_id,
+                    score: acc.total,
+                    score_dense: acc.dense,
+                    score_sparse: acc.sparse,
+                    score_exact: acc.exact,
+                },
+                channels_hit,
+                channels_fired,
+            }
+        })
+        .collect();
+
+    // Defensive against Finding 15: use `total_cmp` so a NaN score (e.g. from a
+    // pathological env-var override or upstream channel input) sorts to a stable
+    // position instead of triggering a panic in Rust ≥ 1.81's sort.
+    fused.sort_by(|a, b| b.scored.score.total_cmp(&a.scored.score));
+    fused
+}
+
+/// Exp4Fuse dual-route RRF (E4): five channels.
+///
+/// Inputs:
+/// - Original query: dense, sparse
+/// - Expanded query: dense, sparse
+/// - Exact substring matches (shared, query-text-based)
+///
+/// All five rank lists contribute under the same RRF formula. Channel-agreement
+/// is tracked across all five for the E6 confidence label.
+///
+/// When either of the expanded lists is empty (e.g. the expansion produced
+/// nothing for this query), those channels simply don't contribute — the
+/// `channels_fired` count reflects only channels with at least one result.
+///
+/// Pass empty slices for any expanded channel to fall back to single-route RRF.
+pub fn exp4_rrf_fuse(
+    orig_dense: &[ScoredChunkId],
+    orig_sparse: &[ScoredChunkId],
+    exp_dense: &[ScoredChunkId],
+    exp_sparse: &[ScoredChunkId],
+    exact_ids: &[u64],
+) -> Vec<RrfFusedResult> {
+    let mut scores: HashMap<u64, RrfAccum> = HashMap::new();
+
+    let orig_dense_active = !orig_dense.is_empty();
+    let orig_sparse_active = !orig_sparse.is_empty();
+    let exp_dense_active = !exp_dense.is_empty();
+    let exp_sparse_active = !exp_sparse.is_empty();
+    let exact_active = !exact_ids.is_empty();
+
+    if orig_dense_active {
+        accumulate_rrf_channel(&mut scores, orig_dense, 0b0_0001, ChannelKind::Dense);
+    }
+    if orig_sparse_active {
+        accumulate_rrf_channel(&mut scores, orig_sparse, 0b0_0010, ChannelKind::Sparse);
+    }
+    if exp_dense_active {
+        accumulate_rrf_channel(&mut scores, exp_dense, 0b0_0100, ChannelKind::Dense);
+    }
+    if exp_sparse_active {
+        accumulate_rrf_channel(&mut scores, exp_sparse, 0b0_1000, ChannelKind::Sparse);
+    }
+    if exact_active {
+        accumulate_rrf_exact(&mut scores, exact_ids, 0b1_0000);
+    }
+
+    let channels_fired = u32::from(orig_dense_active)
+        + u32::from(orig_sparse_active)
+        + u32::from(exp_dense_active)
+        + u32::from(exp_sparse_active)
+        + u32::from(exact_active);
+
+    let mut fused: Vec<RrfFusedResult> = scores
+        .into_iter()
+        .map(|(chunk_id, acc)| {
+            let channels_hit = acc.channels_hit_mask.count_ones();
+            RrfFusedResult {
+                scored: ScoredChunkId {
+                    chunk_id,
+                    score: acc.total,
+                    score_dense: acc.dense,
+                    score_sparse: acc.sparse,
+                    score_exact: acc.exact,
+                },
+                channels_hit,
+                channels_fired,
+            }
+        })
+        .collect();
+
+    // Defensive against Finding 15 (see triple_rrf_fuse).
+    fused.sort_by(|a, b| b.scored.score.total_cmp(&a.scored.score));
+    fused
+}
+
+/// Helper for callers: derive confidence labels for a sorted slice of
+/// `RrfFusedResult`s using each result's gap to its successor.
+///
+/// The last result has no successor — its confidence is derived without the
+/// score-gap check (cannot be `Ambiguous`).
+pub fn assign_confidence(fused: &[RrfFusedResult]) -> Vec<(Confidence, f32)> {
+    fused
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let next = fused.get(i + 1).map(|n| n.scored.score);
+            (r.confidence(next), r.confidence_score())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -637,5 +991,422 @@ mod tests {
         assert!((adapted.w_dense - 0.4).abs() < 1e-5);
         assert!((adapted.w_sparse - 0.5).abs() < 1e-5);
         assert!((adapted.w_exact - 0.8).abs() < 1e-5);
+    }
+
+    // =================================================================
+    // E2 — Triple RRF Fusion tests
+    // =================================================================
+
+    #[test]
+    fn test_triple_rrf_basic() {
+        // Dense ranks 1>2, sparse ranks 2>1. Chunk that appears in both
+        // should be boosted by consensus.
+        let dense = vec![s(1, 0.9), s(2, 0.1)];
+        let sparse = vec![s(2, 10.0), s(1, 1.0)];
+
+        let fused = triple_rrf_fuse(&dense, &sparse, &[]);
+
+        assert_eq!(fused.len(), 2);
+        // Two channels fired (no exact)
+        assert_eq!(fused[0].channels_fired, 2);
+        // Both chunks appear in both channels
+        assert_eq!(fused[0].channels_hit, 2);
+        assert_eq!(fused[1].channels_hit, 2);
+
+        // RRF formula: chunk 1 = 1/(60+0+1) + 1/(60+1+1) = 1/61 + 1/62
+        // chunk 2 = 1/(60+1+1) + 1/(60+0+1) = 1/62 + 1/61
+        // They tie — but the sort is stable enough that the higher of the two should win.
+        // Both should have basically equal scores.
+        let expected = 1.0 / 61.0 + 1.0 / 62.0;
+        assert!((fused[0].scored.score - expected).abs() < 1e-5);
+        assert!((fused[1].scored.score - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_triple_rrf_consensus_wins() {
+        // Chunk 5 appears in all three channels; others appear only in one.
+        // RRF should rank chunk 5 first.
+        let dense = vec![s(5, 0.9), s(10, 0.5)];
+        let sparse = vec![s(5, 10.0), s(20, 5.0)];
+        let exact = vec![5, 30];
+
+        let fused = triple_rrf_fuse(&dense, &sparse, &exact);
+
+        assert_eq!(fused[0].scored.chunk_id, 5);
+        assert_eq!(fused[0].channels_hit, 3);
+        assert_eq!(fused[0].channels_fired, 3);
+    }
+
+    #[test]
+    fn test_triple_rrf_parameter_free_k_named_60() {
+        // Validate the spec-named constant. Do not invent a different k.
+        assert!((RRF_K - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_triple_rrf_empty_inputs() {
+        let fused = triple_rrf_fuse(&[], &[], &[]);
+        assert!(fused.is_empty());
+    }
+
+    #[test]
+    fn test_triple_rrf_only_exact() {
+        let fused = triple_rrf_fuse(&[], &[], &[42, 7]);
+        assert_eq!(fused.len(), 2);
+        // 42 at rank 0, 7 at rank 1 in the exact list → 42 wins
+        assert_eq!(fused[0].scored.chunk_id, 42);
+        assert_eq!(fused[0].channels_fired, 1);
+        assert_eq!(fused[0].channels_hit, 1);
+    }
+
+    #[test]
+    fn test_triple_rrf_no_per_channel_weighting() {
+        // RRF is parameter-free across query types per spec. A high-score outlier
+        // in one channel must NOT dominate a chunk that ranks well in multiple
+        // channels. This is the core RRF property.
+
+        // Dense: chunk 100 ranks high (would dominate with weighted scoring)
+        let dense = vec![s(100, 999.0), s(200, 0.1)];
+        // Sparse: chunk 200 ranks high (cross-confirmed)
+        let sparse = vec![s(200, 0.1), s(100, 0.01)];
+
+        let fused = triple_rrf_fuse(&dense, &sparse, &[]);
+
+        // RRF: both at rank 0+1, both in both channels, equal RRF score.
+        // Critically: the 999.0 outlier doesn't dominate.
+        // chunk 100 = 1/61 + 1/62
+        // chunk 200 = 1/62 + 1/61
+        let chunk_100 = fused.iter().find(|r| r.scored.chunk_id == 100).unwrap();
+        let chunk_200 = fused.iter().find(|r| r.scored.chunk_id == 200).unwrap();
+        assert!((chunk_100.scored.score - chunk_200.scored.score).abs() < 1e-6);
+    }
+
+    // =================================================================
+    // E2 — RRF vs CC behavioural comparison
+    // =================================================================
+
+    #[test]
+    fn test_rrf_vs_cc_perfect_agreement_both_pick_same_winner() {
+        // When channels perfectly agree, RRF and CC must converge on the same
+        // winner. This is the simple-case equivalence test.
+        let dense = vec![s(1, 0.9), s(2, 0.5), s(3, 0.1)];
+        let sparse = vec![s(1, 10.0), s(2, 5.0), s(3, 1.0)];
+        let exact: Vec<u64> = vec![];
+
+        let cc_weights = TripleFusionWeights {
+            w_dense: 1.0,
+            w_sparse: 1.0,
+            w_exact: 1.0,
+        };
+        let cc = triple_cc_fuse(&dense, &sparse, &exact, &cc_weights);
+        let rrf = triple_rrf_fuse(&dense, &sparse, &exact);
+
+        // Both should pick chunk 1 as winner.
+        assert_eq!(cc[0].chunk_id, 1);
+        assert_eq!(rrf[0].scored.chunk_id, 1);
+    }
+
+    // =================================================================
+    // E4 — Exp4Fuse dual-route RRF tests
+    // =================================================================
+
+    #[test]
+    fn test_exp4_basic_five_channels() {
+        // All five channels surface chunk 1, only the original-dense surfaces chunk 2.
+        // chunk 1 must win + be Extracted.
+        let orig_dense = vec![s(1, 0.9), s(2, 0.5)];
+        let orig_sparse = vec![s(1, 10.0)];
+        let exp_dense = vec![s(1, 0.8)];
+        let exp_sparse = vec![s(1, 8.0)];
+        let exact = vec![1u64];
+
+        let fused = exp4_rrf_fuse(&orig_dense, &orig_sparse, &exp_dense, &exp_sparse, &exact);
+
+        assert_eq!(fused[0].scored.chunk_id, 1);
+        assert_eq!(fused[0].channels_fired, 5);
+        assert_eq!(fused[0].channels_hit, 5);
+    }
+
+    #[test]
+    fn test_exp4_with_no_expansion_falls_back() {
+        // Empty expanded slices → equivalent to triple_rrf_fuse on the
+        // original three channels (orig dense + orig sparse + exact).
+        let dense = vec![s(5, 0.9)];
+        let sparse = vec![s(7, 10.0)];
+        let exact = vec![5u64];
+
+        let triple = triple_rrf_fuse(&dense, &sparse, &exact);
+        let exp4 = exp4_rrf_fuse(&dense, &sparse, &[], &[], &exact);
+
+        // Same number of unique chunks
+        assert_eq!(triple.len(), exp4.len());
+
+        // Channels fired count must match (both = 3 active channels)
+        assert_eq!(triple[0].channels_fired, exp4[0].channels_fired);
+        assert_eq!(triple[0].channels_fired, 3);
+    }
+
+    #[test]
+    fn test_exp4_dual_route_finds_more_than_single_route() {
+        // A query expansion that surfaces a chunk neither the original dense
+        // nor the original sparse channel found must appear in the exp4 output.
+        // Without expansion, single-route would miss it.
+
+        let orig_dense = vec![s(1, 0.9)];
+        let orig_sparse = vec![s(1, 10.0)];
+        // Chunk 99 only surfaces via the expanded query — synonym discovery.
+        let exp_dense = vec![s(99, 0.7)];
+        let exp_sparse = vec![s(99, 5.0)];
+        let exact: Vec<u64> = vec![];
+
+        let single = triple_rrf_fuse(&orig_dense, &orig_sparse, &exact);
+        let dual = exp4_rrf_fuse(&orig_dense, &orig_sparse, &exp_dense, &exp_sparse, &exact);
+
+        let single_ids: std::collections::HashSet<u64> =
+            single.iter().map(|r| r.scored.chunk_id).collect();
+        let dual_ids: std::collections::HashSet<u64> =
+            dual.iter().map(|r| r.scored.chunk_id).collect();
+
+        assert!(
+            !single_ids.contains(&99),
+            "Chunk 99 should be missing from single-route"
+        );
+        assert!(
+            dual_ids.contains(&99),
+            "Chunk 99 should be found by dual-route via expansion"
+        );
+    }
+
+    // =================================================================
+    // E6 — Per-result confidence label tests
+    // =================================================================
+
+    #[test]
+    fn test_confidence_extracted_when_all_channels_agree() {
+        // Chunk hit by all 3 channels (3 of 3 fired) → Extracted
+        let dense = vec![s(1, 0.9)];
+        let sparse = vec![s(1, 10.0)];
+        let exact = vec![1u64];
+
+        let fused = triple_rrf_fuse(&dense, &sparse, &exact);
+        let confidence = fused[0].confidence(None);
+        assert_eq!(confidence, Confidence::Extracted);
+        assert!((fused[0].confidence_score() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_confidence_inferred_when_single_channel() {
+        // Chunk hit by only one of two fired channels → Inferred
+        let dense = vec![s(1, 0.9), s(2, 0.8)];
+        let sparse = vec![s(1, 10.0)]; // only chunk 1
+        // Pass a non-ambiguous next_score so we hit the Inferred branch
+        let fused = triple_rrf_fuse(&dense, &sparse, &[]);
+
+        let chunk_2 = fused.iter().find(|r| r.scored.chunk_id == 2).unwrap();
+        // chunk 2 in only dense channel → 1 of 2 fired
+        assert_eq!(chunk_2.channels_hit, 1);
+        assert_eq!(chunk_2.channels_fired, 2);
+        assert_eq!(chunk_2.confidence(None), Confidence::Inferred);
+        assert!((chunk_2.confidence_score() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_confidence_ambiguous_threshold() {
+        // Two results with score gap < 5% → Ambiguous label on the higher one
+        // (when computed with the next-result score). The lower has no next so
+        // cannot be Ambiguous.
+        let r1 = RrfFusedResult {
+            scored: ScoredChunkId::new(1, 1.000),
+            channels_hit: 1,
+            channels_fired: 2,
+        };
+        let r2 = RrfFusedResult {
+            scored: ScoredChunkId::new(2, 0.970), // gap = 0.030 / 1.0 = 3% < 5%
+            channels_hit: 1,
+            channels_fired: 2,
+        };
+        assert_eq!(r1.confidence(Some(r2.scored.score)), Confidence::Ambiguous);
+
+        // Wider gap: above threshold → Inferred (single channel)
+        let r3 = RrfFusedResult {
+            scored: ScoredChunkId::new(3, 0.900), // gap = 0.1 / 1.0 = 10% > 5%
+            channels_hit: 1,
+            channels_fired: 2,
+        };
+        assert_eq!(r1.confidence(Some(r3.scored.score)), Confidence::Inferred);
+    }
+
+    #[test]
+    fn test_confidence_extracted_overrides_ambiguous() {
+        // Even with a tight score gap, full channel agreement → Extracted,
+        // not Ambiguous. Channel-consensus is a stronger signal.
+        let extracted = RrfFusedResult {
+            scored: ScoredChunkId::new(1, 1.000),
+            channels_hit: 3,
+            channels_fired: 3,
+        };
+        let _next_close = 0.999_f32;
+        assert_eq!(
+            extracted.confidence(Some(_next_close)),
+            Confidence::Extracted
+        );
+    }
+
+    #[test]
+    fn test_confidence_single_channel_no_consensus_possible() {
+        // Only 1 channel fired → cannot be Extracted (requires ≥2 fired channels).
+        let solo = RrfFusedResult {
+            scored: ScoredChunkId::new(1, 0.5),
+            channels_hit: 1,
+            channels_fired: 1,
+        };
+        assert_eq!(solo.confidence(None), Confidence::Inferred);
+        assert!((solo.confidence_score() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_confidence_zero_channels_fired_safe() {
+        let empty = RrfFusedResult {
+            scored: ScoredChunkId::new(1, 0.0),
+            channels_hit: 0,
+            channels_fired: 0,
+        };
+        assert!(empty.confidence_score().abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_assign_confidence_propagates_to_list() {
+        // chunk 1 (all 3 channels), chunk 2 (1 of 3 channels) with wide gap → Inferred
+        let dense = vec![s(1, 0.9), s(2, 0.05)];
+        let sparse = vec![s(1, 10.0)];
+        let exact = vec![1u64];
+        let fused = triple_rrf_fuse(&dense, &sparse, &exact);
+
+        let labels = assign_confidence(&fused);
+        assert_eq!(labels.len(), fused.len());
+        assert_eq!(labels[0].0, Confidence::Extracted);
+        assert!((labels[0].1 - 1.0).abs() < f32::EPSILON);
+        // chunk 2 has only dense channel → Inferred, score = 1/3 ≈ 0.333
+        let chunk_2_pos = fused.iter().position(|r| r.scored.chunk_id == 2).unwrap();
+        assert_eq!(labels[chunk_2_pos].0, Confidence::Inferred);
+        assert!((labels[chunk_2_pos].1 - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    // =================================================================
+    // FusionMode env-var parsing
+    // =================================================================
+
+    #[test]
+    fn test_fusion_mode_default_is_rrf() {
+        assert_eq!(FusionMode::default(), FusionMode::Rrf);
+    }
+
+    #[test]
+    fn test_fusion_mode_parse_cc() {
+        assert_eq!(FusionMode::from_env_value("cc"), FusionMode::Cc);
+        assert_eq!(FusionMode::from_env_value("CC"), FusionMode::Cc);
+        assert_eq!(FusionMode::from_env_value("  cc  "), FusionMode::Cc);
+        assert_eq!(FusionMode::from_env_value("convex"), FusionMode::Cc);
+        assert_eq!(FusionMode::from_env_value("weighted"), FusionMode::Cc);
+    }
+
+    #[test]
+    fn test_fusion_mode_parse_rrf() {
+        assert_eq!(FusionMode::from_env_value("rrf"), FusionMode::Rrf);
+        assert_eq!(FusionMode::from_env_value("RRF"), FusionMode::Rrf);
+    }
+
+    #[test]
+    fn test_fusion_mode_unknown_falls_back_to_default() {
+        // Spec: anything unrecognised → default RRF
+        assert_eq!(FusionMode::from_env_value(""), FusionMode::Rrf);
+        assert_eq!(FusionMode::from_env_value("zzz"), FusionMode::Rrf);
+    }
+
+    // =================================================================
+    // Finding 15 — NaN env weights must not panic on sort
+    // =================================================================
+    //
+    // `str::parse::<f32>` accepts "NaN", "inf", "-inf" verbatim. If any of
+    // those reach the fusion weights, they propagate into the per-chunk
+    // score, and `slice::sort_by` panics in Rust ≥ 1.81 on a non-total
+    // comparator. `parse_weight_override` must drop the non-finite tokens
+    // and either reject the override or keep three finite values.
+    //
+    // Each test below uses a UNIQUE env var name so it doesn't race with
+    // sibling tests or pollute the cached `WEIGHT_OVERRIDES` LazyLock used
+    // by `QueryType::triple_fusion_weights()`.
+
+    /// All three values NaN/inf → fewer than 3 finite values → None.
+    #[test]
+    fn test_parse_weight_override_rejects_all_non_finite() {
+        let key = "SEMANTEX_WEIGHTS_FINDING15_ALL_NAN";
+        // SAFETY: test process-level env mutation; key is unique to this test.
+        unsafe {
+            std::env::set_var(key, "NaN,inf,-inf");
+        }
+        let parsed = parse_weight_override(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(
+            parsed.is_none(),
+            "all non-finite weights must yield None, got {parsed:?}"
+        );
+    }
+
+    /// Mixed: 1 NaN + 2 finite → only 2 finite remain → None (length != 3).
+    /// The override is rejected rather than silently coerced.
+    #[test]
+    fn test_parse_weight_override_rejects_mixed_nan() {
+        let key = "SEMANTEX_WEIGHTS_FINDING15_MIXED";
+        unsafe {
+            std::env::set_var(key, "NaN,1.0,0.5");
+        }
+        let parsed = parse_weight_override(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(
+            parsed.is_none(),
+            "partial-finite weights must yield None, got {parsed:?}"
+        );
+    }
+
+    /// Clean input still parses correctly.
+    #[test]
+    fn test_parse_weight_override_accepts_three_finite() {
+        let key = "SEMANTEX_WEIGHTS_FINDING15_CLEAN";
+        unsafe {
+            std::env::set_var(key, "0.4,0.5,1.5");
+        }
+        let parsed = parse_weight_override(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        let w = parsed.expect("three finite values must parse");
+        assert!((w.w_dense - 0.4).abs() < f32::EPSILON);
+        assert!((w.w_sparse - 0.5).abs() < f32::EPSILON);
+        assert!((w.w_exact - 1.5).abs() < f32::EPSILON);
+        assert!(w.w_dense.is_finite() && w.w_sparse.is_finite() && w.w_exact.is_finite());
+    }
+
+    /// Even if NaN somehow reached the fusion weights, the sort must not
+    /// panic — both `triple_cc_fuse` and `triple_rrf_fuse` now use
+    /// `total_cmp` which is a total order on all f32 values including NaN.
+    #[test]
+    fn test_sort_does_not_panic_on_nan_scores() {
+        let weights = TripleFusionWeights {
+            w_dense: f32::NAN,
+            w_sparse: 0.5,
+            w_exact: 0.8,
+        };
+        let dense = vec![s(1, 0.9), s(2, 0.5)];
+        let sparse = vec![s(2, 5.0), s(3, 1.0)];
+        // Must not panic.
+        let cc = triple_cc_fuse(&dense, &sparse, &[1], &weights);
+        assert!(!cc.is_empty());
+        let rrf = triple_rrf_fuse(&dense, &sparse, &[1]);
+        assert!(!rrf.is_empty());
     }
 }

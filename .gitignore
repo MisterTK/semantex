@@ -2,6 +2,9 @@
 /target
 /semantex
 
+# Worktrees (parallel dev branches)
+.worktrees/
+
 # Editor
 *.swp
 *.swo

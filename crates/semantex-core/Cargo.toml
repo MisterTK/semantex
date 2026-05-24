@@ -100,6 +100,11 @@ rust-stemmers = "1.2"
 next-plaid.workspace = true
 next-plaid-onnx.workspace = true
 
+# Memory-mapped files (cold-start: PLAID mapping file mmap'd on Unix; falls back
+# to read-on-open on Windows per E8 risk T5).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+memmap2 = "0.9"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

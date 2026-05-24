@@ -872,6 +872,8 @@ mod tests {
             score_dense: 0.0,
             score_sparse: 0.0,
             score_exact: 0.0,
+            confidence: crate::types::Confidence::Inferred,
+            confidence_score: 0.0,
         }
     }
 
@@ -929,6 +931,8 @@ mod tests {
             score_dense: 0.0,
             score_sparse: 0.0,
             score_exact: 0.0,
+            confidence: crate::types::Confidence::Inferred,
+            confidence_score: 0.0,
         };
         let results = vec![tw_result];
         let indices = triage_results("some text", &results, 8, 100.0);

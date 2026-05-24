@@ -65,7 +65,11 @@ pub fn index_age_secs(project_path: &Path) -> Option<u64> {
 }
 
 /// Check if the index has an outdated schema version.
-fn is_stale(meta_path: &Path) -> bool {
+///
+/// Exposed so callers that already know `meta.json` is present can re-validate
+/// without re-running the full `detect` pass (used by the MCP warm-state fast
+/// path to cheaply enforce the staleness invariant).
+pub fn is_stale(meta_path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(meta_path) else {
         return true; // unreadable meta.json → treat as stale
     };
@@ -79,7 +83,11 @@ fn is_stale(meta_path: &Path) -> bool {
 /// Try to acquire a non-blocking exclusive lock on the file.
 /// Returns `true` if the file is currently locked by another process.
 /// Uses `File::try_lock()` (stabilized in Rust 1.84) for cross-platform support.
-fn is_locked(lock_path: &Path) -> bool {
+///
+/// Exposed so warm-state fast paths can cheaply re-validate that no concurrent
+/// rebuild is in progress without re-running the full `detect` pass. A single
+/// `flock` syscall — sub-microsecond on warm cache.
+pub fn is_locked(lock_path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(lock_path) else {
         return false;
     };
@@ -168,5 +176,38 @@ mod tests {
         assert_eq!(detect(tmp.path()), IndexState::Building);
 
         // Lock released when lock_file drops
+    }
+
+    /// Regression: a pre-v0.3 index (schema_version=7) must be detected as
+    /// `Stale` after the v8 bump, so the MCP/CLI rebuild path runs and creates
+    /// the v0.3 auxiliary tables (`chunk_annotations`, `pattern_matches`,
+    /// `chunk_centrality`) before M5/M6 handlers query them.
+    #[test]
+    fn test_pre_v0_3_schema_v7_is_stale() {
+        // Sanity: this test only makes sense as long as the current schema
+        // is past v7. If we ever roll back, the test should be updated.
+        assert!(
+            IndexMeta::CURRENT_SCHEMA_VERSION > 7,
+            "current schema version regressed; revisit pre-v0.3 stale test"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+
+        let meta = IndexMeta {
+            schema_version: 7,
+            project_path: tmp.path().to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+        };
+        let meta_json = serde_json::to_string(&meta).unwrap();
+        std::fs::write(semantex_dir.join("meta.json"), meta_json).unwrap();
+
+        assert_eq!(detect(tmp.path()), IndexState::Stale);
     }
 }

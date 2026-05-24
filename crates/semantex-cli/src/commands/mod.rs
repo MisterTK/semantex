@@ -7,6 +7,7 @@ pub mod install;
 pub mod mcp;
 pub mod search;
 pub mod serve;
+pub mod skills_generate;
 pub mod status;
 pub mod stop;
 pub mod validate;

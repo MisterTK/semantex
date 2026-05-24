@@ -14,6 +14,21 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 parking_lot = "0.12"
+# Used by M5/M6 to query `pattern_matches` + `chunk_centrality` SQLite tables
+# directly (W4 owns ChunkStore; these tables don't yet have helper accessors).
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# HTTP transport (I2) — optional, gated by feature "http".
+tokio = { workspace = true, optional = true }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+tower = { version = "0.5", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["http"]
+http = ["dep:tokio", "dep:axum", "dep:tower"]
 
 [lints]
 workspace = true

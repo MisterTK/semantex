@@ -90,6 +90,48 @@ pub struct SearchResult {
     pub score_dense: f32,
     pub score_sparse: f32,
     pub score_exact: f32,
+    /// Per-result confidence label derived from channel agreement and score gap.
+    /// See `Confidence` for derivation rules.
+    pub confidence: Confidence,
+    /// Numeric confidence in [0.0, 1.0] — channels-found / channels-fired.
+    /// 0.0 when no fusion was performed.
+    pub confidence_score: f32,
+}
+
+/// Per-result confidence classification (E6).
+///
+/// Derived from channel-agreement and score-gap during fusion:
+/// - `Extracted`: all active channels found this result (highest confidence)
+/// - `Inferred`: result found by only a subset of channels (single-channel hit common)
+/// - `Ambiguous`: result score is within 5% of the next result's score (low margin)
+///
+/// `Inferred` is the default for results without explicit channel-source tracking.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Confidence {
+    /// All active retrieval channels agree on this result.
+    Extracted,
+    /// Only a subset of channels surfaced this result.
+    #[default]
+    Inferred,
+    /// Score gap to the next result is too small to discriminate confidently.
+    Ambiguous,
+}
+
+impl Confidence {
+    /// Lowercase label suitable for JSON/protocol serialization or display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Extracted => "extracted",
+            Self::Inferred => "inferred",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +157,11 @@ pub struct IndexMeta {
 }
 
 impl IndexMeta {
-    pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+    /// Bumped from 7 → 8 when v0.3 added three auxiliary SQLite tables
+    /// (`chunk_annotations`, `pattern_matches`, `chunk_centrality`).
+    /// Pre-v0.3 indexes (schema_version=7) are missing these tables, so
+    /// `state::detect` returns `Stale` and the MCP/CLI layer triggers a rebuild.
+    pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 }
 
 /// File metadata for incremental indexing

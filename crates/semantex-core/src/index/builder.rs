@@ -2,6 +2,7 @@ use crate::chunking::Chunker;
 use crate::chunking::ast_chunker::AstChunker;
 use crate::chunking::import_resolver;
 use crate::chunking::pdf_chunker::PdfChunker;
+use crate::chunking::semantic_role::synthesize_nl_annotation;
 use crate::chunking::structured_meta::TypeRefContext;
 use crate::chunking::text_chunker::TextChunker;
 use crate::config::SemantexConfig;
@@ -12,12 +13,15 @@ use crate::file::hasher;
 use crate::file::walker::FileWalker;
 use crate::index::file_classifier;
 use crate::index::global_graph;
+use crate::index::page_rank;
+use crate::index::pattern_catalog::{self, PatternCatalog, PatternLang};
 use crate::index::storage::ChunkStore;
 use crate::search::code_tokenizer;
 use crate::search::sparse_search::SparseIndex;
 use crate::types::{Chunk, ChunkType, FileEntry, IndexMeta};
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -140,6 +144,15 @@ impl IndexBuilder {
         let mut files_deleted = 0u64;
         let mut removed_chunk_ids: Vec<u64> = Vec::new();
         let mut new_chunk_ids: Vec<u64> = Vec::new();
+
+        // E3 / E7 — buffered per-chunk annotations and pattern matches,
+        // persisted after the indexing transaction commits. Buffering lets us
+        // amortise auxiliary inserts and keeps the per-chunk path allocation-
+        // light.
+        let mut annotations_to_persist: Vec<(u64, String)> = Vec::new();
+        let mut pattern_matches_to_persist: Vec<(u64, pattern_catalog::PatternMatch, String)> =
+            Vec::new();
+        let pattern_catalog_instance = PatternCatalog::new();
 
         store.begin_transaction()?;
 
@@ -271,35 +284,43 @@ impl IndexBuilder {
 
             // Get file metadata
             let metadata = std::fs::metadata(file_path)?;
-            let mtime = metadata
-                .modified()
-                .map(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                })
-                .unwrap_or(0);
+            let mtime = metadata.modified().map_or(0, |t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            });
 
             // Process each chunk: insert into SQLite + BM25
+            let pattern_lang = PatternLang::from_language_name(file_type.language_name());
             for chunk in chunks {
                 let chunk_id = store.insert_chunk(&chunk, file_hash, mtime)?;
                 new_chunk_ids.push(chunk_id);
 
-                // Prepend structured NL summary for BM25 enrichment
-                let base_bm25 = if let ChunkType::AstNode {
+                // E3 — ExCS-style NL annotation synthesized from existing signals
+                // (no LLM). Prepended to BM25 content so the NL→code vocabulary
+                // gap is closed for sparse retrieval (e.g. "parallel failure
+                // handling" lights up Promise.allSettled). Annotation is also
+                // captured for later structured retrieval via the index registry.
+                let (nl_annotation, base_bm25) = if let ChunkType::AstNode {
                     structured_meta: Some(ref meta),
                     ..
                 } = chunk.chunk_type
                 {
+                    let annotation = synthesize_nl_annotation(meta, &meta.calls, &meta.called_by);
                     let nl_expansion = meta.bm25_expansion();
-                    if nl_expansion.is_empty() {
-                        chunk.content.clone()
-                    } else {
-                        format!("{}\n{}", nl_expansion, chunk.content)
-                    }
+                    let bm25 = match (annotation.is_empty(), nl_expansion.is_empty()) {
+                        (true, true) => chunk.content.clone(),
+                        (true, false) => format!("{nl_expansion}\n{}", chunk.content),
+                        (false, true) => format!("{annotation}\n{}", chunk.content),
+                        (false, false) => {
+                            format!("{annotation}\n{nl_expansion}\n{}", chunk.content)
+                        }
+                    };
+                    (annotation, bm25)
                 } else {
-                    chunk.content.clone()
+                    (String::new(), chunk.content.clone())
                 };
+                annotations_to_persist.push((chunk_id, nl_annotation));
 
                 // Identifier expansion applied on top
                 let ident_expansion = code_tokenizer::expand_identifiers(&base_bm25);
@@ -310,6 +331,21 @@ impl IndexBuilder {
                 };
                 let file_path_str = chunk.file_path.to_string_lossy();
                 sparse_writer.add_document(chunk_id, &bm25_content, &file_path_str)?;
+
+                // E7 — Pattern catalog mining. Per-language deterministic
+                // substring patterns; matches buffered for batch insertion
+                // after the per-file loop to amortise the SQL round-trip.
+                if let Some(lang) = pattern_lang {
+                    let matches = pattern_catalog::mine_patterns_with(
+                        &chunk.content,
+                        lang,
+                        &pattern_catalog_instance,
+                    );
+                    let fp_owned = chunk.file_path.to_string_lossy().into_owned();
+                    for m in matches {
+                        pattern_matches_to_persist.push((chunk_id, m, fp_owned.clone()));
+                    }
+                }
 
                 // Store call graph edges and v7 graph data
                 if let ChunkType::AstNode {
@@ -413,6 +449,22 @@ impl IndexBuilder {
                     tracing::warn!("Graph resolution failed (continuing without): {e}");
                 }
             }
+        }
+
+        // Phase 3.5 (W2): annotation persistence (E3) + pattern catalog (E7)
+        // + PageRank (E5). These are all derived signals indexed on chunks.db.
+        // Failures degrade quality but never block the index build.
+        if let Err(e) = persist_auxiliary_signals(
+            &index_dir.join("chunks.db"),
+            &annotations_to_persist,
+            &pattern_matches_to_persist,
+        ) {
+            tracing::warn!("Annotation/pattern persistence failed: {e}");
+        }
+        if total_chunks > 0
+            && let Err(e) = compute_and_store_pagerank(&index_dir.join("chunks.db"))
+        {
+            tracing::warn!("PageRank computation failed: {e}");
         }
 
         let total_removals = removed_chunk_ids.len();
@@ -621,4 +673,377 @@ fn chrono_now() -> String {
     let secs = duration.as_secs();
     // Format as seconds since epoch (good enough without chrono)
     format!("{secs}")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2 — auxiliary signal persistence (E3 annotations, E7 patterns, E5 PageRank)
+//
+// These helpers open a separate connection on `chunks.db` (the same DB the
+// `ChunkStore` uses) so we can add v0.3-introduced tables/columns without
+// touching `storage.rs` (which is co-owned with W4). The schema migration is
+// idempotent via `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN`
+// guarded by a column-existence probe.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Create the v0.3 auxiliary schema (annotations, patterns, pagerank) and
+/// persist the buffered annotations + pattern matches.
+fn persist_auxiliary_signals(
+    db_path: &Path,
+    annotations: &[(u64, String)],
+    pattern_matches: &[(u64, pattern_catalog::PatternMatch, String)],
+) -> Result<()> {
+    let mut conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "Failed to open chunks.db for aux signals: {}",
+            db_path.display()
+        )
+    })?;
+    init_auxiliary_schema(&conn)?;
+
+    let tx = conn.transaction()?;
+
+    // E3 — chunk_annotations: replace existing rows for each chunk so
+    // incremental updates stay consistent.
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO chunk_annotations (chunk_id, nl_annotation) VALUES (?1, ?2)",
+        )?;
+        for (chunk_id, annotation) in annotations {
+            if annotation.is_empty() {
+                continue;
+            }
+            stmt.execute(params![*chunk_id as i64, annotation])?;
+        }
+    }
+
+    // E7 — pattern_matches: keyed by (chunk_id, pattern_name) so re-indexing
+    // the same chunk does not duplicate matches.
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO pattern_matches \
+             (chunk_id, pattern_name, language, description, file_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (chunk_id, m, file_path) in pattern_matches {
+            stmt.execute(params![
+                *chunk_id as i64,
+                m.pattern_name,
+                m.language,
+                m.description,
+                file_path,
+            ])?;
+        }
+    }
+
+    tx.commit()?;
+    tracing::info!(
+        annotations = annotations.len(),
+        patterns = pattern_matches.len(),
+        "Auxiliary signals persisted"
+    );
+    Ok(())
+}
+
+/// Compute PageRank over the call+import+hierarchy graph and persist the
+/// per-chunk centrality scores. Returns early on an empty index.
+fn compute_and_store_pagerank(db_path: &Path) -> Result<()> {
+    let mut conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "Failed to open chunks.db for PageRank: {}",
+            db_path.display()
+        )
+    })?;
+    init_auxiliary_schema(&conn)?;
+
+    // Pull edges + node set in a streaming-friendly shape. All these queries
+    // hit indexed columns and return narrow tuples.
+    let all_chunk_ids = query_all_chunk_ids(&conn)?;
+    if all_chunk_ids.is_empty() {
+        return Ok(());
+    }
+    let call_edges = query_call_edges(&conn)?;
+    let type_ref_edges = query_type_ref_edges(&conn)?;
+    let hierarchy_edges = query_hierarchy_edges(&conn)?;
+
+    let graph = page_rank::build_code_graph(
+        &call_edges,
+        &type_ref_edges,
+        &hierarchy_edges,
+        &all_chunk_ids,
+    );
+    let scores = page_rank::compute_pagerank(&graph);
+    if scores.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO chunk_centrality (chunk_id, structural_centrality) VALUES (?1, ?2)",
+        )?;
+        for (chunk_id, score) in &scores {
+            stmt.execute(params![*chunk_id as i64, f64::from(*score)])?;
+        }
+    }
+    tx.commit()?;
+    tracing::info!(
+        nodes = graph.node_count(),
+        edges = graph.edge_count(),
+        scored = scores.len(),
+        "PageRank stored"
+    );
+    Ok(())
+}
+
+/// Create the v0.3 auxiliary tables if missing. Idempotent.
+fn init_auxiliary_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS chunk_annotations (
+            chunk_id INTEGER PRIMARY KEY,
+            nl_annotation TEXT NOT NULL,
+            FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pattern_matches (
+            chunk_id     INTEGER NOT NULL,
+            pattern_name TEXT NOT NULL,
+            language     TEXT NOT NULL,
+            description  TEXT NOT NULL,
+            file_path    TEXT NOT NULL,
+            PRIMARY KEY (chunk_id, pattern_name),
+            FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pattern_matches_name ON pattern_matches(pattern_name);
+        CREATE INDEX IF NOT EXISTS idx_pattern_matches_lang ON pattern_matches(language);
+
+        CREATE TABLE IF NOT EXISTS chunk_centrality (
+            chunk_id INTEGER PRIMARY KEY,
+            structural_centrality REAL NOT NULL,
+            FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_centrality_score
+            ON chunk_centrality(structural_centrality);
+        ",
+    )?;
+    Ok(())
+}
+
+fn query_all_chunk_ids(conn: &Connection) -> Result<Vec<u64>> {
+    let mut stmt = conn.prepare("SELECT id FROM chunks")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().map(|id| id as u64).collect())
+}
+
+fn query_call_edges(conn: &Connection) -> Result<Vec<(u64, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT caller_chunk_id, callee_chunk_id FROM call_graph WHERE callee_chunk_id IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn query_type_ref_edges(conn: &Connection) -> Result<Vec<(u64, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT defining_chunk, chunk_id FROM type_refs WHERE defining_chunk IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn query_hierarchy_edges(conn: &Connection) -> Result<Vec<(u64, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT child_chunk, parent_chunk FROM type_hierarchy \
+         WHERE child_chunk IS NOT NULL AND parent_chunk IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Chunk, ChunkType};
+    use std::path::PathBuf;
+
+    fn make_chunk(id: u64, content: &str) -> Chunk {
+        Chunk {
+            id,
+            file_path: PathBuf::from("test.rs"),
+            start_line: 1,
+            end_line: 1,
+            content: content.to_string(),
+            chunk_type: ChunkType::TextWindow { window_index: 0 },
+        }
+    }
+
+    #[test]
+    fn aux_schema_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chunks.db");
+        // Seed the chunks table the way ChunkStore would.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS call_graph (
+                    caller_chunk_id INTEGER NOT NULL,
+                    callee_name TEXT NOT NULL,
+                    callee_chunk_id INTEGER);
+                 CREATE TABLE IF NOT EXISTS type_refs (
+                    chunk_id INTEGER NOT NULL,
+                    type_name TEXT NOT NULL,
+                    ref_context TEXT NOT NULL,
+                    defining_chunk INTEGER);
+                 CREATE TABLE IF NOT EXISTS type_hierarchy (
+                    child_name TEXT NOT NULL,
+                    parent_name TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    child_chunk INTEGER,
+                    parent_chunk INTEGER);",
+            )
+            .unwrap();
+        }
+        let conn = Connection::open(&db).unwrap();
+        // Running init twice must not error.
+        init_auxiliary_schema(&conn).unwrap();
+        init_auxiliary_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn persist_annotations_and_patterns_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chunks.db");
+        // Bootstrap chunks table so foreign-key references resolve.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY);
+                 INSERT INTO chunks(id) VALUES (1), (2);",
+            )
+            .unwrap();
+        }
+        let anns = vec![
+            (1u64, "annotation for chunk 1".to_string()),
+            (2u64, "annotation for chunk 2".to_string()),
+        ];
+        let m = pattern_catalog::PatternMatch {
+            pattern_name: "rust.drop_impl".to_string(),
+            description: "Drop impl".to_string(),
+            language: "rust".to_string(),
+        };
+        let matches = vec![(1u64, m, "lib.rs".to_string())];
+        persist_auxiliary_signals(&db, &anns, &matches).unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunk_annotations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let pat_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pattern_matches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pat_count, 1);
+    }
+
+    #[test]
+    fn compute_pagerank_writes_centrality() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chunks.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS call_graph (
+                    caller_chunk_id INTEGER NOT NULL,
+                    callee_name TEXT NOT NULL,
+                    callee_chunk_id INTEGER);
+                 CREATE TABLE IF NOT EXISTS type_refs (
+                    chunk_id INTEGER NOT NULL,
+                    type_name TEXT NOT NULL,
+                    ref_context TEXT NOT NULL,
+                    defining_chunk INTEGER);
+                 CREATE TABLE IF NOT EXISTS type_hierarchy (
+                    child_name TEXT NOT NULL,
+                    parent_name TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    child_chunk INTEGER,
+                    parent_chunk INTEGER);
+                 INSERT INTO chunks(id) VALUES (1), (2), (3);
+                 INSERT INTO call_graph(caller_chunk_id, callee_name, callee_chunk_id)
+                    VALUES (1, 'x', 2), (3, 'x', 2);",
+            )
+            .unwrap();
+        }
+        compute_and_store_pagerank(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunk_centrality", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 3, "all 3 chunks should have a centrality score");
+
+        // Node 2 (the called hub) should outrank nodes 1 and 3.
+        let centrality_for = |id: i64| -> f64 {
+            conn.query_row(
+                "SELECT structural_centrality FROM chunk_centrality WHERE chunk_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            centrality_for(2) > centrality_for(1),
+            "callee hub should outrank caller"
+        );
+    }
+
+    #[test]
+    fn aux_persistence_skips_empty_annotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("chunks.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY);
+                 INSERT INTO chunks(id) VALUES (1);",
+            )
+            .unwrap();
+        }
+        let anns = vec![(1u64, String::new())];
+        persist_auxiliary_signals(&db, &anns, &[]).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunk_annotations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "empty annotations should be skipped");
+    }
+
+    #[test]
+    fn make_chunk_helper_compiles() {
+        // Keeps `make_chunk` and Chunk imports live for future helper tests.
+        let c = make_chunk(42, "hello");
+        assert_eq!(c.id, 42);
+        assert_eq!(c.content, "hello");
+    }
 }
