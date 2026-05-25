@@ -369,23 +369,21 @@ fn find_ort_dylib() -> Option<&'static str> {
 /// inference memory footprint low. The old `McpServer::with_toolset` set
 /// this env var, but by then tracing + mimalloc threads were already
 /// running, which is real UB on platforms with strict env-var thread rules.
-fn mcp_mode_requested() -> bool {
-    // argv[0] is the binary name, so skip it.
-    mcp_mode_from_args(std::env::args().skip(1))
+/// Returns true when the requested subcommand is memory-heavy enough that
+/// we want to cap ORT threads aggressively. Currently: `mcp` (many parallel
+/// sessions, each loading ColBERT), `index` (large batch encoding under
+/// PLAID rebuild — verified to spike to 10 GB on a 2 k-chunk repo with
+/// 4 threads), `watch` (continuous incremental encoding).
+///
+/// On a 12-core machine, fastembed's default of "all cores" allocates
+/// ~1 GB of ORT inference workspace per thread on first encode. 1 thread
+/// keeps the encoding spike under 1 GB without meaningfully slowing
+/// large batch operations (encoding is bandwidth-bound, not compute-bound).
+fn memory_constrained_mode_requested() -> bool {
+    memory_constrained_from_args(std::env::args().skip(1))
 }
 
-/// Inner helper for `mcp_mode_requested` so we can unit-test the parse logic
-/// without touching `std::env::args()`.
-///
-/// Known limitation: this is a deliberately simple "first non-flag token"
-/// scanner — it doesn't know which flags consume values. In practice the
-/// supported MCP invocations are `semantex mcp [--http] [--port N]
-/// [--toolset NAME]`, all of which start with `mcp` directly after the
-/// binary name. The fallback when this misclassifies (e.g. for the unusual
-/// `semantex --max-count 5 mcp --http`) is benign: SEMANTEX_ORT_THREADS
-/// stays at its default of 4 instead of being lowered to 1, which only
-/// affects memory/perf, not correctness.
-fn mcp_mode_from_args<I, S>(args: I) -> bool
+fn memory_constrained_from_args<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -393,10 +391,10 @@ where
     for arg in args {
         let arg = arg.as_ref();
         if arg == "--" {
-            return false; // everything after `--` is a positional arg
+            return false;
         }
         if !arg.starts_with('-') {
-            return arg == "mcp";
+            return matches!(arg, "mcp" | "index" | "watch" | "serve");
         }
     }
     false
@@ -404,49 +402,68 @@ where
 
 #[cfg(test)]
 mod arg_peek_tests {
-    use super::mcp_mode_from_args;
+    use super::memory_constrained_from_args;
 
     #[test]
     fn detects_mcp_subcommand_plain() {
-        assert!(mcp_mode_from_args(["mcp"]));
+        assert!(memory_constrained_from_args(["mcp"]));
+    }
+
+    #[test]
+    fn detects_index_subcommand() {
+        // Indexing is the most memory-heavy operation — must lower ORT threads.
+        assert!(memory_constrained_from_args(["index", "."]));
+    }
+
+    #[test]
+    fn detects_watch_subcommand() {
+        assert!(memory_constrained_from_args(["watch", "/some/path"]));
+    }
+
+    #[test]
+    fn detects_serve_subcommand() {
+        assert!(memory_constrained_from_args(["serve"]));
     }
 
     #[test]
     fn detects_mcp_subcommand_with_flags() {
-        assert!(mcp_mode_from_args(["mcp", "--http", "--port", "5050"]));
+        assert!(memory_constrained_from_args([
+            "mcp", "--http", "--port", "5050"
+        ]));
     }
 
     #[test]
     fn detects_mcp_with_global_flag_before() {
         // global flags (start with `-`) are skipped to find the subcommand
-        assert!(mcp_mode_from_args(["-v", "mcp"]));
+        assert!(memory_constrained_from_args(["-v", "mcp"]));
     }
 
     #[test]
-    fn rejects_other_subcommands() {
-        assert!(!mcp_mode_from_args(["index", "."]));
-        assert!(!mcp_mode_from_args(["serve"]));
-        assert!(!mcp_mode_from_args(["status"]));
+    fn rejects_status_and_other_lightweight_subcommands() {
+        // status/health/validate are cheap reads — keep the higher thread default.
+        assert!(!memory_constrained_from_args(["status"]));
+        assert!(!memory_constrained_from_args(["validate"]));
+        assert!(!memory_constrained_from_args(["download-models"]));
     }
 
     #[test]
     fn rejects_no_subcommand() {
-        assert!(!mcp_mode_from_args(Vec::<&str>::new()));
-        // Search-mode invocation: positional query, not `mcp`.
-        assert!(!mcp_mode_from_args(["how does auth work"]));
+        assert!(!memory_constrained_from_args(Vec::<&str>::new()));
+        // Search-mode invocation: positional query, not a memory-constrained mode.
+        assert!(!memory_constrained_from_args(["how does auth work"]));
     }
 
     #[test]
     fn stops_at_double_dash() {
         // Anything after `--` is a positional arg to the previous command —
         // not a subcommand.
-        assert!(!mcp_mode_from_args(["--", "mcp"]));
+        assert!(!memory_constrained_from_args(["--", "mcp"]));
     }
 
     #[test]
     fn handles_mcp_after_pure_flags() {
         // Pure flags (no flag-takes-value form) before the subcommand work.
-        assert!(mcp_mode_from_args(["--json", "mcp", "--http"]));
+        assert!(memory_constrained_from_args(["--json", "mcp", "--http"]));
     }
 
     #[test]
@@ -454,7 +471,7 @@ mod arg_peek_tests {
         // Documented limitation: a flag that takes a value followed by an
         // arg looks indistinguishable from "subcommand here". Acceptable
         // because the worst outcome is SEMANTEX_ORT_THREADS=4 instead of 1.
-        assert!(!mcp_mode_from_args(["--max-count", "5", "mcp"]));
+        assert!(!memory_constrained_from_args(["--max-count", "5", "mcp"]));
     }
 }
 
@@ -544,7 +561,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            // SEMANTEX_ORT_THREADS=1 for MCP subprocesses.
+            // SEMANTEX_ORT_THREADS=1 for memory-constrained subcommands.
             //
             // Previously set inside `McpServer::with_toolset` (server.rs), but
             // by the time that constructor ran, mimalloc + tracing threads had
@@ -553,11 +570,24 @@ fn main() -> Result<()> {
             // the env var is set BEFORE any thread (mimalloc init, tracing
             // subscriber, tokio runtime, ORT session) reads it.
             //
-            // Only applied when the user invoked `semantex mcp` so non-MCP
-            // commands keep the higher default (currently 4) for other ORT
-            // workloads.
-            if mcp_mode_requested() && std::env::var("SEMANTEX_ORT_THREADS").is_err() {
+            // Applied to: mcp (many parallel sessions, each ~1 GB ORT scratch),
+            // index (verified 10 GB spike with 4 threads on a 2 k-chunk repo
+            // due to PLAID rebuild + ORT scratch), watch (continuous encoding),
+            // serve (similar memory profile). One-off CLI search keeps the
+            // higher default (4) since it pays the cost once.
+            if memory_constrained_mode_requested() && std::env::var("SEMANTEX_ORT_THREADS").is_err()
+            {
                 std::env::set_var("SEMANTEX_ORT_THREADS", "1");
+                // The OMP/MKL/etc. vars set above must follow suit so we don't
+                // get 4-thread BLAS underneath single-thread ORT.
+                for var in &[
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS",
+                ] {
+                    std::env::set_var(var, "1");
+                }
             }
         }
     }

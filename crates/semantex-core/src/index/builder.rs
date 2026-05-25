@@ -539,7 +539,20 @@ impl IndexBuilder {
             };
 
             if plaid_missing {
-                // Full rebuild — stream chunks from SQLite in batches to bound peak RAM.
+                // Full rebuild — encode in small batches (memory bound), then
+                // make ONE call to update_or_create with all embeddings.
+                //
+                // Why one call: every update_or_create call to next_plaid runs
+                // a full k-means clustering and read-modify-write of the index
+                // files. Each call has been measured to allocate ~10× the
+                // batch's working set due to the library's allocation pattern
+                // (verified: 2229 chunks in 17 batches × 128 → 34 GB peak RSS).
+                // Collecting all encoded embeddings first, then a single call,
+                // bounds peak RSS to:
+                //   (raw embeddings) + (one k-means working set)
+                //   ≈ N_chunks × avg_tokens × dim × 4 bytes + per-call overhead
+                // For gin (2229 chunks, 48-dim ColBERT): ~50 MB of embeddings
+                // + library overhead. Far safer than repeated calls.
                 if plaid_dir.exists() {
                     let _ = std::fs::remove_dir_all(&plaid_dir);
                 }
@@ -552,11 +565,11 @@ impl IndexBuilder {
                 }
 
                 let mut full_mapping: Vec<u64> = Vec::with_capacity(all_ids.len());
+                let mut all_embeddings: Vec<_> = Vec::with_capacity(all_ids.len());
+
                 for batch in all_ids.chunks(PLAID_BATCH) {
-                    // Memory failsafe: abort cleanly if RSS exceeds the soft cap
-                    // before queuing the next batch. Without this, a runaway
-                    // PLAID build can OOM the host.
-                    if let Err(e) = crate::memory::check_rss_or_abort("PLAID full-rebuild batch") {
+                    // Memory failsafe between batches.
+                    if let Err(e) = crate::memory::check_rss_or_abort("PLAID encode batch") {
                         anyhow::bail!("Indexing aborted: {e}");
                     }
                     let chunks = store.get_chunks(batch)?;
@@ -565,14 +578,24 @@ impl IndexBuilder {
                     }
                     let contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
                     let embeddings = embedder.encode_documents(&contents)?;
-                    MmapIndex::update_or_create(
-                        &embeddings,
-                        &plaid_dir_str,
-                        &plaid_config,
-                        &UpdateConfig::default(),
-                    )?;
+                    all_embeddings.extend(embeddings);
                     full_mapping.extend(chunks.iter().map(|c| c.id));
                 }
+
+                // Final memory check before the single big PLAID call.
+                if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (single call)") {
+                    anyhow::bail!("Indexing aborted: {e}");
+                }
+                MmapIndex::update_or_create(
+                    &all_embeddings,
+                    &plaid_dir_str,
+                    &plaid_config,
+                    &UpdateConfig::default(),
+                )?;
+                // Drop the in-memory embeddings ASAP so they don't compete with
+                // the post-PLAID work (graph resolution, PageRank, etc.).
+                drop(all_embeddings);
+                crate::memory::purge_allocator();
 
                 let mapping_bytes =
                     bincode::serde::encode_to_vec(&full_mapping, bincode::config::standard())?;
