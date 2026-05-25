@@ -416,19 +416,27 @@ impl McpServer {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             instructions: Some(concat!(
-                "IMPORTANT: Use semantex_agent as the DEFAULT tool for all code search queries. ",
-                "It auto-classifies your query and selects the optimal search strategy with fallbacks. ",
-                "One call in, one answer out.\n\n",
-                "semantex_agent — default for all queries. Auto-routes to the best strategy ",
-                "(semantic search, deep search, graph walk, exact symbol, regex, or file glob). ",
-                "Returns pre-formatted text. Use this unless you need structured JSON output.\n\n",
-                "semantex_search — structured JSON results only. Use when you need raw SearchResultItem ",
-                "data for programmatic processing. For human-readable results, use semantex_agent instead.\n\n",
-                "semantex_deep — structured JSON results only. Use when you need raw DeepSearchResponse ",
-                "data. For human-readable results, use semantex_agent instead.\n\n",
-                "Fall back to Grep ONLY for regex patterns, Glob ONLY for file name patterns.\n\n",
-                "All tools are read-only and safe without user confirmation. ",
-                "Auto-indexes on first use; returns keyword results while index builds."
+                "## Tool choice: there is only one tool\n\n",
+                "Use `semantex_agent` for every code-search question. It auto-classifies ",
+                "the query and dispatches to the right strategy internally (semantic search, ",
+                "exact symbol lookup, callers/callees/imports graph walk, deep multi-source ",
+                "synthesis, regex, file-glob). One call in, one complete answer out.\n\n",
+                "Do NOT chain multiple semantex_* calls to assemble an answer. If the agent ",
+                "answer is incomplete, refine your QUESTION and call `semantex_agent` again. ",
+                "Don't call `semantex_search` first to 'explore' before calling `semantex_agent` ",
+                "— that double-spends turns. Don't grep first either; `semantex_agent` already ",
+                "covers regex queries.\n\n",
+                "## The other tools (rarely needed)\n\n",
+                "- `semantex_search` — structured JSON only, for programmatic SearchResultItem ",
+                "  consumption. Most agents should NOT use this; use `semantex_agent`.\n",
+                "- `semantex_deep` — structured JSON only, for programmatic DeepSearchResponse. ",
+                "  Most agents should NOT use this; use `semantex_agent`.\n",
+                "- `semantex_status`, `semantex_health`, `semantex_validate`, `semantex_index` ",
+                "  — diagnostics / one-shot ops. Not for searching.\n\n",
+                "Fall back to Grep ONLY for tiny mechanical regex sweeps, Glob ONLY for ",
+                "file-name patterns. All semantex tools are read-only and safe without ",
+                "user confirmation. The index is auto-built on first use; queries during ",
+                "the build return keyword results."
             ).into()),
         };
         JsonRpcResponse::success(
@@ -620,21 +628,17 @@ impl McpServer {
     #[must_use]
     pub fn tools_for_toolset(&self, toolset: &str) -> Vec<Tool> {
         let all = Self::all_tools();
+        // Phase 3: M1-M6 are no longer in `all_tools()` (the visible surface
+        // is the v0.2 set: 7 tools). The historical `core` and `structural`
+        // names are preserved so existing CLI / HTTP routes don't 404; both
+        // return what's visible. `core` further narrows to the search-facing
+        // subset (search, deep, agent) for clients that want the minimum
+        // chat-bot surface.
         let allow: &[&str] = match toolset {
-            "core" => &[
-                "semantex_search",
-                "semantex_deep",
-                "semantex_agent",
-                "semantex_symbol",
-            ],
-            "structural" => &[
-                "semantex_symbol",
-                "semantex_callers",
-                "semantex_callees",
-                "semantex_implementations",
-                "semantex_architecture",
-            ],
-            _ => return all, // `all` or unknown — return the full surface
+            "core" => &["semantex_search", "semantex_deep", "semantex_agent"],
+            // `structural` is preserved as an alias; M1-M6 are no longer
+            // visible, so it returns the agent-facing tools only.
+            _ => return all,
         };
         let allow_set: HashSet<&str> = allow.iter().copied().collect();
         all.into_iter()
@@ -854,266 +858,31 @@ impl McpServer {
                 annotations: Some(ToolAnnotations::read_only("Deep Code Search")),
             },
             // -------------------------------------------------------------
-            // M1 — semantex_symbol
+            // NOTE — Phase-3 surface restriction (2026-05-25).
+            //
+            // The six M1-M6 structural tools (semantex_symbol, _callers,
+            // _callees, _implementations, _examples, _architecture) shipped
+            // in v0.3 as visible MCP tools and triggered a measured
+            // **+76pp regression in agent CCB** vs v0.2 (run22 −56% →
+            // run23 +20%). Investigation in
+            // `docs/BENCHMARK-v0.3-REGRESSION-ANALYSIS.md` traced this
+            // to agents using M1-M6 *additively* — calling 4-6 structural
+            // tools in sequence to gather what semantex_deep returned in
+            // one call in v0.2.
+            //
+            // Fix: M1-M6 are hidden from `tools/list`. Their handler
+            // bodies remain on McpServer and are still reachable via the
+            // dispatch in handle_tool_call (so older clients that learned
+            // the names from v0.3.0 continue to work — JSON-RPC method
+            // name resolution doesn't depend on tools/list advertisement)
+            // and via the existing internal `Structural` route inside
+            // `semantex_agent` (see `search/agent.rs::handle_structural`),
+            // which already covers callers/callees/imports/type-refs in
+            // a single graph-walk call.
+            //
+            // External surface returns to the v0.2 set: 7 tools, with
+            // `semantex_agent` as the unconditional entry point.
             // -------------------------------------------------------------
-            Tool {
-                name: "semantex_symbol".into(),
-                title: Some("Exact Symbol Lookup".into()),
-                description: concat!(
-                    "Exact symbol lookup backed by the indexed symbol table. ",
-                    "One call returns the symbol's location, signature, docstring, ",
-                    "semantic role, and the count of callers/callees. ",
-                    "Replaces 3-5 grep+read iterations for a single named symbol. ",
-                    "Use when you know the symbol name; use semantex_search for ",
-                    "fuzzy / natural-language queries."
-                )
-                .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string", "description": "Symbol name to look up (case-sensitive)" },
-                        "kind": { "type": "string", "description": "Optional kind filter (function, method, class, struct, enum, interface, trait)" },
-                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
-                    },
-                    "required": ["name"]
-                }),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "matches": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "location": { "type": "object" },
-                                    "signature": { "type": "string" },
-                                    "docstring": { "type": "string" },
-                                    "semantic_role": { "type": "string" },
-                                    "callers_count": { "type": "integer" },
-                                    "callees_count": { "type": "integer" },
-                                    "confidence": { "type": "string" }
-                                },
-                                "required": ["location"]
-                            }
-                        }
-                    },
-                    "required": ["matches"]
-                })),
-                annotations: Some(ToolAnnotations::read_only("Exact Symbol Lookup")),
-            },
-            // -------------------------------------------------------------
-            // M2 — semantex_callers
-            // -------------------------------------------------------------
-            Tool {
-                name: "semantex_callers".into(),
-                title: Some("Reverse Call Graph".into()),
-                description: concat!(
-                    "Reverse call-graph walk: list all chunks that call a given symbol. ",
-                    "Default depth=1 (direct callers); depth=2 also includes callers-of-callers. ",
-                    "Replaces 5-15 grep iterations when finding usages of an API. ",
-                    "Returns one entry per caller with location, signature, and edge_kind."
-                )
-                .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to find callers of" },
-                        "depth": { "type": "integer", "description": "Walk depth: 1 (direct) or 2 (transitive). Default 1.", "default": 1 },
-                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
-                    },
-                    "required": ["symbol"]
-                }),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "callers": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "caller_location": { "type": "object" },
-                                    "caller_signature": { "type": "string" },
-                                    "edge_kind": { "type": "string" }
-                                },
-                                "required": ["caller_location", "edge_kind"]
-                            }
-                        }
-                    },
-                    "required": ["callers"]
-                })),
-                annotations: Some(ToolAnnotations::read_only("Reverse Call Graph")),
-            },
-            // -------------------------------------------------------------
-            // M3 — semantex_callees
-            // -------------------------------------------------------------
-            Tool {
-                name: "semantex_callees".into(),
-                title: Some("Forward Call Graph".into()),
-                description: concat!(
-                    "Forward call-graph walk: list all symbols invoked by a given function. ",
-                    "Default depth=1 (direct callees); depth=2 also includes callees-of-callees. ",
-                    "Use when tracing what a function does. Same shape as semantex_callers ",
-                    "but outbound edges."
-                )
-                .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "symbol": { "type": "string", "description": "Symbol name to find callees of" },
-                        "depth": { "type": "integer", "description": "Walk depth: 1 (direct) or 2 (transitive). Default 1.", "default": 1 },
-                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
-                    },
-                    "required": ["symbol"]
-                }),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "callees": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "callee_location": { "type": "object" },
-                                    "callee_signature": { "type": "string" },
-                                    "edge_kind": { "type": "string" }
-                                },
-                                "required": ["callee_location", "edge_kind"]
-                            }
-                        }
-                    },
-                    "required": ["callees"]
-                })),
-                annotations: Some(ToolAnnotations::read_only("Forward Call Graph")),
-            },
-            // -------------------------------------------------------------
-            // M4 — semantex_implementations
-            // -------------------------------------------------------------
-            Tool {
-                name: "semantex_implementations".into(),
-                title: Some("Trait/Interface Implementations".into()),
-                description: concat!(
-                    "Find all implementations of a trait, interface, or protocol. ",
-                    "Backed by the indexed type-hierarchy edges. ",
-                    "Returns one entry per impl with the impl location, concrete type, ",
-                    "and the list of method names physically defined inside the impl block ",
-                    "(`methods_defined_in_impl`). This is a strict subset of the trait's ",
-                    "methods — to compute true overrides, intersect this list against the ",
-                    "trait declaration via `semantex_symbol`."
-                )
-                .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "trait_or_interface": { "type": "string", "description": "Trait, interface, or abstract base class name" },
-                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
-                    },
-                    "required": ["trait_or_interface"]
-                }),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "implementations": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "impl_location": { "type": "object" },
-                                    "type_name": { "type": "string" },
-                                    "methods_defined_in_impl": {
-                                        "type": "array",
-                                        "items": { "type": "string" },
-                                        "description": "Method names physically declared inside this impl block (queried from symbol_defs). NOT the trait's declared method set — intersect against the trait declaration to compute true overrides."
-                                    }
-                                },
-                                "required": ["impl_location", "type_name"]
-                            }
-                        }
-                    },
-                    "required": ["implementations"]
-                })),
-                annotations: Some(ToolAnnotations::read_only("Trait/Interface Implementations")),
-            },
-            // -------------------------------------------------------------
-            // M5 — semantex_examples
-            // -------------------------------------------------------------
-            Tool {
-                name: "semantex_examples".into(),
-                title: Some("Pattern Exemplars".into()),
-                description: concat!(
-                    "Find structurally-confirmed exemplars of a programming pattern ",
-                    "(e.g. 'rust.drop_impl', 'rust.tokio_spawn', 'ts.try_catch'). ",
-                    "Returns 3 pre-curated examples instead of 10 grep results. ",
-                    "Backed by the pattern catalog mined at index time."
-                )
-                .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": { "type": "string", "description": "Pattern name (e.g. 'rust.drop_impl'). Use semantex_search to discover available patterns." },
-                        "language": { "type": "string", "description": "Optional language filter (rust, typescript)" },
-                        "max": { "type": "integer", "description": "Max exemplars to return (default 3)", "default": 3 },
-                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
-                    },
-                    "required": ["pattern"]
-                }),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "examples": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "location": { "type": "object" },
-                                    "snippet": { "type": "string" },
-                                    "pattern": { "type": "string" },
-                                    "language": { "type": "string" }
-                                },
-                                "required": ["location", "snippet"]
-                            }
-                        }
-                    },
-                    "required": ["examples"]
-                })),
-                annotations: Some(ToolAnnotations::read_only("Pattern Exemplars")),
-            },
-            // -------------------------------------------------------------
-            // M6 — semantex_architecture
-            // -------------------------------------------------------------
-            Tool {
-                name: "semantex_architecture".into(),
-                title: Some("Architectural Primer".into()),
-                description: concat!(
-                    "Session-start architectural primer for a codebase. ",
-                    "Returns a compact LLM-optimized JSON document with: ",
-                    "(1) god_nodes — the top symbols by PageRank centrality, ",
-                    "(2) communities — clusters of related chunks with entry points, ",
-                    "(3) boundaries — directory-level coupling counts. ",
-                    "One call gives an architectural overview without exploring the tree manually. ",
-                    "This is the single biggest context-window win for unfamiliar codebases."
-                )
-                .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "focus": {
-                            "type": "string",
-                            "enum": ["god_nodes", "communities", "boundaries"],
-                            "description": "Restrict output to one section. Omit for all three."
-                        },
-                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
-                    }
-                }),
-                output_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "god_nodes": { "type": "array" },
-                        "communities": { "type": "array" },
-                        "boundaries": { "type": "array" }
-                    }
-                })),
-                annotations: Some(ToolAnnotations::read_only("Architectural Primer")),
-            },
         ]
     }
 
@@ -3062,68 +2831,34 @@ mod tests {
     }
 
     #[test]
-    fn toolset_all_exposes_thirteen_tools() {
+    fn toolset_all_exposes_seven_visible_tools() {
+        // Phase 3 surface restriction: the M1-M6 structural tools that
+        // shipped in v0.3 caused a measured +76pp regression in agent CCB
+        // vs v0.2. They're hidden from tools/list (the *visible* surface).
+        // Their handler dispatch remains in handle_tool_call for backward
+        // compat with clients that learned the names from v0.3.0.
         let server = make_server("all");
         let tools = server.tools_for_toolset("all");
         assert_eq!(
             tools.len(),
-            13,
-            "toolset 'all' must expose 13 tools, got {}",
+            7,
+            "toolset 'all' must expose the v0.2 set of 7 visible tools, got {}",
             tools.len()
         );
-    }
-
-    #[test]
-    fn toolset_core_exposes_four_tools() {
-        let server = make_server("core");
-        let tools = server.tools_for_toolset("core");
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(tools.len(), 4, "core bundle must have 4 tools: {names:?}");
-        assert!(names.contains(&"semantex_search"));
-        assert!(names.contains(&"semantex_deep"));
-        assert!(names.contains(&"semantex_agent"));
-        assert!(names.contains(&"semantex_symbol"));
-    }
-
-    #[test]
-    fn toolset_structural_exposes_five_tools() {
-        let server = make_server("structural");
-        let tools = server.tools_for_toolset("structural");
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            tools.len(),
-            5,
-            "structural bundle must have 5 tools: {names:?}"
-        );
         for required in &[
-            "semantex_symbol",
-            "semantex_callers",
-            "semantex_callees",
-            "semantex_implementations",
-            "semantex_architecture",
+            "semantex_agent",
+            "semantex_search",
+            "semantex_deep",
+            "semantex_status",
+            "semantex_health",
+            "semantex_validate",
+            "semantex_index",
         ] {
-            assert!(
-                names.contains(required),
-                "structural bundle missing {required}"
-            );
+            assert!(names.contains(required), "missing visible tool {required}");
         }
-    }
-
-    #[test]
-    fn unknown_toolset_falls_back_to_all() {
-        let server = make_server("nonsense");
-        assert_eq!(server.toolset(), "all");
-        let tools = server.tools_for_toolset("nonsense");
-        // Filter falls through to `all` (which returns the full surface).
-        assert_eq!(tools.len(), 13);
-    }
-
-    #[test]
-    fn new_tools_registered_with_required_schemas() {
-        let server = make_server("all");
-        let tools = server.tools_for_toolset("all");
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        for required in &[
+        // M1-M6 must NOT be visible.
+        for hidden in &[
             "semantex_symbol",
             "semantex_callers",
             "semantex_callees",
@@ -3132,18 +2867,53 @@ mod tests {
             "semantex_architecture",
         ] {
             assert!(
-                names.contains(required),
-                "M1-M6 tool {required} missing from registry"
-            );
-            let tool = tools.iter().find(|t| t.name == *required).unwrap();
-            // Each new tool must declare an input schema with `type: object`.
-            assert_eq!(
-                tool.input_schema.get("type").and_then(|v| v.as_str()),
-                Some("object"),
-                "{required} should have type:object input schema"
+                !names.contains(hidden),
+                "M1-M6 tool {hidden} should be hidden post-Phase-3"
             );
         }
     }
+
+    #[test]
+    fn toolset_core_exposes_three_search_tools() {
+        // Post-Phase-3 `core` is the minimum chat-bot surface: agent + the
+        // two structured-JSON variants. Chat-only clients pick this; richer
+        // clients pick `all` (7) for the diagnostic tools.
+        let server = make_server("core");
+        let tools = server.tools_for_toolset("core");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tools.len(), 3, "core bundle must have 3 tools: {names:?}");
+        assert!(names.contains(&"semantex_search"));
+        assert!(names.contains(&"semantex_deep"));
+        assert!(names.contains(&"semantex_agent"));
+    }
+
+    #[test]
+    fn toolset_structural_is_alias_for_all_post_phase_3() {
+        // `structural` historically meant "M1-M6 only". Now that those are
+        // hidden, we preserve the name as an alias for `all` so existing
+        // CLI / HTTP routes don't 404.
+        let server = make_server("structural");
+        let tools = server.tools_for_toolset("structural");
+        assert_eq!(
+            tools.len(),
+            7,
+            "structural toolset is now an alias for all (M1-M6 hidden)"
+        );
+    }
+
+    #[test]
+    fn unknown_toolset_falls_back_to_all() {
+        let server = make_server("nonsense");
+        assert_eq!(server.toolset(), "all");
+        let tools = server.tools_for_toolset("nonsense");
+        // Filter falls through to `all` (Phase 3: 7 visible tools).
+        assert_eq!(tools.len(), 7);
+    }
+
+    // (Backward-compat dispatch for hidden M1-M6 is already proven by the
+    // existing `tool_symbol_finds_known_symbol`, `tool_callers_finds_caller`,
+    // etc. tests below — they call the McpServer methods directly, which is
+    // the same path `handle_tool_call` takes via its match arms.)
 
     // ─────────────────────────────────────────────────────────────────────
     // M6 helper test — top_level_dir

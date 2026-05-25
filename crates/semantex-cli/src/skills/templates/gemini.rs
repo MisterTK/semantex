@@ -62,7 +62,7 @@ mod tests {
             .get("_context_md")
             .and_then(|v| v.as_str())
             .expect("_context_md present");
-        for tool in &tools {
+        for tool in tools.iter().filter(|t| t.live) {
             assert!(
                 context.contains(tool.name),
                 "context missing `{}`",

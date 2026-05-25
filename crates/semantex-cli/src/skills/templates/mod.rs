@@ -49,15 +49,19 @@ pub(crate) fn render_examples_md(tool: &ToolMetadata) -> String {
 }
 
 /// Helper: render a markdown section per tool.
+///
+/// Skips tools where `live == false`. The flag exists for documenting tools
+/// that are present on the MCP server but hidden from `tools/list` (e.g.
+/// the M1-M6 structural tools post-Phase-3) — they're still callable for
+/// back-compat, but shouldn't be shown to agents because chaining them
+/// regresses CCB (see docs/BENCHMARK-v0.3-REGRESSION-ANALYSIS.md).
 pub(crate) fn render_tools_md(tools: &[ToolMetadata]) -> String {
     let mut out = String::new();
     for tool in tools {
-        let status_tag = if tool.live {
-            ""
-        } else {
-            " *(planned in v0.3, not yet live)*"
-        };
-        let _ = writeln!(out, "### `{}`{}\n", tool.name, status_tag);
+        if !tool.live {
+            continue; // hidden from generated skill docs
+        }
+        let _ = writeln!(out, "### `{}`\n", tool.name);
         out.push_str(tool.description);
         out.push_str("\n\n");
         if !tool.when_to_use.is_empty() {

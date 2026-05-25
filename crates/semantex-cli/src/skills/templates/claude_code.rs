@@ -70,7 +70,7 @@ mod tests {
 
         // Body should be non-empty markdown and mention every tool.
         assert!(!body.trim().is_empty(), "markdown body must be non-empty");
-        for tool in &tools {
+        for tool in tools.iter().filter(|t| t.live) {
             assert!(
                 body.contains(tool.name),
                 "body should mention tool `{}`",

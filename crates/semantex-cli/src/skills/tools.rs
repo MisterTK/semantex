@@ -339,7 +339,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 args_json: r#"{"name": "NewSessionManager"}"#,
             }],
             mutates: false,
-            live: true,
+            live: false,
         },
         ToolMetadata {
             name: "semantex_callers",
@@ -371,7 +371,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 args_json: r#"{"symbol": "ConnectionPool::get"}"#,
             }],
             mutates: false,
-            live: true,
+            live: false,
         },
         ToolMetadata {
             name: "semantex_callees",
@@ -400,7 +400,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 args_json: r#"{"symbol": "handle_request", "depth": 2}"#,
             }],
             mutates: false,
-            live: true,
+            live: false,
         },
         ToolMetadata {
             name: "semantex_implementations",
@@ -425,7 +425,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 args_json: r#"{"trait_or_interface": "Handler"}"#,
             }],
             mutates: false,
-            live: true,
+            live: false,
         },
         ToolMetadata {
             name: "semantex_examples",
@@ -479,7 +479,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 },
             ],
             mutates: false,
-            live: true,
+            live: false,
         },
         ToolMetadata {
             name: "semantex_architecture",
@@ -514,7 +514,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 },
             ],
             mutates: false,
-            live: true,
+            live: false,
         },
     ]
 }

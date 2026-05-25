@@ -43,7 +43,7 @@ mod tests {
         assert!(!out.trim().is_empty());
         assert!(out.starts_with("# "));
         assert!(out.contains("## Tools"));
-        for tool in &tools {
+        for tool in tools.iter().filter(|t| t.live) {
             assert!(out.contains(tool.name), "missing tool `{}`", tool.name);
         }
     }

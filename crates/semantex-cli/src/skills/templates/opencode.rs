@@ -58,7 +58,7 @@ mod tests {
             .get("rules")
             .and_then(|v| v.as_str())
             .expect("rules present");
-        for tool in &tools {
+        for tool in tools.iter().filter(|t| t.live) {
             assert!(rules.contains(tool.name), "rules missing `{}`", tool.name);
         }
     }

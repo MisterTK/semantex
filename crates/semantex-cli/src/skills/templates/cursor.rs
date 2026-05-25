@@ -58,7 +58,7 @@ mod tests {
             serde_yml::from_str(header).expect("Cursor header must be valid YAML");
         assert!(out.contains("semantex_agent"));
         // Markdown body must mention every tool.
-        for tool in &tools {
+        for tool in tools.iter().filter(|t| t.live) {
             assert!(out.contains(tool.name), "missing tool `{}`", tool.name);
         }
     }
