@@ -1167,9 +1167,9 @@ dependencies = [
 
 [[package]]
 name = "fastkmeans-rs"
-version = "0.1.7"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3c659c753618a3c3f023ba1b8e7f84a8596524858cd049c785ed5457d51bf2a"
+checksum = "1e4488640442526b76eea0097d0d807b61deb98e45a76c8454a471029df70167"
 dependencies = [
  "ndarray 0.16.1",
  "ndarray-rand",
@@ -2446,9 +2446,9 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "next-plaid"
-version = "1.0.7"
+version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99c1d87e18031c8b21ae99f0bd46292c798e944efad3b8573a54d3fe818f0720"
+checksum = "182ed6bc82d6156a97ff0c0a25ea5e0479e3312ca5d55a477f6836d28cb8f5ef"
 dependencies = [
  "byteorder",
  "fastkmeans-rs",
@@ -2471,9 +2471,9 @@ dependencies = [
 
 [[package]]
 name = "next-plaid-onnx"
-version = "1.0.7"
+version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89f2532a701720842e1cefcb9e0c809f19914a06f8813d791b520bb2ad8f3cfb"
+checksum = "e15c527dc01791d80f38d6188c854a5e012210e43f66d2316f1919edb6a86ad6"
 dependencies = [
  "anyhow",
  "glob",

@@ -533,8 +533,22 @@ impl IndexBuilder {
             let plaid_dir = index_dir.join("plaid");
             let mapping_path = index_dir.join("plaid_mapping.bin");
             let plaid_dir_str = plaid_dir.to_string_lossy().into_owned();
+            // PLAID 1.3+: IndexConfig.batch_size defaults to 50_000, which
+            // allocates buffers sized for 50 k docs even when we only have
+            // 2 k. Override to 1024 to bound peak RAM during clustering
+            // (k-means scratch + centroid expansion working set both scale
+            // linearly with batch_size). force_cpu=true bypasses the GPU
+            // K-means path; we're already CPU-only on macOS and don't have
+            // CUDA configured. Same knobs on UpdateConfig below.
             let plaid_config = IndexConfig {
                 nbits: self.config.plaid_nbits,
+                batch_size: 1024,
+                force_cpu: true,
+                ..Default::default()
+            };
+            let update_config = UpdateConfig {
+                batch_size: 1024,
+                force_cpu: true,
                 ..Default::default()
             };
 
@@ -590,7 +604,7 @@ impl IndexBuilder {
                     &all_embeddings,
                     &plaid_dir_str,
                     &plaid_config,
-                    &UpdateConfig::default(),
+                    &update_config,
                 )?;
                 // Drop the in-memory embeddings ASAP so they don't compete with
                 // the post-PLAID work (graph resolution, PageRank, etc.).
@@ -660,7 +674,7 @@ impl IndexBuilder {
                             &embeddings,
                             &plaid_dir_str,
                             &plaid_config,
-                            &UpdateConfig::default(),
+                            &update_config,
                         )?;
                         mapping.extend(chunks.iter().map(|c| c.id));
                     }

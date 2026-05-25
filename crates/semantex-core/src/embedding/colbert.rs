@@ -91,6 +91,14 @@ impl ColbertEmbedder {
     }
 
     /// Build the inner ONNX session (called lazily on first encode).
+    ///
+    /// Defaults: int8-quantized model, CPU execution provider, small inference
+    /// batch (2 docs), `SEMANTEX_ORT_THREADS` threads. Memory profile:
+    /// session load ~150 MB + per-encode ~50 MB scratch. The earlier OOM was
+    /// caused by `ExecutionProvider::Auto` picking CoreML on macOS, which
+    /// allocated 10+ GB of partition/buffer state on first inference.
+    /// Opt back into CoreML via `SEMANTEX_COREML=1` only if you've verified
+    /// the memory profile on your specific model + macOS version.
     fn build_encoder(&self) -> Result<Colbert> {
         self.build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -98,13 +106,26 @@ impl ColbertEmbedder {
         #[allow(unused_mut)]
         let mut builder = Colbert::builder(&self.model_dir)
             .with_quantized(true)
-            .with_threads(self.threads);
+            .with_threads(self.threads)
+            // README's "Parallel CPU" best practice: small per-inference
+            // batch_size keeps ORT working set small. Documents are still
+            // grouped into our outer encode batches (PLAID_BATCH=128 in the
+            // indexer); this knob bounds the ORT-internal batch, not ours.
+            .with_batch_size(2);
 
+        // EXPLICIT CPU on macOS by default. ExecutionProvider::Auto would pick
+        // CoreML if the `coreml` feature were enabled, which on this codebase's
+        // index sizes triggered partition+buffer growth into the 10+ GB range.
+        // Users who want CoreML can set SEMANTEX_COREML=1 (gated below).
         #[cfg(target_os = "macos")]
-        if self.use_coreml {
-            builder = builder.with_execution_provider(next_plaid_onnx::ExecutionProvider::CoreML);
+        {
+            let provider = if self.use_coreml {
+                next_plaid_onnx::ExecutionProvider::CoreML
+            } else {
+                next_plaid_onnx::ExecutionProvider::Cpu
+            };
+            builder = builder.with_execution_provider(provider);
         }
-
         #[cfg(not(target_os = "macos"))]
         let _ = self.use_coreml;
 
