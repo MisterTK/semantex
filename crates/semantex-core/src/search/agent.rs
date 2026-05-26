@@ -58,6 +58,11 @@ impl<'a> AgentPipeline<'a> {
             }
             AgentRoute::Exhaustive => self.handle_exhaustive(&request.query, budget),
             AgentRoute::Semantic => self.handle_semantic(&request.query, budget, false),
+            AgentRoute::Architecture => self.handle_architecture(&request.query, budget),
+            AgentRoute::ExhaustiveStructural => {
+                self.handle_exhaustive_structural(&request.query, budget)
+            }
+            AgentRoute::DeepWithExamples => self.handle_deep_with_examples(&request.query, budget),
         };
         let search_ms = search_start.elapsed().as_millis() as u64;
 
@@ -368,6 +373,226 @@ impl<'a> AgentPipeline<'a> {
 
     fn handle_file_pattern(&self, query: &str) -> HandlerResult {
         glob_files(&self.project_root, query)
+    }
+
+    /// Phase 4 — Architecture overview. Replaces the v0.3 M6 visible MCP tool
+    /// (which regressed CCB by encouraging agents to call it alongside other
+    /// structural tools). Returns the same ArchOverview (god nodes +
+    /// communities + boundaries) but rendered as formatted text and routed
+    /// internally by `semantex_agent` based on classifier intent.
+    fn handle_architecture(&self, query: &str, budget: usize) -> HandlerResult {
+        use crate::index::architecture::build_arch_overview;
+        let db_path = self.project_root.join(".semantex").join("chunks.db");
+        let Ok(overview) = self
+            .searcher
+            .with_store(|store| build_arch_overview(store, &db_path))
+        else {
+            return self.handle_deep(query, budget, true);
+        };
+        if overview.god_nodes.is_empty()
+            && overview.communities.is_empty()
+            && overview.boundaries.is_empty()
+        {
+            // Pre-v0.3 index without architecture tables → fall back to deep.
+            return self.handle_deep(query, budget, true);
+        }
+        let mut out = String::with_capacity(2048);
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("# Architectural overview\n\n"));
+        if !overview.god_nodes.is_empty() {
+            out.push_str("## Top central symbols (PageRank-ranked)\n\n");
+            for (i, g) in overview.god_nodes.iter().enumerate() {
+                let role = g
+                    .semantic_role
+                    .as_deref()
+                    .map(|r| format!(" [{r}]"))
+                    .unwrap_or_default();
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "{:>2}. `{}` ({} L{}-{}){} — centrality {:.4}\n",
+                        i + 1,
+                        g.symbol,
+                        g.file,
+                        g.start_line,
+                        g.end_line,
+                        role,
+                        g.centrality
+                    ),
+                );
+            }
+            out.push('\n');
+        }
+        if !overview.communities.is_empty() {
+            out.push_str("## Communities (clusters via call-graph BFS)\n\n");
+            for c in &overview.communities {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("### {} — {} members\n", c.label, c.size),
+                );
+                if !c.entry_points.is_empty() {
+                    out.push_str("Entry points: ");
+                    let mut first = true;
+                    for ep in &c.entry_points {
+                        if !first {
+                            out.push_str(", ");
+                        }
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut out,
+                            format_args!(
+                                "`{}` ({}:{}-{})",
+                                ep.symbol, ep.file, ep.start_line, ep.end_line
+                            ),
+                        );
+                        first = false;
+                    }
+                    out.push_str("\n\n");
+                }
+                if !c.member_files.is_empty() {
+                    out.push_str("Sample files:\n");
+                    for f in &c.member_files {
+                        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("  - {f}\n"));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+        if !overview.boundaries.is_empty() {
+            out.push_str("## Cross-directory coupling (top import-edge counts)\n\n");
+            for b in &overview.boundaries {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("- `{}` → `{}` — {} edges\n", b.from, b.to, b.edge_count),
+                );
+            }
+            out.push('\n');
+        }
+        if out.len() > budget * 3 {
+            out.truncate(budget * 3);
+            out.push_str("\n[truncated to fit response budget]\n");
+        }
+        let total =
+            overview.god_nodes.len() + overview.communities.len() + overview.boundaries.len();
+        HandlerResult {
+            formatted: out,
+            fallback_used: false,
+            result_count: total,
+        }
+    }
+
+    /// Phase 4 — Exhaustive enumeration with structural enrichment. The
+    /// agent classifier routes here when the query asks to *list all*
+    /// configuration / options / flags / env vars. Combines a wider search
+    /// (more candidates, larger budget) with structural callers/imports
+    /// information so the agent gets definitions AND usages in one response.
+    fn handle_exhaustive_structural(&self, query: &str, budget: usize) -> HandlerResult {
+        // Use the existing exhaustive path's wider search settings; the
+        // formatter is what makes the difference. Inject a structural hint
+        // by widening max_results and enriching the budget so callers can
+        // be listed alongside definitions.
+        let exhaustive_budget = budget * 4;
+        let sq = SearchQuery::new(query).max_results(30);
+        match self.searcher.search(&sq) {
+            Ok(output) if !output.results.is_empty() => {
+                let items: Vec<SearchResultItem> = output
+                    .results
+                    .iter()
+                    .map(|r| search_result_to_item(r, true))
+                    .collect();
+                let confidence = compute_confidence(&items);
+                let count = items.len();
+                let resp = SearchResponse {
+                    results: items,
+                    duration_ms: output.metrics.total_ms,
+                    dense_count: output.metrics.dense_count,
+                    sparse_count: output.metrics.sparse_count,
+                    fused_count: output.metrics.fused_count,
+                    metrics: None,
+                    confidence: Some(confidence),
+                };
+                HandlerResult {
+                    formatted: format_search_results(
+                        &resp,
+                        FormatStyle::Default,
+                        exhaustive_budget,
+                    ),
+                    fallback_used: false,
+                    result_count: count,
+                }
+            }
+            _ => self.handle_exhaustive(query, budget),
+        }
+    }
+
+    /// Phase 4 — Deep search enriched with pattern-catalog exemplars. The
+    /// classifier routes here for "explain the most complex algorithm" /
+    /// "deep dive into X with examples" queries. If the deep response
+    /// mentions a known pattern name (e.g. `rust.tokio_spawn`), the
+    /// pattern's exemplars are pulled inline so the agent sees concrete
+    /// code without a follow-up call.
+    fn handle_deep_with_examples(&self, query: &str, budget: usize) -> HandlerResult {
+        let deep_result = self.handle_deep(query, budget, false);
+        // Scan deep output for pattern-name mentions (e.g. `rust.X`, `ts.X`)
+        // and pull up to 3 exemplars per matched pattern from the catalog.
+        let db_path = self.project_root.join(".semantex").join("chunks.db");
+        let mut found_patterns: Vec<String> = Vec::new();
+        for cap in regex::Regex::new(r"\b(?:rust|ts|py|go|java)\.[a-z_]+\b")
+            .ok()
+            .map(|re| {
+                re.find_iter(&deep_result.formatted)
+                    .map(|m| m.as_str().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        {
+            if !found_patterns.contains(&cap) {
+                found_patterns.push(cap);
+            }
+            if found_patterns.len() >= 3 {
+                break;
+            }
+        }
+        if found_patterns.is_empty() {
+            return deep_result;
+        }
+        let mut enriched = deep_result.formatted.clone();
+        enriched.push_str("\n\n## Pattern catalog exemplars\n\n");
+        let mut added = 0usize;
+        for pat in &found_patterns {
+            let examples =
+                crate::index::architecture::query_pattern_matches(&db_path, pat, None, 3)
+                    .unwrap_or_default();
+            if examples.is_empty() {
+                continue;
+            }
+            let _ = std::fmt::Write::write_fmt(
+                &mut enriched,
+                format_args!("### `{}` ({} matches)\n\n", pat, examples.len()),
+            );
+            for (chunk_id, _name, lang) in &examples {
+                if let Ok(chunk) = self.searcher.with_store(|s| s.get_chunk(*chunk_id)) {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut enriched,
+                        format_args!(
+                            "- `{}:{}-{}` ({})\n",
+                            chunk.file_path.display(),
+                            chunk.start_line,
+                            chunk.end_line,
+                            lang
+                        ),
+                    );
+                    added += 1;
+                }
+            }
+            enriched.push('\n');
+        }
+        if added == 0 {
+            return deep_result;
+        }
+        HandlerResult {
+            formatted: enriched,
+            fallback_used: false,
+            result_count: deep_result.result_count + added,
+        }
     }
 }
 

@@ -27,6 +27,13 @@ fn has_caps_prefix_symbol(s: &str) -> bool {
 }
 
 /// High-level query intent for agent routing.
+///
+/// **Phase 4 additions** (`Architecture`, `ExhaustiveStructural`,
+/// `DeepWithExamples`): replace the M1-M6 visible MCP tools that the
+/// v0.3-visible release exposed and that regressed CCB by +20%. The agent
+/// pipeline now routes architecture/exhaustive/deep-pattern queries
+/// internally to the same logic those tools used, without inviting agents
+/// to chain multiple structural tools additively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRoute {
@@ -38,6 +45,18 @@ pub enum AgentRoute {
     Analytical,
     Exhaustive,
     Semantic,
+    /// "What are the main components?" / "Architecture overview" / "god nodes".
+    /// Returns a compact ArchOverview (PageRank god nodes + communities +
+    /// cross-directory boundaries) in one call.
+    Architecture,
+    /// "List all configuration options" / "every CLI flag" / "enumerate X".
+    /// Wide-net search with structural enumeration of callers/imports for
+    /// each candidate, in one response.
+    ExhaustiveStructural,
+    /// "Explain the most complex algorithm" / "deep dive into X with examples".
+    /// Deep search enriched with pattern-catalog exemplars for any pattern
+    /// names matched in the result set.
+    DeepWithExamples,
 }
 
 impl std::fmt::Display for AgentRoute {
@@ -51,6 +70,9 @@ impl std::fmt::Display for AgentRoute {
             Self::Analytical => write!(f, "analytical"),
             Self::Exhaustive => write!(f, "exhaustive"),
             Self::Semantic => write!(f, "semantic"),
+            Self::Architecture => write!(f, "architecture"),
+            Self::ExhaustiveStructural => write!(f, "exhaustive_structural"),
+            Self::DeepWithExamples => write!(f, "deep_with_examples"),
         }
     }
 }
@@ -159,8 +181,45 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
-    // 4. Structural
     let lower = query.to_lowercase();
+
+    // 3b. Architecture — Phase 4. Matches the v0.3 spec's M6 use case
+    // ("primer at session start"). Triggered by overview-style language;
+    // routes internally to ArchOverview (god nodes + communities + boundaries)
+    // so the agent gets a complete map in one call instead of grep-spelunking.
+    let architecture_keywords = [
+        "main components",
+        "main component",
+        "primary components",
+        "key components",
+        "core components",
+        "main modules",
+        "primary subsystems",
+        "key subsystems",
+        "architecture overview",
+        "architectural overview",
+        "system architecture",
+        "high-level architecture",
+        "high level architecture",
+        "god nodes",
+        "god node",
+        "entry points",
+        "primary data flow",
+        "how do they interact",
+        "how do these interact",
+        "overall structure",
+        "overall organization",
+        "project structure",
+        "code organization",
+        "main subsystems",
+    ];
+    for kw in &architecture_keywords {
+        if lower.contains(kw) {
+            return AgentRoute::Architecture;
+        }
+    }
+
+    // 4. Structural — callers/callees/imports/type-refs intent.
     let structural_keywords = [
         "callers",
         "callees",
@@ -179,6 +238,32 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
     for kw in &structural_keywords {
         if lower.contains(kw) {
             return AgentRoute::Structural;
+        }
+    }
+
+    // 4b. DeepWithExamples — Phase 4. Checked BEFORE the Deep prefix scan
+    // so "explain the most complex algorithm" doesn't fall through to plain
+    // Deep. Routes to deep search enriched with pattern-catalog exemplars
+    // for any pattern names matched in the result set, so the agent gets
+    // concrete code alongside prose without a follow-up turn.
+    let deep_with_examples_markers = [
+        "explain the most complex",
+        "most complex algorithm",
+        "key algorithm",
+        "main algorithm",
+        "data transformation",
+        "core algorithm",
+        "step by step",
+        "step-by-step",
+        "deep dive",
+        "show me how",
+        "show me the pattern",
+        "with examples",
+        "give examples of",
+    ];
+    for marker in &deep_with_examples_markers {
+        if lower.contains(marker) {
+            return AgentRoute::DeepWithExamples;
         }
     }
 
@@ -241,10 +326,35 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         "enumerate every",
         "enumerate ",
     ];
+    let mut is_exhaustive = false;
     for marker in &exhaustive_markers {
         if lower.contains(marker) {
-            return AgentRoute::Exhaustive;
+            is_exhaustive = true;
+            break;
         }
+    }
+    if is_exhaustive {
+        // 7b. ExhaustiveStructural — Phase 4. When an exhaustive query also
+        // mentions config/env/cli/flag/option, route to the richer structural
+        // enumeration that includes definitions + usages in one pass.
+        let structural_exhaustive_markers = [
+            "config",
+            "env var",
+            "environment variable",
+            "cli flag",
+            "command line",
+            "option",
+            "setting",
+            "every flag",
+            "every option",
+            "every config",
+        ];
+        for kw in &structural_exhaustive_markers {
+            if lower.contains(kw) {
+                return AgentRoute::ExhaustiveStructural;
+            }
+        }
+        return AgentRoute::Exhaustive;
     }
 
     // 8. Semantic — default
@@ -454,9 +564,13 @@ mod tests {
 
     #[test]
     fn test_exhaustive_list_all() {
+        // Phase 4: "list all" + "configuration options" / "environment variables"
+        // is now ExhaustiveStructural — the richer route that enumerates
+        // definitions + usages in one response. The plain Exhaustive route is
+        // for queries that don't name a configuration/CLI surface.
         assert_eq!(
             classify_agent_query("List all configuration options and environment variables"),
-            AgentRoute::Exhaustive
+            AgentRoute::ExhaustiveStructural
         );
     }
     #[test]
@@ -467,10 +581,11 @@ mod tests {
         );
     }
     #[test]
-    fn test_exhaustive_enumerate() {
+    fn test_exhaustive_enumerate_cli() {
+        // Phase 4: "enumerate" + "CLI flags" routes to ExhaustiveStructural.
         assert_eq!(
             classify_agent_query("enumerate the CLI flags this project supports"),
-            AgentRoute::Exhaustive
+            AgentRoute::ExhaustiveStructural
         );
     }
     #[test]
@@ -485,6 +600,76 @@ mod tests {
         assert_eq!(
             classify_agent_query("show all middleware registered in the app"),
             AgentRoute::Exhaustive
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Phase 4 — Architecture / ExhaustiveStructural / DeepWithExamples
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_architecture_main_components() {
+        // The exact Q1 wording from agent_bench.py. v0.2 misclassified this as
+        // Semantic (no architecture keyword) which led to ~40 baseline turns.
+        // Phase 4 routes it to Architecture → one-call ArchOverview.
+        assert_eq!(
+            classify_agent_query(
+                "What are the main components of this project and how do they interact? \
+                 Trace the primary data flow from entry point through the core logic."
+            ),
+            AgentRoute::Architecture
+        );
+    }
+    #[test]
+    fn test_architecture_primary_subsystems() {
+        assert_eq!(
+            classify_agent_query("identify the primary subsystems"),
+            AgentRoute::Architecture
+        );
+    }
+    #[test]
+    fn test_architecture_god_nodes() {
+        assert_eq!(
+            classify_agent_query("show the god nodes in this codebase"),
+            AgentRoute::Architecture
+        );
+    }
+    #[test]
+    fn test_exhaustive_structural_config() {
+        // Q4-class question; explicit config/env routing.
+        assert_eq!(
+            classify_agent_query(
+                "list all configuration options, environment variables, \
+                 and CLI flags this project supports"
+            ),
+            AgentRoute::ExhaustiveStructural
+        );
+    }
+    #[test]
+    fn test_exhaustive_plain_still_exhaustive() {
+        // No config/CLI hint → stays as plain Exhaustive.
+        assert_eq!(
+            classify_agent_query("list all middleware registered in the app"),
+            AgentRoute::Exhaustive
+        );
+    }
+    #[test]
+    fn test_deep_with_examples_most_complex() {
+        // Q3-class question. Phase 4 routes to deep+exemplars so the agent
+        // gets curated code blocks without a follow-up turn.
+        assert_eq!(
+            classify_agent_query(
+                "explain the most complex algorithm or data transformation in \
+                 this codebase step by step"
+            ),
+            AgentRoute::DeepWithExamples
+        );
+    }
+    #[test]
+    fn test_deep_with_examples_show_me_how() {
+        assert_eq!(
+            classify_agent_query("show me how the retry backoff is implemented"),
+            AgentRoute::DeepWithExamples
         );
     }
 

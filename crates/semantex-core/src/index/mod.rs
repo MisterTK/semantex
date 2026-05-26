@@ -1,3 +1,4 @@
+pub mod architecture;
 pub mod builder;
 pub mod file_classifier;
 pub mod global_graph;
