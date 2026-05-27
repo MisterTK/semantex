@@ -1,26 +1,32 @@
-# Release Sequence — v0.3.1 → v0.4 → v0.5 → v0.6
+# Release Sequence — v0.3.1 → v0.4 → v0.5 → v0.6 → v0.7+
 
-**Date:** 2026-05-26
-**Status:** Authoritative ordering for two-spec parallel refactor
+**Date:** 2026-05-26 (initial), amended 2026-05-27 (post-v0.6 LLM scrub)
+**Status:** Authoritative ordering for the v0.3.1→v0.6 refactor (now SHIPPED) and the v0.7+ LLM integration.
 **Source specs:**
 - `docs/superpowers/specs/2026-05-26-semantex-v0.3.1-v0.5-refactor.md` (quality/benchmark — "Spec Q")
 - `docs/v0.4_SPEC.md` (deps & capabilities — "Spec D")
+- `docs/superpowers/specs/2026-05-27-semantex-llm-integration.md` (LLM integration — "Spec L"; **supersedes** Spec Q Items 9 + 12)
 
-This document resolves the v0.4 label collision between the two specs above, locks the file-ownership order across them, and amends two acceptance gates that are unsafe as written. Subagent dispatch MUST NOT begin until this doc is read and §5's pre-flight is green.
+This document resolves the v0.4 label collision between Spec Q/Spec D, locks the file-ownership order across them, amends two acceptance gates that are unsafe as written, and (as of 2026-05-27) records that all LLM-bearing work has been carved out into Spec L for separate sequencing. Subagent dispatch MUST NOT begin until this doc is read and §5's pre-flight is green.
 
 ---
 
 ## 1. Version remap (authoritative)
 
-| Release | Source | Scope | Bench artifact |
-|---|---|---|---|
-| **v0.3.1** | Spec Q Tier 1 (Items 1, 2, 3, 4) | Adaptive output budgets, multi-language classifier, deep_with_examples trim, small-repo arch override | `run27-v0.3.1/` (gin + flask + platform subset) |
-| **v0.4** | Spec D (all 18 items, 5 workstreams) | Dep upgrades (bincode→postcard, axum 0.8, rusqlite 0.40, tantivy 0.26), PLAID 1.3 wiring, colgrep ranking signals, C# 10 / Scala 3 / Vue / OCaml chunking | `run28-v0.4/` (full 6 repos) |
-| **v0.5** | Spec Q Tier 2 (Items 5, 6, 7, 8) | Deep audit, confidence-driven disambiguation, adaptive structural walk, deep dedup | `run29-v0.5/` (full 6 repos) |
-| **v0.6** | Spec Q Tier 3 (Items 9, 10, 11, 12) | Local LLM classifier + HyDE, internal multi-step planner, cross-repo daemon (conditional), index-time LLM enrichment | `run30-v0.6/` |
-| (strategic) | Spec Q Tier 4 (Items 13–16) | Quality benchmarks, prebuilt indexes, streaming MCP, web UI | n/a |
+| Release | Source | Scope | Bench artifact | Status |
+|---|---|---|---|---|
+| **v0.3.1** | Spec Q Tier 1 (Items 1, 2, 3, 4) | Adaptive output budgets, multi-language classifier, deep_with_examples trim, small-repo arch override | `run27-v0.3.1/` (gin + flask + platform subset) | shipped 2026-05-27 |
+| **v0.4** | Spec D (all 18 items, 5 workstreams) | Dep upgrades (bincode→postcard, axum 0.8, rusqlite 0.40, tantivy 0.26), PLAID 1.3 wiring, colgrep ranking signals, C# 10 / Scala 3 / Vue / OCaml chunking | `run28-v0.4/` (full 6 repos) | shipped 2026-05-27 |
+| **v0.5** | Spec Q Tier 2 (Items 5, 6, 7, 8) | Deep audit, confidence-driven disambiguation, adaptive structural walk, deep dedup | `run29-v0.5/` (full 6 repos) | shipped 2026-05-27 (bench deferred) |
+| **v0.6** | Spec Q Tier 3 partial (Item 10 only — Items 9, 11, 12 **moved to Spec L**) | Multi-step internal planner (pure-Rust orchestration). Items 11 (cross-repo daemon) deferred; Items 9 (LLM classifier+HyDE) and 12 (LLM index-time enrichment) **out of scope per `docs/superpowers/specs/2026-05-27-semantex-llm-integration.md`** | `run30-v0.6/` | shipped 2026-05-27, includes /simplify fix sweep; **LLM scaffold scrubbed** post-tag |
+| **v0.7** | Spec L Phase 1 | `genai` adapter: LLM-driven classifier + HyDE retrieval, behind `--features llm` Cargo feature. Default build dep-graph unchanged. | TBD (Spec L §8 Phase 1 gate) | pending |
+| **v0.8** | Spec L Phase 2 | `SubscriptionCli` backend: shell out to `claude` / `codex` / (gated) `antigravity` for users with bundled subscription quota. | TBD (Spec L §8 Phase 2 gate) | pending |
+| (strategic) | Spec Q Tier 4 (Items 13–16) | Quality benchmarks, prebuilt indexes, streaming MCP, web UI | n/a | not started |
+| (deferred) | Spec Q Item 11 (cross-repo workspace daemon) | Single daemon serving N projects | n/a | conditional on downstream consumer request |
 
 Anything still saying "Tier 2 = v0.4" or "Tier 3 = v0.5" in Spec Q has been remapped; the spec header has been amended. Disregard older copies.
+
+**2026-05-27 amendment:** v0.6 originally landed Spec Q Item 9 (local LLM classifier + HyDE) + Item 10 (internal planner) per the table above. Item 9 (and the deferred Item 12) have since been **scrubbed from main** and re-scoped into the standalone **Spec L** (`docs/superpowers/specs/2026-05-27-semantex-llm-integration.md`), targeting v0.7 (Phase 1: genai adapter) and v0.8 (Phase 2: SubscriptionCli backend). The Item 10 planner remains shipped — it is pure-Rust orchestration with no LLM dependency.
 
 ---
 
@@ -127,3 +133,9 @@ Each bench artifact lives under `benchmarks/results/<name>/` and the comparison 
 ## 7. Changelog
 
 - **2026-05-26** — Initial coordination doc. Resolves v0.4 label collision (Spec D wins, Spec Q tiers shift by one). Locks `protocol.rs` order (postcard → disambiguation). Loosens Spec D §10 per-cell gate; adds investigation gate to Spec Q Item 2.
+- **2026-05-27** — Post-v0.6 amendments:
+  - v0.3.1, v0.4, v0.4.1, v0.5, v0.6 all shipped and tagged on `origin/main`. Bench artifacts run28/29/30 deferred to a separate user-authorized session.
+  - All LLM-bearing work carved out of Spec Q (Items 9, 12) and Spec D into the new standalone Spec L (`docs/superpowers/specs/2026-05-27-semantex-llm-integration.md`).
+  - The v0.6 LLM scaffold (`crates/semantex-core/src/llm/`, `classify_with_llm`, `hybrid_search_with_hyde`, `merge_hyde_results`, `--features local-llm`) is **scrubbed from main**. Reason: design decision to (a) treat LLM integration as a dedicated workstream, (b) avoid bundling a model, (c) leverage `rust-genai` and coding-agent CLI subscriptions instead of hand-rolling provider clients. See Spec L §1 for full rationale.
+  - The v0.6 Item 10 planner (`crates/semantex-core/src/search/planner.rs`) and `AgentRoute::FeaturePlanning` route remain shipped — they are pure-Rust orchestration with no LLM dependency.
+  - Spec Q Item 11 (cross-repo workspace daemon) remains conditional / deferred, unchanged.

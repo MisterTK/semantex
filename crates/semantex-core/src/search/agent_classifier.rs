@@ -419,29 +419,6 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
     AgentRoute::Semantic
 }
 
-/// LLM-augmented classification (v0.6 Item 9).
-///
-/// Wraps `classify_agent_query` with an opt-in `LlmClassifier` consulted
-/// first. If the LLM returns `Ok(route)`, that route is used. On any error
-/// — model not loaded, inference failure, tokenization issue — we silently
-/// fall back to the deterministic keyword classifier. The keyword
-/// classifier remains the single source of truth in any build that doesn't
-/// load a model, including the default `cargo build` with no feature
-/// flags.
-///
-/// This function is intentionally synchronous: the LLM inference itself is
-/// a blocking call into the ONNX runtime, and adding a tokio executor just
-/// to await a single blocking op would bloat the default build. If we
-/// later want to overlap inference with other I/O, this signature can be
-/// promoted to async without breaking callers (it returns `AgentRoute`,
-/// not a route + cost tuple).
-pub fn classify_with_llm(query: &str, llm: &dyn crate::llm::LlmClassifier) -> AgentRoute {
-    match llm.classify(query) {
-        Ok(route) => route,
-        Err(_) => classify_agent_query(query),
-    }
-}
-
 /// Extract the most relevant symbol from a query string.
 ///
 /// Scans tokens right-to-left. Pass 1: wrapped symbols. Pass 2: code patterns.
@@ -907,46 +884,6 @@ mod tests {
         assert_eq!(
             classify_agent_query("who calls authenticate"),
             AgentRoute::Structural
-        );
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    // v0.6 Item 9 — classify_with_llm fallback behaviour
-    // ────────────────────────────────────────────────────────────────────
-
-    /// Stub LLM that always returns FeaturePlanning. Used to assert the
-    /// LLM result wins when the LLM returns Ok.
-    struct ConstClassifier(AgentRoute);
-    impl crate::llm::LlmClassifier for ConstClassifier {
-        fn classify(&self, _query: &str) -> anyhow::Result<AgentRoute> {
-            Ok(self.0)
-        }
-    }
-    /// Stub LLM that always errors. Used to assert keyword fallback.
-    struct ErrClassifier;
-    impl crate::llm::LlmClassifier for ErrClassifier {
-        fn classify(&self, _query: &str) -> anyhow::Result<AgentRoute> {
-            Err(anyhow::anyhow!("model not loaded"))
-        }
-    }
-
-    #[test]
-    fn classify_with_llm_uses_llm_result_when_ok() {
-        let llm = ConstClassifier(AgentRoute::FeaturePlanning);
-        // Query that would normally route to Semantic.
-        assert_eq!(
-            classify_with_llm("authentication middleware", &llm),
-            AgentRoute::FeaturePlanning
-        );
-    }
-
-    #[test]
-    fn classify_with_llm_falls_back_on_error() {
-        let llm = ErrClassifier;
-        // Query that the keyword classifier routes to Deep.
-        assert_eq!(
-            classify_with_llm("how does authentication work?", &llm),
-            AgentRoute::Deep
         );
     }
 }
