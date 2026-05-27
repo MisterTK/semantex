@@ -111,6 +111,7 @@ mod tests {
             fused_count: 28,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         });
 
         let json = serde_json::to_string(&response).unwrap();
@@ -221,6 +222,7 @@ mod tests {
             fused_count: 0,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         });
         let response_line = format!("{}\n", serde_json::to_string(&response).unwrap());
 
@@ -337,6 +339,7 @@ mod tests {
             fused_count: 28,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         });
 
         let encoded = encode_binary_response(&resp);
@@ -540,6 +543,7 @@ mod tests {
             fused_count: 0,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         });
         let bin: BinaryResponse = resp.into();
         assert!(matches!(bin, BinaryResponse::Search(_)));
@@ -612,6 +616,7 @@ mod tests {
             fused_count: 12,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         });
 
         let encoded = encode_binary_response(&resp);
@@ -663,6 +668,7 @@ mod tests {
             fused_count: 0,
             metrics: None,
             confidence: Some("high".to_string()),
+            disambiguation: None,
         });
         let encoded = encode_binary_response(&resp);
         let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
@@ -725,6 +731,7 @@ mod tests {
             fused_count: 0,
             metrics: None,
             confidence: Some(conf.to_string()),
+            disambiguation: None,
         };
 
         let resp = BinaryResponse::MultiSearch(MultiSearchResponse {
@@ -823,6 +830,7 @@ mod tests {
             fused_count: 8,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         });
         let wire_response = encode_binary_response(&server_resp);
 

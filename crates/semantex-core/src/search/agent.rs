@@ -1,14 +1,15 @@
 use super::agent_classifier::{AgentRoute, classify_agent_query, extract_symbol};
 use super::agent_formatter::{
-    DEFAULT_BUDGET, FormatStyle, format_code_blocks, format_deep_results, format_graph_results,
-    format_search_results,
+    DEFAULT_BUDGET, FormatStyle, append_disambiguation_block, format_code_blocks,
+    format_deep_results, format_graph_results, format_search_results,
 };
 use crate::index::architecture::budget_for_chunk_count;
 use crate::search::SearchQuery;
 use crate::search::deep as deep_search_module;
 use crate::search::hybrid::HybridSearcher;
 use crate::server::handler::{
-    compute_confidence, deep_result_to_response, graph_walk_from_store, search_result_to_item,
+    AdaptiveGraphWalk, AdaptiveOptions, compute_confidence, deep_result_to_response,
+    graph_walk_from_store_adaptive, search_result_to_item,
 };
 use crate::server::protocol::{
     AgentMetrics, AgentRequest, AgentResponse, GraphWalkResponse, SearchResponse, SearchResultItem,
@@ -24,6 +25,12 @@ pub(crate) struct HandlerResult {
     formatted: String,
     fallback_used: bool,
     result_count: usize,
+    /// v0.5 Item 6: when the search's top result was `Confidence::Ambiguous`,
+    /// up to 3 runner-up suggestions are surfaced here so `handle()` can
+    /// populate the matching field on `AgentResponse`. `None` when the
+    /// handler did not run a confidence-bearing search or the top result
+    /// was Extracted / Inferred.
+    disambiguation: Option<Vec<crate::server::protocol::DisambigSuggestion>>,
 }
 
 /// Orchestrates agent queries: classify → dispatch → fallback → format.
@@ -86,6 +93,7 @@ impl<'a> AgentPipeline<'a> {
                 fallback_used: result.fallback_used,
                 result_count: result.result_count,
             },
+            disambiguation: result.disambiguation,
         }
     }
 
@@ -99,6 +107,7 @@ impl<'a> AgentPipeline<'a> {
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
+                let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
                 let resp = SearchResponse {
                     results: items,
@@ -108,11 +117,17 @@ impl<'a> AgentPipeline<'a> {
                     fused_count: output.metrics.fused_count,
                     metrics: None,
                     confidence: Some(confidence),
+                    disambiguation: disambig.clone(),
                 };
+                let mut formatted = format_search_results(&resp, FormatStyle::Default, budget);
+                if let Some(suggestions) = &disambig {
+                    append_disambiguation_block(&mut formatted, suggestions);
+                }
                 HandlerResult {
-                    formatted: format_search_results(&resp, FormatStyle::Default, budget),
+                    formatted,
                     fallback_used: is_fallback,
                     result_count: count,
+                    disambiguation: disambig,
                 }
             }
             _ => {
@@ -121,6 +136,7 @@ impl<'a> AgentPipeline<'a> {
                         formatted: format!("No results found for: {query}"),
                         fallback_used: is_fallback,
                         result_count: 0,
+                        disambiguation: None,
                     }
                 } else {
                     // Fallback to deep search
@@ -132,12 +148,14 @@ impl<'a> AgentPipeline<'a> {
                                 formatted: format_deep_results(&resp, budget),
                                 fallback_used: true,
                                 result_count: count,
+                                disambiguation: None,
                             }
                         }
                         _ => HandlerResult {
                             formatted: format!("No results found for: {query}"),
                             fallback_used: is_fallback,
                             result_count: 0,
+                            disambiguation: None,
                         },
                     }
                 }
@@ -154,6 +172,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted: format_deep_results(&resp, budget),
                     fallback_used: is_fallback,
                     result_count: count,
+                    disambiguation: None,
                 }
             }
             _ => {
@@ -162,6 +181,7 @@ impl<'a> AgentPipeline<'a> {
                         formatted: format!("No results found for: {query}"),
                         fallback_used: true,
                         result_count: 0,
+                        disambiguation: None,
                     }
                 } else {
                     self.handle_semantic(query, budget, true)
@@ -182,6 +202,7 @@ impl<'a> AgentPipeline<'a> {
                 .map(|r| search_result_to_item(r, true))
                 .collect();
             let confidence = compute_confidence(&items);
+            let disambig = disambiguation_from_results(&output.results);
             let count = items.len();
             let resp = SearchResponse {
                 results: items,
@@ -191,11 +212,17 @@ impl<'a> AgentPipeline<'a> {
                 fused_count: output.metrics.fused_count,
                 metrics: None,
                 confidence: Some(confidence),
+                disambiguation: disambig.clone(),
             };
+            let mut formatted = format_search_results(&resp, FormatStyle::Default, budget);
+            if let Some(suggestions) = &disambig {
+                append_disambiguation_block(&mut formatted, suggestions);
+            }
             return HandlerResult {
-                formatted: format_search_results(&resp, FormatStyle::Default, budget),
+                formatted,
                 fallback_used: false,
                 result_count: count,
+                disambiguation: disambig,
             };
         }
         // Fallback: grep mode
@@ -216,42 +243,83 @@ impl<'a> AgentPipeline<'a> {
                     fused_count: output.metrics.fused_count,
                     metrics: None,
                     confidence: Some("medium".into()),
+                    disambiguation: None,
                 };
                 HandlerResult {
                     formatted: format_search_results(&resp, FormatStyle::Default, budget),
                     fallback_used: true,
                     result_count: count,
+                    disambiguation: None,
                 }
             }
             _ => HandlerResult {
                 formatted: format!("Symbol not found: {symbol}"),
                 fallback_used: true,
                 result_count: 0,
+                disambiguation: None,
             },
         }
     }
 
+    /// v0.5 Item 7 — adaptive structural walk.
+    ///
+    /// Uses [`AdaptiveOptions::default()`] (min=5, max=50, depth_initial=1).
+    /// When the depth-1 caller / callee list is oversized, the adaptive
+    /// walk replaces it with a per-module summary string surfaced through
+    /// `AdaptiveGraphWalk::*_summary`. When undersized, it walks one level
+    /// deeper and merges. We append the summary text outside
+    /// `format_graph_results` so the existing formatter stays untouched
+    /// (it is owned by W-Gamma per spec §10).
     fn handle_structural(&self, query: &str, budget: usize) -> HandlerResult {
         if let Some(symbol) = extract_symbol(query) {
-            let resp: GraphWalkResponse = self.searcher.with_store(|store| {
-                graph_walk_from_store(store, &symbol).unwrap_or_else(|_| GraphWalkResponse {
-                    target: vec![],
-                    callers: vec![],
-                    callees: vec![],
-                    type_refs: vec![],
-                    hierarchy: vec![],
-                })
+            let walk: AdaptiveGraphWalk = self.searcher.with_store(|store| {
+                graph_walk_from_store_adaptive(store, &symbol, AdaptiveOptions::default())
+                    .unwrap_or_else(|_| AdaptiveGraphWalk {
+                        response: GraphWalkResponse {
+                            target: vec![],
+                            callers: vec![],
+                            callees: vec![],
+                            type_refs: vec![],
+                            hierarchy: vec![],
+                        },
+                        callers_summary: None,
+                        callees_summary: None,
+                    })
             });
+            let resp = &walk.response;
             let total = resp.target.len()
                 + resp.callers.len()
                 + resp.callees.len()
                 + resp.type_refs.len()
-                + resp.hierarchy.len();
+                + resp.hierarchy.len()
+                + usize::from(walk.callers_summary.is_some())
+                + usize::from(walk.callees_summary.is_some());
             if total > 0 {
+                let mut formatted = format_graph_results(resp);
+                // Append collapsed summaries (Item 7): each replaces the
+                // per-item list with one line. Done outside `format_graph_results`
+                // so the W-Gamma-owned formatter stays untouched.
+                if let Some(s) = &walk.callers_summary {
+                    if !formatted.ends_with('\n') {
+                        formatted.push('\n');
+                    }
+                    formatted.push_str("\nCallers (collapsed):\n  ");
+                    formatted.push_str(s);
+                    formatted.push('\n');
+                }
+                if let Some(s) = &walk.callees_summary {
+                    if !formatted.ends_with('\n') {
+                        formatted.push('\n');
+                    }
+                    formatted.push_str("\nCallees (collapsed):\n  ");
+                    formatted.push_str(s);
+                    formatted.push('\n');
+                }
                 return HandlerResult {
-                    formatted: format_graph_results(&resp),
+                    formatted,
                     fallback_used: false,
                     result_count: total,
+                    disambiguation: None,
                 };
             }
         }
@@ -268,20 +336,25 @@ impl<'a> AgentPipeline<'a> {
                     .iter()
                     .map(|r| search_result_to_item(r, true))
                     .collect();
+                let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
                 if full_code {
                     let code_contents: Vec<String> = items
                         .iter()
                         .map(|i| i.content.clone().unwrap_or_default())
                         .collect();
-                    let formatted = format_code_blocks(&items, &code_contents, budget);
+                    let mut formatted = format_code_blocks(&items, &code_contents, budget);
                     if formatted == "No code blocks to display." {
                         return self.handle_deep(query, budget, true);
+                    }
+                    if let Some(suggestions) = &disambig {
+                        append_disambiguation_block(&mut formatted, suggestions);
                     }
                     HandlerResult {
                         formatted,
                         fallback_used: false,
                         result_count: count,
+                        disambiguation: disambig,
                     }
                 } else {
                     let confidence = compute_confidence(&items);
@@ -293,11 +366,17 @@ impl<'a> AgentPipeline<'a> {
                         fused_count: output.metrics.fused_count,
                         metrics: None,
                         confidence: Some(confidence),
+                        disambiguation: disambig.clone(),
                     };
+                    let mut formatted = format_search_results(&resp, FormatStyle::Default, budget);
+                    if let Some(suggestions) = &disambig {
+                        append_disambiguation_block(&mut formatted, suggestions);
+                    }
                     HandlerResult {
-                        formatted: format_search_results(&resp, FormatStyle::Default, budget),
+                        formatted,
                         fallback_used: false,
                         result_count: count,
+                        disambiguation: disambig,
                     }
                 }
             }
@@ -318,6 +397,7 @@ impl<'a> AgentPipeline<'a> {
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
+                let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
                 let resp = SearchResponse {
                     results: items,
@@ -327,15 +407,18 @@ impl<'a> AgentPipeline<'a> {
                     fused_count: output.metrics.fused_count,
                     metrics: None,
                     confidence: Some(confidence),
+                    disambiguation: disambig.clone(),
                 };
+                let mut formatted =
+                    format_search_results(&resp, FormatStyle::Default, exhaustive_budget);
+                if let Some(suggestions) = &disambig {
+                    append_disambiguation_block(&mut formatted, suggestions);
+                }
                 HandlerResult {
-                    formatted: format_search_results(
-                        &resp,
-                        FormatStyle::Default,
-                        exhaustive_budget,
-                    ),
+                    formatted,
                     fallback_used: false,
                     result_count: count,
+                    disambiguation: disambig,
                 }
             }
             _ => self.handle_deep(query, exhaustive_budget, true),
@@ -368,11 +451,13 @@ impl<'a> AgentPipeline<'a> {
             fused_count,
             metrics: None,
             confidence: None,
+            disambiguation: None,
         };
         HandlerResult {
             formatted: format_search_results(&resp, FormatStyle::Grep, budget),
             fallback_used: false,
             result_count: items.len(),
+            disambiguation: None,
         }
     }
 
@@ -498,6 +583,7 @@ impl<'a> AgentPipeline<'a> {
             formatted: out,
             fallback_used: false,
             result_count: total,
+            disambiguation: None,
         }
     }
 
@@ -527,6 +613,7 @@ impl<'a> AgentPipeline<'a> {
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let confidence = compute_confidence(&items);
+                let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
                 let resp = SearchResponse {
                     results: items,
@@ -536,15 +623,18 @@ impl<'a> AgentPipeline<'a> {
                     fused_count: output.metrics.fused_count,
                     metrics: None,
                     confidence: Some(confidence),
+                    disambiguation: disambig.clone(),
                 };
+                let mut formatted =
+                    format_search_results(&resp, FormatStyle::Default, exhaustive_budget);
+                if let Some(suggestions) = &disambig {
+                    append_disambiguation_block(&mut formatted, suggestions);
+                }
                 HandlerResult {
-                    formatted: format_search_results(
-                        &resp,
-                        FormatStyle::Default,
-                        exhaustive_budget,
-                    ),
+                    formatted,
                     fallback_used: false,
                     result_count: count,
+                    disambiguation: disambig,
                 }
             }
             _ => self.handle_exhaustive(query, budget),
@@ -644,8 +734,67 @@ impl<'a> AgentPipeline<'a> {
             formatted: enriched,
             fallback_used: false,
             result_count: deep_result.result_count + added,
+            disambiguation: None,
         }
     }
+}
+
+// --- v0.5 Item 6: confidence-driven disambiguation suggestions -------------
+
+/// Max number of runner-up entries surfaced in the disambiguation block.
+/// Per spec §5 Item 6 — bounded at 3.
+const DISAMBIG_MAX_SUGGESTIONS: usize = 3;
+
+/// Compute disambiguation suggestions for the agent's top result.
+///
+/// Returns `Some(Vec<DisambigSuggestion>)` with up to
+/// `DISAMBIG_MAX_SUGGESTIONS` runner-up entries iff `results[0].confidence`
+/// is `Confidence::Ambiguous`. Otherwise returns `None`.
+///
+/// Suggestion selection rules:
+/// - Skip the top result itself (index 0).
+/// - Skip any candidate whose symbol name matches an already-included
+///   suggestion (or the top result's name) — runners-up with the same
+///   name as the top result wouldn't help refine the query.
+/// - Skip candidates without a symbol name (TextWindow / PdfPage chunks
+///   can't be referenced by name in a refined query).
+/// - Bound to `DISAMBIG_MAX_SUGGESTIONS` entries.
+pub(crate) fn disambiguation_from_results(
+    results: &[crate::types::SearchResult],
+) -> Option<Vec<crate::server::protocol::DisambigSuggestion>> {
+    use crate::server::protocol::DisambigSuggestion;
+    use crate::types::Confidence;
+
+    let top = results.first()?;
+    if top.confidence != Confidence::Ambiguous {
+        return None;
+    }
+
+    let mut seen_names: Vec<String> = Vec::with_capacity(DISAMBIG_MAX_SUGGESTIONS + 1);
+    if let Some(name) = top.chunk.symbol_name() {
+        seen_names.push(name.to_string());
+    }
+
+    let mut out: Vec<DisambigSuggestion> = Vec::with_capacity(DISAMBIG_MAX_SUGGESTIONS);
+    for r in results.iter().skip(1) {
+        if out.len() >= DISAMBIG_MAX_SUGGESTIONS {
+            break;
+        }
+        let Some(name) = r.chunk.symbol_name() else {
+            continue;
+        };
+        if seen_names.iter().any(|n| n == name) {
+            continue;
+        }
+        seen_names.push(name.to_string());
+        out.push(DisambigSuggestion {
+            name: name.to_string(),
+            path: r.chunk.file_path.display().to_string(),
+            line: r.chunk.start_line as usize,
+        });
+    }
+
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Adaptive pattern × example caps for `handle_deep_with_examples`.
@@ -722,6 +871,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
             formatted: format!("Invalid glob pattern: {pattern}"),
             fallback_used: false,
             result_count: 0,
+            disambiguation: None,
         };
     };
 
@@ -767,6 +917,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
         formatted: lines.join("\n"),
         fallback_used: false,
         result_count: total,
+        disambiguation: None,
     }
 }
 
@@ -873,5 +1024,201 @@ mod tests {
         // Even with plenty of sources, a zero budget disables enrichment.
         let l = deep_examples_limits(0);
         assert!(!should_enrich_with_examples(50, &l));
+    }
+}
+
+// --- v0.5 Item 6: disambiguation suggestion tests --------------------------
+
+#[cfg(test)]
+mod disambig_tests {
+    use super::*;
+    use crate::types::{AstNodeKind, Chunk, ChunkType, Confidence, SearchResult, SearchSource};
+    use std::path::PathBuf;
+
+    /// Build a synthetic AST-node SearchResult with the given name, file,
+    /// line, score, and per-result confidence.
+    fn mk_result(
+        name: &str,
+        file: &str,
+        line: u32,
+        score: f32,
+        confidence: Confidence,
+    ) -> SearchResult {
+        SearchResult {
+            chunk: Chunk {
+                id: 0,
+                file_path: PathBuf::from(file),
+                start_line: line,
+                end_line: line + 10,
+                content: format!("fn {name}() {{}}"),
+                chunk_type: ChunkType::AstNode {
+                    name: name.into(),
+                    kind: AstNodeKind::Function,
+                    language: "rust".into(),
+                    structured_meta: None,
+                },
+            },
+            score,
+            source: SearchSource::Hybrid,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
+            confidence,
+            confidence_score: 0.5,
+        }
+    }
+
+    /// Spec §5 Item 6: synthetic SearchResult with Ambiguous top result
+    /// produces up to 3 disambiguation entries.
+    #[test]
+    fn ambiguous_top_produces_three_suggestions() {
+        let results = vec![
+            mk_result(
+                "userAuthHandler",
+                "auth/users.rs",
+                42,
+                0.92,
+                Confidence::Ambiguous,
+            ),
+            mk_result(
+                "tokenAuthHandler",
+                "auth/tokens.rs",
+                18,
+                0.91,
+                Confidence::Inferred,
+            ),
+            mk_result(
+                "sessionAuth",
+                "sessions/handler.rs",
+                107,
+                0.90,
+                Confidence::Inferred,
+            ),
+            mk_result(
+                "authMiddleware",
+                "api/middleware.rs",
+                12,
+                0.88,
+                Confidence::Inferred,
+            ),
+        ];
+
+        let disambig = disambiguation_from_results(&results).expect("must populate");
+        assert_eq!(disambig.len(), 3);
+        assert_eq!(disambig[0].name, "tokenAuthHandler");
+        assert_eq!(disambig[0].path, "auth/tokens.rs");
+        assert_eq!(disambig[0].line, 18);
+        assert_eq!(disambig[1].name, "sessionAuth");
+        assert_eq!(disambig[2].name, "authMiddleware");
+    }
+
+    /// Spec §5 Item 6: when top result is Extracted (not Ambiguous),
+    /// disambiguation is None and formatted output contains no
+    /// disambiguation block.
+    #[test]
+    fn extracted_top_produces_no_suggestions() {
+        let results = vec![
+            mk_result(
+                "authHandler",
+                "auth/main.rs",
+                1,
+                0.99,
+                Confidence::Extracted,
+            ),
+            mk_result(
+                "tokenAuthHandler",
+                "auth/tokens.rs",
+                18,
+                0.50,
+                Confidence::Inferred,
+            ),
+            mk_result(
+                "sessionAuth",
+                "sessions/handler.rs",
+                107,
+                0.40,
+                Confidence::Inferred,
+            ),
+        ];
+
+        let disambig = disambiguation_from_results(&results);
+        assert!(
+            disambig.is_none(),
+            "Extracted top must not populate disambig"
+        );
+    }
+
+    /// Spec §5 Item 6: when top is Inferred (also not Ambiguous), no
+    /// suggestions either.
+    #[test]
+    fn inferred_top_produces_no_suggestions() {
+        let results = vec![mk_result(
+            "lonely",
+            "src/m.rs",
+            1,
+            0.5,
+            Confidence::Inferred,
+        )];
+        assert!(disambiguation_from_results(&results).is_none());
+    }
+
+    /// Spec §5 Item 6: dedup by name — a runner-up that shares a name
+    /// with the top (e.g. polymorphic same-named symbol in two files) is
+    /// skipped, since refining by that name wouldn't disambiguate.
+    #[test]
+    fn runners_up_with_duplicate_names_are_skipped() {
+        let results = vec![
+            mk_result("commonName", "a/x.rs", 10, 0.92, Confidence::Ambiguous),
+            // duplicate name as top → skip
+            mk_result("commonName", "b/x.rs", 20, 0.91, Confidence::Inferred),
+            // duplicate name as the next pick → skip second instance
+            mk_result("uniqueName", "c/x.rs", 30, 0.90, Confidence::Inferred),
+            mk_result("uniqueName", "d/x.rs", 40, 0.89, Confidence::Inferred),
+            mk_result("otherName", "e/x.rs", 50, 0.88, Confidence::Inferred),
+        ];
+
+        let disambig = disambiguation_from_results(&results).expect("must populate");
+        assert_eq!(disambig.len(), 2);
+        assert_eq!(disambig[0].name, "uniqueName");
+        assert_eq!(disambig[0].path, "c/x.rs");
+        assert_eq!(disambig[1].name, "otherName");
+    }
+
+    /// Empty results → None (caller is responsible for not calling on
+    /// empties, but the helper is safe).
+    #[test]
+    fn empty_results_produce_no_suggestions() {
+        assert!(disambiguation_from_results(&[]).is_none());
+    }
+
+    /// Spec §5 Item 6: runners-up that are TextWindow chunks (no
+    /// symbol name) are skipped — agents can't refine by a missing name.
+    #[test]
+    fn runners_up_without_symbol_names_are_skipped() {
+        let no_name_result = SearchResult {
+            chunk: Chunk {
+                id: 0,
+                file_path: PathBuf::from("text.md"),
+                start_line: 1,
+                end_line: 1,
+                content: "lorem ipsum".into(),
+                chunk_type: ChunkType::TextWindow { window_index: 0 },
+            },
+            score: 0.91,
+            source: SearchSource::Sparse,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
+            confidence: Confidence::Inferred,
+            confidence_score: 0.5,
+        };
+        let results = vec![
+            mk_result("topResult", "a/x.rs", 1, 0.92, Confidence::Ambiguous),
+            no_name_result,
+            mk_result("realRunner", "b/x.rs", 30, 0.89, Confidence::Inferred),
+        ];
+        let disambig = disambiguation_from_results(&results).expect("must populate");
+        assert_eq!(disambig.len(), 1);
+        assert_eq!(disambig[0].name, "realRunner");
     }
 }

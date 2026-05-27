@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// A JSON message always starts with '{' (0x7b), so 0x00 is unambiguous.
 pub const BINARY_MAGIC: u8 = 0x00;
 
-/// Daemon binary-protocol version (v0.4.1 W-Index #2).
+/// Daemon binary-protocol version (v0.4.1 W-Index #2, bumped in v0.5 W-Delta Item 6).
 ///
 /// Encoded as the second byte of every binary frame, immediately after
 /// `BINARY_MAGIC`. A client and daemon that disagree on this byte refuse to
@@ -16,7 +16,17 @@ pub const BINARY_MAGIC: u8 = 0x00;
 /// `BinaryResponse` tag set, or any non-self-describing postcard schema in
 /// those types changes. Postcard does not encode field/type tags, so silent
 /// drift is a real risk and the version byte is the cheapest way to catch it.
-pub const BINARY_PROTOCOL_VERSION: u8 = 1;
+///
+/// v2 (v0.5): adds `disambiguation: Option<Vec<DisambigSuggestion>>` to
+/// `SearchResponse` and `AgentResponse` (Item 6). Postcard is a non-self-
+/// describing format — `#[serde(default)]` does NOT default missing
+/// trailing fields, so a v1 client decoding a v2 daemon response (or
+/// vice-versa) would hit `DeserializeUnexpectedEnd` rather than
+/// gracefully back-filling `None`. The version byte forces a clean
+/// `BinaryFrameError::UnsupportedVersion` instead. Users must restart
+/// the daemon after upgrading from a v0.4.x build (same UX as the v0.4
+/// bincode→postcard cutover).
+pub const BINARY_PROTOCOL_VERSION: u8 = 2;
 
 /// Error type returned by binary decode when the framing is malformed.
 ///
@@ -197,6 +207,31 @@ pub struct SearchResponse {
     /// Based on top result score and score gap to second result.
     #[serde(default)]
     pub confidence: Option<String>,
+    /// v0.5 Item 6: when the top result's per-result confidence is
+    /// `Confidence::Ambiguous`, up to 3 runner-up suggestions are surfaced
+    /// here so the agent can refine without a fresh full search. `None`
+    /// otherwise. Wire-protocol bump v1→v2 covers this new field.
+    ///
+    /// NOTE: `#[serde(default)]` only — do NOT add
+    /// `skip_serializing_if = "Option::is_none"`. Postcard is a
+    /// non-self-describing format and `skip_serializing_if` makes the
+    /// encoded payload one byte shorter than the schema, producing
+    /// `DeserializeUnexpectedEnd` on the decode side.
+    #[serde(default)]
+    pub disambiguation: Option<Vec<DisambigSuggestion>>,
+}
+
+/// v0.5 Item 6 — a runner-up suggestion surfaced when the top result is
+/// `Confidence::Ambiguous`. Minimal shape: just enough for an agent to
+/// re-issue a refined query without a fresh round trip.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct DisambigSuggestion {
+    /// Display name of the candidate result (e.g. function/struct/method name).
+    pub name: String,
+    /// Project-relative file path the candidate lives in.
+    pub path: String,
+    /// Start line of the candidate chunk in its file.
+    pub line: usize,
 }
 
 /// A single result item in the response
@@ -438,6 +473,17 @@ pub struct AgentResponse {
     pub route: AgentRoute,
     pub formatted: String,
     pub metrics: AgentMetrics,
+    /// v0.5 Item 6: same semantics as `SearchResponse::disambiguation` — when
+    /// the underlying top result was `Confidence::Ambiguous`, up to 3
+    /// runner-up suggestions surface here for programmatic consumers. The
+    /// formatted text already contains the rendered block; this field is
+    /// for clients that want the structured form.
+    ///
+    /// NOTE: `#[serde(default)]` only — see the comment on
+    /// `SearchResponse::disambiguation` for the rationale (postcard +
+    /// `skip_serializing_if` together produce `DeserializeUnexpectedEnd`).
+    #[serde(default)]
+    pub disambiguation: Option<Vec<DisambigSuggestion>>,
 }
 
 /// Performance metrics for agent queries.
@@ -491,6 +537,7 @@ mod agent_protocol_tests {
                 fallback_used: false,
                 result_count: 3,
             },
+            disambiguation: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: AgentResponse = serde_json::from_str(&json).unwrap();
@@ -574,5 +621,89 @@ mod agent_protocol_tests {
                 got: 0
             }
         ));
+    }
+
+    // --- v0.5 Item 6: protocol version bump 1→2 ----------------------------
+
+    /// v0.5 Item 6 (per W-Delta dispatch + coordinator Option A): a v1
+    /// `SearchResponse` payload that lacks the new `disambiguation` field
+    /// must be rejected by the v2 decoder with `UnsupportedVersion`, NOT
+    /// with `Decode(DeserializeUnexpectedEnd)`. The point of bumping
+    /// `BINARY_PROTOCOL_VERSION` from 1 to 2 is that the framing layer
+    /// catches the schema drift cleanly rather than the postcard
+    /// deserializer producing a silent mis-decode or a confusing EOF.
+    #[test]
+    fn decode_v1_response_as_v2_rejected_cleanly() {
+        // Build a v1-shaped wire body. We can't construct a v1
+        // `SearchResponse` literal anymore (the struct gained
+        // `disambiguation`), so synthesize the v1 byte sequence by hand
+        // using the postcard wire format. Frame body = [V=1][postcard].
+        //
+        // Easier: serialize a v2-shaped Health response (no payload
+        // change) but with version byte set to 1. The decode path
+        // shouldn't even get to postcard.
+        let postcard_payload = postcard::to_stdvec(&BinaryResponse::Health(HealthResponse {
+            status: "ok".into(),
+            uptime_s: 0,
+            searches: 0,
+        }))
+        .unwrap();
+        let mut v1_body = vec![1u8]; // legacy version byte
+        v1_body.extend_from_slice(&postcard_payload);
+
+        let err = decode_binary_response(&v1_body).expect_err("must reject v1 frame under v2");
+        match err {
+            BinaryFrameError::UnsupportedVersion { expected, got } => {
+                assert_eq!(expected, BINARY_PROTOCOL_VERSION);
+                assert_eq!(expected, 2, "v0.5 Item 6 raised protocol version to 2");
+                assert_eq!(got, 1, "v1 client/daemon payload should be flagged as v1");
+            }
+            BinaryFrameError::Decode(e) => {
+                panic!("v1 frame must surface as UnsupportedVersion, not silent decode error: {e}")
+            }
+        }
+    }
+
+    /// Symmetric check on the request side — a v1 request payload from an
+    /// old client should never be mis-decoded by the v2 daemon.
+    #[test]
+    fn decode_v1_request_as_v2_rejected_cleanly() {
+        let postcard_payload = postcard::to_stdvec(&BinaryRequest::Health).unwrap();
+        let mut v1_body = vec![1u8];
+        v1_body.extend_from_slice(&postcard_payload);
+
+        let err = decode_binary_request(&v1_body).expect_err("must reject v1 frame under v2");
+        assert!(matches!(
+            err,
+            BinaryFrameError::UnsupportedVersion {
+                expected: 2,
+                got: 1
+            }
+        ));
+    }
+
+    /// v0.5 Item 6 protocol bump sanity: the constant is at the post-bump
+    /// value so a future accidental revert lights this test up.
+    #[test]
+    fn protocol_version_is_v2_per_item_6() {
+        assert_eq!(BINARY_PROTOCOL_VERSION, 2);
+    }
+
+    /// `DisambigSuggestion` round-trips through JSON and postcard.
+    #[test]
+    fn disambig_suggestion_roundtrips() {
+        let s = DisambigSuggestion {
+            name: "userAuthHandler".into(),
+            path: "auth/users.rs".into(),
+            line: 42,
+        };
+        // JSON
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: DisambigSuggestion = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, s);
+        // Postcard (the wire format)
+        let bytes = postcard::to_stdvec(&s).unwrap();
+        let decoded: DisambigSuggestion = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, s);
     }
 }

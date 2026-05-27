@@ -1,5 +1,5 @@
 use crate::server::protocol::{
-    DeepSearchResponse, GraphWalkResponse, SearchResponse, SearchResultItem,
+    DeepSearchResponse, DisambigSuggestion, GraphWalkResponse, SearchResponse, SearchResultItem,
 };
 use std::fmt::Write as _;
 
@@ -298,6 +298,48 @@ pub fn format_code_blocks(
     out
 }
 
+/// v0.5 Item 6: append a disambiguation block to an already-rendered
+/// agent / search response.
+///
+/// Per spec §5 Item 6, the block lists up to 3 runner-up suggestions and
+/// references the actual number of candidates surfaced (the spec's "4
+/// distinct concepts" phrasing is illustrative — we substitute the real
+/// `suggestions.len()`). Format:
+///
+/// ```text
+/// [uncertainty: this query matches N distinct concepts. Refine with:]
+/// - "userAuthHandler" (auth/users.rs:42)
+/// - "tokenAuthHandler" (auth/tokens.rs:18)
+/// - "sessionAuth" (sessions/handler.rs:107)
+/// ```
+///
+/// Renders to the end of `out` separated by a blank line. No-ops on an
+/// empty `suggestions` slice (the caller is expected to gate on
+/// `disambiguation.is_some()`, but the no-op safety is cheap).
+///
+/// New helper introduced by W-Delta per spec §10 / §11 — does NOT touch
+/// `format_search_results` / `format_deep_results` / `format_graph_results`
+/// (those are W-Gamma territory).
+pub fn append_disambiguation_block(out: &mut String, suggestions: &[DisambigSuggestion]) {
+    if suggestions.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "[uncertainty: this query matches {} distinct concepts. Refine with:]",
+        suggestions.len()
+    );
+    for s in suggestions {
+        let _ = writeln!(out, "- \"{}\" ({}:{})", s.name, s.path, s.line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +385,7 @@ mod tests {
             fused_count: 10,
             metrics: None,
             confidence: Some("high".into()),
+            disambiguation: None,
         };
         let out = format_search_results(&resp, FormatStyle::Default, DEFAULT_BUDGET);
         assert!(out.contains("src/auth.rs:10-20"));
@@ -362,6 +405,7 @@ mod tests {
             fused_count: 1,
             metrics: None,
             confidence: Some("medium".into()),
+            disambiguation: None,
         };
         let out = format_search_results(&resp, FormatStyle::Grep, DEFAULT_BUDGET);
         assert!(out.contains("src/auth.rs:42:"));
@@ -378,6 +422,7 @@ mod tests {
             fused_count: 0,
             metrics: None,
             confidence: Some("none".into()),
+            disambiguation: None,
         };
         assert_eq!(
             format_search_results(&resp, FormatStyle::Default, DEFAULT_BUDGET),
@@ -468,6 +513,7 @@ mod tests {
             fused_count: 20,
             metrics: None,
             confidence: Some("high".into()),
+            disambiguation: None,
         };
         let out = format_search_results(&resp, FormatStyle::Default, 500);
         assert!(out.contains("more results"));
@@ -545,5 +591,76 @@ mod tests {
         let out = format_code_blocks(&results, &code, 6000);
         let block_count = out.matches("###").count();
         assert!((1..=4).contains(&block_count));
+    }
+
+    // --- v0.5 Item 6 ----------------------------------------------------
+
+    /// Spec §5 Item 6: rendered block contains the header with actual
+    /// count, and one bullet per suggestion in the spec-required format.
+    #[test]
+    fn append_disambiguation_block_renders_three_entries() {
+        let mut out = String::from("preceding output");
+        let suggestions = vec![
+            DisambigSuggestion {
+                name: "userAuthHandler".into(),
+                path: "auth/users.rs".into(),
+                line: 42,
+            },
+            DisambigSuggestion {
+                name: "tokenAuthHandler".into(),
+                path: "auth/tokens.rs".into(),
+                line: 18,
+            },
+            DisambigSuggestion {
+                name: "sessionAuth".into(),
+                path: "sessions/handler.rs".into(),
+                line: 107,
+            },
+        ];
+        append_disambiguation_block(&mut out, &suggestions);
+        // Header substitutes the actual count.
+        assert!(
+            out.contains("[uncertainty: this query matches 3 distinct concepts. Refine with:]"),
+            "out: {out}"
+        );
+        // One bullet per entry in the spec format.
+        assert!(
+            out.contains("- \"userAuthHandler\" (auth/users.rs:42)"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("- \"tokenAuthHandler\" (auth/tokens.rs:18)"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("- \"sessionAuth\" (sessions/handler.rs:107)"),
+            "out: {out}"
+        );
+        // Preceding content preserved.
+        assert!(out.starts_with("preceding output"), "out: {out}");
+    }
+
+    /// Empty suggestions → no-op (formatter never emits a stray header).
+    #[test]
+    fn append_disambiguation_block_noop_on_empty_input() {
+        let mut out = String::from("existing");
+        append_disambiguation_block(&mut out, &[]);
+        assert_eq!(out, "existing");
+    }
+
+    /// Single suggestion renders with count "1" and one bullet.
+    #[test]
+    fn append_disambiguation_block_handles_single_entry() {
+        let mut out = String::new();
+        append_disambiguation_block(
+            &mut out,
+            &[DisambigSuggestion {
+                name: "only".into(),
+                path: "p.rs".into(),
+                line: 1,
+            }],
+        );
+        assert!(out.contains("matches 1 distinct concepts"), "out: {out}");
+        assert!(out.contains("- \"only\" (p.rs:1)"), "out: {out}");
     }
 }

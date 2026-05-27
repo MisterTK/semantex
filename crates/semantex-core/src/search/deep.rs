@@ -35,6 +35,16 @@ pub struct DeepSource {
     pub end_line: u32,
     pub name: Option<String>,
     pub kind: Option<String>,
+    /// Item 8 (cross-source dedup): channel labels of duplicate entries that
+    /// pointed at the same `(file, start_line, end_line)` and were collapsed
+    /// into this kept entry. Populated only when at least one duplicate was
+    /// dropped; empty otherwise.
+    ///
+    /// The wire-format `DeepSearchResponse` (in `server/protocol.rs`) does not
+    /// carry this field — surfacing to the agent happens through a textual
+    /// footer appended to `DeepResult::answer`. See `dedup_by_range` and
+    /// `append_dedup_footer` below.
+    pub also_matched_via: Vec<String>,
 }
 
 /// Per-phase timing and count metrics for a deep search invocation.
@@ -130,18 +140,25 @@ fn kind_matches_preference(kind: Option<&str>, pref: PreferredKind) -> bool {
     }
 }
 
-/// Triage search results: deduplicate, enforce per-file caps, apply preference boosts.
+/// Pass-1 scorer used by `triage_results`. Computed inline here so the rescue pass
+/// (Item 5; see `docs/DEEP-AUDIT-2026-05.md`) can re-invoke it with `apply_noise_floor=false`.
 ///
-/// Returns indices into `results` for the selected chunks (preserving original order).
-fn triage_results(
+/// Always-applied filters:
+/// - TextWindow chunks scoring < 0.1 are skipped (unrelated to noise-floor calibration).
+///
+/// Conditionally-applied filter (`apply_noise_floor=true`):
+/// - Chunks whose normalized score (raw / `max_possible`) falls below
+///   `CONFIDENCE_NOISE_FLOOR` are dropped. The rescue pass disables this filter
+///   when the first pass returned nothing.
+///
+/// Returns `(idx_in_results, adjusted_score, file_str, start_line, end_line)` tuples.
+fn score_triage_candidates(
     query: &str,
+    pref: PreferredKind,
     results: &[SearchResult],
-    max_chunks: usize,
     max_possible: f32,
-) -> Vec<usize> {
-    let pref = classify_query_preference(query);
-
-    // Pass 1: Compute adjusted scores for all candidates.
+    apply_noise_floor: bool,
+) -> Vec<(usize, f32, String, u32, u32)> {
     let mut scored: Vec<(usize, f32, String, u32, u32)> = Vec::new();
 
     for (idx, result) in results.iter().enumerate() {
@@ -149,13 +166,14 @@ fn triage_results(
         let start = result.chunk.start_line;
         let end = result.chunk.end_line;
 
-        // Skip very low-scoring text windows.
+        // Skip very low-scoring text windows (always — TextWindow ranking is unrelated
+        // to the noise-floor calibration issue documented in DEEP-AUDIT-2026-05.md §3).
         if matches!(result.chunk.chunk_type, ChunkType::TextWindow { .. }) && result.score < 0.1 {
             continue;
         }
 
-        // Skip chunks below the noise floor (normalized score).
-        if max_possible > 0.0 {
+        // Skip chunks below the noise floor (normalized score). Bypassed on the rescue pass.
+        if apply_noise_floor && max_possible > 0.0 {
             let normalized = result.score / max_possible;
             if normalized < CONFIDENCE_NOISE_FLOOR {
                 continue;
@@ -192,6 +210,37 @@ fn triage_results(
         let adjusted_score = result.score + kind_boost + docstring_boost + consensus_bonus;
 
         scored.push((idx, adjusted_score, file, start, end));
+    }
+
+    scored
+}
+
+/// Triage search results: deduplicate, enforce per-file caps, apply preference boosts.
+///
+/// Returns indices into `results` for the selected chunks (preserving original order).
+fn triage_results(
+    query: &str,
+    results: &[SearchResult],
+    max_chunks: usize,
+    max_possible: f32,
+) -> Vec<usize> {
+    let pref = classify_query_preference(query);
+
+    let mut scored = score_triage_candidates(query, pref, results, max_possible, true);
+
+    // Item 5 rescue pass: when the noise floor filtered out every candidate but the
+    // hybrid search did return results, redo Pass 1 with the floor disabled. This is
+    // a measurable, surgical change: behavior is bit-identical in cases where the
+    // first pass produced at least one candidate; only the all-zero case is rescued.
+    //
+    // Justification: in small or focused repos on diffuse cross-cutting queries,
+    // fused scores cluster below `CONFIDENCE_NOISE_FLOOR * max_possible`, which made
+    // `semantex_deep` return "No relevant code found" for queries that hybrid search
+    // actually had candidates for (see `docs/DEEP-AUDIT-2026-05.md`). The downstream
+    // per-file cap, overlap dedup, and `max_chunks` cap still bound output size, and
+    // the low-confidence warning in `deep_search_inner` still fires for these results.
+    if scored.is_empty() && !results.is_empty() {
+        scored = score_triage_candidates(query, pref, results, max_possible, false);
     }
 
     // Sort by adjusted score descending.
@@ -241,6 +290,148 @@ fn triage_results(
     // Return indices in original result order (stable for downstream consumers).
     indices.sort_unstable();
     indices
+}
+
+/// Item 8 (cross-source dedup): a triage-selected result plus the channel labels
+/// of any duplicate entries (same `(file, start_line, end_line)` tuple) collapsed
+/// into it. `also_matched_via` is empty when no duplicates were dropped.
+#[derive(Debug, Clone)]
+struct DedupedSelection<'a> {
+    result: &'a SearchResult,
+    also_matched_via: Vec<String>,
+}
+
+/// Channel label string for a `SearchResult` — derived from which per-channel
+/// scores are non-zero. The label format is e.g. `"dense"`, `"sparse+exact"`.
+///
+/// Used by `dedup_by_range` to aggregate the channels of dropped duplicate entries.
+fn channels_label(result: &SearchResult) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if result.score_dense > 0.0 {
+        parts.push("dense");
+    }
+    if result.score_sparse > 0.0 {
+        parts.push("sparse");
+    }
+    if result.score_exact > 0.0 {
+        parts.push("exact");
+    }
+    if parts.is_empty() {
+        // Fall back to the result's source enum when no per-channel score is set
+        // (older SearchResults pre-Cardinal commit may lack per-channel scores).
+        format!("{:?}", result.source).to_lowercase()
+    } else {
+        parts.join("+")
+    }
+}
+
+/// Item 8: dedup selected results by `(file_path, start_line, end_line)`.
+///
+/// For each group of duplicates: keeps the entry with the highest `result.score`,
+/// aggregates the channel labels of the dropped entries into the kept entry's
+/// `also_matched_via` (deduplicated, sorted, max 4 entries to bound footer size).
+///
+/// The order of kept entries follows the order of the FIRST appearance of each
+/// `(file, start, end)` key in `selected` — this preserves the score-descending
+/// order triage already imposed.
+///
+/// Operates on selected_results only (post-triage). Graph-expanded chunks have
+/// no SearchResult context, so they're handled separately downstream.
+fn dedup_by_range<'a>(selected: &[&'a SearchResult]) -> Vec<DedupedSelection<'a>> {
+    use std::collections::HashMap;
+
+    // Cap the number of labels we surface per kept entry — keeps the answer
+    // footer bounded even if a pathological query produces dozens of duplicates.
+    // The channel-label vocabulary is only 4 unique values (dense / sparse /
+    // exact / their `+`-joined combos + the "hybrid" fallback), so this cap is
+    // a defensive limit, not a hot truncation point.
+    const MAX_LABELS: usize = 4;
+
+    let mut order: Vec<(String, u32, u32)> = Vec::new();
+    // key → (best_index_into_selected, set of channel labels from dropped duplicates)
+    let mut by_key: HashMap<(String, u32, u32), (usize, Vec<String>)> = HashMap::new();
+
+    for (idx, result) in selected.iter().enumerate() {
+        let key = (
+            result.chunk.file_path.display().to_string(),
+            result.chunk.start_line,
+            result.chunk.end_line,
+        );
+        if let Some(entry) = by_key.get_mut(&key) {
+            // Compare scores; keep the higher one, push the lower one's channel
+            // label into also_matched_via.
+            let (best_idx, ref mut also) = *entry;
+            let best_score = selected[best_idx].score;
+            let this_score = result.score;
+            if this_score > best_score {
+                also.push(channels_label(selected[best_idx]));
+                *entry = (idx, std::mem::take(also));
+            } else {
+                also.push(channels_label(result));
+            }
+        } else {
+            order.push(key.clone());
+            by_key.insert(key, (idx, Vec::new()));
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|key| {
+            let (best_idx, mut also) = by_key.remove(&key).expect("key inserted above");
+            // Dedup + sort + cap the labels for stable, bounded footer output.
+            also.sort();
+            also.dedup();
+            also.truncate(MAX_LABELS);
+            DedupedSelection {
+                result: selected[best_idx],
+                also_matched_via: also,
+            }
+        })
+        .collect()
+}
+
+/// Item 8: append a textual footer to the deep answer listing any sources that
+/// absorbed cross-source duplicates. The footer is the agent-facing surface for
+/// `DeepSource::also_matched_via`, since the wire-format `DeepSearchResponse`
+/// (in `server/protocol.rs`, owned by W-Delta) does not carry this field.
+///
+/// Returns the input `answer` unchanged when no source has duplicates.
+fn append_dedup_footer(answer: String, sources: &[DeepSource]) -> String {
+    use std::fmt::Write as _;
+
+    let lines: Vec<String> = sources
+        .iter()
+        .filter(|s| !s.also_matched_via.is_empty())
+        .map(|s| {
+            let mut line = format!("- {}:{}-{}", s.file, s.start_line, s.end_line);
+            if let Some(name) = &s.name {
+                line.push(' ');
+                line.push_str(name);
+            }
+            let _ = write!(
+                line,
+                " (also matched via: {})",
+                s.also_matched_via.join(", ")
+            );
+            line
+        })
+        .collect();
+
+    if lines.is_empty() {
+        return answer;
+    }
+
+    let mut out = answer;
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str("Cross-source dedup:");
+    for line in &lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
 }
 
 /// Expand the selected chunk set via graph edges.
@@ -490,6 +681,7 @@ fn try_symbol_shortcut(
                 end_line: chunk.end_line,
                 name,
                 kind,
+                also_matched_via: Vec::new(),
             }
         })
         .collect();
@@ -746,6 +938,32 @@ fn deep_search_inner(
         .collect();
     metrics.triage_ms = triage_start.elapsed().as_millis() as u64;
 
+    // ---- Item 8: cross-source dedup (BEFORE graph expansion + summarize) ----
+    // Collapse entries sharing the same `(file, start_line, end_line)` tuple,
+    // keeping the highest-score entry and aggregating the dropped entries'
+    // channel labels into `also_matched_via`. Smaller `combined_chunks` →
+    // smaller synthesis output, without information loss.
+    let deduped_selected: Vec<DedupedSelection<'_>> = dedup_by_range(&selected_results);
+    // Build a lookup so the final sources can pick up `also_matched_via` by
+    // (file, start_line, end_line). Graph-expanded chunks (no SearchResult
+    // context) get an empty Vec — they're not eligible for cross-source dedup
+    // since they have no channel labels to attribute.
+    let dedup_lookup: HashMap<(String, u32, u32), Vec<String>> = deduped_selected
+        .iter()
+        .filter(|d| !d.also_matched_via.is_empty())
+        .map(|d| {
+            (
+                (
+                    d.result.chunk.file_path.display().to_string(),
+                    d.result.chunk.start_line,
+                    d.result.chunk.end_line,
+                ),
+                d.also_matched_via.clone(),
+            )
+        })
+        .collect();
+    let selected_results: Vec<&SearchResult> = deduped_selected.iter().map(|d| d.result).collect();
+
     // Extract chunk IDs for graph expansion.
     let selected_ids: Vec<u64> = selected_results.iter().map(|r| r.chunk.id).collect();
 
@@ -813,15 +1031,27 @@ fn deep_search_inner(
                 }
                 _ => (None, None),
             };
+            let file = chunk.file_path.display().to_string();
+            let also_matched_via = dedup_lookup
+                .get(&(file.clone(), chunk.start_line, chunk.end_line))
+                .cloned()
+                .unwrap_or_default();
             DeepSource {
-                file: chunk.file_path.display().to_string(),
+                file,
                 start_line: chunk.start_line,
                 end_line: chunk.end_line,
                 name,
                 kind,
+                also_matched_via,
             }
         })
         .collect();
+
+    // ---- Item 8: Cross-source dedup footer ----
+    // The wire-format `DeepSearchResponse` (server/protocol.rs, owned by W-Delta)
+    // does not expose `also_matched_via`. Surface to the agent via a textual
+    // footer appended to the answer for any kept source that absorbed duplicates.
+    let answer = append_dedup_footer(answer, &sources);
 
     // Append low-confidence warning if needed.
     let answer = if confidence_zone == "low" || confidence_zone == "no_results" {
@@ -1196,7 +1426,9 @@ mod tests {
 
     #[test]
     fn test_triage_noise_floor_filter() {
-        // Results with scores below noise floor should be filtered out.
+        // Results with scores below noise floor should be filtered out
+        // WHEN at least one candidate is above the floor (the floor still does work
+        // in healthy result sets — only the all-empty case is rescued, see Item 5).
         // Using max_possible = 1.0 so normalized = raw score.
         let results = vec![
             make_ast_result("a.rs", "good_fn", 1, 20, 0.5), // normalized 0.5 > 0.08
@@ -1204,9 +1436,60 @@ mod tests {
             make_ast_result("c.rs", "barely_noise", 1, 20, 0.07), // normalized 0.07 < 0.08
         ];
         let indices = triage_results("test query", &results, 8, 1.0);
-        // Only the first result should pass the noise floor filter.
+        // Only the first result should pass the noise floor filter — the rescue pass
+        // does NOT activate because at least one candidate was above the floor.
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_triage_noise_floor_rescue_on_total_filter() {
+        // Item 5 regression test (`docs/DEEP-AUDIT-2026-05.md`):
+        // when *every* search candidate is below the normalized noise floor, the
+        // previous behavior was to drop them all and emit "No relevant code found".
+        // The rescue pass must keep the top-K candidates instead.
+        //
+        // Setup: 3 AstNode results, all scores below CONFIDENCE_NOISE_FLOOR=0.08
+        // when max_possible=1.0. Without the rescue pass, triage returns empty.
+        // With it, triage returns up to `max_chunks` candidates.
+        let results = vec![
+            make_ast_result("a.rs", "fn_a", 1, 20, 0.04), // normalized 0.04 < 0.08
+            make_ast_result("b.rs", "fn_b", 1, 20, 0.05), // normalized 0.05 < 0.08
+            make_ast_result("c.rs", "fn_c", 1, 20, 0.06), // normalized 0.06 < 0.08
+        ];
+        let indices = triage_results("test query", &results, 8, 1.0);
+        // Rescue pass: all 3 should be returned (none above floor, none dropped by
+        // per-file cap or overlap dedup).
+        assert_eq!(
+            indices.len(),
+            3,
+            "Rescue pass should restore all candidates when noise floor would have \
+             dropped everything; got {indices:?}"
+        );
+        // Indices come back in original (input) order after the stable post-sort.
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_triage_rescue_respects_max_chunks() {
+        // Rescue pass must not bypass `max_chunks`. With 5 below-floor candidates
+        // and max_chunks=2, expect exactly 2 returned (not 5).
+        let results: Vec<SearchResult> = (0..5u32)
+            .map(|i| make_ast_result(&format!("f{i}.rs"), &format!("fn_{i}"), 1, 20, 0.05))
+            .collect();
+        let indices = triage_results("test query", &results, 2, 1.0);
+        assert_eq!(
+            indices.len(),
+            2,
+            "Rescue pass must still honor max_chunks; got {indices:?}"
+        );
+    }
+
+    #[test]
+    fn test_triage_rescue_skips_when_input_empty() {
+        // No input → still no output, regardless of rescue pass.
+        let indices = triage_results("test query", &[], 8, 1.0);
+        assert!(indices.is_empty());
     }
 
     // --- Symbol shortcut tests ---
@@ -1228,6 +1511,7 @@ mod tests {
                 end_line: 30,
                 name: Some("getUserById".to_string()),
                 kind: Some("fn".to_string()),
+                also_matched_via: Vec::new(),
             }],
             metrics: DeepMetrics {
                 confidence_zone: "high".to_string(),
@@ -1363,5 +1647,229 @@ mod tests {
         assert!(parts[1].contains("entry points"));
         assert!(!parts[1].contains("middleware")); // must NOT contain HTTP-specific term
         assert!(!parts[1].contains("request handling")); // must NOT contain HTTP-specific term
+    }
+
+    // ---------------------------------------------------------------------
+    // Item 8 — cross-source dedup tests
+    // ---------------------------------------------------------------------
+
+    /// Test helper: build a SearchResult with per-channel scores set explicitly.
+    /// `chunk_id` is unique even when (file, start, end) collides, so we exercise
+    /// the (file, start, end)-keyed dedup path independently of chunk_id-keyed
+    /// dedup elsewhere in the pipeline.
+    #[allow(clippy::too_many_arguments)] // test helper, parameters are mechanically named
+    fn make_result_with_channels(
+        chunk_id: u64,
+        file: &str,
+        start: u32,
+        end: u32,
+        score: f32,
+        score_dense: f32,
+        score_sparse: f32,
+        score_exact: f32,
+    ) -> SearchResult {
+        SearchResult {
+            chunk: Chunk {
+                id: chunk_id,
+                file_path: PathBuf::from(file),
+                start_line: start,
+                end_line: end,
+                content: format!("// chunk {chunk_id}"),
+                chunk_type: ChunkType::AstNode {
+                    name: format!("fn_{chunk_id}"),
+                    kind: AstNodeKind::Function,
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            },
+            score,
+            source: SearchSource::Hybrid,
+            score_dense,
+            score_sparse,
+            score_exact,
+            confidence: crate::types::Confidence::Inferred,
+            confidence_score: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_channels_label_combinations() {
+        // dense+sparse → "dense+sparse"
+        let r = make_result_with_channels(1, "a.rs", 1, 10, 0.5, 0.3, 0.2, 0.0);
+        assert_eq!(channels_label(&r), "dense+sparse");
+
+        // exact only → "exact"
+        let r = make_result_with_channels(2, "a.rs", 1, 10, 0.5, 0.0, 0.0, 0.5);
+        assert_eq!(channels_label(&r), "exact");
+
+        // all three → "dense+sparse+exact"
+        let r = make_result_with_channels(3, "a.rs", 1, 10, 1.0, 0.3, 0.3, 0.4);
+        assert_eq!(channels_label(&r), "dense+sparse+exact");
+
+        // no per-channel scores → fall back to SearchSource enum lowercase
+        let r = make_result_with_channels(4, "a.rs", 1, 10, 0.5, 0.0, 0.0, 0.0);
+        assert_eq!(channels_label(&r), "hybrid");
+    }
+
+    #[test]
+    fn test_dedup_by_range_collapses_three_duplicates() {
+        // 5 entries, 3 of which share (a.rs, 10, 20). Expected: 3 final entries.
+        // The kept entry for the duplicate group is the highest-score one
+        // (score 0.9 from dense+sparse channels); the other two are absorbed.
+        let r1 = make_result_with_channels(1, "a.rs", 10, 20, 0.9, 0.5, 0.4, 0.0); // kept
+        let r2 = make_result_with_channels(2, "a.rs", 10, 20, 0.5, 0.0, 0.5, 0.0); // dropped (sparse)
+        let r3 = make_result_with_channels(3, "a.rs", 10, 20, 0.3, 0.0, 0.0, 0.3); // dropped (exact)
+        let r4 = make_result_with_channels(4, "b.rs", 30, 40, 0.8, 0.4, 0.4, 0.0); // unique
+        let r5 = make_result_with_channels(5, "c.rs", 50, 60, 0.7, 0.0, 0.7, 0.0); // unique
+
+        let selected = vec![&r1, &r2, &r3, &r4, &r5];
+        let deduped = dedup_by_range(&selected);
+
+        assert_eq!(
+            deduped.len(),
+            3,
+            "5 entries with 3 collapsing should yield 3"
+        );
+
+        // First entry is the duplicate group's keeper.
+        assert_eq!(deduped[0].result.chunk.id, 1);
+        assert_eq!(deduped[0].result.chunk.file_path, PathBuf::from("a.rs"));
+        // Two duplicates absorbed: labels "exact" and "sparse" (sorted, deduped).
+        assert_eq!(deduped[0].also_matched_via, vec!["exact", "sparse"]);
+
+        // Subsequent entries are unique, empty also_matched_via.
+        assert_eq!(deduped[1].result.chunk.id, 4);
+        assert!(deduped[1].also_matched_via.is_empty());
+
+        assert_eq!(deduped[2].result.chunk.id, 5);
+        assert!(deduped[2].also_matched_via.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_keeps_highest_score_on_out_of_order_input() {
+        // The duplicate group appears highest-score-LAST in the input.
+        // The kept entry must still be the highest-score one (r3 here),
+        // not the first-seen (r1).
+        let r1 = make_result_with_channels(1, "x.rs", 5, 15, 0.2, 0.2, 0.0, 0.0);
+        let r2 = make_result_with_channels(2, "x.rs", 5, 15, 0.5, 0.0, 0.5, 0.0);
+        let r3 = make_result_with_channels(3, "x.rs", 5, 15, 0.9, 0.0, 0.0, 0.9);
+
+        let selected = vec![&r1, &r2, &r3];
+        let deduped = dedup_by_range(&selected);
+
+        assert_eq!(deduped.len(), 1);
+        // Kept = highest score = r3
+        assert_eq!(deduped[0].result.chunk.id, 3);
+        // Dropped channels: dense (from r1) and sparse (from r2)
+        assert_eq!(deduped[0].also_matched_via, vec!["dense", "sparse"]);
+    }
+
+    #[test]
+    fn test_dedup_preserves_order_for_uniques() {
+        // No duplicates → output mirrors input order.
+        let r1 = make_result_with_channels(1, "a.rs", 1, 10, 0.9, 0.5, 0.4, 0.0);
+        let r2 = make_result_with_channels(2, "b.rs", 1, 10, 0.8, 0.4, 0.4, 0.0);
+        let r3 = make_result_with_channels(3, "c.rs", 1, 10, 0.7, 0.3, 0.4, 0.0);
+
+        let selected = vec![&r1, &r2, &r3];
+        let deduped = dedup_by_range(&selected);
+
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].result.chunk.id, 1);
+        assert_eq!(deduped[1].result.chunk.id, 2);
+        assert_eq!(deduped[2].result.chunk.id, 3);
+        for d in &deduped {
+            assert!(d.also_matched_via.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_dedup_empty_input() {
+        let selected: Vec<&SearchResult> = vec![];
+        let deduped = dedup_by_range(&selected);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_caps_also_matched_via_at_four() {
+        // 6 entries all sharing the same range; the kept entry should carry at
+        // most 4 unique channel labels (MAX_LABELS) — but our channel-space is
+        // only 3 unique values + "hybrid" fallback, so this also tests dedup
+        // of repeated labels.
+        let r1 = make_result_with_channels(1, "x.rs", 1, 10, 0.9, 0.5, 0.0, 0.0);
+        let r2 = make_result_with_channels(2, "x.rs", 1, 10, 0.1, 0.1, 0.0, 0.0); // dense
+        let r3 = make_result_with_channels(3, "x.rs", 1, 10, 0.1, 0.0, 0.1, 0.0); // sparse
+        let r4 = make_result_with_channels(4, "x.rs", 1, 10, 0.1, 0.0, 0.0, 0.1); // exact
+        let r5 = make_result_with_channels(5, "x.rs", 1, 10, 0.1, 0.1, 0.1, 0.0); // dense+sparse
+        let r6 = make_result_with_channels(6, "x.rs", 1, 10, 0.1, 0.1, 0.1, 0.1); // dense+sparse+exact
+
+        let selected = vec![&r1, &r2, &r3, &r4, &r5, &r6];
+        let deduped = dedup_by_range(&selected);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].result.chunk.id, 1);
+        // After dedup + sort + cap, we expect ≤4 unique labels.
+        assert!(
+            deduped[0].also_matched_via.len() <= 4,
+            "got: {:?}",
+            deduped[0].also_matched_via
+        );
+        // Labels are sorted alphabetically.
+        let mut sorted = deduped[0].also_matched_via.clone();
+        sorted.sort();
+        assert_eq!(deduped[0].also_matched_via, sorted);
+    }
+
+    #[test]
+    fn test_append_dedup_footer_with_matches() {
+        let sources = vec![DeepSource {
+            file: "src/auth.rs".to_string(),
+            start_line: 10,
+            end_line: 30,
+            name: Some("authenticate".to_string()),
+            kind: Some("fn".to_string()),
+            also_matched_via: vec!["sparse".to_string(), "exact".to_string()],
+        }];
+        let answer = "Auth uses JWT.".to_string();
+        let out = append_dedup_footer(answer, &sources);
+        assert!(out.starts_with("Auth uses JWT."));
+        assert!(out.contains("Cross-source dedup:"));
+        assert!(out.contains("src/auth.rs:10-30 authenticate"));
+        assert!(out.contains("(also matched via: sparse, exact)"));
+    }
+
+    #[test]
+    fn test_append_dedup_footer_no_op_when_no_duplicates() {
+        // No source has any also_matched_via → footer omitted, answer unchanged.
+        let sources = vec![DeepSource {
+            file: "src/auth.rs".to_string(),
+            start_line: 10,
+            end_line: 30,
+            name: Some("authenticate".to_string()),
+            kind: Some("fn".to_string()),
+            also_matched_via: Vec::new(),
+        }];
+        let answer = "Auth uses JWT.".to_string();
+        let out = append_dedup_footer(answer.clone(), &sources);
+        assert_eq!(
+            out, answer,
+            "footer must not be added when no duplicates exist"
+        );
+    }
+
+    #[test]
+    fn test_append_dedup_footer_handles_empty_answer() {
+        // Edge case: empty answer + dedup match → footer is the whole output.
+        let sources = vec![DeepSource {
+            file: "a.rs".to_string(),
+            start_line: 1,
+            end_line: 5,
+            name: None,
+            kind: None,
+            also_matched_via: vec!["dense".to_string()],
+        }];
+        let out = append_dedup_footer(String::new(), &sources);
+        assert!(out.starts_with("Cross-source dedup:"));
+        assert!(out.contains("a.rs:1-5"));
+        assert!(out.contains("(also matched via: dense)"));
     }
 }

@@ -244,6 +244,11 @@ pub fn daemon_search(
             .get("confidence")
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string),
+        // v0.5 Item 6: JSON path also surfaces disambiguation if the
+        // daemon emitted it. Field is optional, missing → None.
+        disambiguation: response
+            .get("disambiguation")
+            .and_then(|d| serde_json::from_value(d.clone()).ok()),
     })
 }
 

@@ -141,3 +141,120 @@ In the published tantivy 0.26.1 source, `IndexingTerm` is `pub(crate)` (see `src
 **Action taken:** kept the existing `tantivy::Term::from_field_u64` call. WS-E item 18 should verify against tantivy docs whether a future tantivy 0.27 exposes `IndexingTerm` publicly and adjust the call there.
 
 A second tantivy 0.26 API change DID require a one-line fix (also in `sparse_search.rs`): `TopDocs::with_limit(k)` is no longer itself a `Collector`; you now chain `.order_by_score()` to obtain a Collector with the same `Vec<(Score, DocAddress)>` fruit type. This is the lazy-scorer split mentioned in Spec D §5.4.1; the fix is mechanical and additive (no behavior change for the equivalent old call).
+
+---
+
+## Request 9 — W-Delta (v0.5 Item 6): postcard does NOT honor `#[serde(default)]` for trailing fields
+**Date:** 2026-05-26
+**Branch:** `worktree-agent-a0fd7166b902fbff0`
+**Status:** Resolved — Option A landed in commit `HEAD` on `worktree-agent-a0fd7166b902fbff0`
+(the commit closing this request is titled `v0.5 Item 6: confidence-driven
+disambiguation suggestions (protocol v1→v2)`; once pushed, the SHA can be
+substituted here).
+
+### Resolution summary (added on close)
+
+- `BINARY_PROTOCOL_VERSION` bumped from `1` to `2` in `protocol.rs`.
+- Added `pub struct DisambigSuggestion { name: String, path: String, line: usize }`
+  with `Serialize, Deserialize, Debug, Clone, PartialEq` derives.
+- Added `disambiguation: Option<Vec<DisambigSuggestion>>` to `SearchResponse`
+  and `AgentResponse`. **Used `#[serde(default)]` only** — `skip_serializing_if`
+  was attempted per the coordinator's hint but empirically breaks postcard
+  decode (`DeserializeUnexpectedEnd` on roundtrip); the postcard wire format
+  requires a 1-byte tag for `None` and absent fields are NOT defaulted on the
+  read side. Comment on each field records the constraint so a future cleanup
+  pass doesn't re-introduce `skip_serializing_if`.
+- Backward-decode test `decode_v1_response_as_v2_rejected_cleanly` (plus
+  symmetric request-side variant) asserts a v=1 frame surfaces as
+  `BinaryFrameError::UnsupportedVersion { expected: 2, got: 1 }` — not a
+  silent postcard decode error. A second test asserts `BINARY_PROTOCOL_VERSION == 2`
+  so an accidental revert lights up immediately.
+- `disambiguation_from_results(&[SearchResult])` in `search/agent.rs` populates
+  up to 3 entries when top result confidence is `Confidence::Ambiguous`; skips
+  duplicate names (vs the top result and amongst itself) and non-AST chunks
+  (TextWindow/PdfPage). Called from every `handle_*` path that produces
+  fresh `SearchResult`s (semantic / exact_symbol / analytical / exhaustive /
+  exhaustive_structural) and propagated through `HandlerResult.disambiguation`
+  into `AgentResponse.disambiguation`. Also wired into `Handler::handle_search`
+  in `server/handler.rs` so the programmatic `semantex_search` path emits the
+  structured field even when not going through `semantex_agent`.
+- `agent_formatter::append_disambiguation_block` (new helper, scoped to
+  Item 6 — does NOT touch `format_search_results`/`format_deep_results`/
+  `format_graph_results`/`format_code_blocks`) renders the spec §5 format
+  with the actual suggestion count substituted for the illustrative "4 distinct
+  concepts" wording.
+- Mechanical cascade: 13 `disambiguation: None,` site updates in non-owned
+  files (`server/mod.rs` JSON decoder — 1 production site;
+  `server/tests.rs` — 8 test fixtures; `server/protocol.rs` — 1 existing test
+  fixture; `search/agent_formatter.rs` — 4 test fixtures). The cascade is the
+  unavoidable cost of adding a public field that the coordinator approved.
+
+Original investigation text retained below for the audit trail.
+
+### Decision needed
+
+Spec Q §5 Item 6's dispatch prompt and Item 6 itself both assume that adding a trailing `Option<T>` field with `#[serde(default)]` to a postcard-serialized struct is wire-format-backward-compatible. The prompt instructs:
+
+> "Bump `BINARY_PROTOCOL_VERSION` only if removing fields; adding optional fields is backward-compatible — verify with a unit test that an older payload (without the new field) still decodes."
+> "adding an `Option<T>` with `#[serde(default)]` typically does NOT require a version bump"
+
+**This premise is empirically false for postcard 1.x.** Postcard is a non-self-describing format; the deserializer reads exactly the bytes the schema expects. `#[serde(default)]` is honored only when a containing enum-variant or struct is absent — not when a *trailing field* is absent from the byte stream. Adding `disambiguation: Option<Vec<DisambigSuggestion>>` at the end of `SearchResponse` / `AgentResponse` causes `postcard::Error::DeserializeUnexpectedEnd` on old payloads.
+
+### Repro (verified locally on this worktree's host, postcard 1.1.3 + serde 1)
+
+Minimal Rust program:
+
+```rust
+#[derive(Serialize, Deserialize)] struct V1 { a: u32, b: String }
+#[derive(Serialize, Deserialize)] struct V2 {
+    a: u32, b: String,
+    #[serde(default)] c: Option<Vec<String>>,
+}
+
+let v1 = V1 { a: 42, b: "hi".into() };
+let bytes = postcard::to_stdvec(&v1).unwrap();
+// v1 bytes: [42, 2, 104, 105]   — no trailing byte for `c`
+let v2: Result<V2, _> = postcard::from_bytes(&bytes);
+// v2 from v1: Err(DeserializeUnexpectedEnd)
+```
+
+Actual run output:
+
+```
+v1 bytes: [42, 2, 104, 105]
+v2 decoded from v1: Err(DeserializeUnexpectedEnd)
+```
+
+The "unit test that confirms backward decode" the prompt asks for **would fail** on the new code, blocking the Item 6 gate.
+
+### Why this matters
+
+`SearchResponse` and `AgentResponse` are part of `BinaryResponse`. They're serialized by the daemon to clients (CLI + MCP) via postcard, and the framing layer already carries `BINARY_PROTOCOL_VERSION` (currently 1) precisely to surface schema drift as `BinaryFrameError::UnsupportedVersion` rather than a silent mis-decode. The mechanism was added in v0.4.1 W-Index #2 for exactly this kind of change.
+
+### Three options the controller can choose
+
+**Option A — bump `BINARY_PROTOCOL_VERSION` from 1 to 2.**
+- Old daemon ↔ new client (or vice versa) cleanly errors with `UnsupportedVersion`. User restarts daemon (one command, daemon auto-respawns). Same UX as the v0.4 postcard cutover.
+- Backward-decode test becomes: "v2 client rejects v1 payload with `UnsupportedVersion`" — clean and writable.
+- Overrides spec language "bump only on field removal", which is based on the empirically false postcard premise.
+
+**Option B — defer the wire field; ship the formatting-only portion of Item 6.**
+- Append the disambiguation block to `AgentResponse.formatted` (string-only) when top confidence is Ambiguous.
+- Pros: zero wire-format risk, no version bump, no client coordination.
+- Cons: programmatic consumers of `SearchResponse` / `AgentResponse` can't read structured suggestions. Spec §5 Item 6's "synthetic SearchResult with Ambiguous confidence produces 3 disambiguation entries" acceptance test checks the formatted string, not the struct.
+
+**Option C — add a new `BinaryResponse::SearchV2` variant rather than mutating `SearchResponse`.**
+- Postcard reads enum tags as varint; old clients reading a new `SearchV2` payload still fail at the tag level, so the protocol version bump in Option A is still effectively required for safety. Doubles surface area for little benefit. Not recommended.
+
+**W-Delta recommendation:** Option A. One-line constant bump, plus an updated test, and the framing-layer error path is already wired. The v0.4 → v0.5 boundary is the least surprising place to require a daemon restart.
+
+### What W-Delta is doing while you decide
+
+- **Item 6:** STOPPED writing. The `DisambigSuggestion` struct, field additions, populate-on-Ambiguous logic, formatter helper, and tests are NOT yet written. No edits to `protocol.rs`, `agent.rs`, or `agent_formatter.rs` for Item 6.
+- **Item 7 (adaptive structural walk):** wire-format-neutral (only changes call shapes inside the daemon; `GraphWalkResponse` struct is unchanged). Proceeded and committed in this branch as a separate commit so the controller can integrate Item 7 independently of the Item 6 decision.
+
+### Resume plan once decided
+
+- **Option A:** bump `BINARY_PROTOCOL_VERSION` 1 → 2, add `DisambigSuggestion` + the new field, write per-spec tests + a `decode_v1_response_as_v2_rejected_cleanly` test asserting `UnsupportedVersion`. ETA: ~30 min.
+- **Option B:** add `format_disambiguation_block` helper, call from agent handlers when top confidence is Ambiguous, no protocol change. ETA: ~20 min.
+- **Option C:** scope new variant carefully — escalate again with concrete patch sketch before writing.
