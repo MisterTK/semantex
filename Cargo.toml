@@ -22,7 +22,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "net", "process", "fs", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bincode = { version = "2", features = ["serde"] }
+postcard = { version = "1", features = ["use-std"] }
 regex = "1"
 # next-plaid 1.4: brings UpdateConfig.batch_size + buffer_size + force_cpu knobs,
 # the (MmapIndex, Vec<i64>) return tuple from update_or_create, and the streaming

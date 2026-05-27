@@ -796,6 +796,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
         FileType::Elixir => Some(tree_sitter_elixir::LANGUAGE.into()),
         FileType::Svelte => Some(tree_sitter_svelte_next::LANGUAGE.into()),
+        FileType::Vue => Some(tree_sitter_vue_next::LANGUAGE.into()),
         FileType::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         _ => None,
     }
@@ -853,6 +854,8 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "enum_declaration",
             "struct_declaration",
             "namespace_declaration",
+            "record_declaration",                // C# 9+ records
+            "file_scoped_namespace_declaration", // C# 10+ file-scoped namespaces
         ]),
         FileType::Scala => Some(&[
             "class_definition",
@@ -860,6 +863,10 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "trait_definition",
             "function_definition",
             "val_definition",
+            "given_definition",     // Scala 3 contextual instances
+            "extension_definition", // Scala 3 extension methods
+            "enum_definition",      // Scala 3 enums (distinct from Java/TS enum_declaration)
+            "type_definition",      // type aliases
         ]),
         FileType::Php => Some(&[
             "class_declaration",
@@ -882,10 +889,16 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "type_definition",
             "module_definition",
             "class_definition",
+            // Top-level `external name : type = "c_func"` — OCaml grammar
+            // emits node kind `external` at the structure_item level (not
+            // `external_declaration`, which is only used inside type defs).
+            "external",
+            "external_declaration",
         ]),
         FileType::Zig => Some(&["function_declaration", "container_declaration"]),
         FileType::R => Some(&["function_definition", "left_assignment"]),
         FileType::Html | FileType::Svelte => Some(&["element", "script_element", "style_element"]),
+        FileType::Vue => Some(&["script_element", "template_element", "style_element"]),
         FileType::Swift => Some(&[
             "class_declaration",
             "function_declaration",
@@ -989,7 +1002,11 @@ fn extract_name(node: &Node, source: &[u8]) -> Option<String> {
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
             match child.kind() {
-                "identifier" | "name" | "property_identifier" | "type_identifier" => {
+                "identifier"
+                | "name"
+                | "property_identifier"
+                | "type_identifier"
+                | "value_name" => {
                     let text = &source[child.start_byte()..child.end_byte()];
                     return Some(String::from_utf8_lossy(text).to_string());
                 }
@@ -1011,7 +1028,9 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "local_function_declaration"
         | "function"
         | "getter_signature"
-        | "setter_signature" => AstNodeKind::Function,
+        | "setter_signature"
+        | "external"
+        | "external_declaration" => AstNodeKind::Function,
         "method_definition"
         | "method_declaration"
         | "method"
@@ -1020,8 +1039,10 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "class_definition" | "class_declaration" | "class_specifier" | "class" => {
             AstNodeKind::Class
         }
-        "struct_item" | "struct_specifier" | "struct_declaration" => AstNodeKind::Struct,
-        "enum_item" | "enum_declaration" => AstNodeKind::Enum,
+        "struct_item" | "struct_specifier" | "struct_declaration" | "record_declaration" => {
+            AstNodeKind::Struct
+        }
+        "enum_item" | "enum_declaration" | "enum_definition" => AstNodeKind::Enum,
         "interface_declaration"
         | "trait_item"
         | "protocol_declaration"
@@ -1032,11 +1053,14 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "mixin_declaration"
         | "extension_declaration"
         | "namespace_declaration"
+        | "file_scoped_namespace_declaration"
         | "module_definition"
         | "object_definition" => AstNodeKind::Module,
-        "type_alias" => AstNodeKind::Other("type_alias".to_string()),
+        "type_alias" | "type_definition" => AstNodeKind::Other("type_alias".to_string()),
         "impl_item" => AstNodeKind::Other("impl".to_string()),
         "type_declaration" => AstNodeKind::Other("type".to_string()),
+        "given_definition" => AstNodeKind::Other("given".to_string()),
+        "extension_definition" => AstNodeKind::Other("extension".to_string()),
         other => AstNodeKind::Other(other.to_string()),
     }
 }
@@ -1415,6 +1439,171 @@ fn callee() {
                 _ => panic!("Expected AstNode with structured_meta"),
             }
         }
+    }
+
+    #[test]
+    fn test_vue_sfc_chunks_script_template_style() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"<template>
+  <div class="hello">{{ msg }}</div>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue'
+const msg = ref('hello')
+</script>
+
+<style scoped>
+.hello { color: red; }
+</style>
+"#;
+        let chunks = chunker.chunk(Path::new("App.vue"), content).unwrap();
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        // Expect at least one chunk per <script>, <template>, <style> block.
+        assert!(
+            ast_chunks.len() >= 3,
+            "Expected at least 3 AST chunks (script/template/style), got {}: {:?}",
+            ast_chunks.len(),
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_ocaml_external_declaration() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"
+external sqrt : float -> float = "sqrt_C_func"
+
+let double x = x * 2
+"#;
+        let chunks = chunker.chunk(Path::new("test.ml"), content).unwrap();
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        let has_sqrt = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "sqrt" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            has_sqrt,
+            "Should find external sqrt as Function: {:?}",
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_scala3_given_extension_enum_type() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"
+trait Show[A]:
+  def show(a: A): String
+
+given showInt: Show[Int] with
+  def show(a: Int): String = a.toString
+
+enum Color:
+  case Red, Green, Blue
+
+extension (s: String)
+  def kebab: String = s.replace(' ', '-')
+
+type StringMap = Map[String, String]
+"#;
+        let chunks = chunker.chunk(Path::new("test.scala"), content).unwrap();
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "Should produce AST chunks for Scala 3 file"
+        );
+
+        let has_enum_color = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "Color" && matches!(kind, AstNodeKind::Enum)
+            }
+            _ => false,
+        });
+        assert!(
+            has_enum_color,
+            "Should find enum Color classified as Enum: {:?}",
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+
+        // given_definition -> Other("given")
+        let has_given = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { kind, .. } => {
+                matches!(kind, AstNodeKind::Other(s) if s == "given")
+            }
+            _ => false,
+        });
+        assert!(
+            has_given,
+            "Should find given_definition classified as Other(given): {:?}",
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+
+        // extension_definition -> Other("extension")
+        let has_extension = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { kind, .. } => {
+                matches!(kind, AstNodeKind::Other(s) if s == "extension")
+            }
+            _ => false,
+        });
+        assert!(
+            has_extension,
+            "Should find extension_definition classified as Other(extension)"
+        );
+    }
+
+    #[test]
+    fn test_csharp_record_and_file_scoped_namespace() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"
+namespace Foo.Bar;
+
+public record Person(string Name, int Age);
+
+public class Other {
+    public void Method() { }
+}
+"#;
+        let chunks = chunker.chunk(Path::new("test.cs"), content).unwrap();
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        // Expect at least: namespace, record, class, method
+        assert!(
+            ast_chunks.len() >= 3,
+            "Expected at least 3 AST chunks (namespace, record, class), got {}: {:?}",
+            ast_chunks.len(),
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+
+        let has_record = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "Person" && matches!(kind, AstNodeKind::Struct)
+            }
+            _ => false,
+        });
+        assert!(has_record, "Should find record Person classified as Struct");
+
+        let has_file_scoped_ns = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { kind, .. } => matches!(kind, AstNodeKind::Module),
+            _ => false,
+        });
+        assert!(
+            has_file_scoped_ns,
+            "Should find file-scoped namespace as Module"
+        );
     }
 
     #[test]

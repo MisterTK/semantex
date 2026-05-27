@@ -7,6 +7,7 @@ use crate::search::SearchQuery;
 use crate::search::adaptive;
 use crate::search::fastembed_reranker::FastembedReranker;
 use crate::search::graph_propagation::{self, GraphPropagationConfig};
+use crate::search::path_signals;
 use crate::search::plaid_search::PlaidSearcher;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
 use crate::search::sparse_search::SparseIndex;
@@ -41,7 +42,11 @@ impl HybridSearcher {
 
         let sparse_path = index_dir.join("sparse");
         let sparse = if sparse_path.exists() {
-            Some(SparseIndex::open(&sparse_path)?)
+            // v0.4 Item 18: stemmer flag MUST match the value used at
+            // index-build time. We trust the current config; mismatched
+            // flag without a reindex silently degrades recall — see
+            // `docs/CONFIGURATION.md` (`use_bm25_stemmer`).
+            Some(SparseIndex::open(&sparse_path, config.use_bm25_stemmer)?)
         } else {
             None
         };
@@ -84,7 +89,8 @@ impl HybridSearcher {
         // Open sparse searcher
         let sparse_path = index_dir.join("sparse");
         let sparse = if sparse_path.exists() {
-            Some(SparseIndex::open(&sparse_path)?)
+            // v0.4 Item 18: see `open_sparse_only` for the stemmer caveat.
+            Some(SparseIndex::open(&sparse_path, config.use_bm25_stemmer)?)
         } else {
             None
         };
@@ -239,6 +245,55 @@ impl HybridSearcher {
             None
         };
 
+        // v0.4 WS-B Item 15: precompute the PLAID chunk-ID subset when the
+        // query carries an active `file_filter`. PLAID 1.3 accepts a doc-ID
+        // subset on `search()` and proportionally scales `n_ivf_probe` to
+        // compensate for the smaller candidate pool — this is meaningfully
+        // faster than scoring every doc and post-filtering when the filter
+        // matches a small fraction of files. We compute the subset once and
+        // pass it to both dense channels (original and expanded query).
+        //
+        // The subset is the set of indexed chunk_ids whose file_path passes
+        // the filter. We walk `plaid.doc_to_chunk()` (the canonical list of
+        // chunks present in the dense index) and bulk-fetch their paths from
+        // the store in bounded batches (SQLite's default parameter cap is
+        // 999 — we batch at 500 for headroom). The lock is released before
+        // we enter `thread::scope` to avoid contention with `exact_handle`,
+        // which takes the same lock.
+        let plaid_chunk_subset: Option<Vec<u64>> = match (
+            query.use_dense.then_some(()).and(self.plaid.as_ref()),
+            query.file_filter.as_ref().filter(|f| f.is_active()),
+        ) {
+            (Some(plaid), Some(filter)) => {
+                let all_indexed = plaid.doc_to_chunk();
+                if all_indexed.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    const FILTER_BATCH: usize = 500;
+                    let store = self.store.lock();
+                    let mut subset: Vec<u64> = Vec::new();
+                    for batch in all_indexed.chunks(FILTER_BATCH) {
+                        if let Ok(chunks) = store.get_chunks(batch) {
+                            for c in chunks {
+                                if filter.matches(&c.file_path) {
+                                    subset.push(c.id);
+                                }
+                            }
+                        }
+                    }
+                    drop(store);
+                    tracing::debug!(
+                        indexed = all_indexed.len(),
+                        subset = subset.len(),
+                        "PLAID file_filter subset prepared"
+                    );
+                    Some(subset)
+                }
+            }
+            _ => None,
+        };
+        let plaid_subset_slice: Option<&[u64]> = plaid_chunk_subset.as_deref();
+
         // Stage 1: Candidate retrieval — run dense, sparse, exact, and (in RRF mode)
         // the expanded-query dense + sparse channels in parallel.
         let (
@@ -257,7 +312,21 @@ impl HybridSearcher {
                 }
                 let dense_start = std::time::Instant::now();
                 let results = if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
-                    match plaid.search(colbert, &effective_text, retrieval_candidates) {
+                    // v0.4 WS-B Item 15: when a file_filter is active, route
+                    // through `search_with_subset` with the pre-computed
+                    // chunk-ID subset so PLAID skips MaxSim work on chunks
+                    // the user has filtered out.
+                    let res = if plaid_subset_slice.is_some() {
+                        plaid.search_with_subset(
+                            colbert,
+                            &effective_text,
+                            retrieval_candidates,
+                            plaid_subset_slice,
+                        )
+                    } else {
+                        plaid.search(colbert, &effective_text, retrieval_candidates)
+                    };
+                    match res {
                         Ok(results) => {
                             tracing::debug!(
                                 results_count = results.len(),
@@ -344,7 +413,19 @@ impl HybridSearcher {
                     return Vec::new();
                 }
                 if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
-                    match plaid.search(colbert, text, retrieval_candidates) {
+                    // v0.4 WS-B Item 15: same subset-aware routing as the
+                    // primary dense channel.
+                    let res = if plaid_subset_slice.is_some() {
+                        plaid.search_with_subset(
+                            colbert,
+                            text,
+                            retrieval_candidates,
+                            plaid_subset_slice,
+                        )
+                    } else {
+                        plaid.search(colbert, text, retrieval_candidates)
+                    };
+                    match res {
                         Ok(r) => {
                             tracing::debug!(
                                 expanded_dense_count = r.len(),
@@ -588,6 +669,116 @@ impl HybridSearcher {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 tracing::debug!("File role boost applied");
+            }
+        }
+
+        // Phase 3b: Path penalty (downrank tests/compat/examples on non-test queries)
+        //
+        // Per spec §7.2 (v0.4 Item 6): apply a multiplicative penalty to chunks
+        // whose path matches test/compat/example/barrel/declaration-stub patterns.
+        // Disabled when the query itself mentions test/spec/bench/example/demo,
+        // so users actively searching for those still see them.
+        if path_signals::should_apply_path_penalty(&effective_text) {
+            for scored in &mut fused {
+                if let Some(chunk) = chunk_map.get(&scored.chunk_id) {
+                    let factor = path_signals::file_path_penalty(&chunk.file_path);
+                    scored.score *= factor;
+                }
+            }
+            fused.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            tracing::debug!("Path penalty applied");
+        }
+
+        // Phase 3c: Path stem boost (filename / query overlap)
+        //
+        // Per spec §7.3 (v0.4 Item 7): additively boost chunks whose file
+        // stem contains identifier sub-tokens overlapping with the query.
+        // Exact subtoken match wins STEM_EXACT_BOOST_FRAC × max_score;
+        // prefix match (≥ STEM_PREFIX_MIN_LEN chars) wins
+        // STEM_PREFIX_BOOST_FRAC × max_score. The boost is clamped to
+        // max_score so we never inflate above the current rank-1 result.
+        {
+            let query_tokens = path_signals::query_tokens_for_path_signals(&effective_text);
+            if !query_tokens.is_empty() {
+                let max_score = fused.first().map_or(1.0, |s| s.score);
+                for scored in &mut fused {
+                    if let Some(chunk) = chunk_map.get(&scored.chunk_id) {
+                        let frac =
+                            path_signals::path_stem_boost_factor(&chunk.file_path, &query_tokens);
+                        if frac > 0.0 {
+                            scored.score = (scored.score + frac * max_score).min(max_score);
+                        }
+                    }
+                }
+                fused.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                tracing::debug!("Path stem boost applied");
+            }
+        }
+
+        // Phase 3d: Definition boost (symbol name / query overlap)
+        //
+        // Per spec §7.4 (v0.4 Item 8): additively boost AST-aware chunks
+        // whose symbol name shares an identifier sub-token with the query
+        // (case-insensitive, after camelCase/snake_case decomposition).
+        // The boost is clamped to max_score so we never inflate beyond the
+        // current rank-1 result. The disabled "symbol exact lookup" path
+        // (see comment at the top of search()) remains disabled — Phase 3d
+        // is the v0.4 replacement: softer, RRF-compatible signal.
+        {
+            let query_tokens = path_signals::query_tokens_for_path_signals(&effective_text);
+            if !query_tokens.is_empty() {
+                let max_score = fused.first().map_or(1.0, |s| s.score);
+                for scored in &mut fused {
+                    if let Some(chunk) = chunk_map.get(&scored.chunk_id)
+                        && let Some(name) = chunk.symbol_name()
+                    {
+                        let frac = path_signals::definition_boost_factor(name, &query_tokens);
+                        if frac > 0.0 {
+                            scored.score = (scored.score + frac * max_score).min(max_score);
+                        }
+                    }
+                }
+                fused.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                tracing::debug!("Definition boost applied");
+            }
+        }
+
+        // Phase 3e: File coherence boost (multi-chunk-from-same-file reward)
+        //
+        // Per spec §7.5 (v0.4 Item 9): when several chunks in the result
+        // set share a file, that file is more likely to be the canonical
+        // implementation. We additively boost only the top-scoring chunk
+        // of each multi-chunk file, scaled by the file's relative
+        // contribution to the result set (file_sum / max_file_sum). The
+        // existing directory-proximity bonus further down stays in place —
+        // both signals coexist for v0.4 per spec §7.5.3.
+        {
+            let max_score = fused.first().map_or(1.0, |s| s.score);
+            let boosts = path_signals::file_coherence_boosts(&fused, &chunk_map);
+            if !boosts.is_empty() {
+                for scored in &mut fused {
+                    if let Some(&frac) = boosts.get(&scored.chunk_id) {
+                        scored.score = (scored.score + frac * max_score).min(max_score);
+                    }
+                }
+                fused.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                tracing::debug!(boosted_count = boosts.len(), "File coherence boost applied");
             }
         }
 

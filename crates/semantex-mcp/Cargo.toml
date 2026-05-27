@@ -20,7 +20,7 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 
 # HTTP transport (I2) — optional, gated by feature "http".
 tokio = { workspace = true, optional = true }
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
 tower = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]

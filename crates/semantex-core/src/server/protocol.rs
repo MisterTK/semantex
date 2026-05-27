@@ -1,7 +1,7 @@
 use crate::search::SearchMetrics;
 use serde::{Deserialize, Serialize};
 
-/// Magic byte prefix to distinguish binary (bincode) from JSON protocol.
+/// Magic byte prefix to distinguish binary (postcard) from JSON protocol.
 /// A JSON message always starts with '{' (0x7b), so 0x00 is unambiguous.
 pub const BINARY_MAGIC: u8 = 0x00;
 
@@ -212,15 +212,15 @@ pub struct GraphWalkResponse {
     pub hierarchy: Vec<SearchResultItem>,
 }
 
-// --- Binary (bincode) wire format ---
+// --- Binary (postcard) wire format ---
 //
 // Binary messages use a simple framing:
-//   [BINARY_MAGIC: 1 byte] [length: 4 bytes LE] [bincode payload: length bytes]
+//   [BINARY_MAGIC: 1 byte] [length: 4 bytes LE] [postcard payload: length bytes]
 //
 // The first byte lets the listener auto-detect whether a client is sending
 // JSON (starts with '{') or binary (starts with 0x00).
 
-/// Binary request type tag for bincode (serde tags don't work well with bincode).
+/// Binary request type tag for postcard (serde tags don't work well with non-self-describing formats).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BinaryRequest {
     Search(SearchRequest),
@@ -232,7 +232,7 @@ pub enum BinaryRequest {
     Agent(AgentRequest),
 }
 
-/// Binary response type for bincode.
+/// Binary response type for postcard.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BinaryResponse {
     Search(SearchResponse),
@@ -274,10 +274,9 @@ impl From<Response> for BinaryResponse {
     }
 }
 
-/// Encode a binary request into a framed message: [0x00][len:4 LE][bincode]
+/// Encode a binary request into a framed message: [0x00][len:4 LE][postcard]
 pub fn encode_binary_request(req: &BinaryRequest) -> Vec<u8> {
-    let payload =
-        bincode::serde::encode_to_vec(req, bincode::config::standard()).expect("bincode serialize");
+    let payload = postcard::to_stdvec(req).expect("postcard serialize");
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(1 + 4 + payload.len());
     buf.push(BINARY_MAGIC);
@@ -286,10 +285,9 @@ pub fn encode_binary_request(req: &BinaryRequest) -> Vec<u8> {
     buf
 }
 
-/// Encode a binary response into a framed message: [0x00][len:4 LE][bincode]
+/// Encode a binary response into a framed message: [0x00][len:4 LE][postcard]
 pub fn encode_binary_response(resp: &BinaryResponse) -> Vec<u8> {
-    let payload = bincode::serde::encode_to_vec(resp, bincode::config::standard())
-        .expect("bincode serialize");
+    let payload = postcard::to_stdvec(resp).expect("postcard serialize");
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(1 + 4 + payload.len());
     buf.push(BINARY_MAGIC);
@@ -299,13 +297,13 @@ pub fn encode_binary_response(resp: &BinaryResponse) -> Vec<u8> {
 }
 
 /// Decode a binary response from raw bytes (after stripping the magic+length frame).
-pub fn decode_binary_response(data: &[u8]) -> Result<BinaryResponse, bincode::error::DecodeError> {
-    bincode::serde::decode_from_slice(data, bincode::config::standard()).map(|(v, _)| v)
+pub fn decode_binary_response(data: &[u8]) -> Result<BinaryResponse, postcard::Error> {
+    postcard::from_bytes::<BinaryResponse>(data)
 }
 
 /// Decode a binary request from raw bytes (after stripping the magic+length frame).
-pub fn decode_binary_request(data: &[u8]) -> Result<BinaryRequest, bincode::error::DecodeError> {
-    bincode::serde::decode_from_slice(data, bincode::config::standard()).map(|(v, _)| v)
+pub fn decode_binary_request(data: &[u8]) -> Result<BinaryRequest, postcard::Error> {
+    postcard::from_bytes::<BinaryRequest>(data)
 }
 
 // --- Agent types ---

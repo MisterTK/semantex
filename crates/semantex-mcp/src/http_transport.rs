@@ -5,8 +5,8 @@
 //! browser-based clients) to talk to semantex without spawning a subprocess.
 //!
 //! Routes:
-//!   * `POST /mcp/:toolset`         — Streamable HTTP (JSON-RPC body in, JSON-RPC body out)
-//!   * `GET  /mcp/:toolset/events`  — Server-Sent Events stream for notifications
+//!   * `POST /mcp/{toolset}`         — Streamable HTTP (JSON-RPC body in, JSON-RPC body out)
+//!   * `GET  /mcp/{toolset}/events`  — Server-Sent Events stream for notifications
 //!   * `GET  /healthz`              — Liveness probe
 //!
 //! Toolsets: `core`, `structural`, `all` (per spec section 2.5 I3).
@@ -632,8 +632,8 @@ pub fn build_router<B: Backend>(backend: Arc<B>) -> Router {
         .route("/healthz", get(healthz))
         .route("/mcp/", post(mcp_default_post))
         .route("/mcp/", get(mcp_default_events))
-        .route("/mcp/:toolset", post(mcp_post))
-        .route("/mcp/:toolset/events", get(mcp_events))
+        .route("/mcp/{toolset}", post(mcp_post))
+        .route("/mcp/{toolset}/events", get(mcp_events))
         // Friendly default 404 with a hint
         .fallback(unknown_route)
         .with_state(state)

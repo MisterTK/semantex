@@ -107,6 +107,7 @@ impl FileType {
                 | FileType::Swift
                 | FileType::Elixir
                 | FileType::Svelte
+                | FileType::Vue
                 | FileType::Kotlin
                 | FileType::Markdown
                 | FileType::Toml

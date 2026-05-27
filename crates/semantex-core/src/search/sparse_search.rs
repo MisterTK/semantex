@@ -21,10 +21,23 @@ pub struct SparseIndex {
 }
 
 /// Register the code-aware tokenizer on an index.
-fn register_code_tokenizer(index: &Index) {
-    let code_analyzer = TextAnalyzer::builder(CodeTokenizer)
-        .filter(Stemmer::default()) // English Snowball stemmer
-        .build();
+///
+/// `use_stemmer` toggles the English Snowball stemmer filter (v0.4 Item 18).
+/// `CodeTokenizer` already emits lowercased sub-tokens, so no `LowerCaser`
+/// filter is needed.
+///
+/// Tantivy 0.26 `TextAnalyzerBuilder::filter` returns a builder whose
+/// generic parameter encodes the filter chain at the type level, which
+/// makes a conditional `if`-branch produce two incompatible types. We use
+/// `filter_dynamic` to box the filter and keep the builder type stable
+/// across both branches. The performance cost is negligible at index-build
+/// rates (analyzer is invoked once per document, not per query).
+fn register_code_tokenizer(index: &Index, use_stemmer: bool) {
+    let mut analyzer_builder = TextAnalyzer::builder(CodeTokenizer).dynamic();
+    if use_stemmer {
+        analyzer_builder = analyzer_builder.filter_dynamic(Stemmer::default());
+    }
+    let code_analyzer = analyzer_builder.build();
     index.tokenizers().register("code", code_analyzer);
 }
 
@@ -46,15 +59,21 @@ fn build_schema() -> (Schema, Field, Field, Field) {
 }
 
 impl SparseIndex {
-    /// Create a new tantivy index at the given path
-    pub fn create(index_path: &Path) -> Result<Self> {
+    /// Create a new tantivy index at the given path.
+    ///
+    /// `use_stemmer` controls whether the English Snowball stemmer filter is
+    /// applied to indexed tokens (v0.4 Item 18). The same value MUST be passed
+    /// to `open` on subsequent loads; mismatched stemmer state between build
+    /// and search produces query/index token mismatches (silent recall loss).
+    /// See `docs/CONFIGURATION.md` (`use_bm25_stemmer`) for the limitation.
+    pub fn create(index_path: &Path, use_stemmer: bool) -> Result<Self> {
         std::fs::create_dir_all(index_path)?;
 
         let (schema, chunk_id_field, content_field, path_field) = build_schema();
 
         let dir = tantivy::directory::MmapDirectory::open(index_path)?;
         let index = Index::create(dir, schema, IndexSettings::default())?;
-        register_code_tokenizer(&index);
+        register_code_tokenizer(&index, use_stemmer);
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -69,13 +88,16 @@ impl SparseIndex {
         })
     }
 
-    /// Open an existing tantivy index
-    pub fn open(index_path: &Path) -> Result<Self> {
+    /// Open an existing tantivy index.
+    ///
+    /// `use_stemmer` MUST match the value passed to `create` when the index
+    /// was built. See `create` for the rationale.
+    pub fn open(index_path: &Path, use_stemmer: bool) -> Result<Self> {
         let (_, chunk_id_field, content_field, path_field) = build_schema();
 
         let dir = tantivy::directory::MmapDirectory::open(index_path)?;
         let index = Index::open(dir)?;
-        register_code_tokenizer(&index);
+        register_code_tokenizer(&index, use_stemmer);
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -113,7 +135,10 @@ impl SparseIndex {
             .parse_query(query)
             .with_context(|| "Failed to parse query".to_string())?;
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(top_k))?;
+        // tantivy 0.26: `TopDocs::with_limit` returns a `TopDocs`, not a `Collector`.
+        // Call `.order_by_score()` to obtain a Collector emitting `(Score, DocAddress)`
+        // pairs (the same fruit type the previous `with_limit`-as-Collector produced).
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(top_k).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -175,5 +200,109 @@ impl SparseIndexWriter {
     pub fn commit(mut self) -> Result<()> {
         self.writer.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Helper: build a fresh index with three documents (`retry`, `retries`,
+    /// `unrelated`), commit, reload, and return the index ready to query.
+    fn build_index_with_retry_corpus(index_path: &Path, use_stemmer: bool) -> SparseIndex {
+        let index = SparseIndex::create(index_path, use_stemmer).expect("create");
+        {
+            let mut writer = index.writer().expect("writer");
+            writer
+                .add_document(1, "function retry handler implementation", "a.rs")
+                .expect("add 1");
+            writer
+                .add_document(2, "the retries counter is incremented here", "b.rs")
+                .expect("add 2");
+            writer
+                .add_document(3, "wholly unrelated content about cats", "c.rs")
+                .expect("add 3");
+            writer.commit().expect("commit");
+        }
+        index.reload().expect("reload");
+        index
+    }
+
+    /// v0.4 Item 18 acceptance criterion (spec §9.2.4):
+    /// "Setting `use_bm25_stemmer: false` MUST produce a tantivy index in
+    ///  which `retry` and `retries` are NOT conflated."
+    ///
+    /// With stemmer on: query `retries` matches both doc 1 (`retry`, stemmed
+    /// to `retri`) and doc 2 (`retries`, stemmed to `retri`).
+    /// With stemmer off: query `retries` matches ONLY doc 2 (`retries`
+    /// literal), and a query for `retry` matches ONLY doc 1.
+    #[test]
+    fn stemmer_flag_controls_retry_retries_conflation() {
+        let dir_on = tempdir().expect("tempdir on");
+        let dir_off = tempdir().expect("tempdir off");
+
+        let index_on = build_index_with_retry_corpus(dir_on.path(), true);
+        let index_off = build_index_with_retry_corpus(dir_off.path(), false);
+
+        let hits_on_retries = index_on.search("retries", 10).expect("search on");
+        let hits_off_retries = index_off.search("retries", 10).expect("search off");
+
+        let ids_on: std::collections::BTreeSet<u64> =
+            hits_on_retries.iter().map(|s| s.chunk_id).collect();
+        let ids_off: std::collections::BTreeSet<u64> =
+            hits_off_retries.iter().map(|s| s.chunk_id).collect();
+
+        // Stemmer ON: query 'retries' conflates with 'retry' -> both docs hit.
+        assert!(
+            ids_on.contains(&1) && ids_on.contains(&2),
+            "stemmer on: expected 'retries' query to match docs 1 (retry) and 2 (retries), got {:?}",
+            ids_on
+        );
+
+        // Stemmer OFF: query 'retries' must NOT match doc 1 ('retry' literal).
+        assert!(
+            !ids_off.contains(&1),
+            "stemmer off: 'retries' must NOT conflate with 'retry' (doc 1), got {:?}",
+            ids_off
+        );
+        assert!(
+            ids_off.contains(&2),
+            "stemmer off: 'retries' must still match its own literal in doc 2, got {:?}",
+            ids_off
+        );
+
+        // The two result sets MUST differ — this is the core acceptance signal.
+        assert_ne!(
+            ids_on, ids_off,
+            "stemmer flag must produce different result sets (on={:?}, off={:?})",
+            ids_on, ids_off
+        );
+    }
+
+    /// Symmetric check: with stemmer OFF, the literal `retry` must not pull
+    /// in the `retries` document either.
+    #[test]
+    fn stemmer_off_keeps_retry_and_retries_disjoint() {
+        let dir = tempdir().expect("tempdir");
+        let index = build_index_with_retry_corpus(dir.path(), false);
+
+        let hits_retry: std::collections::BTreeSet<u64> = index
+            .search("retry", 10)
+            .expect("search retry")
+            .iter()
+            .map(|s| s.chunk_id)
+            .collect();
+
+        assert!(
+            hits_retry.contains(&1),
+            "'retry' must match doc 1 (literal 'retry'), got {:?}",
+            hits_retry
+        );
+        assert!(
+            !hits_retry.contains(&2),
+            "stemmer off: 'retry' must NOT match doc 2 ('retries'), got {:?}",
+            hits_retry
+        );
     }
 }

@@ -7,6 +7,7 @@ pub mod deep;
 pub mod fastembed_reranker;
 pub mod graph_propagation;
 pub mod hybrid;
+pub mod path_signals;
 pub mod plaid_search;
 pub mod query_classifier;
 pub mod query_expander;
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Measured performance metrics from a single search invocation.
 ///
 /// NOTE: `skip_serializing_if` is intentionally omitted from Optional fields.
-/// This struct is serialized via bincode v2 (positional encoding) for the binary
+/// This struct is serialized via postcard (positional encoding) for the binary
 /// daemon protocol. Skipping fields in positional encoding causes field misalignment
 /// during deserialization. `#[serde(default)]` is kept for JSON compatibility
 /// (fills in `null` fields when deserializing older responses).

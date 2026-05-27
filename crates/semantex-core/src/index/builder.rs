@@ -26,6 +26,16 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// PLAID UpdateConfig buffer_size: pending-document threshold below which
+/// next-plaid 1.3+ writes new docs to `buffer.npy` (and serves them from
+/// the buffer during search) WITHOUT running the full k-means centroid
+/// expansion. Auto-refresh triggered by a single file change benefits
+/// strongly: incremental updates of 1-10 chunks no longer pay the 2-3s
+/// k-means cost on every call. Buffer flushes to a proper segment on
+/// the next update that exceeds this threshold. Default chosen per
+/// v0.4_SPEC §6.3 / §4.2 (audit recommendation).
+const PLAID_BUFFER_SIZE: usize = 50;
+
 /// Statistics from an indexing operation
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -184,18 +194,23 @@ impl IndexBuilder {
             );
         }
 
-        // Load or create sparse (BM25) index
+        // Load or create sparse (BM25) index. The `use_bm25_stemmer` flag
+        // (v0.4 Item 18) controls whether the English Snowball stemmer is
+        // applied to indexed tokens. The same value MUST be used at
+        // search-open time (see `hybrid.rs`); toggling without a reindex
+        // silently degrades recall — see `docs/CONFIGURATION.md`.
         let sparse_path = index_dir.join("sparse");
         let is_incremental = sparse_path.exists();
+        let use_stemmer = self.config.use_bm25_stemmer;
         let sparse_index = if is_incremental {
             tracing::info!("Opening existing BM25 index for incremental update");
-            SparseIndex::open(&sparse_path)?
+            SparseIndex::open(&sparse_path, use_stemmer)?
         } else {
             tracing::info!("Building new BM25 index...");
             if sparse_path.exists() {
                 let _ = std::fs::remove_dir_all(&sparse_path);
             }
-            SparseIndex::create(&sparse_path)?
+            SparseIndex::create(&sparse_path, use_stemmer)?
         };
         let mut sparse_writer = sparse_index.writer()?;
 
@@ -548,6 +563,9 @@ impl IndexBuilder {
             };
             let update_config = UpdateConfig {
                 batch_size: 1024,
+                // next-plaid 1.3 fast path: skip k-means when fewer than
+                // PLAID_BUFFER_SIZE pending docs (see module-level constant).
+                buffer_size: PLAID_BUFFER_SIZE,
                 force_cpu: true,
                 ..Default::default()
             };
@@ -600,30 +618,38 @@ impl IndexBuilder {
                 if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (single call)") {
                     anyhow::bail!("Indexing aborted: {e}");
                 }
-                MmapIndex::update_or_create(
+                // next-plaid 1.3 returns (MmapIndex, Vec<i64>) where the Vec<i64>
+                // is the authoritative list of PLAID doc IDs assigned to the
+                // just-added embeddings. We keep the positional `full_mapping`
+                // (built above in the same order as `all_embeddings`) for the
+                // on-disk mapping, but assert the invariant that the doc count
+                // matches the chunk count. If next-plaid ever stops assigning
+                // IDs sequentially starting at 0, this assert fires and the
+                // positional logic must be replaced.
+                let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
                     &all_embeddings,
                     &plaid_dir_str,
                     &plaid_config,
                     &update_config,
                 )?;
+                debug_assert_eq!(
+                    plaid_doc_ids.len(),
+                    full_mapping.len(),
+                    "PLAID doc count must match chunk count"
+                );
                 // Drop the in-memory embeddings ASAP so they don't compete with
                 // the post-PLAID work (graph resolution, PageRank, etc.).
                 drop(all_embeddings);
                 crate::memory::purge_allocator();
 
-                let mapping_bytes =
-                    bincode::serde::encode_to_vec(&full_mapping, bincode::config::standard())?;
+                let mapping_bytes = postcard::to_stdvec(&full_mapping)?;
                 std::fs::write(&mapping_path, mapping_bytes)?;
                 tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
             } else {
                 // Incremental update — only touch new/removed chunks.
                 let mut mapping: Vec<u64> = if mapping_path.exists() {
                     let bytes = std::fs::read(&mapping_path)?;
-                    bincode::serde::decode_from_slice::<Vec<u64>, _>(
-                        &bytes,
-                        bincode::config::standard(),
-                    )?
-                    .0
+                    postcard::from_bytes::<Vec<u64>>(&bytes)?
                 } else {
                     Vec::new()
                 };
@@ -670,18 +696,25 @@ impl IndexBuilder {
                         let contents: Vec<String> =
                             chunks.iter().map(|c| c.content.clone()).collect();
                         let embeddings = embedder.encode_documents(&contents)?;
-                        MmapIndex::update_or_create(
+                        // Same invariant as the full-rebuild path: next-plaid 1.3
+                        // returns the freshly-assigned doc IDs; we keep the
+                        // positional mapping logic and assert the count match.
+                        let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
                             &embeddings,
                             &plaid_dir_str,
                             &plaid_config,
                             &update_config,
                         )?;
+                        debug_assert_eq!(
+                            plaid_doc_ids.len(),
+                            chunks.len(),
+                            "PLAID doc count must match incremental chunk count"
+                        );
                         mapping.extend(chunks.iter().map(|c| c.id));
                     }
                 }
 
-                let mapping_bytes =
-                    bincode::serde::encode_to_vec(&mapping, bincode::config::standard())?;
+                let mapping_bytes = postcard::to_stdvec(&mapping)?;
                 std::fs::write(&mapping_path, mapping_bytes)?;
                 tracing::info!(
                     added = new_chunk_ids.len(),

@@ -86,8 +86,11 @@ fn split_camel_case(word: &str) -> Vec<&str> {
 }
 
 /// Expands identifiers in code content for BM25 indexing.
-/// Splits camelCase/snake_case identifiers into component words.
-/// Returns space-separated expansion string to prepend to BM25 content.
+/// Splits camelCase/snake_case identifiers into component words and additionally
+/// emits adjacent-pair bigrams (underscore-joined) so multi-word identifier
+/// queries score higher. For `getUserById` we emit both the sub-tokens
+/// (`get user by id`) and the bigrams `get_user`, `user_by`, `by_id`.
+/// Returns a space-separated expansion string to prepend to BM25 content.
 pub fn expand_identifiers(content: &str) -> String {
     let mut expansions = Vec::new();
 
@@ -112,6 +115,12 @@ pub fn expand_identifiers(content: &str) -> String {
         // Only include if the token actually splits into multiple parts
         if sub_tokens.len() > 1 {
             expansions.push(sub_tokens.join(" "));
+
+            // Adjacent-pair bigrams (spec §9.1): a_b, b_c, c_d ...
+            // Skipped for single-token identifiers (no adjacency).
+            for pair in sub_tokens.windows(2) {
+                expansions.push(format!("{}_{}", pair[0], pair[1]));
+            }
         }
     }
 
@@ -199,6 +208,20 @@ fn tokenize_code(text: &str) -> Vec<Token> {
                 text: joined,
                 position_length: sub_tokens.len(),
             });
+
+            // Adjacent-pair bigrams (spec §9.1.3): each bigram is emitted at the
+            // position of its first sub-token (so `get_user` shares position with
+            // `get`). offset_from/offset_to mirror the parent identifier span so
+            // highlighting points back at the source identifier.
+            for (i, pair) in sub_tokens.windows(2).enumerate() {
+                tokens.push(Token {
+                    offset_from,
+                    offset_to,
+                    position: first_position + i,
+                    text: format!("{}_{}", pair[0], pair[1]),
+                    position_length: 2,
+                });
+            }
         }
     }
 
@@ -227,9 +250,19 @@ mod tests {
     #[test]
     fn test_camel_case() {
         let tokens = tokenize("getUserById");
+        // Sub-tokens + joined + adjacent-pair bigrams (Item 16, spec §9.1).
         assert_eq!(
             texts(&tokens),
-            vec!["get", "user", "by", "id", "getuserbyid"]
+            vec![
+                "get",
+                "user",
+                "by",
+                "id",
+                "getuserbyid",
+                "get_user",
+                "user_by",
+                "by_id"
+            ]
         );
     }
 
@@ -238,7 +271,16 @@ mod tests {
         let tokens = tokenize("get_user_by_id");
         assert_eq!(
             texts(&tokens),
-            vec!["get", "user", "by", "id", "getuserbyid"]
+            vec![
+                "get",
+                "user",
+                "by",
+                "id",
+                "getuserbyid",
+                "get_user",
+                "user_by",
+                "by_id"
+            ]
         );
     }
 
@@ -251,7 +293,9 @@ mod tests {
                 "connection",
                 "service",
                 "factory",
-                "connectionservicefactory"
+                "connectionservicefactory",
+                "connection_service",
+                "service_factory"
             ]
         );
     }
@@ -261,16 +305,25 @@ mod tests {
         let tokens = tokenize("MAX_RETRY_COUNT");
         assert_eq!(
             texts(&tokens),
-            vec!["max", "retry", "count", "maxretrycount"]
+            vec![
+                "max",
+                "retry",
+                "count",
+                "maxretrycount",
+                "max_retry",
+                "retry_count"
+            ]
         );
     }
 
     #[test]
     fn test_dot_path() {
         let tokens = tokenize("com.example.MyClass");
+        // Three separate identifier spans: com, example, MyClass.
+        // Only MyClass splits into multiple sub-tokens -> emits joined + bigram.
         assert_eq!(
             texts(&tokens),
-            vec!["com", "example", "my", "class", "myclass"]
+            vec!["com", "example", "my", "class", "myclass", "my_class"]
         );
     }
 
@@ -279,7 +332,7 @@ mod tests {
         let tokens = tokenize("std::collections::HashMap");
         assert_eq!(
             texts(&tokens),
-            vec!["std", "collections", "hash", "map", "hashmap"]
+            vec!["std", "collections", "hash", "map", "hashmap", "hash_map"]
         );
     }
 
@@ -297,13 +350,26 @@ mod tests {
     #[test]
     fn test_xml_parser() {
         let tokens = tokenize("XMLParser");
-        assert_eq!(texts(&tokens), vec!["xml", "parser", "xmlparser"]);
+        assert_eq!(
+            texts(&tokens),
+            vec!["xml", "parser", "xmlparser", "xml_parser"]
+        );
     }
 
     #[test]
     fn test_fhir_base_url() {
         let tokens = tokenize("fhirBaseUrl");
-        assert_eq!(texts(&tokens), vec!["fhir", "base", "url", "fhirbaseurl"]);
+        assert_eq!(
+            texts(&tokens),
+            vec![
+                "fhir",
+                "base",
+                "url",
+                "fhirbaseurl",
+                "fhir_base",
+                "base_url"
+            ]
+        );
     }
 
     #[test]
@@ -331,12 +397,17 @@ mod tests {
     fn test_positions() {
         let tokens = tokenize("getUserById");
         // Sub-tokens: get(0), user(1), by(2), id(3)
-        // Joined: getuserbyid(0) -- same position as first sub-token
+        // Joined: getuserbyid(0) -- same position as first sub-token.
+        // Bigrams (Item 16): get_user(0), user_by(1), by_id(2) -- each at the
+        // position of its first sub-token.
         assert_eq!(tokens[0].position, 0); // get
         assert_eq!(tokens[1].position, 1); // user
         assert_eq!(tokens[2].position, 2); // by
         assert_eq!(tokens[3].position, 3); // id
         assert_eq!(tokens[4].position, 0); // getuserbyid (same as "get")
+        assert_eq!(tokens[5].position, 0); // get_user   (same as "get")
+        assert_eq!(tokens[6].position, 1); // user_by    (same as "user")
+        assert_eq!(tokens[7].position, 2); // by_id      (same as "by")
     }
 
     #[test]
@@ -351,23 +422,42 @@ mod tests {
                 "by",
                 "id",
                 "getuserbyid",
+                "get_user",
+                "user_by",
+                "by_id",
                 "max",
                 "retry",
                 "count",
-                "maxretrycount"
+                "maxretrycount",
+                "max_retry",
+                "retry_count"
             ]
         );
-        // Second group starts at position 4
-        assert_eq!(tokens[5].position, 4); // max
-        assert_eq!(tokens[6].position, 5); // retry
-        assert_eq!(tokens[7].position, 6); // count
-        assert_eq!(tokens[8].position, 4); // maxretrycount
+        // First group: positions 0..=3 for sub-tokens; joined + 3 bigrams reuse
+        // positions 0..=2. Second group's sub-tokens start at position 4.
+        // tokens layout for first group (indices 0..8):
+        //   [0]=get(0) [1]=user(1) [2]=by(2) [3]=id(3)
+        //   [4]=getuserbyid(0)
+        //   [5]=get_user(0) [6]=user_by(1) [7]=by_id(2)
+        // Second group (indices 8..14):
+        //   [8]=max(4) [9]=retry(5) [10]=count(6)
+        //   [11]=maxretrycount(4)
+        //   [12]=max_retry(4) [13]=retry_count(5)
+        assert_eq!(tokens[8].position, 4); // max
+        assert_eq!(tokens[9].position, 5); // retry
+        assert_eq!(tokens[10].position, 6); // count
+        assert_eq!(tokens[11].position, 4); // maxretrycount
+        assert_eq!(tokens[12].position, 4); // max_retry  (shares with "max")
+        assert_eq!(tokens[13].position, 5); // retry_count(shares with "retry")
     }
 
     #[test]
     fn test_arrow_separator() {
         let tokens = tokenize("self->getValue");
-        assert_eq!(texts(&tokens), vec!["self", "get", "value", "getvalue"]);
+        assert_eq!(
+            texts(&tokens),
+            vec!["self", "get", "value", "getvalue", "get_value"]
+        );
     }
 
     #[test]
@@ -385,7 +475,10 @@ mod tests {
     #[test]
     fn test_numeric_in_identifier() {
         let tokens = tokenize("base64Encode");
-        assert_eq!(texts(&tokens), vec!["base64", "encode", "base64encode"]);
+        assert_eq!(
+            texts(&tokens),
+            vec!["base64", "encode", "base64encode", "base64_encode"]
+        );
     }
 
     #[test]
@@ -428,5 +521,142 @@ mod tests {
     fn test_expand_identifiers_no_split_needed() {
         let result = expand_identifiers("simple token here");
         assert!(result.is_empty()); // single-component tokens don't need expansion
+    }
+
+    // ---------- Item 16: adjacent-pair bigrams ----------
+
+    #[test]
+    fn test_expand_identifiers_bigrams_four_parts() {
+        // getUserById -> sub_tokens [get, user, by, id]
+        // Bigrams: get_user, user_by, by_id
+        let result = expand_identifiers("getUserById");
+        // Sub-tokens still present (in the space-joined expansion):
+        assert!(
+            result.contains("get user by id"),
+            "expected sub-token expansion, got: {result}"
+        );
+        // Bigrams must be present:
+        assert!(
+            result.contains("get_user"),
+            "missing bigram get_user in: {result}"
+        );
+        assert!(
+            result.contains("user_by"),
+            "missing bigram user_by in: {result}"
+        );
+        assert!(
+            result.contains("by_id"),
+            "missing bigram by_id in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_expand_identifiers_bigrams_two_parts() {
+        // getUser is too short (len 7 is OK, > 4)
+        let result = expand_identifiers("getUser foo");
+        assert!(result.contains("get_user"), "missing get_user: {result}");
+    }
+
+    #[test]
+    fn test_expand_identifiers_bigrams_skip_single_token() {
+        // "parse" splits to a single sub-token -> no bigram.
+        let result = expand_identifiers("parse");
+        assert!(
+            !result.contains('_'),
+            "single-token identifier produced a bigram: {result}"
+        );
+    }
+
+    #[test]
+    fn test_expand_identifiers_bigrams_mixed_case() {
+        // MyHTTPHandler -> sub_tokens [my, http, handler] (UPPER+Lower boundary rules)
+        let result = expand_identifiers("MyHTTPHandler");
+        // Verify expected decomposition first:
+        assert!(
+            result.contains("my http handler"),
+            "unexpected decomposition: {result}"
+        );
+        // And bigrams between adjacent pairs:
+        assert!(result.contains("my_http"), "missing my_http in: {result}");
+        assert!(
+            result.contains("http_handler"),
+            "missing http_handler in: {result}"
+        );
+    }
+
+    #[test]
+    fn test_expand_identifiers_bigrams_snake_case() {
+        // snake_case identifiers also produce bigrams.
+        let result = expand_identifiers("get_user_by_id");
+        assert!(result.contains("get_user"));
+        assert!(result.contains("user_by"));
+        assert!(result.contains("by_id"));
+    }
+
+    #[test]
+    fn test_tokenize_code_emits_bigrams() {
+        // getUserById -> sub-tokens get, user, by, id; joined getuserbyid;
+        // bigrams get_user, user_by, by_id at positions 0, 1, 2 respectively.
+        let tokens = tokenize_code("getUserById");
+        let token_texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            token_texts.contains(&"get_user"),
+            "missing get_user in {token_texts:?}"
+        );
+        assert!(
+            token_texts.contains(&"user_by"),
+            "missing user_by in {token_texts:?}"
+        );
+        assert!(
+            token_texts.contains(&"by_id"),
+            "missing by_id in {token_texts:?}"
+        );
+    }
+
+    #[test]
+    fn test_tokenize_code_bigram_position_matches_first_subtoken() {
+        // Spec §9.1.3: bigram must share position with the first sub-token of the pair.
+        let tokens = tokenize_code("getUserById");
+
+        // Build text -> position map for sub-tokens.
+        let pos = |text: &str| {
+            tokens
+                .iter()
+                .find(|t| t.text == text)
+                .unwrap_or_else(|| panic!("no token {text} in {tokens:?}"))
+                .position
+        };
+
+        // Sub-tokens are emitted in order at positions 0..=3.
+        assert_eq!(pos("get"), 0);
+        assert_eq!(pos("user"), 1);
+        assert_eq!(pos("by"), 2);
+        assert_eq!(pos("id"), 3);
+
+        // Each bigram must sit at the position of its FIRST sub-token.
+        assert_eq!(pos("get_user"), 0, "get_user must share position with get");
+        assert_eq!(pos("user_by"), 1, "user_by must share position with user");
+        assert_eq!(pos("by_id"), 2, "by_id must share position with by");
+    }
+
+    #[test]
+    fn test_tokenize_code_no_bigrams_for_single_token() {
+        let tokens = tokenize_code("parse");
+        let token_texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        // Only "parse" should be present; no underscore-joined tokens.
+        assert_eq!(token_texts, vec!["parse"]);
+        assert!(!token_texts.iter().any(|t| t.contains('_')));
+    }
+
+    #[test]
+    fn test_tokenize_code_bigram_offset_first_subtoken() {
+        // Bigram tokens must keep offset_from == offset of the identifier (spec hint:
+        // bigrams highlight the source identifier). We assert offset_from/offset_to
+        // match the parent identifier span.
+        let tokens = tokenize_code("getUserById");
+        let parent: &Token = tokens.iter().find(|t| t.text == "get").unwrap();
+        let bigram: &Token = tokens.iter().find(|t| t.text == "get_user").unwrap();
+        assert_eq!(bigram.offset_from, parent.offset_from);
+        assert_eq!(bigram.offset_to, parent.offset_to);
     }
 }

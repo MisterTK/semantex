@@ -20,6 +20,18 @@ pub struct Chunk {
     pub chunk_type: ChunkType,
 }
 
+impl Chunk {
+    /// Returns the symbol name for AST-aware chunks, or `None` for text-window
+    /// / PDF-page chunks. Used by the v0.4 definition-boost ranking signal
+    /// (see `search/path_signals.rs`, spec §7.4.2).
+    pub fn symbol_name(&self) -> Option<&str> {
+        match &self.chunk_type {
+            ChunkType::AstNode { name, .. } => Some(name.as_str()),
+            ChunkType::TextWindow { .. } | ChunkType::PdfPage { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChunkType {
     /// AST-aware chunk: a function, method, class, etc.

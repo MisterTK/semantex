@@ -95,3 +95,49 @@ cargo test   -p semantex-core --lib                # 589 passed, 1 ignored, 0 fa
 cargo clippy -p semantex-core -- -D warnings       # clean
 cargo fmt    --all --check                         # clean
 ```
+---
+
+## Request 7 — v0.4 WS-A Item 4 (rusqlite 0.38 → 0.40): BLOCKED by next-plaid 1.3
+**Status:** OPEN — needs cross-spec decision.
+
+`crates/semantex-core/Cargo.toml` and `crates/semantex-mcp/Cargo.toml` were bumped from `rusqlite = "0.38"` to `"0.40"` per Spec D §5.3. Build fails with:
+
+```
+package `libsqlite3-sys` links to the native library `sqlite3`, but it
+conflicts with a previous package which links to `sqlite3` as well:
+  package `libsqlite3-sys v0.38.0`
+    ... rusqlite v0.40.0 (semantex-core, semantex-mcp)
+  vs
+  package `libsqlite3-sys v0.36.0`
+    ... rusqlite v0.38.0
+    ... next-plaid v1.3.0 (workspace.dependencies)
+```
+
+`libsqlite3-sys` is a `links = "sqlite3"` crate; the Cargo resolver can't unify two majors of it because each tries to link the native library.
+
+`next-plaid 1.3.1` (latest published on crates.io) pins `rusqlite = "^0.38"`. There is no `next-plaid 1.4` yet. Until next-plaid bumps its own rusqlite, semantex-core cannot move past 0.38.
+
+**Options:**
+1. **Defer Item 4 to v0.5 / v0.6** (recommended). Mark Item 4 BLOCKED in the Spec D acceptance matrix. WAL perf gain (3.51.3 → 3.53.1) is a "nice-to-have" — semantex doesn't bottleneck on SQLite right now.
+2. **File an upstream PR against next-plaid** to bump its rusqlite. Wait for 1.4 release. Outside this spec's 6h budget.
+3. **Vendor a forked next-plaid** with rusqlite bumped. Anti-pattern; rejected per CLAUDE.md OSS rules.
+
+Reverted Item 4 in this workstream commit; Items 2 / 3 / 5 ship as planned. Coordinator should pick option (1) and document in Spec D §5.3 that Item 4 is deferred.
+
+---
+
+## Request 8 — v0.4 WS-A Item 5: Spec-prescribed `IndexingTerm` is `pub(crate)` in tantivy 0.26.1
+**Status:** Resolved in-band (spec text appears to be incorrect).
+
+Spec D §5.4.2 directs:
+
+> change `tantivy::Term::from_field_u64(self.chunk_id_field, id)` to
+> `tantivy::IndexingTerm::from_field_u64(self.chunk_id_field, id)`.
+> The surrounding `self.writer.delete_term(term)` accepts the new
+> `IndexingTerm` type.
+
+In the published tantivy 0.26.1 source, `IndexingTerm` is `pub(crate)` (see `src/indexer/indexing_term.rs:16`) and is not re-exported at the crate root. `Term::from_field_u64` is still public and `IndexWriter::delete_term` still takes `Term` (`src/indexer/index_writer.rs:680`). The intended migration appears to be a no-op for this call site.
+
+**Action taken:** kept the existing `tantivy::Term::from_field_u64` call. WS-E item 18 should verify against tantivy docs whether a future tantivy 0.27 exposes `IndexingTerm` publicly and adjust the call there.
+
+A second tantivy 0.26 API change DID require a one-line fix (also in `sparse_search.rs`): `TopDocs::with_limit(k)` is no longer itself a `Collector`; you now chain `.order_by_score()` to obtain a Collector with the same `Vec<(Score, DocAddress)>` fruit type. This is the lazy-scorer split mentioned in Spec D §5.4.1; the fix is mechanical and additive (no behavior change for the equivalent old call).

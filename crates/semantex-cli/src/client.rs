@@ -10,7 +10,7 @@ const CLIENT_PID_FILE: &str = "client.pid";
 
 /// A persistent client that maintains a long-lived TCP connection to the
 /// semantex daemon. Eliminates per-query connection overhead and uses the
-/// binary (bincode) protocol for minimal serialization cost.
+/// binary (postcard) protocol for minimal serialization cost.
 pub struct PersistentClient {
     stream: TcpStream,
     /// Pre-allocated read buffer

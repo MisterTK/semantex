@@ -285,7 +285,7 @@ fn send_binary_request(
         .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))
 }
 
-/// Send a binary (bincode) search request to the daemon at the given port.
+/// Send a binary (postcard) search request to the daemon at the given port.
 /// Returns the SearchResponse or an error. Much faster than JSON.
 pub fn daemon_search_binary(
     port: u16,

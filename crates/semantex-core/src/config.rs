@@ -55,6 +55,15 @@ pub struct SemantexConfig {
     pub colbert_model: ColbertModelChoice,
     /// PLAID quantization bits (2 or 4, default: 4)
     pub plaid_nbits: usize,
+    /// Whether to apply the English Snowball stemmer to BM25 index tokens.
+    /// Default `true` (legacy behavior). Code-identifier-heavy corpora MAY
+    /// benefit from disabling: with stemming on, `retry` -> `retri`,
+    /// `handle` -> `handl`, which can hurt exact identifier matching.
+    ///
+    /// This flag is respected at index-build time only. Toggling without a
+    /// reindex has no effect on existing indexes (no runtime warning is
+    /// emitted; see `docs/CONFIGURATION.md`).
+    pub use_bm25_stemmer: bool,
 }
 
 impl Default for SemantexConfig {
@@ -81,6 +90,7 @@ impl Default for SemantexConfig {
             min_score_mixed: 0.10,
             colbert_model: ColbertModelChoice::default(),
             plaid_nbits: 4,
+            use_bm25_stemmer: true,
         }
     }
 }
@@ -177,5 +187,20 @@ impl SemantexConfig {
             || Self::semantex_home().join("config.yaml"),
             |d| d.join("semantex").join("config.yaml"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.4 Item 18: BM25 stemmer ON by default (preserves legacy behavior).
+    #[test]
+    fn default_config_enables_bm25_stemmer() {
+        let cfg = SemantexConfig::default();
+        assert!(
+            cfg.use_bm25_stemmer,
+            "Default must preserve legacy stemming behavior (true) per v0.4 spec §9.2.3"
+        );
     }
 }

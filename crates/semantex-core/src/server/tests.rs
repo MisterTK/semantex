@@ -117,7 +117,7 @@ mod tests {
         assert!(json.contains("\"type\":\"search\""));
         assert!(json.contains("src/main.rs"));
         assert!(json.contains("\"duration_ms\":31"));
-        // content is null when None (included for bincode compatibility)
+        // content is null when None (included for postcard compatibility)
         assert!(json.contains("\"content\":null"));
     }
 
@@ -575,14 +575,12 @@ mod tests {
         };
 
         let json_size = serde_json::to_string(&item).unwrap().len();
-        let bincode_size = bincode::serde::encode_to_vec(&item, bincode::config::standard())
-            .unwrap()
-            .len();
+        let postcard_size = postcard::to_stdvec(&item).unwrap().len();
 
-        // bincode should be smaller than JSON
+        // postcard should be smaller than JSON
         assert!(
-            bincode_size < json_size,
-            "bincode ({bincode_size} bytes) should be smaller than JSON ({json_size} bytes)"
+            postcard_size < json_size,
+            "postcard ({postcard_size} bytes) should be smaller than JSON ({json_size} bytes)"
         );
     }
 
@@ -766,8 +764,8 @@ mod tests {
     #[test]
     fn test_binary_tcp_protocol_simulation() {
         // Simulate the full binary protocol flow as it would happen over TCP:
-        // Client sends: [0x00][len:4 LE][bincode request]
-        // Server reads, processes, responds: [0x00][len:4 LE][bincode response]
+        // Client sends: [0x00][len:4 LE][postcard request]
+        // Server reads, processes, responds: [0x00][len:4 LE][postcard response]
 
         // 1. Client encodes request
         let client_req = BinaryRequest::Search(SearchRequest {

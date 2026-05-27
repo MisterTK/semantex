@@ -25,40 +25,41 @@ fastembed = "5.9"
 ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
 
 # Full-text search (BM25)
-tantivy = "0.25"
+tantivy = { version = "0.26", features = ["stemmer"] }
 
 # AST parsing
-tree-sitter = "0.26.5"
+tree-sitter = "0.26.9"
 tree-sitter-language = "0.1"
-tree-sitter-rust = "0.24"
+tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23.5"
-tree-sitter-c = "0.24.1"
+tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-ruby = "0.23.1"
-tree-sitter-md = "0.5.2"
+tree-sitter-md = "0.5.3"
 tree-sitter-json = "0.24.8"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-dart-orchard = "0.3"
-tree-sitter-c-sharp = "0.23.1"
-tree-sitter-scala = "0.24"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-scala = "0.26"
 tree-sitter-php = "0.24"
-tree-sitter-lua = "0.4"
+tree-sitter-lua = "0.5"
 tree-sitter-haskell = "0.23"
-tree-sitter-ocaml = "0.24"
+tree-sitter-ocaml = "0.25"
 tree-sitter-zig = "1"
 tree-sitter-r = "1"
 tree-sitter-html = "0.23"
-tree-sitter-swift = "0.7"
-tree-sitter-elixir = "0.3"
+tree-sitter-swift = "0.7.2"
+tree-sitter-elixir = "0.3.5"
 tree-sitter-svelte-next = "0.1"
 tree-sitter-kotlin-ng = "1.1"
-# tree-sitter-sql (0.19), tree-sitter-vue:
-# Not yet available with tree-sitter 0.26+ API (LANGUAGE static).
-# These languages fall back to text chunking until compatible versions are published.
+tree-sitter-vue-next = "0.1"
+# tree-sitter-sql (0.19): Not yet available with tree-sitter 0.26+ API
+# (LANGUAGE static). Falls back to text chunking until a compatible version
+# is published.
 
 # File handling
 ignore = "0.4"
@@ -93,7 +94,7 @@ dirs = "6"
 ctrlc = { version = "3", features = ["termination"] }
 tempfile = "3"
 walkdir = "2"
-bincode = { workspace = true }
+postcard = { workspace = true }
 parking_lot = "0.12"
 regex = { workspace = true }
 rust-stemmers = "1.2"

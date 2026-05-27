@@ -228,7 +228,7 @@ impl Listener {
         }
     }
 
-    /// Handle a binary (bincode) framed connection.
+    /// Handle a binary (postcard) framed connection.
     fn handle_binary_connection(
         &self,
         reader: &mut BufReader<&TcpStream>,
