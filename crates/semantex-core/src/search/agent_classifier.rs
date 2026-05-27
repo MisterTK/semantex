@@ -724,4 +724,47 @@ mod tests {
             Some("auth.service".into())
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // v0.3.1 Item 2 investigation — release-sequence §4.2
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // The v0.3.1 spec hypothesized that the platform Q2 +69% CCB regression
+    // came from `Structural` over-matching on the multi-language repo. The
+    // amended gate in `docs/RELEASE-SEQUENCE-2026-05.md` §4.2 requires running
+    // the classifier on the EXACT Q2 wording from `benchmarks/agent_bench.py`
+    // BEFORE writing any production code. The result determines whether the
+    // proposed `detect_languages` override is warranted.
+    //
+    // Q2 wording (verbatim from `benchmarks/agent_bench.py::QUESTIONS`):
+    //   "How does this project handle errors? What patterns are used for
+    //    error propagation, reporting, and recovery?"
+    //
+    // Walking the classifier:
+    //   - Not FilePattern (no `*`, no mid-token `?`).
+    //   - Not Regex.
+    //   - Not ExactSymbol (whitespace present).
+    //   - Not Architecture (no architecture keyword matches).
+    //   - Not Structural (none of: callers/callees/who calls/used by/uses/
+    //     depends on/references/imports/etc. appear in the query).
+    //   - Not DeepWithExamples (no marker matches).
+    //   - Deep prefix `"how "` matches → AgentRoute::Deep.
+    //
+    // Conclusion (§4.2 branch (a)): The classifier ALREADY routes platform
+    // Q2 to Deep. The proposed `detect_languages` override is NOT warranted
+    // — the regression source is downstream (likely the Deep handler on
+    // multi-language repos), and Tier 2 Item 5 already owns deep-audit work.
+    // No production change in this workstream.
+    #[test]
+    fn q2_already_routes_to_deep_so_no_classifier_fix_needed() {
+        let q2_exact_wording = "How does this project handle errors? What \
+                                patterns are used for error propagation, \
+                                reporting, and recovery?";
+        assert_eq!(
+            classify_agent_query(q2_exact_wording),
+            AgentRoute::Deep,
+            "Q2 must route to Deep; if this changes, re-evaluate v0.3.1 \
+             Item 2 per release-sequence §4.2"
+        );
+    }
 }

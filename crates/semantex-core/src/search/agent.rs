@@ -3,6 +3,7 @@ use super::agent_formatter::{
     DEFAULT_BUDGET, FormatStyle, format_code_blocks, format_deep_results, format_graph_results,
     format_search_results,
 };
+use crate::index::architecture::budget_for_chunk_count;
 use crate::search::SearchQuery;
 use crate::search::deep as deep_search_module;
 use crate::search::hybrid::HybridSearcher;
@@ -13,6 +14,10 @@ use crate::server::protocol::{
     AgentMetrics, AgentRequest, AgentResponse, GraphWalkResponse, SearchResponse, SearchResultItem,
 };
 use std::path::{Path, PathBuf};
+
+/// Threshold below which `handle_architecture` switches into "tiny repo" mode
+/// (god_nodes section only, no communities, no boundaries). Per spec §4 Item 4.
+const ARCH_TINY_REPO_THRESHOLD: u64 = 500;
 
 /// Result from an individual handler method.
 pub(crate) struct HandlerResult {
@@ -380,12 +385,29 @@ impl<'a> AgentPipeline<'a> {
     /// structural tools). Returns the same ArchOverview (god nodes +
     /// communities + boundaries) but rendered as formatted text and routed
     /// internally by `semantex_agent` based on classifier intent.
+    ///
+    /// v0.3.1 Item 1 + Item 4 (per spec §4): the overview is now size-adaptive.
+    /// `chunk_count < 500` → tiny-repo mode (god_nodes only, max 5, no
+    /// communities / boundaries — too few to be meaningful, and rendering
+    /// them on tiny repos triggers the agent to do follow-up exploration).
+    /// `chunk_count >= 500` → use the `budget_for_chunk_count` tier
+    /// (small / medium / large) from Item 1.
     fn handle_architecture(&self, query: &str, budget: usize) -> HandlerResult {
         use crate::index::architecture::build_arch_overview;
         let db_path = self.project_root.join(".semantex").join("chunks.db");
+        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
+        // Item 1: derive the adaptive budget from index size.
+        // Item 4: when chunk_count < 500, force communities=0 and boundaries=0
+        // so build_arch_overview skips those passes; cap god_nodes at 5.
+        let mut arch_budget = budget_for_chunk_count(chunk_count as usize);
+        if chunk_count < ARCH_TINY_REPO_THRESHOLD {
+            arch_budget.god_nodes = arch_budget.god_nodes.min(5);
+            arch_budget.communities = 0;
+            arch_budget.boundaries = 0;
+        }
         let Ok(overview) = self
             .searcher
-            .with_store(|store| build_arch_overview(store, &db_path))
+            .with_store(|store| build_arch_overview(store, &db_path, Some(arch_budget)))
         else {
             return self.handle_deep(query, budget, true);
         };
@@ -484,13 +506,19 @@ impl<'a> AgentPipeline<'a> {
     /// configuration / options / flags / env vars. Combines a wider search
     /// (more candidates, larger budget) with structural callers/imports
     /// information so the agent gets definitions AND usages in one response.
+    ///
+    /// v0.3.1 Item 1: `max_results` is now derived from `budget_for_chunk_count`
+    /// (was hardcoded 30, which over-fetched on small repos and triggered
+    /// follow-up exploration — see spec §4 Item 1, platform Q4 +29%).
     fn handle_exhaustive_structural(&self, query: &str, budget: usize) -> HandlerResult {
         // Use the existing exhaustive path's wider search settings; the
         // formatter is what makes the difference. Inject a structural hint
         // by widening max_results and enriching the budget so callers can
         // be listed alongside definitions.
         let exhaustive_budget = budget * 4;
-        let sq = SearchQuery::new(query).max_results(30);
+        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
+        let arch_budget = budget_for_chunk_count(chunk_count as usize);
+        let sq = SearchQuery::new(query).max_results(arch_budget.exhaustive_max);
         match self.searcher.search(&sq) {
             Ok(output) if !output.results.is_empty() => {
                 let items: Vec<SearchResultItem> = output
@@ -529,10 +557,30 @@ impl<'a> AgentPipeline<'a> {
     /// mentions a known pattern name (e.g. `rust.tokio_spawn`), the
     /// pattern's exemplars are pulled inline so the agent sees concrete
     /// code without a follow-up call.
+    ///
+    /// v0.3.1 Item 3 (spec §4): pattern × example expansion is now capped
+    /// adaptively by `ArchBudget.deep_examples_max`:
+    ///   - small repo (chunks ≤ 2000): 1 pattern × 2 examples = 2 hits
+    ///   - medium (≤ 10000):           2 patterns × 3 examples = 6 hits
+    ///   - large:                       3 patterns × 3 examples = 9 hits
+    ///
+    /// Also: if the upstream deep result has < 5 sources, the enrichment
+    /// pass is skipped entirely — the answer is already focused and the
+    /// extra exemplars would just bloat tokens (motivates flask Q3 +54%).
     fn handle_deep_with_examples(&self, query: &str, budget: usize) -> HandlerResult {
         let deep_result = self.handle_deep(query, budget, false);
+        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
+        let arch_budget = budget_for_chunk_count(chunk_count as usize);
+        let limits = deep_examples_limits(arch_budget.deep_examples_max);
+
+        // Item 3: short-circuit when the deep response is already focused.
+        if !should_enrich_with_examples(deep_result.result_count, &limits) {
+            return deep_result;
+        }
+
         // Scan deep output for pattern-name mentions (e.g. `rust.X`, `ts.X`)
-        // and pull up to 3 exemplars per matched pattern from the catalog.
+        // and pull `limits.examples_per_pattern` exemplars per matched
+        // pattern from the catalog, capped at `limits.max_patterns`.
         let db_path = self.project_root.join(".semantex").join("chunks.db");
         let mut found_patterns: Vec<String> = Vec::new();
         for cap in regex::Regex::new(r"\b(?:rust|ts|py|go|java)\.[a-z_]+\b")
@@ -547,7 +595,7 @@ impl<'a> AgentPipeline<'a> {
             if !found_patterns.contains(&cap) {
                 found_patterns.push(cap);
             }
-            if found_patterns.len() >= 3 {
+            if found_patterns.len() >= limits.max_patterns {
                 break;
             }
         }
@@ -558,9 +606,13 @@ impl<'a> AgentPipeline<'a> {
         enriched.push_str("\n\n## Pattern catalog exemplars\n\n");
         let mut added = 0usize;
         for pat in &found_patterns {
-            let examples =
-                crate::index::architecture::query_pattern_matches(&db_path, pat, None, 3)
-                    .unwrap_or_default();
+            let examples = crate::index::architecture::query_pattern_matches(
+                &db_path,
+                pat,
+                None,
+                limits.examples_per_pattern,
+            )
+            .unwrap_or_default();
             if examples.is_empty() {
                 continue;
             }
@@ -594,6 +646,60 @@ impl<'a> AgentPipeline<'a> {
             result_count: deep_result.result_count + added,
         }
     }
+}
+
+/// Adaptive pattern × example caps for `handle_deep_with_examples`.
+///
+/// Derived from `ArchBudget.deep_examples_max` via `deep_examples_limits`.
+/// Per spec §4 Item 3:
+///   - small repo (deep_examples_max = 1): 1 pattern × 2 examples = 2 hits
+///   - medium (= 3):                       2 patterns × 3 examples = 6 hits
+///   - large (= 5):                        3 patterns × 3 examples = 9 hits
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeepExamplesLimits {
+    pub max_patterns: usize,
+    pub examples_per_pattern: usize,
+}
+
+/// Map `ArchBudget.deep_examples_max` to the pattern × example grid used by
+/// `handle_deep_with_examples`. Pure function so it's trivially unit-testable.
+pub(crate) fn deep_examples_limits(deep_examples_max: usize) -> DeepExamplesLimits {
+    // The grid is intentionally non-linear: small repos get *both* fewer
+    // patterns and fewer examples per pattern, since the answer is usually
+    // narrow already; large repos keep the original 3×3 ceiling.
+    match deep_examples_max {
+        0 => DeepExamplesLimits {
+            max_patterns: 0,
+            examples_per_pattern: 0,
+        },
+        1 => DeepExamplesLimits {
+            max_patterns: 1,
+            examples_per_pattern: 2,
+        },
+        2..=4 => DeepExamplesLimits {
+            max_patterns: 2,
+            examples_per_pattern: 3,
+        },
+        _ => DeepExamplesLimits {
+            max_patterns: 3,
+            examples_per_pattern: 3,
+        },
+    }
+}
+
+/// Decide whether `handle_deep_with_examples` should run pattern enrichment.
+///
+/// Per spec §4 Item 3: if the upstream deep result has fewer than 5 sources,
+/// the answer is already focused and we skip enrichment entirely. Also skip
+/// if the budget reduces to zero hits.
+pub(crate) fn should_enrich_with_examples(
+    deep_result_count: usize,
+    limits: &DeepExamplesLimits,
+) -> bool {
+    if deep_result_count < 5 {
+        return false;
+    }
+    limits.max_patterns > 0 && limits.examples_per_pattern > 0
 }
 
 /// Perform a filesystem glob walk and return matching file paths.
@@ -710,5 +816,62 @@ mod tests {
         let result = glob_files(dir.path(), "*.rs");
         assert!(result.formatted.contains("... and 10 more files"));
         assert_eq!(result.result_count, 60);
+    }
+
+    // --- v0.3.1 Item 3 helpers ---------------------------------------------
+
+    #[test]
+    fn deep_examples_limits_small_repo() {
+        // small tier deep_examples_max = 1 → 1 pattern × 2 examples
+        let l = deep_examples_limits(1);
+        assert_eq!(l.max_patterns, 1);
+        assert_eq!(l.examples_per_pattern, 2);
+    }
+
+    #[test]
+    fn deep_examples_limits_medium_repo() {
+        // medium tier deep_examples_max = 3 → 2 patterns × 3 examples
+        let l = deep_examples_limits(3);
+        assert_eq!(l.max_patterns, 2);
+        assert_eq!(l.examples_per_pattern, 3);
+    }
+
+    #[test]
+    fn deep_examples_limits_large_repo() {
+        // large tier deep_examples_max = 5 → 3 patterns × 3 examples
+        let l = deep_examples_limits(5);
+        assert_eq!(l.max_patterns, 3);
+        assert_eq!(l.examples_per_pattern, 3);
+    }
+
+    #[test]
+    fn deep_examples_limits_zero_yields_zero() {
+        // Edge case: explicit zero budget should disable enrichment entirely.
+        let l = deep_examples_limits(0);
+        assert_eq!(l.max_patterns, 0);
+        assert_eq!(l.examples_per_pattern, 0);
+    }
+
+    #[test]
+    fn should_enrich_skips_when_few_sources() {
+        // Spec §4 Item 3: result_count < 5 → skip enrichment regardless of budget.
+        let l = deep_examples_limits(5); // generous large-repo budget
+        assert!(!should_enrich_with_examples(0, &l));
+        assert!(!should_enrich_with_examples(3, &l));
+        assert!(!should_enrich_with_examples(4, &l));
+    }
+
+    #[test]
+    fn should_enrich_runs_with_enough_sources() {
+        let l = deep_examples_limits(3);
+        assert!(should_enrich_with_examples(5, &l));
+        assert!(should_enrich_with_examples(20, &l));
+    }
+
+    #[test]
+    fn should_enrich_skips_when_budget_zero() {
+        // Even with plenty of sources, a zero budget disables enrichment.
+        let l = deep_examples_limits(0);
+        assert!(!should_enrich_with_examples(50, &l));
     }
 }
