@@ -266,8 +266,11 @@ fn triage_results(
             let overlap_start = start.max(sel_start);
             let overlap_end = end.min(sel_end);
             if overlap_end >= overlap_start {
-                let overlap_lines = (overlap_end - overlap_start + 1) as f32;
-                let my_lines = (end - start + 1).max(1) as f32;
+                // saturating_sub guards against pathological chunks where
+                // start > end (corrupted index, unusual tree-sitter parse) —
+                // would panic in debug / wrap in release otherwise.
+                let overlap_lines = (overlap_end.saturating_sub(*overlap_start) + 1) as f32;
+                let my_lines = (end.saturating_sub(*start) + 1).max(1) as f32;
                 if overlap_lines / my_lines > 0.5 {
                     overlaps = true;
                     break;
@@ -1032,10 +1035,16 @@ fn deep_search_inner(
                 _ => (None, None),
             };
             let file = chunk.file_path.display().to_string();
-            let also_matched_via = dedup_lookup
-                .get(&(file.clone(), chunk.start_line, chunk.end_line))
-                .cloned()
-                .unwrap_or_default();
+            // Short-circuit: on the common zero-duplicate path, dedup_lookup
+            // is empty — skip the lookup (and its key clone) entirely.
+            let also_matched_via = if dedup_lookup.is_empty() {
+                Vec::new()
+            } else {
+                dedup_lookup
+                    .get(&(file.clone(), chunk.start_line, chunk.end_line))
+                    .cloned()
+                    .unwrap_or_default()
+            };
             DeepSource {
                 file,
                 start_line: chunk.start_line,

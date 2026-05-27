@@ -15,6 +15,7 @@ pub mod config;
 pub mod embedding;
 pub mod file;
 pub mod index;
+pub mod llm;
 pub mod memory;
 pub mod search;
 pub mod server;

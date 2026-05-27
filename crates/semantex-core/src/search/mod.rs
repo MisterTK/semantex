@@ -9,6 +9,7 @@ pub mod graph_propagation;
 pub mod hybrid;
 pub mod path_signals;
 pub mod plaid_search;
+pub mod planner;
 pub mod query_classifier;
 pub mod query_expander;
 pub mod regex_semantic;

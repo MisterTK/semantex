@@ -75,6 +75,7 @@ impl<'a> AgentPipeline<'a> {
                 self.handle_exhaustive_structural(&request.query, budget)
             }
             AgentRoute::DeepWithExamples => self.handle_deep_with_examples(&request.query, budget),
+            AgentRoute::FeaturePlanning => self.handle_feature_planning(&request.query, budget),
         };
         let search_ms = search_start.elapsed().as_millis() as u64;
 
@@ -574,7 +575,11 @@ impl<'a> AgentPipeline<'a> {
             out.push('\n');
         }
         if out.len() > budget * 3 {
-            out.truncate(budget * 3);
+            // floor_char_boundary keeps the truncate point on a UTF-8 char
+            // boundary; raw String::truncate panics mid-codepoint (e.g. on
+            // em-dashes in arch overviews or non-ASCII identifiers).
+            let cut = out.floor_char_boundary(budget * 3);
+            out.truncate(cut);
             out.push_str("\n[truncated to fit response budget]\n");
         }
         let total =
@@ -735,6 +740,80 @@ impl<'a> AgentPipeline<'a> {
             fallback_used: false,
             result_count: deep_result.result_count + added,
             disambiguation: None,
+        }
+    }
+
+    /// v0.6 Item 10 — Feature-planning route. The classifier sends
+    /// "if I wanted to add X, what files would change?" questions here.
+    /// We build a 3-step plan (Architecture → ConventionLookup →
+    /// ImpactedFiles) and merge per-step outputs into one response,
+    /// collapsing what would otherwise be 30+ external tool turns into a
+    /// single `semantex_agent` call.
+    ///
+    /// Safety: the planner enforces a 5-step cap and a 10s wall (see
+    /// `search::planner::{MAX_STEPS, MAX_WALL}`). On any planner error —
+    /// timeout, step failure, oversized plan — we fall back to the
+    /// existing `handle_deep` path. The existing deep handler is reused
+    /// unchanged; W-Gamma and v0.5 own its body.
+    fn handle_feature_planning(&self, query: &str, budget: usize) -> HandlerResult {
+        use super::planner::{Plan, PlanStepKind};
+
+        let Ok(plan) = Plan::new(query, super::agent_classifier::AgentRoute::FeaturePlanning)
+        else {
+            return self.handle_deep(query, budget, true);
+        };
+
+        // Each step is a thin search-shaped call. The runner returns the
+        // step's formatted body; `Plan::execute` concatenates them.
+        let runner = |step: &super::planner::PlanStep,
+                      _remaining: std::time::Duration|
+         -> anyhow::Result<String> {
+            match step.kind {
+                PlanStepKind::Architecture => {
+                    Ok(self.handle_architecture(&step.query, budget).formatted)
+                }
+                PlanStepKind::ConventionLookup
+                | PlanStepKind::ImpactedFiles
+                | PlanStepKind::ExampleSites
+                | PlanStepKind::Synthesize => {
+                    let sq = SearchQuery::new(&step.query).max_results(8);
+                    match self.searcher.search(&sq) {
+                        Ok(output) if !output.results.is_empty() => {
+                            let items: Vec<SearchResultItem> = output
+                                .results
+                                .iter()
+                                .map(|r| search_result_to_item(r, true))
+                                .collect();
+                            let resp = SearchResponse {
+                                results: items,
+                                duration_ms: output.metrics.total_ms,
+                                dense_count: output.metrics.dense_count,
+                                sparse_count: output.metrics.sparse_count,
+                                fused_count: output.metrics.fused_count,
+                                metrics: None,
+                                confidence: Some("medium".into()),
+                                disambiguation: None,
+                            };
+                            Ok(format_search_results(&resp, FormatStyle::Default, budget))
+                        }
+                        _ => Ok(String::new()),
+                    }
+                }
+            }
+        };
+
+        match plan.execute(runner) {
+            Ok(result) => HandlerResult {
+                formatted: result.merged,
+                fallback_used: false,
+                result_count: result
+                    .per_step
+                    .iter()
+                    .filter(|s| !s.output.is_empty())
+                    .count(),
+                disambiguation: None,
+            },
+            Err(_) => self.handle_deep(query, budget, true),
         }
     }
 }

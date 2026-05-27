@@ -464,10 +464,13 @@ pub(crate) fn graph_walk_from_store_adaptive(
         &target_ids,
         MAX_PER_SECTION_ADAPTIVE,
     );
+    // Outgoing edges keep self-references on purpose: recursive functions
+    // legitimately call themselves, and legacy `graph_walk_from_store`
+    // filtered target_ids out of *callers* only, not callees. Match that.
     let mut outgoing_ids = unique_neighbors(
         &store.get_call_edges_from(&target_ids)?,
         |(_, callee)| *callee,
-        &target_ids,
+        &[],
         MAX_PER_SECTION_ADAPTIVE,
     );
 

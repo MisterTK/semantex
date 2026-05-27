@@ -57,6 +57,12 @@ pub enum AgentRoute {
     /// Deep search enriched with pattern-catalog exemplars for any pattern
     /// names matched in the result set.
     DeepWithExamples,
+    /// "If I wanted to add X, what files would change?" — v0.6 Item 10.
+    /// Routes to the multi-step internal planner which decomposes the
+    /// question into Architecture → ConventionLookup → ImpactedFiles
+    /// sub-queries and merges the results into one response. Falls back
+    /// to `Deep` if the planner errors or times out.
+    FeaturePlanning,
 }
 
 impl std::fmt::Display for AgentRoute {
@@ -73,8 +79,47 @@ impl std::fmt::Display for AgentRoute {
             Self::Architecture => write!(f, "architecture"),
             Self::ExhaustiveStructural => write!(f, "exhaustive_structural"),
             Self::DeepWithExamples => write!(f, "deep_with_examples"),
+            Self::FeaturePlanning => write!(f, "feature_planning"),
         }
     }
+}
+
+/// Detect "feature_planning"-class questions for v0.6 Item 10 routing.
+///
+/// The input is expected to be already lowercased (the classifier calls
+/// `query.to_lowercase()` once and reuses it). Matches the three patterns
+/// documented in the spec:
+///   1. "if I want(ed) to add ..."
+///   2. "how do I add ..."
+///   3. "what files would (change|need|be touched) (to|when) ..."
+///
+/// Kept as plain substring scans to stay aligned with the rest of the
+/// keyword classifier — no regex crate use, no allocation beyond the
+/// single lowercased copy the caller already owns.
+fn is_feature_planning_query(lower: &str) -> bool {
+    if lower.contains("if i want to add") || lower.contains("if i wanted to add") {
+        return true;
+    }
+    if lower.contains("how do i add") {
+        return true;
+    }
+    // "what files would <verb>" — a verb alone is a strong enough signal.
+    // The original pattern required a verb-prep pair, which silently missed
+    // the common short variant "what files would change?" (no prep).
+    if lower.contains("what files would") {
+        let after = lower.split("what files would").nth(1).unwrap_or("");
+        // Look-ahead window: only consider the next ~80 chars to avoid
+        // matching unrelated "would" + "change" elsewhere in the prompt.
+        let window: String = after.chars().take(80).collect();
+        let has_verb = window.contains("change")
+            || window.contains("need")
+            || window.contains("touched")
+            || window.contains("update");
+        if has_verb {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns true if the query looks like a regex pattern.
@@ -219,6 +264,19 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
+    // 3c. FeaturePlanning — v0.6 Item 10. Catches "feature_planning"-class
+    // questions ("if I wanted to add X, what files would change?") before
+    // the Deep prefix scan claims them via the `how ` / `what ` openers.
+    // Matched patterns:
+    //   - "if I want(ed) to add ..."  → user is planning a change
+    //   - "how do I add ..."           → explicit "how to add" form
+    //   - "what files would change/need/be touched to/when ..." → impact query
+    // Kept as cheap substring matches; the substrings are unlikely to appear
+    // verbatim in unrelated NL queries.
+    if is_feature_planning_query(&lower) {
+        return AgentRoute::FeaturePlanning;
+    }
+
     // 4. Structural — callers/callees/imports/type-refs intent.
     let structural_keywords = [
         "callers",
@@ -359,6 +417,29 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
 
     // 8. Semantic — default
     AgentRoute::Semantic
+}
+
+/// LLM-augmented classification (v0.6 Item 9).
+///
+/// Wraps `classify_agent_query` with an opt-in `LlmClassifier` consulted
+/// first. If the LLM returns `Ok(route)`, that route is used. On any error
+/// — model not loaded, inference failure, tokenization issue — we silently
+/// fall back to the deterministic keyword classifier. The keyword
+/// classifier remains the single source of truth in any build that doesn't
+/// load a model, including the default `cargo build` with no feature
+/// flags.
+///
+/// This function is intentionally synchronous: the LLM inference itself is
+/// a blocking call into the ONNX runtime, and adding a tokio executor just
+/// to await a single blocking op would bloat the default build. If we
+/// later want to overlap inference with other I/O, this signature can be
+/// promoted to async without breaking callers (it returns `AgentRoute`,
+/// not a route + cost tuple).
+pub fn classify_with_llm(query: &str, llm: &dyn crate::llm::LlmClassifier) -> AgentRoute {
+    match llm.classify(query) {
+        Ok(route) => route,
+        Err(_) => classify_agent_query(query),
+    }
 }
 
 /// Extract the most relevant symbol from a query string.
@@ -765,6 +846,107 @@ mod tests {
             AgentRoute::Deep,
             "Q2 must route to Deep; if this changes, re-evaluate v0.3.1 \
              Item 2 per release-sequence §4.2"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // v0.6 Item 10 — FeaturePlanning classifier
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fp_if_i_wanted_to_add() {
+        assert_eq!(
+            classify_agent_query("if I wanted to add logging, what would change?"),
+            AgentRoute::FeaturePlanning
+        );
+    }
+
+    #[test]
+    fn fp_how_do_i_add() {
+        assert_eq!(
+            classify_agent_query("how do I add a new transport"),
+            AgentRoute::FeaturePlanning
+        );
+    }
+
+    #[test]
+    fn fp_what_files_would_change_to() {
+        assert_eq!(
+            classify_agent_query("what files would change to support multi-tenant tables"),
+            AgentRoute::FeaturePlanning
+        );
+    }
+
+    #[test]
+    fn fp_what_files_would_need_to() {
+        assert_eq!(
+            classify_agent_query("what files would need to be updated to add tracing"),
+            AgentRoute::FeaturePlanning
+        );
+    }
+
+    #[test]
+    fn fp_does_not_match_unrelated_how_question() {
+        // "how does X work" must keep routing to Deep, not FeaturePlanning.
+        assert_eq!(
+            classify_agent_query("how does the cache work"),
+            AgentRoute::Deep
+        );
+    }
+
+    #[test]
+    fn fp_does_not_match_plain_architecture_question() {
+        assert_eq!(
+            classify_agent_query("what are the main components of this project"),
+            AgentRoute::Architecture
+        );
+    }
+
+    #[test]
+    fn fp_does_not_match_structural_question() {
+        assert_eq!(
+            classify_agent_query("who calls authenticate"),
+            AgentRoute::Structural
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // v0.6 Item 9 — classify_with_llm fallback behaviour
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Stub LLM that always returns FeaturePlanning. Used to assert the
+    /// LLM result wins when the LLM returns Ok.
+    struct ConstClassifier(AgentRoute);
+    impl crate::llm::LlmClassifier for ConstClassifier {
+        fn classify(&self, _query: &str) -> anyhow::Result<AgentRoute> {
+            Ok(self.0)
+        }
+    }
+    /// Stub LLM that always errors. Used to assert keyword fallback.
+    struct ErrClassifier;
+    impl crate::llm::LlmClassifier for ErrClassifier {
+        fn classify(&self, _query: &str) -> anyhow::Result<AgentRoute> {
+            Err(anyhow::anyhow!("model not loaded"))
+        }
+    }
+
+    #[test]
+    fn classify_with_llm_uses_llm_result_when_ok() {
+        let llm = ConstClassifier(AgentRoute::FeaturePlanning);
+        // Query that would normally route to Semantic.
+        assert_eq!(
+            classify_with_llm("authentication middleware", &llm),
+            AgentRoute::FeaturePlanning
+        );
+    }
+
+    #[test]
+    fn classify_with_llm_falls_back_on_error() {
+        let llm = ErrClassifier;
+        // Query that the keyword classifier routes to Deep.
+        assert_eq!(
+            classify_with_llm("how does authentication work?", &llm),
+            AgentRoute::Deep
         );
     }
 }

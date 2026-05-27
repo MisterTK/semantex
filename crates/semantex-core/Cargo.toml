@@ -10,6 +10,13 @@ repository.workspace = true
 [features]
 default = []
 cuda = ["ort/cuda"]
+# v0.6 Item 9: opt-in local LLM scaffold (classifier + HyDE).
+# No new dependency is required — the loader reuses the workspace `ort`
+# crate that's already pulled in for ColBERT embeddings. The feature
+# exists so the scaffold modules (`llm::{classifier, hyde, loader}`) and
+# their tests compile only when explicitly requested, keeping the default
+# build identical to v0.5.
+local-llm = []
 
 [dependencies]
 anyhow.workspace = true
