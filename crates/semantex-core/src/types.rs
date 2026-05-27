@@ -3,6 +3,19 @@ use std::path::PathBuf;
 
 use crate::chunking::structured_meta::StructuredChunkMeta;
 
+/// Sentinel value written into `plaid_mapping.bin` at positions whose PLAID
+/// doc_id was deleted by an incremental rebuild (v0.4.1 W-Index #3).
+///
+/// The mapping is positional — `mapping[doc_id] = chunk_id`. Deleting a chunk
+/// MUST stamp `PLAID_TOMBSTONE` into the slot, not truncate the Vec or shift
+/// subsequent entries: PLAID may still reference the doc_id internally, and
+/// later positions stay positionally correct. Search-time readers
+/// (`PlaidSearcher::search`, subset-construction in `hybrid.rs`) must skip
+/// any slot equal to this sentinel rather than mapping it to a phantom
+/// chunk. `u64::MAX` is reserved because real chunk IDs are SQLite
+/// AUTOINCREMENT row ids starting at 1.
+pub const PLAID_TOMBSTONE: u64 = u64::MAX;
+
 /// A chunk of text extracted from a file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
@@ -156,6 +169,12 @@ pub enum SearchSource {
 }
 
 /// Index metadata stored alongside the index
+///
+/// v9 layout (v0.4.1 W-Index #4) adds `use_bm25_stemmer` so the daemon can
+/// detect at open time that an index was built with a different stemmer
+/// setting than the running config. Older v8 meta.json files lack the field
+/// and fail to deserialize — `state::detect` then returns `Stale` via the
+/// "unparseable meta -> Stale" rule, forcing a clean rebuild.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub schema_version: u32,
@@ -166,6 +185,12 @@ pub struct IndexMeta {
     pub chunk_count: u64,
     pub embedding_model: String,
     pub embedding_dim: u32,
+    /// Snowball-stemmer flag that was passed to `SparseIndex::create` when
+    /// this index was built. Open-time code re-validates against the runtime
+    /// `SemantexConfig.use_bm25_stemmer` and refuses to load on mismatch
+    /// (since tantivy stores the analyzer state implicitly via the index
+    /// schema). v0.4.1 W-Index #4.
+    pub use_bm25_stemmer: bool,
 }
 
 impl IndexMeta {
@@ -173,7 +198,13 @@ impl IndexMeta {
     /// (`chunk_annotations`, `pattern_matches`, `chunk_centrality`).
     /// Pre-v0.3 indexes (schema_version=7) are missing these tables, so
     /// `state::detect` returns `Stale` and the MCP/CLI layer triggers a rebuild.
-    pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+    ///
+    /// v9: postcard wire format for `plaid_mapping.bin` (was bincode); also
+    /// persists `use_bm25_stemmer` (see field below). v8 indexes written
+    /// before the postcard switch fail to decode the mapping file and the
+    /// missing-field deserialize blocks v8 meta.json from parsing as v9 —
+    /// both surface as `Stale` via `state::detect`, triggering a rebuild.
+    pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 }
 
 /// File metadata for incremental indexing
@@ -247,5 +278,45 @@ impl FileFilter {
 
     pub fn is_active(&self) -> bool {
         !self.include_extensions.is_empty() || !self.exclude_extensions.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.4.1 W-Index #1: the on-disk schema version must be 9 — the bump from
+    /// 8 records both the postcard wire format for `plaid_mapping.bin` and the
+    /// addition of the persisted `use_bm25_stemmer` field. Older v8 indexes
+    /// stay incompatible (rebuild via the stale-detection path).
+    #[test]
+    fn current_schema_version_is_9() {
+        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 9);
+    }
+
+    /// Synthetic v8 meta.json must be detected as `Stale` by `state::detect`
+    /// after the v9 bump, so the MCP/CLI rebuild path triggers a force-rebuild.
+    #[test]
+    fn synthetic_v8_meta_is_stale() {
+        use crate::index::state;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).expect("create .semantex dir");
+        let meta = IndexMeta {
+            schema_version: 8,
+            project_path: tmp.path().to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+        };
+        let meta_json = serde_json::to_string(&meta).expect("serialize meta");
+        std::fs::write(semantex_dir.join("meta.json"), meta_json).expect("write meta");
+        assert_eq!(state::detect(tmp.path()), state::IndexState::Stale);
     }
 }

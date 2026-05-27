@@ -2119,6 +2119,10 @@ impl McpServer {
 
     #[tracing::instrument(skip(self, args), fields(tool = "architecture"))]
     fn tool_architecture(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        use semantex_core::index::architecture::{
+            ARCH_TINY_REPO_THRESHOLD, ArchBudget, budget_for_chunk_count, build_arch_overview,
+        };
+
         let focus = args
             .get("focus")
             .and_then(|v| v.as_str())
@@ -2137,67 +2141,150 @@ impl McpServer {
         let store = ChunkStore::open_for_search(&db_path)
             .context("Failed to open chunk store for semantex_architecture")?;
 
-        // 1. God nodes — top-N chunks by PageRank centrality.
-        let god_nodes = if focus.as_deref().is_none_or(|f| f == "god_nodes") {
-            let top = query_top_centrality(&db_path, 10)?;
-            let mut entries: Vec<serde_json::Value> = Vec::new();
-            for (chunk_id, centrality) in &top {
-                let Ok(chunk) = store.get_chunk(*chunk_id) else {
-                    continue;
-                };
-                let meta = store.get_structured_meta(*chunk_id)?;
-                let (symbol, role) = if let Some(ref m) = meta {
-                    let name = m
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| chunk.file_path.display().to_string());
-                    let role_str = m.semantic_role.as_ref().map_or_else(
-                        || m.kind.clone().unwrap_or_default(),
-                        |r| r.as_label().to_string(),
-                    );
-                    (name, role_str)
-                } else {
-                    (chunk.file_path.display().to_string(), "module".to_string())
-                };
-                entries.push(serde_json::json!({
-                    "symbol": symbol,
-                    "centrality": centrality,
-                    "role": role,
-                    "location": {
-                        "file": chunk.file_path.display().to_string(),
-                        "start_line": chunk.start_line,
-                        "end_line": chunk.end_line,
-                    },
-                }));
+        // Derive an adaptive output budget from index size. Mirrors the
+        // agent path's `handle_architecture` so both surfaces emit the same
+        // section sizes for the same index. Tiny repos collapse to god_nodes
+        // only (no communities / boundaries) to avoid empty-section noise.
+        let chunk_count = store.chunk_count().unwrap_or(0);
+        let arch_budget = if chunk_count < ARCH_TINY_REPO_THRESHOLD {
+            ArchBudget {
+                god_nodes: 5,
+                communities: 0,
+                boundaries: 0,
+                deep_examples_max: 0,
+                exhaustive_max: 0,
             }
-            entries
         } else {
-            Vec::new()
+            budget_for_chunk_count(chunk_count as usize)
         };
 
-        // 2. Communities — connected components over call + import edges.
-        let communities = if focus.as_deref().is_none_or(|f| f == "communities") {
-            compute_communities(&store, &db_path)?
-        } else {
-            Vec::new()
-        };
+        let overview = build_arch_overview(&store, &db_path, Some(arch_budget))
+            .context("Failed to build architectural overview")?;
 
-        // 3. Boundaries — directory-level coupling: count cross-dir edges.
-        let boundaries = if focus.as_deref().is_none_or(|f| f == "boundaries") {
-            compute_boundaries_from_path(&db_path)?
-        } else {
-            Vec::new()
-        };
+        // Adapter: convert ArchOverview into the legacy tool_architecture JSON
+        // shape. We preserve the v0.3 Phase 4 surface:
+        //   god_nodes: [{symbol, centrality, role, location:{file,start_line,end_line}}]
+        //   communities: [{label, size, members:[file_path], entry_points:[{symbol, location:{...}}]}]
+        //   boundaries: [{from, to, edge_count}]
+        // The `role` field needs the structured_meta `kind` fallback that the
+        // typed GodNode struct doesn't carry, so we re-read meta per god_node
+        // here. With MEDIUM budget (10 god_nodes) that's at most 10 single-row
+        // queries — negligible at the tool boundary.
+        let god_nodes_json: Vec<serde_json::Value> =
+            if focus.as_deref().is_none_or(|f| f == "god_nodes") {
+                let mut entries: Vec<serde_json::Value> =
+                    Vec::with_capacity(overview.god_nodes.len());
+                // Batch-fetch chunks for all god_node ids so symbol-name reads
+                // go through Chunk::symbol_name() (single source of truth — see
+                // Defect #15). This is one batched query for the full list.
+                let ids: Vec<u64> = overview.god_nodes.iter().map(|g| g.chunk_id).collect();
+                let chunks = store.get_chunks(&ids).unwrap_or_default();
+                let chunk_by_id: HashMap<u64, semantex_core::types::Chunk> =
+                    chunks.into_iter().map(|c| (c.id, c)).collect();
+                for g in &overview.god_nodes {
+                    let meta = store.get_structured_meta(g.chunk_id).ok().flatten();
+                    // Role precedence (preserves legacy shape):
+                    //   1. structured_meta.semantic_role.as_label()
+                    //   2. structured_meta.kind
+                    //   3. "module"  (no meta at all)
+                    //   4. ""        (meta present but no role / kind)
+                    let role = match meta.as_ref() {
+                        Some(m) => m.semantic_role.as_ref().map_or_else(
+                            || m.kind.clone().unwrap_or_default(),
+                            |r| r.as_label().to_string(),
+                        ),
+                        None => "module".to_string(),
+                    };
+                    // Defect #15: symbol-name read goes through Chunk::symbol_name
+                    // (matches hybrid.rs Phase 3d), falling back to file path
+                    // for non-AstNode chunks. Architecture overview is
+                    // intentionally AstNode-centric (god nodes are functions /
+                    // classes / methods), so dropping non-AstNode names here is
+                    // acceptable.
+                    let symbol = chunk_by_id
+                        .get(&g.chunk_id)
+                        .and_then(|c| c.symbol_name().map(str::to_string))
+                        .unwrap_or_else(|| g.file.clone());
+                    entries.push(serde_json::json!({
+                        "symbol": symbol,
+                        "centrality": g.centrality,
+                        "role": role,
+                        "location": {
+                            "file": g.file,
+                            "start_line": g.start_line,
+                            "end_line": g.end_line,
+                        },
+                    }));
+                }
+                entries
+            } else {
+                Vec::new()
+            };
+
+        let communities_json: Vec<serde_json::Value> =
+            if focus.as_deref().is_none_or(|f| f == "communities") {
+                overview
+                    .communities
+                    .iter()
+                    .map(|c| {
+                        let entry_points: Vec<serde_json::Value> = c
+                            .entry_points
+                            .iter()
+                            .map(|ep| {
+                                serde_json::json!({
+                                    "symbol": ep.symbol,
+                                    "location": {
+                                        "file": ep.file,
+                                        "start_line": ep.start_line,
+                                        "end_line": ep.end_line,
+                                    },
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "label": c.label,
+                            "size": c.size,
+                            "members": c.member_files,
+                            "entry_points": entry_points,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let boundaries_json: Vec<serde_json::Value> =
+            if focus.as_deref().is_none_or(|f| f == "boundaries") {
+                overview
+                    .boundaries
+                    .iter()
+                    .map(|b| {
+                        serde_json::json!({
+                            "from": b.from,
+                            "to": b.to,
+                            "edge_count": b.edge_count,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let mut structured = serde_json::Map::new();
         if focus.as_deref().is_none_or(|f| f == "god_nodes") {
-            structured.insert("god_nodes".into(), serde_json::Value::Array(god_nodes));
+            structured.insert("god_nodes".into(), serde_json::Value::Array(god_nodes_json));
         }
         if focus.as_deref().is_none_or(|f| f == "communities") {
-            structured.insert("communities".into(), serde_json::Value::Array(communities));
+            structured.insert(
+                "communities".into(),
+                serde_json::Value::Array(communities_json),
+            );
         }
         if focus.as_deref().is_none_or(|f| f == "boundaries") {
-            structured.insert("boundaries".into(), serde_json::Value::Array(boundaries));
+            structured.insert(
+                "boundaries".into(),
+                serde_json::Value::Array(boundaries_json),
+            );
         }
         let structured = serde_json::Value::Object(structured);
         let text = serde_json::to_string_pretty(&structured)?;
@@ -2408,193 +2495,13 @@ fn query_pattern_examples(
     Ok(out)
 }
 
-/// Top-N chunks ordered by `structural_centrality` desc.
-fn query_top_centrality(db_path: &Path, n: usize) -> Result<Vec<(u64, f64)>> {
-    use rusqlite::Connection;
-    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
-    let mut stmt = conn.prepare(
-        "SELECT chunk_id, structural_centrality FROM chunk_centrality \
-         ORDER BY structural_centrality DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map([n as i64], |row| {
-        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?))
-    })?;
-    let mut out = Vec::with_capacity(n);
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-/// Detect simple communities via BFS over call edges from the top-centrality
-/// seed set. Returns up to 5 largest components, each as
-/// `{label, size, members, entry_points}`. Members are file-path samples.
-fn compute_communities(store: &ChunkStore, db_path: &Path) -> Result<Vec<serde_json::Value>> {
-    // Seeds: top 200 chunks by PageRank centrality. Bounded so we don't walk
-    // the whole graph in giant repos.
-    let seeds = match query_top_centrality(db_path, 200) {
-        Ok(s) if !s.is_empty() => s,
-        _ => return Ok(Vec::new()),
-    };
-    let seed_ids: Vec<u64> = seeds.iter().map(|(id, _)| *id).collect();
-
-    // Pull edges incident to seed_ids.
-    let call_out = store.get_call_edges_from(&seed_ids)?;
-    let call_in = store.get_call_edges_to(&seed_ids)?;
-    let mut adj: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let add_edge = |a: u64, b: u64, adj: &mut HashMap<u64, HashSet<u64>>| {
-        adj.entry(a).or_default().insert(b);
-        adj.entry(b).or_default().insert(a);
-    };
-    for sid in &seed_ids {
-        adj.entry(*sid).or_default();
-    }
-    for (a, b) in &call_out {
-        add_edge(*a, *b, &mut adj);
-    }
-    for (a, b) in &call_in {
-        add_edge(*a, *b, &mut adj);
-    }
-
-    // BFS to enumerate components.
-    let mut visited: HashSet<u64> = HashSet::new();
-    let mut components: Vec<Vec<u64>> = Vec::new();
-    for &node in adj.keys() {
-        if visited.contains(&node) {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut stack = vec![node];
-        while let Some(n) = stack.pop() {
-            if !visited.insert(n) {
-                continue;
-            }
-            component.push(n);
-            if let Some(neighbors) = adj.get(&n) {
-                for &nb in neighbors {
-                    if !visited.contains(&nb) {
-                        stack.push(nb);
-                    }
-                }
-            }
-        }
-        components.push(component);
-    }
-
-    // Sort by size, keep top 5.
-    components.sort_by_key(|c| std::cmp::Reverse(c.len()));
-    components.truncate(5);
-
-    // Score map for picking entry points (top-centrality member).
-    let score_by_id: HashMap<u64, f64> = seeds.iter().copied().collect();
-
-    let mut out = Vec::with_capacity(components.len());
-    for (idx, component) in components.iter().enumerate() {
-        if component.is_empty() {
-            continue;
-        }
-        // Sample up to 8 members for the response (file paths).
-        let mut member_paths: Vec<String> = Vec::new();
-        let mut member_seen: HashSet<String> = HashSet::new();
-        let mut entry_points: Vec<serde_json::Value> = Vec::new();
-
-        // Sort component members by centrality desc; pick top 3 as entry points.
-        let mut sorted: Vec<u64> = component.clone();
-        sorted.sort_by(|a, b| {
-            score_by_id
-                .get(b)
-                .partial_cmp(&score_by_id.get(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        for &cid in sorted.iter().take(component.len().min(20)) {
-            if let Ok(chunk) = store.get_chunk(cid) {
-                let p = chunk.file_path.display().to_string();
-                if member_seen.insert(p.clone()) {
-                    member_paths.push(p);
-                }
-                if entry_points.len() < 3 {
-                    let meta = store.get_structured_meta(cid).ok().flatten();
-                    let name = meta
-                        .and_then(|m| m.name)
-                        .unwrap_or_else(|| chunk.file_path.display().to_string());
-                    entry_points.push(serde_json::json!({
-                        "symbol": name,
-                        "location": {
-                            "file": chunk.file_path.display().to_string(),
-                            "start_line": chunk.start_line,
-                            "end_line": chunk.end_line,
-                        },
-                    }));
-                }
-            }
-            if member_paths.len() >= 8 {
-                break;
-            }
-        }
-
-        out.push(serde_json::json!({
-            "label": format!("community-{}", idx + 1),
-            "size": component.len(),
-            "members": member_paths,
-            "entry_points": entry_points,
-        }));
-    }
-
-    Ok(out)
-}
-
-/// Count edges that cross top-level directory boundaries. Returns up to 25
-/// `{from, to, edge_count}` entries sorted by edge_count desc.
-fn compute_boundaries_from_path(db_path: &Path) -> Result<Vec<serde_json::Value>> {
-    use rusqlite::Connection;
-    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open {} read-only", db_path.display()))?;
-
-    let mut counts: HashMap<(String, String), u64> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT importer_path, imported_path FROM module_edges")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for r in rows {
-            let (a, b) = r?;
-            let da = top_level_dir(&a);
-            let db = top_level_dir(&b);
-            if da == db {
-                continue; // intra-directory edge
-            }
-            *counts.entry((da, db)).or_insert(0) += 1;
-        }
-    }
-
-    let mut sorted: Vec<((String, String), u64)> = counts.into_iter().collect();
-    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-    sorted.truncate(25);
-
-    Ok(sorted
-        .into_iter()
-        .map(|((from, to), n)| {
-            serde_json::json!({
-                "from": from,
-                "to": to,
-                "edge_count": n,
-            })
-        })
-        .collect())
-}
-
-/// First path component (top-level directory). For `crates/foo/bar.rs` → `crates`.
-/// Empty for files at the root.
-fn top_level_dir(p: &str) -> String {
-    let path = Path::new(p);
-    path.components()
-        .next()
-        .and_then(|c| c.as_os_str().to_str())
-        .unwrap_or("")
-        .to_string()
-}
+// NOTE: the local `query_top_centrality`, `compute_communities`,
+// `compute_boundaries_from_path`, and `top_level_dir` helpers used by the
+// previous `tool_architecture` body were removed when the handler was rerouted
+// through `semantex_core::index::architecture::build_arch_overview` (v0.4.1
+// W-MCP defect #14). The shared implementations now live in
+// `crates/semantex-core/src/index/architecture.rs` and are used by both the
+// agent path (`AgentRoute::Architecture`) and this MCP handler.
 
 // =============================================================================
 // Tool output helper
@@ -2743,8 +2650,9 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TOOLSET, McpServer, TOOLSETS, apply_focus, top_level_dir};
+    use super::{DEFAULT_TOOLSET, McpServer, TOOLSETS, apply_focus};
     use semantex_core::config::SemantexConfig;
+    use semantex_core::index::architecture::top_level_dir;
     use semantex_core::index::state::IndexState;
 
     #[test]
@@ -3032,6 +2940,10 @@ mod tests {
             chunk_count: 2,
             embedding_model: "test".to_string(),
             embedding_dim: 96,
+            // v0.4.1 W-Index #4: IndexMeta now persists use_bm25_stemmer so
+            // open-time mismatch detection can refuse to load a mis-tuned
+            // index. Default-true matches the v0.4 legacy build behaviour.
+            use_bm25_stemmer: true,
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
@@ -3219,6 +3131,165 @@ mod tests {
             gods[0]["location"]["file"].as_str(),
             Some("src/a.rs"),
             "highest centrality node should map to src/a.rs"
+        );
+    }
+
+    /// Defect #14: `tool_architecture` must route through
+    /// `build_arch_overview` with a size-adaptive budget. On a tiny repo
+    /// (chunk_count < `ARCH_TINY_REPO_THRESHOLD` = 500), the budget collapses
+    /// to god_nodes only — communities and boundaries must be empty arrays.
+    /// This mirrors `handle_architecture` on the agent path.
+    #[test]
+    fn tool_architecture_tiny_repo_collapses_to_god_nodes_only() {
+        // `build_minimal_index` produces a 2-chunk fixture. 2 < 500 → tiny
+        // tier → communities=0 / boundaries=0 in the budget override.
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_architecture(&serde_json::json!({
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        // Every section key must still be present (focus=None keeps all
+        // three keys in the response shape, even if their arrays are empty).
+        assert!(s.get("god_nodes").is_some(), "god_nodes missing: {s}");
+        assert!(s.get("communities").is_some(), "communities missing: {s}");
+        assert!(s.get("boundaries").is_some(), "boundaries missing: {s}");
+        // Communities and boundaries must be empty on a tiny repo — the
+        // budget override forces communities=0 / boundaries=0 before passing
+        // through to build_arch_overview.
+        let communities = s["communities"].as_array().expect("communities array");
+        assert!(
+            communities.is_empty(),
+            "tiny-repo budget must produce zero communities; got: {communities:?}"
+        );
+        let boundaries = s["boundaries"].as_array().expect("boundaries array");
+        assert!(
+            boundaries.is_empty(),
+            "tiny-repo budget must produce zero boundaries; got: {boundaries:?}"
+        );
+        // God_nodes are populated from the fixture's chunk_centrality rows
+        // (chunks 1 + 2). Cap on tiny-repo override is 5, so we get at most 2
+        // for this fixture.
+        let gods = s["god_nodes"].as_array().expect("god_nodes array");
+        assert!(
+            !gods.is_empty(),
+            "tiny-repo must still expose god_nodes when centrality table is populated"
+        );
+        assert!(
+            gods.len() <= 5,
+            "tiny-repo override caps god_nodes at 5; got {}",
+            gods.len()
+        );
+    }
+
+    /// Defect #15: `tool_architecture`'s symbol-name reads must use
+    /// `Chunk::symbol_name()` (writer-side truth in `chunks.chunk_type`), NOT
+    /// `StructuredChunkMeta.name`. The two writers can drift; this reader
+    /// must agree with the v0.4 hybrid.rs Phase 3d definition-boost signal.
+    ///
+    /// We plant a synthetic chunk where the two name sources disagree on
+    /// purpose, then assert the MCP response surfaces the AstNode.name.
+    #[test]
+    fn tool_architecture_god_nodes_use_chunk_symbol_name_not_structured_meta() {
+        use rusqlite::Connection;
+        use semantex_core::chunking::structured_meta::StructuredChunkMeta;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+
+        // Chunk with mismatched name fields:
+        //   AstNode.name              = "FooBar"      (Phase 3d source)
+        //   structured_meta.name      = "WrongName"
+        // If tool_architecture ever drifts back to reading
+        // structured_meta.name, this test catches it.
+        {
+            let store = ChunkStore::open(&db_path).expect("open store");
+            let meta = StructuredChunkMeta {
+                name: Some("WrongName".to_string()),
+                kind: Some("function".to_string()),
+                ..StructuredChunkMeta::default()
+            };
+            let chunk = Chunk {
+                id: 0,
+                file_path: PathBuf::from("src/lib.rs"),
+                start_line: 1,
+                end_line: 5,
+                content: "fn FooBar() {}".to_string(),
+                chunk_type: ChunkType::AstNode {
+                    name: "FooBar".to_string(),
+                    kind: AstNodeKind::Function,
+                    language: "rust".to_string(),
+                    structured_meta: Some(Box::new(meta)),
+                },
+            };
+            let chunk_id = store.insert_chunk(&chunk, 0xfeed_face, 0).unwrap();
+            // Plant chunk_centrality so the chunk is selected as a god_node.
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS chunk_centrality (
+                    chunk_id INTEGER PRIMARY KEY,
+                    structural_centrality REAL NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunk_centrality(chunk_id, structural_centrality) VALUES (?1, 0.9)",
+                rusqlite::params![chunk_id as i64],
+            )
+            .unwrap();
+        }
+
+        // Write a valid meta.json so detect_state_fast returns Ready.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let meta = semantex_core::types::IndexMeta {
+            schema_version: semantex_core::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: dir.path().to_path_buf(),
+            created_at: now_secs.to_string(),
+            updated_at: now_secs.to_string(),
+            file_count: 1,
+            chunk_count: 1,
+            embedding_model: "test".to_string(),
+            embedding_dim: 96,
+            // v0.4.1 W-Index #4: IndexMeta now persists use_bm25_stemmer so
+            // open-time mismatch detection can refuse to load a mis-tuned
+            // index. Default-true matches the v0.4 legacy build behaviour.
+            use_bm25_stemmer: true,
+        };
+        std::fs::write(
+            semantex_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let project = dir.path().to_path_buf();
+        let server = make_server("all");
+        let out = server
+            .tool_architecture(&serde_json::json!({
+                "path": project.display().to_string(),
+                "focus": "god_nodes",
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        let gods = s["god_nodes"].as_array().expect("god_nodes array");
+        assert_eq!(gods.len(), 1, "expected exactly one god node");
+        let symbol = gods[0]["symbol"].as_str().unwrap_or("");
+        assert_eq!(
+            symbol, "FooBar",
+            "tool_architecture must read symbol via Chunk::symbol_name() \
+             (got {symbol:?}; expected `FooBar` from AstNode.name, NOT \
+             `WrongName` from structured_meta.name)"
+        );
+        assert_ne!(
+            symbol, "WrongName",
+            "regression: tool_architecture leaked structured_meta.name \
+             instead of Chunk::symbol_name()"
         );
     }
 
@@ -3463,6 +3534,10 @@ mod tests {
             chunk_count: 5,
             embedding_model: "test".to_string(),
             embedding_dim: 96,
+            // v0.4.1 W-Index #4: IndexMeta now persists use_bm25_stemmer so
+            // open-time mismatch detection can refuse to load a mis-tuned
+            // index. Default-true matches the v0.4 legacy build behaviour.
+            use_bm25_stemmer: true,
         };
         std::fs::write(
             semantex_dir.join("meta.json"),

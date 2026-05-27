@@ -253,13 +253,17 @@ mod tests {
 
         let encoded = encode_binary_request(&req);
 
-        // Verify framing: magic byte + 4-byte length + payload
+        // Verify framing: magic byte + 4-byte length + body. v0.4.1 W-Index #2
+        // moves the version byte INSIDE the length-prefixed body, so the header
+        // layout stays `[MAGIC][len:4]` (5 bytes) and the body begins with
+        // `[VERSION][postcard]`.
         assert_eq!(encoded[0], BINARY_MAGIC);
         let len = u32::from_le_bytes(encoded[1..5].try_into().unwrap()) as usize;
-        assert_eq!(encoded.len(), 1 + 4 + len);
+        assert_eq!(encoded.len(), BINARY_FRAME_HEADER_LEN + len);
+        assert_eq!(encoded[BINARY_FRAME_HEADER_LEN], BINARY_PROTOCOL_VERSION);
 
         // Decode the payload
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryRequest::Search(s) => {
                 assert_eq!(s.query, "error handling in authentication");
@@ -283,7 +287,7 @@ mod tests {
         let encoded = encode_binary_request(&req);
         assert_eq!(encoded[0], BINARY_MAGIC);
 
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         assert!(matches!(decoded, BinaryRequest::Health));
     }
 
@@ -292,7 +296,7 @@ mod tests {
         let req = BinaryRequest::Shutdown;
         let encoded = encode_binary_request(&req);
 
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         assert!(matches!(decoded, BinaryRequest::Shutdown));
     }
 
@@ -338,7 +342,7 @@ mod tests {
         let encoded = encode_binary_response(&resp);
         assert_eq!(encoded[0], BINARY_MAGIC);
 
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::Search(sr) => {
                 assert_eq!(sr.results.len(), 2);
@@ -367,7 +371,7 @@ mod tests {
         });
 
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::Health(h) => {
                 assert_eq!(h.status, "ok");
@@ -385,7 +389,7 @@ mod tests {
         });
 
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::Error(e) => {
                 assert_eq!(e.message, "Index not found");
@@ -456,7 +460,7 @@ mod tests {
             symbol: "my_function".to_string(),
         });
         let encoded = encode_binary_request(&req);
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryRequest::GraphWalk(g) => assert_eq!(g.symbol, "my_function"),
             _ => panic!("Expected GraphWalk"),
@@ -485,7 +489,7 @@ mod tests {
             hierarchy: vec![],
         });
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::GraphWalk(g) => {
                 assert_eq!(g.target.len(), 1);
@@ -611,7 +615,7 @@ mod tests {
         });
 
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::Search(sr) => {
                 assert_eq!(
@@ -642,7 +646,7 @@ mod tests {
             auto_peek_top: true,
         });
         let encoded = encode_binary_request(&req);
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryRequest::Search(s) => assert!(s.auto_peek_top),
             _ => panic!("Expected Search"),
@@ -661,7 +665,7 @@ mod tests {
             confidence: Some("high".to_string()),
         });
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::Search(sr) => {
                 assert_eq!(sr.confidence.as_deref(), Some("high"));
@@ -699,7 +703,7 @@ mod tests {
         let encoded = encode_binary_request(&req);
         assert_eq!(encoded[0], BINARY_MAGIC);
 
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryRequest::MultiSearch(mr) => {
                 assert_eq!(mr.queries.len(), 3);
@@ -728,7 +732,7 @@ mod tests {
         });
 
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::MultiSearch(mr) => {
                 assert_eq!(mr.responses.len(), 2);
@@ -788,11 +792,20 @@ mod tests {
         // 2. Server reads first byte = 0x00 → binary path
         assert_eq!(wire_request[0], BINARY_MAGIC);
 
-        // 3. Server reads length
+        // 3. Server reads length (v0.4.1 W-Index #2: header stays
+        // `[MAGIC][len:4]`; version byte moved into the length-prefixed body).
         let len = u32::from_le_bytes(wire_request[1..5].try_into().unwrap()) as usize;
 
-        // 4. Server reads and decodes payload
-        let decoded_req = decode_binary_request(&wire_request[5..5 + len]).unwrap();
+        // 4. Server reads and decodes body. `decode_binary_request` verifies
+        // the leading version byte against `BINARY_PROTOCOL_VERSION`.
+        assert_eq!(
+            wire_request[BINARY_FRAME_HEADER_LEN],
+            BINARY_PROTOCOL_VERSION
+        );
+        let decoded_req = decode_binary_request(
+            &wire_request[BINARY_FRAME_HEADER_LEN..BINARY_FRAME_HEADER_LEN + len],
+        )
+        .unwrap();
         match &decoded_req {
             BinaryRequest::Search(s) => assert_eq!(s.query, "authentication flow"),
             _ => panic!("Expected search"),
@@ -813,10 +826,17 @@ mod tests {
         });
         let wire_response = encode_binary_response(&server_resp);
 
-        // 7. Client reads response
+        // 7. Client reads response — same header layout as the request.
         assert_eq!(wire_response[0], BINARY_MAGIC);
         let resp_len = u32::from_le_bytes(wire_response[1..5].try_into().unwrap()) as usize;
-        let decoded_resp = decode_binary_response(&wire_response[5..5 + resp_len]).unwrap();
+        assert_eq!(
+            wire_response[BINARY_FRAME_HEADER_LEN],
+            BINARY_PROTOCOL_VERSION
+        );
+        let decoded_resp = decode_binary_response(
+            &wire_response[BINARY_FRAME_HEADER_LEN..BINARY_FRAME_HEADER_LEN + resp_len],
+        )
+        .unwrap();
         match decoded_resp {
             BinaryResponse::Search(sr) => {
                 assert_eq!(sr.duration_ms, 25);
@@ -834,7 +854,7 @@ mod tests {
             use_graph: true,
         });
         let encoded = encode_binary_request(&req);
-        let decoded = decode_binary_request(&encoded[5..]).unwrap();
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryRequest::DeepSearch(d) => {
                 assert_eq!(d.query, "how does search work");
@@ -870,7 +890,7 @@ mod tests {
             confidence: 0.85,
         });
         let encoded = encode_binary_response(&resp);
-        let decoded = decode_binary_response(&encoded[5..]).unwrap();
+        let decoded = decode_binary_response(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryResponse::DeepSearch(d) => {
                 assert_eq!(d.sources.len(), 1);

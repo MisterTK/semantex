@@ -36,6 +36,20 @@ use std::time::{Duration, Instant};
 /// v0.4_SPEC §6.3 / §4.2 (audit recommendation).
 const PLAID_BUFFER_SIZE: usize = 50;
 
+/// PLAID batch size for incremental + full-rebuild encode loops.
+///
+/// v0.4.1 W-Index #12: must stay strictly below `PLAID_BUFFER_SIZE` so the
+/// incremental fast path (no k-means) fires on typical single-file auto-
+/// refreshes. With PLAID_BATCH ≥ PLAID_BUFFER_SIZE every batch
+/// `update_or_create` call exceeds the buffer threshold and pays the full
+/// k-means cost — defeating the auto-refresh latency win.
+///
+/// We also keep this small (≤ 64) to bound peak RSS during batch encoding:
+/// next-plaid 1.3 retains a working copy of the index per call, so smaller
+/// batches → smaller per-call peak. The pre-W-Index value was 128, which
+/// (a) always exceeded PLAID_BUFFER_SIZE and (b) inflated peak memory.
+const PLAID_BATCH: usize = 32;
+
 /// Statistics from an indexing operation
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -103,28 +117,43 @@ impl IndexBuilder {
             }
         }
 
-        // Check schema version compatibility
+        // Check schema version compatibility. We must tolerate a meta.json
+        // whose shape no longer matches the current `IndexMeta` struct (older
+        // schemas may lack fields added in newer versions), so we parse the
+        // schema_version field via a permissive Value path before attempting
+        // a full IndexMeta deserialize. Either signal — older schema_version
+        // OR meta.json that fails to deserialize against the current struct —
+        // means a full rebuild.
         let expected_version = IndexMeta::CURRENT_SCHEMA_VERSION;
         let meta_path = index_dir.join("meta.json");
         if meta_path.exists()
             && let Ok(meta_str) = std::fs::read_to_string(&meta_path)
-            && let Ok(existing_meta) = serde_json::from_str::<IndexMeta>(&meta_str)
-            && existing_meta.schema_version != expected_version
         {
-            tracing::warn!(
-                "Index schema version mismatch (found v{}, expected v{}). \
-                 Full re-index required.",
-                existing_meta.schema_version,
-                expected_version
-            );
-            // Remove existing index files to force full rebuild
-            let _ = std::fs::remove_dir_all(index_dir.join("sparse"));
-            let _ = std::fs::remove_dir_all(index_dir.join("plaid"));
-            let _ = std::fs::remove_file(index_dir.join("plaid_mapping.bin"));
-            let _ = std::fs::remove_file(index_dir.join("chunks.db"));
-            // Clean up legacy HNSW files if present
-            let _ = std::fs::remove_file(index_dir.join("dense.usearch"));
-            let _ = std::fs::remove_file(index_dir.join("dense_coarse.usearch"));
+            let raw_version = serde_json::from_str::<serde_json::Value>(&meta_str)
+                .ok()
+                .as_ref()
+                .and_then(|v| v.get("schema_version").and_then(serde_json::Value::as_u64));
+            let strict_parse = serde_json::from_str::<IndexMeta>(&meta_str).is_ok();
+            let version_mismatch = raw_version != Some(u64::from(expected_version));
+            let shape_mismatch = !strict_parse;
+            if version_mismatch || shape_mismatch {
+                let label =
+                    raw_version.map_or_else(|| "unreadable".to_string(), |v| format!("v{v}"));
+                tracing::warn!(
+                    "Index schema mismatch (found {}, expected v{}). Forcing full rebuild.",
+                    label,
+                    expected_version
+                );
+                // Remove existing index files to force full rebuild.
+                let _ = std::fs::remove_dir_all(index_dir.join("sparse"));
+                let _ = std::fs::remove_dir_all(index_dir.join("plaid"));
+                let _ = std::fs::remove_file(index_dir.join("plaid_mapping.bin"));
+                let _ = std::fs::remove_file(index_dir.join("chunks.db"));
+                let _ = std::fs::remove_file(&meta_path);
+                // Clean up legacy HNSW files if present
+                let _ = std::fs::remove_file(index_dir.join("dense.usearch"));
+                let _ = std::fs::remove_file(index_dir.join("dense_coarse.usearch"));
+            }
         }
 
         // Initialize components
@@ -196,9 +225,11 @@ impl IndexBuilder {
 
         // Load or create sparse (BM25) index. The `use_bm25_stemmer` flag
         // (v0.4 Item 18) controls whether the English Snowball stemmer is
-        // applied to indexed tokens. The same value MUST be used at
-        // search-open time (see `hybrid.rs`); toggling without a reindex
-        // silently degrades recall — see `docs/CONFIGURATION.md`.
+        // applied to indexed tokens. v0.4.1 W-Index #4 makes the flag part
+        // of `IndexMeta`, and `SparseIndex::open` refuses to load an index
+        // built with a different stemmer than the runtime config — so an
+        // incremental rebuild after toggling the config errors out at this
+        // point, telling the user to run `semantex index --rebuild`.
         let sparse_path = index_dir.join("sparse");
         let is_incremental = sparse_path.exists();
         let use_stemmer = self.config.use_bm25_stemmer;
@@ -532,17 +563,13 @@ impl IndexBuilder {
         let colbert_model_dir = model_manager::ensure_colbert_model(&self.config.models_dir())?;
         match (|| -> Result<()> {
             use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
-            // PLAID batch size: 128 chunks per update_or_create call.
-            //
-            // Every call rewrites a portion of the on-disk index; smaller
-            // batches mean more disk I/O but bound peak memory. For a 35k-chunk
-            // repo the index can be 100-500 MB, and update_or_create appears
-            // to hold the entire index plus a working copy in memory during
-            // each rewrite. With 128 we cap the per-batch peak at roughly
-            // 2× index size + 128 embeddings (~150 MB peak above baseline),
-            // keeping the OS far from OOM territory even on memory-constrained
-            // hosts. Previous value (512) was the OOM trigger on a 48 GB host.
-            const PLAID_BATCH: usize = 128;
+            // PLAID_BATCH (32) is defined at module scope (see comment there).
+            // Picked to satisfy two constraints:
+            //   1. Strictly < PLAID_BUFFER_SIZE so the incremental fast path
+            //      (no k-means) fires on typical single-file auto-refreshes.
+            //   2. Small enough to bound per-call RSS during update_or_create,
+            //      which holds a working copy of the index. The pre-W-Index
+            //      value (128) violated (1) and inflated peak memory.
 
             let embedder = ColbertEmbedder::new(&colbert_model_dir)?;
             let plaid_dir = index_dir.join("plaid");
@@ -632,10 +659,13 @@ impl IndexBuilder {
                     &plaid_config,
                     &update_config,
                 )?;
-                debug_assert_eq!(
+                // v0.4.1 W-Index #3: promoted from debug_assert_eq! so release
+                // builds also catch contract violations.
+                anyhow::ensure!(
+                    plaid_doc_ids.len() == full_mapping.len(),
+                    "PLAID returned {} doc IDs for {} chunks — contract violated",
                     plaid_doc_ids.len(),
                     full_mapping.len(),
-                    "PLAID doc count must match chunk count"
                 );
                 // Drop the in-memory embeddings ASAP so they don't compete with
                 // the post-PLAID work (graph resolution, PageRank, etc.).
@@ -647,6 +677,24 @@ impl IndexBuilder {
                 tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
             } else {
                 // Incremental update — only touch new/removed chunks.
+                //
+                // v0.4.1 W-Index #3: the mapping Vec is positional (doc_id =
+                // index, chunk_id = value). Previous behaviour appended new
+                // chunk_ids at the tail without zeroing tombstoned positions,
+                // so if next-plaid recycled the freed doc_id slots the lookup
+                // would return a stale chunk_id. The fix:
+                //   1. Stamp `crate::types::PLAID_TOMBSTONE` (= u64::MAX) into
+                //      every position the delete touched, so search-time
+                //      readers know to skip the slot.
+                //   2. Write each new entry at the doc_id `update_or_create`
+                //      returned for it, growing the mapping with tombstones if
+                //      the returned doc_id is past the end. This handles BOTH
+                //      tail-append (the common case) AND slot recycling
+                //      without making assumptions about next-plaid's internal
+                //      strategy.
+                //   3. Promote the debug_assert_eq! count check to an
+                //      anyhow::ensure! so release builds also catch contract
+                //      violations.
                 let mut mapping: Vec<u64> = if mapping_path.exists() {
                     let bytes = std::fs::read(&mapping_path)?;
                     postcard::from_bytes::<Vec<u64>>(&bytes)?
@@ -654,7 +702,7 @@ impl IndexBuilder {
                     Vec::new()
                 };
 
-                // Soft-delete removed chunks from PLAID.
+                // Soft-delete removed chunks from PLAID and from the mapping.
                 if !removed_chunk_ids.is_empty() {
                     let removed_set: std::collections::HashSet<u64> =
                         removed_chunk_ids.iter().copied().collect();
@@ -662,7 +710,9 @@ impl IndexBuilder {
                         .iter()
                         .enumerate()
                         .filter_map(|(plaid_id, &chunk_id)| {
-                            if removed_set.contains(&chunk_id) {
+                            if chunk_id != crate::types::PLAID_TOMBSTONE
+                                && removed_set.contains(&chunk_id)
+                            {
                                 Some(plaid_id as i64)
                             } else {
                                 None
@@ -677,6 +727,16 @@ impl IndexBuilder {
                                 }
                             }
                             Err(e) => tracing::warn!("PLAID load for delete failed: {e}"),
+                        }
+                        // Stamp tombstones into the mapping. The positions are
+                        // still valid u64 indices into the Vec; we keep the
+                        // length so that doc_id N (still potentially referenced
+                        // by next-plaid internals) maps to a sentinel rather
+                        // than a phantom chunk.
+                        for plaid_id in &plaid_delete_ids {
+                            if let Some(slot) = mapping.get_mut(*plaid_id as usize) {
+                                *slot = crate::types::PLAID_TOMBSTONE;
+                            }
                         }
                     }
                 }
@@ -696,21 +756,41 @@ impl IndexBuilder {
                         let contents: Vec<String> =
                             chunks.iter().map(|c| c.content.clone()).collect();
                         let embeddings = embedder.encode_documents(&contents)?;
-                        // Same invariant as the full-rebuild path: next-plaid 1.3
-                        // returns the freshly-assigned doc IDs; we keep the
-                        // positional mapping logic and assert the count match.
+                        // next-plaid 1.3 returns `plaid_doc_ids: Vec<i64>`,
+                        // the authoritative positional IDs it assigned to the
+                        // freshly-added embeddings. Write each `(doc_id,
+                        // chunk_id)` pair into mapping[doc_id] = chunk_id.
                         let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
                             &embeddings,
                             &plaid_dir_str,
                             &plaid_config,
                             &update_config,
                         )?;
-                        debug_assert_eq!(
+                        anyhow::ensure!(
+                            plaid_doc_ids.len() == chunks.len(),
+                            "PLAID returned {} doc IDs for {} chunks — contract violated",
                             plaid_doc_ids.len(),
                             chunks.len(),
-                            "PLAID doc count must match incremental chunk count"
                         );
-                        mapping.extend(chunks.iter().map(|c| c.id));
+                        for (&doc_id, chunk) in plaid_doc_ids.iter().zip(chunks.iter()) {
+                            anyhow::ensure!(
+                                doc_id >= 0,
+                                "PLAID returned negative doc_id {doc_id} for chunk {}",
+                                chunk.id,
+                            );
+                            let idx = doc_id as usize;
+                            // Grow the mapping with tombstones so doc_id is
+                            // an in-bounds index. Slots between the current
+                            // tail and `idx` represent positions next-plaid
+                            // hasn't assigned a chunk to (still tombstoned
+                            // from a delete, or just empty). Treating them as
+                            // PLAID_TOMBSTONE is correct: they map to no
+                            // semantex chunk.
+                            while mapping.len() <= idx {
+                                mapping.push(crate::types::PLAID_TOMBSTONE);
+                            }
+                            mapping[idx] = chunk.id;
+                        }
                     }
                 }
 
@@ -729,7 +809,10 @@ impl IndexBuilder {
             Err(e) => tracing::warn!("PLAID index build failed (continuing without): {e}"),
         }
 
-        // Save metadata
+        // Save metadata. v0.4.1 W-Index #4: persist the BM25 stemmer flag so
+        // open-time code (see `sparse_search::SparseIndex::open` + the
+        // verification call in `hybrid.rs`) can refuse to load an index whose
+        // build-time stemmer disagrees with the runtime config.
         let actual_chunk_count = store.chunk_count().unwrap_or(total_chunks as u64);
         let actual_file_count = store.file_count().unwrap_or(files_indexed + files_skipped);
         let meta = IndexMeta {
@@ -741,6 +824,7 @@ impl IndexBuilder {
             chunk_count: actual_chunk_count,
             embedding_model: "LateOn-Code-edge".to_string(),
             embedding_dim: 48,
+            use_bm25_stemmer: self.config.use_bm25_stemmer,
         };
         let meta_json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(index_dir.join("meta.json"), meta_json)?;
@@ -993,6 +1077,75 @@ mod tests {
             content: content.to_string(),
             chunk_type: ChunkType::TextWindow { window_index: 0 },
         }
+    }
+
+    /// v0.4.1 W-Index #12: the PLAID encode batch size must stay strictly below
+    /// the next-plaid `UpdateConfig.buffer_size` so a single per-file
+    /// auto-refresh produces a sub-buffer batch and skips k-means clustering.
+    /// Violating this invariant silently regresses incremental-update latency
+    /// (each batch pays the 2-3 s k-means cost).
+    #[test]
+    fn plaid_batch_strictly_below_buffer_size() {
+        assert!(
+            PLAID_BATCH < PLAID_BUFFER_SIZE,
+            "PLAID_BATCH ({}) must be strictly less than PLAID_BUFFER_SIZE ({}) \
+             — see v0.4.1 W-Index #12. Single-file incremental updates rely on \
+             the buffer-only fast path firing instead of k-means clustering.",
+            PLAID_BATCH,
+            PLAID_BUFFER_SIZE,
+        );
+    }
+
+    /// v0.4.1 W-Index #3 — synthetic mapping contract:
+    ///
+    /// A mapping vector with `PLAID_TOMBSTONE` at index 1 and real chunk IDs
+    /// at indices 0 and 2 must be safe to pass through the
+    /// `translate_chunk_subset_to_doc_subset` translator and through
+    /// `PlaidSearcher::search`-shape iterators without surfacing the
+    /// tombstone slot as a chunk_id 0 phantom.
+    ///
+    /// This is a unit-level test for the search-side reader contract; the
+    /// integration test (mapping survives a real delete+rebuild) requires
+    /// a live PLAID index and is exercised by the manual `--rebuild` flow.
+    #[test]
+    fn tombstone_skipping_in_doc_to_chunk_lookup() {
+        use crate::types::PLAID_TOMBSTONE;
+
+        // Synthetic mapping: doc 0 -> chunk 100, doc 1 -> tombstone,
+        // doc 2 -> chunk 300.
+        let mapping: Vec<u64> = vec![100, PLAID_TOMBSTONE, 300];
+
+        // Simulate the per-result filter that `PlaidSearcher::search` runs
+        // against `passage_ids` (doc_ids returned by next-plaid). The
+        // contract is: a result hitting the tombstone slot must NOT surface
+        // as a SearchResult.
+        let passage_ids = vec![0i64, 1, 2];
+        let scored: Vec<u64> = passage_ids
+            .iter()
+            .filter_map(|&doc_id| {
+                let doc_idx = doc_id as usize;
+                mapping
+                    .get(doc_idx)
+                    .filter(|&&cid| cid != PLAID_TOMBSTONE)
+                    .copied()
+            })
+            .collect();
+
+        assert_eq!(
+            scored,
+            vec![100u64, 300],
+            "tombstoned position must NOT surface as a chunk_id; got {scored:?}",
+        );
+    }
+
+    /// v0.4.1 W-Index #3: a `PLAID_TOMBSTONE` value must never be confused
+    /// with a real chunk_id. This is a documentation-as-test: SQLite
+    /// AUTOINCREMENT IDs start at 1 and rowid is i64, so u64::MAX is well
+    /// above the practical chunk-id space and reserved as the sentinel.
+    #[test]
+    fn plaid_tombstone_is_reserved_sentinel() {
+        use crate::types::PLAID_TOMBSTONE;
+        assert_eq!(PLAID_TOMBSTONE, u64::MAX);
     }
 
     #[test]

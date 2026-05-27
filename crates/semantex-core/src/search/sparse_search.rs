@@ -41,6 +41,47 @@ fn register_code_tokenizer(index: &Index, use_stemmer: bool) {
     index.tokenizers().register("code", code_analyzer);
 }
 
+/// Verify that the persisted `use_bm25_stemmer` flag in
+/// `<index_path>/../meta.json` matches `expected` (v0.4.1 W-Index #4).
+///
+/// `index_path` is the tantivy sparse directory (`<index_dir>/sparse`). We
+/// walk one level up to find `meta.json`, which the indexer (`builder.rs`)
+/// writes alongside `sparse/`.
+///
+/// Returns:
+/// * `Ok(())` if the persisted flag agrees with `expected`, OR if meta.json
+///   is missing / unparseable (production callers reach this code only after
+///   `state::detect` has already vetted meta.json; in-crate unit tests build
+///   `SparseIndex` directly without writing one).
+/// * `Err(anyhow!)` on a value mismatch, naming both flags and pointing the
+///   user at `semantex index --rebuild`.
+fn verify_persisted_stemmer_matches(index_path: &Path, expected: bool) -> Result<()> {
+    let Some(index_dir) = index_path.parent() else {
+        return Ok(());
+    };
+    let meta_path = index_dir.join("meta.json");
+    let Ok(meta_str) = std::fs::read_to_string(&meta_path) else {
+        // No meta.json (test setups, or pre-v9 indexes already flagged as
+        // Stale by state::detect). Skip the check.
+        return Ok(());
+    };
+    let Ok(meta) = serde_json::from_str::<crate::types::IndexMeta>(&meta_str) else {
+        // Unparseable meta.json — `state::detect` returns `Stale` for the
+        // same condition, so production callers should never reach here.
+        return Ok(());
+    };
+    if meta.use_bm25_stemmer != expected {
+        anyhow::bail!(
+            "BM25 stemmer flag mismatch: index built with use_bm25_stemmer={}, \
+             config says use_bm25_stemmer={}. Run `semantex index --rebuild` \
+             to reconcile.",
+            meta.use_bm25_stemmer,
+            expected,
+        );
+    }
+    Ok(())
+}
+
 /// Build the schema with the code-aware tokenizer for content and file_path fields.
 fn build_schema() -> (Schema, Field, Field, Field) {
     let mut schema_builder = Schema::builder();
@@ -90,9 +131,24 @@ impl SparseIndex {
 
     /// Open an existing tantivy index.
     ///
-    /// `use_stemmer` MUST match the value passed to `create` when the index
-    /// was built. See `create` for the rationale.
+    /// `use_stemmer` MUST match the value the index was built with — tantivy
+    /// stores no analyzer metadata on disk, so a mismatch would silently
+    /// produce query/index token skew (recall loss).
+    ///
+    /// v0.4.1 W-Index #4 promotes the "MUST match" into a runtime check:
+    /// `verify_persisted_stemmer_matches` reads the persisted
+    /// `use_bm25_stemmer` flag from `<index_path>/../meta.json` (written by
+    /// the indexer in `builder.rs`) and refuses to open on disagreement,
+    /// returning an error that names both values and recommends
+    /// `semantex index --rebuild`. If meta.json is missing or unparseable we
+    /// proceed without the check — that case is already covered by
+    /// `state::detect` reporting `Stale`, which forces a rebuild before this
+    /// function is reached in production. Skipping the check on
+    /// missing/unparseable also keeps in-crate unit tests (which build
+    /// SparseIndex directly without writing meta.json) working unchanged.
     pub fn open(index_path: &Path, use_stemmer: bool) -> Result<Self> {
+        verify_persisted_stemmer_matches(index_path, use_stemmer)?;
+
         let (_, chunk_id_field, content_field, path_field) = build_schema();
 
         let dir = tantivy::directory::MmapDirectory::open(index_path)?;
@@ -278,6 +334,101 @@ mod tests {
             "stemmer flag must produce different result sets (on={:?}, off={:?})",
             ids_on, ids_off
         );
+    }
+
+    /// v0.4.1 W-Index #4: building an index with `use_bm25_stemmer=true`
+    /// and then trying to open it with `use_bm25_stemmer=false` must fail
+    /// loudly at open time, naming both values. Tantivy stores no analyzer
+    /// metadata, so a silent open would produce query/index token skew that
+    /// only surfaces as a recall regression — exactly the failure mode the
+    /// persisted flag was added to catch.
+    ///
+    /// The fixture writes a sibling `meta.json` so
+    /// `verify_persisted_stemmer_matches` can pick up the persisted value.
+    /// Without meta.json the helper skips the check (covered by every other
+    /// test in this module).
+    #[test]
+    fn open_with_mismatched_stemmer_flag_errors() {
+        use crate::types::IndexMeta;
+
+        let dir = tempdir().expect("tempdir");
+        // Indexer layout: `<index_dir>/sparse` + `<index_dir>/meta.json`.
+        let index_dir = dir.path();
+        let sparse_dir = index_dir.join("sparse");
+
+        // 1. Build a real sparse index with stemmer=true.
+        let _ = SparseIndex::create(&sparse_dir, true).expect("create stemmed index");
+
+        // 2. Persist the matching meta.json so the open-time check has data.
+        let meta = IndexMeta {
+            schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: index_dir.to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+        };
+        std::fs::write(
+            index_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Re-open with the OPPOSITE flag — must fail. `SparseIndex` does
+        // not implement `Debug`, so we can't use `expect_err`; pattern-match
+        // on the Result instead.
+        let err = match SparseIndex::open(&sparse_dir, false) {
+            Err(e) => e,
+            Ok(_) => panic!("opening with mismatched stemmer flag must fail"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BM25 stemmer flag mismatch"),
+            "expected mismatch error, got: {msg}",
+        );
+        assert!(
+            msg.contains("use_bm25_stemmer=true") && msg.contains("use_bm25_stemmer=false"),
+            "expected both flag values in the error, got: {msg}",
+        );
+        assert!(
+            msg.contains("semantex index --rebuild"),
+            "expected recovery hint in error, got: {msg}",
+        );
+    }
+
+    /// Companion check: opening with the SAME flag must succeed when
+    /// meta.json agrees.
+    #[test]
+    fn open_with_matching_stemmer_flag_succeeds() {
+        use crate::types::IndexMeta;
+
+        let dir = tempdir().expect("tempdir");
+        let index_dir = dir.path();
+        let sparse_dir = index_dir.join("sparse");
+
+        let _ = SparseIndex::create(&sparse_dir, false).expect("create unstemmed index");
+
+        let meta = IndexMeta {
+            schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: index_dir.to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: false,
+        };
+        std::fs::write(
+            index_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        SparseIndex::open(&sparse_dir, false).expect("matching flag must open cleanly");
     }
 
     /// Symmetric check: with stemmer OFF, the literal `retry` must not pull

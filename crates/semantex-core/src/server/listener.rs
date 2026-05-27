@@ -1,5 +1,7 @@
 use super::handler::Handler;
-use super::protocol::{self, BINARY_MAGIC, BinaryResponse, ErrorResponse, Request, Response};
+use super::protocol::{
+    self, BINARY_MAGIC, BinaryFrameError, BinaryResponse, ErrorResponse, Request, Response,
+};
 use crate::config::SemantexConfig;
 use crate::embedding::{colbert::ColbertEmbedder, model_manager};
 use crate::index::storage::{self, PrefetchOutcome};
@@ -229,6 +231,16 @@ impl Listener {
     }
 
     /// Handle a binary (postcard) framed connection.
+    ///
+    /// Frame layout (v0.4.1 W-Index #2):
+    ///   `[BINARY_MAGIC][len:4 LE][BINARY_PROTOCOL_VERSION][postcard]`
+    ///
+    /// The magic byte has already been consumed by the caller. We read the
+    /// 4-byte length, then the length-prefixed body whose first byte is the
+    /// protocol version — that version check happens inside
+    /// `decode_binary_request`, which surfaces a `BinaryFrameError`. Version
+    /// mismatch is reported back to the client as a structured
+    /// `Response::Error`; we do NOT crash or silently drop the connection.
     fn handle_binary_connection(
         &self,
         reader: &mut BufReader<&TcpStream>,
@@ -244,11 +256,11 @@ impl Listener {
             return Ok(());
         }
 
-        // Read payload
-        let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload)?;
+        // Read body = [VERSION:1][postcard].
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body)?;
 
-        let response = match protocol::decode_binary_request(&payload) {
+        let response = match protocol::decode_binary_request(&body) {
             Ok(bin_req) => {
                 let request: Request = bin_req.into();
                 let is_shutdown = matches!(request, Request::Shutdown);
@@ -265,12 +277,25 @@ impl Listener {
 
                 resp
             }
-            Err(e) => Response::Error(ErrorResponse {
+            Err(BinaryFrameError::UnsupportedVersion { expected, got }) => {
+                tracing::warn!(
+                    expected,
+                    got,
+                    "Rejected binary frame with unsupported protocol version"
+                );
+                Response::Error(ErrorResponse {
+                    message: format!(
+                        "Unsupported binary protocol version: daemon speaks v{expected}, \
+                         client sent v{got}. Upgrade the client or daemon to match.",
+                    ),
+                })
+            }
+            Err(BinaryFrameError::Decode(e)) => Response::Error(ErrorResponse {
                 message: format!("Invalid binary request: {e}"),
             }),
         };
 
-        // Write binary response
+        // Write binary response — always at the daemon's protocol version.
         let bin_resp: BinaryResponse = response.into();
         let frame = protocol::encode_binary_response(&bin_resp);
         let mut writer = stream;

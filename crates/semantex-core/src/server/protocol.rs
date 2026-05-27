@@ -5,6 +5,62 @@ use serde::{Deserialize, Serialize};
 /// A JSON message always starts with '{' (0x7b), so 0x00 is unambiguous.
 pub const BINARY_MAGIC: u8 = 0x00;
 
+/// Daemon binary-protocol version (v0.4.1 W-Index #2).
+///
+/// Encoded as the second byte of every binary frame, immediately after
+/// `BINARY_MAGIC`. A client and daemon that disagree on this byte refuse to
+/// decode the frame and surface a clean error instead of silently
+/// mis-deserializing a postcard payload.
+///
+/// Bump this constant whenever the binary frame layout, the `BinaryRequest` /
+/// `BinaryResponse` tag set, or any non-self-describing postcard schema in
+/// those types changes. Postcard does not encode field/type tags, so silent
+/// drift is a real risk and the version byte is the cheapest way to catch it.
+pub const BINARY_PROTOCOL_VERSION: u8 = 1;
+
+/// Error type returned by binary decode when the framing is malformed.
+///
+/// Wraps both postcard decode errors and our own version/magic mismatches so
+/// callers (listener, client) can render a single uniform error path.
+#[derive(Debug)]
+pub enum BinaryFrameError {
+    /// The version byte following `BINARY_MAGIC` did not match
+    /// `BINARY_PROTOCOL_VERSION`. The mismatched value is included so the
+    /// log message can distinguish "wrong version" from "garbage byte".
+    UnsupportedVersion { expected: u8, got: u8 },
+    /// Postcard failed to decode the payload (truncated, schema drift, etc.).
+    Decode(postcard::Error),
+}
+
+impl std::fmt::Display for BinaryFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion { expected, got } => {
+                write!(
+                    f,
+                    "unsupported binary protocol version: expected {expected}, got {got}"
+                )
+            }
+            Self::Decode(e) => write!(f, "postcard decode error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BinaryFrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedVersion { .. } => None,
+            Self::Decode(e) => Some(e),
+        }
+    }
+}
+
+impl From<postcard::Error> for BinaryFrameError {
+    fn from(e: postcard::Error) -> Self {
+        Self::Decode(e)
+    }
+}
+
 /// Request sent from client to daemon over TCP
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -214,11 +270,14 @@ pub struct GraphWalkResponse {
 
 // --- Binary (postcard) wire format ---
 //
-// Binary messages use a simple framing:
-//   [BINARY_MAGIC: 1 byte] [length: 4 bytes LE] [postcard payload: length bytes]
+// Binary messages use a versioned framing (v0.4.1 W-Index #2):
+//   [BINARY_MAGIC: 1 byte] [BINARY_PROTOCOL_VERSION: 1 byte]
+//   [length: 4 bytes LE] [postcard payload: length bytes]
 //
 // The first byte lets the listener auto-detect whether a client is sending
-// JSON (starts with '{') or binary (starts with 0x00).
+// JSON (starts with '{') or binary (starts with 0x00). The second byte is a
+// protocol version so client/daemon mismatch surfaces a clean error instead
+// of a silently-misdeserialized postcard payload.
 
 /// Binary request type tag for postcard (serde tags don't work well with non-self-describing formats).
 #[derive(Debug, Serialize, Deserialize)]
@@ -274,36 +333,84 @@ impl From<Response> for BinaryResponse {
     }
 }
 
-/// Encode a binary request into a framed message: [0x00][len:4 LE][postcard]
+/// Encode a binary request into a framed message:
+/// `[BINARY_MAGIC][len:4 LE][BINARY_PROTOCOL_VERSION][postcard]`.
+///
+/// `len` covers the version byte and the postcard payload. Placing the
+/// version inside the length-prefixed body lets the existing
+/// `[MAGIC][len:4][body]` framing readers parse the frame unchanged; only
+/// the decoder, which consumes byte 0 of `body` as the version, has new
+/// behaviour.
 pub fn encode_binary_request(req: &BinaryRequest) -> Vec<u8> {
     let payload = postcard::to_stdvec(req).expect("postcard serialize");
-    let len = payload.len() as u32;
-    let mut buf = Vec::with_capacity(1 + 4 + payload.len());
+    let body_len = 1 + payload.len();
+    let len = body_len as u32;
+    let mut buf = Vec::with_capacity(BINARY_FRAME_HEADER_LEN + payload.len());
     buf.push(BINARY_MAGIC);
     buf.extend_from_slice(&len.to_le_bytes());
+    buf.push(BINARY_PROTOCOL_VERSION);
     buf.extend_from_slice(&payload);
     buf
 }
 
-/// Encode a binary response into a framed message: [0x00][len:4 LE][postcard]
+/// Encode a binary response into a framed message:
+/// `[BINARY_MAGIC][len:4 LE][BINARY_PROTOCOL_VERSION][postcard]`.
 pub fn encode_binary_response(resp: &BinaryResponse) -> Vec<u8> {
     let payload = postcard::to_stdvec(resp).expect("postcard serialize");
-    let len = payload.len() as u32;
-    let mut buf = Vec::with_capacity(1 + 4 + payload.len());
+    let body_len = 1 + payload.len();
+    let len = body_len as u32;
+    let mut buf = Vec::with_capacity(BINARY_FRAME_HEADER_LEN + payload.len());
     buf.push(BINARY_MAGIC);
     buf.extend_from_slice(&len.to_le_bytes());
+    buf.push(BINARY_PROTOCOL_VERSION);
     buf.extend_from_slice(&payload);
     buf
 }
 
-/// Decode a binary response from raw bytes (after stripping the magic+length frame).
-pub fn decode_binary_response(data: &[u8]) -> Result<BinaryResponse, postcard::Error> {
-    postcard::from_bytes::<BinaryResponse>(data)
+/// Length of the fixed-size frame header that precedes the length-prefixed
+/// body: `[MAGIC: 1 byte][len: 4 bytes LE]`. The body itself begins with the
+/// 1-byte protocol version followed by the postcard payload.
+pub const BINARY_FRAME_HEADER_LEN: usize = 1 + 4;
+
+/// Decode a binary response body. The body is `[VERSION: 1 byte][postcard]`,
+/// i.e. exactly the bytes the caller read off the wire as the length-prefixed
+/// payload. Returns `UnsupportedVersion` if byte 0 disagrees with
+/// `BINARY_PROTOCOL_VERSION`; postcard errors surface as `Decode`.
+///
+/// An empty `data` slice returns `UnsupportedVersion { got: 0 }` to surface
+/// the truncation; the empty frame is never a valid response.
+pub fn decode_binary_response(data: &[u8]) -> Result<BinaryResponse, BinaryFrameError> {
+    let Some((&version, payload)) = data.split_first() else {
+        return Err(BinaryFrameError::UnsupportedVersion {
+            expected: BINARY_PROTOCOL_VERSION,
+            got: 0,
+        });
+    };
+    if version != BINARY_PROTOCOL_VERSION {
+        return Err(BinaryFrameError::UnsupportedVersion {
+            expected: BINARY_PROTOCOL_VERSION,
+            got: version,
+        });
+    }
+    Ok(postcard::from_bytes::<BinaryResponse>(payload)?)
 }
 
-/// Decode a binary request from raw bytes (after stripping the magic+length frame).
-pub fn decode_binary_request(data: &[u8]) -> Result<BinaryRequest, postcard::Error> {
-    postcard::from_bytes::<BinaryRequest>(data)
+/// Decode a binary request body. The body is `[VERSION: 1 byte][postcard]`.
+/// Returns `UnsupportedVersion` on mismatch and `Decode` on postcard failure.
+pub fn decode_binary_request(data: &[u8]) -> Result<BinaryRequest, BinaryFrameError> {
+    let Some((&version, payload)) = data.split_first() else {
+        return Err(BinaryFrameError::UnsupportedVersion {
+            expected: BINARY_PROTOCOL_VERSION,
+            got: 0,
+        });
+    };
+    if version != BINARY_PROTOCOL_VERSION {
+        return Err(BinaryFrameError::UnsupportedVersion {
+            expected: BINARY_PROTOCOL_VERSION,
+            got: version,
+        });
+    }
+    Ok(postcard::from_bytes::<BinaryRequest>(payload)?)
 }
 
 // --- Agent types ---
@@ -400,10 +507,72 @@ mod agent_protocol_tests {
             full_code: false,
         });
         let encoded = encode_binary_request(&req);
-        let decoded = decode_binary_request(&encoded[5..]).unwrap(); // Skip magic + length
+        // v0.4.1 W-Index #2: frame is [MAGIC][len:4][VERSION][postcard]; the
+        // length-prefixed body (decode input) begins at BINARY_FRAME_HEADER_LEN
+        // and starts with the version byte.
+        assert_eq!(encoded[0], BINARY_MAGIC);
+        assert_eq!(encoded[BINARY_FRAME_HEADER_LEN], BINARY_PROTOCOL_VERSION);
+        let decoded = decode_binary_request(&encoded[BINARY_FRAME_HEADER_LEN..]).unwrap();
         match decoded {
             BinaryRequest::Agent(r) => assert_eq!(r.query, "test query"),
             _ => panic!("Wrong variant"),
         }
+    }
+
+    /// v0.4.1 W-Index #2: a frame whose version byte is something other than
+    /// `BINARY_PROTOCOL_VERSION` must produce a clean `UnsupportedVersion`
+    /// error rather than silently mis-decoding.
+    #[test]
+    fn unsupported_version_rejected_on_decode() {
+        // Build a synthetic body with a bogus version prefix.
+        let bogus_version = 99u8;
+        let postcard_payload = postcard::to_stdvec(&BinaryRequest::Health).unwrap();
+        let mut body = vec![bogus_version];
+        body.extend_from_slice(&postcard_payload);
+
+        let err = decode_binary_request(&body).expect_err("must reject");
+        match err {
+            BinaryFrameError::UnsupportedVersion { expected, got } => {
+                assert_eq!(expected, BINARY_PROTOCOL_VERSION);
+                assert_eq!(got, bogus_version);
+            }
+            BinaryFrameError::Decode(e) => panic!("expected version mismatch, got decode: {e}"),
+        }
+    }
+
+    /// Symmetric check on the response side.
+    #[test]
+    fn unsupported_version_rejected_on_response_decode() {
+        let postcard_payload = postcard::to_stdvec(&BinaryResponse::Health(HealthResponse {
+            status: "ok".into(),
+            uptime_s: 0,
+            searches: 0,
+        }))
+        .unwrap();
+        let mut body = vec![42u8];
+        body.extend_from_slice(&postcard_payload);
+
+        let err = decode_binary_response(&body).expect_err("must reject");
+        assert!(matches!(
+            err,
+            BinaryFrameError::UnsupportedVersion {
+                expected: BINARY_PROTOCOL_VERSION,
+                got: 42
+            }
+        ));
+    }
+
+    /// An empty body (length-prefixed truncation) must surface as
+    /// `UnsupportedVersion { got: 0 }` rather than panic.
+    #[test]
+    fn empty_frame_rejected_cleanly() {
+        let err = decode_binary_request(&[]).expect_err("must reject");
+        assert!(matches!(
+            err,
+            BinaryFrameError::UnsupportedVersion {
+                expected: BINARY_PROTOCOL_VERSION,
+                got: 0
+            }
+        ));
     }
 }

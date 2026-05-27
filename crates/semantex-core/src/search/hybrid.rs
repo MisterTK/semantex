@@ -42,10 +42,14 @@ impl HybridSearcher {
 
         let sparse_path = index_dir.join("sparse");
         let sparse = if sparse_path.exists() {
-            // v0.4 Item 18: stemmer flag MUST match the value used at
-            // index-build time. We trust the current config; mismatched
-            // flag without a reindex silently degrades recall — see
-            // `docs/CONFIGURATION.md` (`use_bm25_stemmer`).
+            // v0.4 Item 18 / v0.4.1 W-Index #4: stemmer flag MUST match the
+            // value used at index-build time. `SparseIndex::open` reads the
+            // persisted flag from meta.json and fails loudly on mismatch
+            // (the previous "silently degrade recall" caveat was promoted
+            // into a hard error). The `?` here propagates the mismatch up
+            // to the daemon startup path, which is correct: the user wants
+            // to know before the daemon binds, not after queries return
+            // wrong results.
             Some(SparseIndex::open(&sparse_path, config.use_bm25_stemmer)?)
         } else {
             None
@@ -89,7 +93,9 @@ impl HybridSearcher {
         // Open sparse searcher
         let sparse_path = index_dir.join("sparse");
         let sparse = if sparse_path.exists() {
-            // v0.4 Item 18: see `open_sparse_only` for the stemmer caveat.
+            // v0.4.1 W-Index #4: SparseIndex::open verifies the persisted
+            // stemmer flag against `config.use_bm25_stemmer` and fails
+            // loudly on mismatch — see `open_sparse_only` above.
             Some(SparseIndex::open(&sparse_path, config.use_bm25_stemmer)?)
         } else {
             None
@@ -270,24 +276,60 @@ impl HybridSearcher {
                     Some(Vec::new())
                 } else {
                     const FILTER_BATCH: usize = 500;
-                    let store = self.store.lock();
-                    let mut subset: Vec<u64> = Vec::new();
-                    for batch in all_indexed.chunks(FILTER_BATCH) {
-                        if let Ok(chunks) = store.get_chunks(batch) {
+                    // v0.4.1 W-Index #7: previously this loop swallowed
+                    // SQLite errors with `if let Ok(chunks) = ...`, so a
+                    // transient DB failure produced a partial subset that
+                    // PLAID then searched as if it were the complete
+                    // candidate set (silently dropping results from
+                    // un-fetched batches). Now we propagate the error and
+                    // fall back to an unfiltered PLAID search — slower, but
+                    // correct: post-filter dedup in the result-merge stage
+                    // already handles the file_filter check.
+                    //
+                    // v0.4.1 W-Index #3: also pre-filter PLAID_TOMBSTONE
+                    // entries from the input batch so we never ask SQLite
+                    // for a chunk_id that's the deleted-slot sentinel.
+                    let subset_result: anyhow::Result<Vec<u64>> = (|| {
+                        let store = self.store.lock();
+                        let mut subset: Vec<u64> = Vec::new();
+                        for batch in all_indexed.chunks(FILTER_BATCH) {
+                            let live: Vec<u64> = batch
+                                .iter()
+                                .copied()
+                                .filter(|&cid| cid != crate::types::PLAID_TOMBSTONE)
+                                .collect();
+                            if live.is_empty() {
+                                continue;
+                            }
+                            let chunks = store.get_chunks(&live)?;
                             for c in chunks {
                                 if filter.matches(&c.file_path) {
                                     subset.push(c.id);
                                 }
                             }
                         }
+                        Ok(subset)
+                    })();
+
+                    match subset_result {
+                        Ok(s) => {
+                            tracing::debug!(
+                                indexed = all_indexed.len(),
+                                subset = s.len(),
+                                "PLAID file_filter subset prepared"
+                            );
+                            Some(s)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "PLAID file_filter subset construction failed — \
+                                 falling back to unfiltered dense search (result \
+                                 merge will still apply the file_filter)"
+                            );
+                            None
+                        }
                     }
-                    drop(store);
-                    tracing::debug!(
-                        indexed = all_indexed.len(),
-                        subset = subset.len(),
-                        "PLAID file_filter subset prepared"
-                    );
-                    Some(subset)
                 }
             }
             _ => None,
@@ -699,8 +741,14 @@ impl HybridSearcher {
         // stem contains identifier sub-tokens overlapping with the query.
         // Exact subtoken match wins STEM_EXACT_BOOST_FRAC × max_score;
         // prefix match (≥ STEM_PREFIX_MIN_LEN chars) wins
-        // STEM_PREFIX_BOOST_FRAC × max_score. The boost is clamped to
-        // max_score so we never inflate above the current rank-1 result.
+        // STEM_PREFIX_BOOST_FRAC × max_score.
+        //
+        // The boost is additive (no max_score clamp); the fusion stage
+        // produces a final ranking that doesn't require scores to stay
+        // in [0, 1]. The old `.min(max_score)` clamp made it impossible
+        // for the rank-1 chunk to ever benefit from a boost (its score
+        // was already == max_score) and caused boosted chunks to pile
+        // at max_score, producing ties. See defect #13.
         {
             let query_tokens = path_signals::query_tokens_for_path_signals(&effective_text);
             if !query_tokens.is_empty() {
@@ -710,7 +758,7 @@ impl HybridSearcher {
                         let frac =
                             path_signals::path_stem_boost_factor(&chunk.file_path, &query_tokens);
                         if frac > 0.0 {
-                            scored.score = (scored.score + frac * max_score).min(max_score);
+                            scored.score += frac * max_score;
                         }
                     }
                 }
@@ -728,10 +776,13 @@ impl HybridSearcher {
         // Per spec §7.4 (v0.4 Item 8): additively boost AST-aware chunks
         // whose symbol name shares an identifier sub-token with the query
         // (case-insensitive, after camelCase/snake_case decomposition).
-        // The boost is clamped to max_score so we never inflate beyond the
-        // current rank-1 result. The disabled "symbol exact lookup" path
-        // (see comment at the top of search()) remains disabled — Phase 3d
-        // is the v0.4 replacement: softer, RRF-compatible signal.
+        // The disabled "symbol exact lookup" path (see comment at the top
+        // of search()) remains disabled — Phase 3d is the v0.4
+        // replacement: softer, RRF-compatible signal.
+        //
+        // The boost is additive (no max_score clamp); the fusion stage
+        // produces a final ranking that doesn't require scores to stay
+        // in [0, 1]. See defect #13 for why the clamp was removed.
         {
             let query_tokens = path_signals::query_tokens_for_path_signals(&effective_text);
             if !query_tokens.is_empty() {
@@ -742,7 +793,7 @@ impl HybridSearcher {
                     {
                         let frac = path_signals::definition_boost_factor(name, &query_tokens);
                         if frac > 0.0 {
-                            scored.score = (scored.score + frac * max_score).min(max_score);
+                            scored.score += frac * max_score;
                         }
                     }
                 }
@@ -764,13 +815,17 @@ impl HybridSearcher {
         // contribution to the result set (file_sum / max_file_sum). The
         // existing directory-proximity bonus further down stays in place —
         // both signals coexist for v0.4 per spec §7.5.3.
+        //
+        // The boost is additive (no max_score clamp); the fusion stage
+        // produces a final ranking that doesn't require scores to stay
+        // in [0, 1]. See defect #13 for why the clamp was removed.
         {
             let max_score = fused.first().map_or(1.0, |s| s.score);
             let boosts = path_signals::file_coherence_boosts(&fused, &chunk_map);
             if !boosts.is_empty() {
                 for scored in &mut fused {
                     if let Some(&frac) = boosts.get(&scored.chunk_id) {
-                        scored.score = (scored.score + frac * max_score).min(max_score);
+                        scored.score += frac * max_score;
                     }
                 }
                 fused.sort_by(|a, b| {
@@ -1525,6 +1580,111 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    // ---- Defect #13 regression: Phase 3 boosts must NOT clamp at
+    //      max_score. The previous `.min(max_score)` ceiling collapsed
+    //      boosted chunks into ties with the rank-1 result and made it
+    //      impossible for the rank-1 chunk to benefit from any boost. ----
+
+    /// Simulate the additive-only boost logic used in Phase 3c/3d/3e.
+    /// Matches the in-place mutation in `search()` so the test exercises
+    /// the same arithmetic shape: `score += frac * max_score`.
+    fn apply_additive_boost(
+        fused: &mut [ScoredChunkId],
+        boosted_ids: &[(u64, f32)], // (chunk_id, frac)
+    ) {
+        let max_score = fused.first().map_or(1.0, |s| s.score);
+        for scored in fused.iter_mut() {
+            if let Some(&(_, frac)) = boosted_ids.iter().find(|(id, _)| *id == scored.chunk_id) {
+                scored.score += frac * max_score;
+            }
+        }
+        fused.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    #[test]
+    fn phase_3_boosts_can_promote_rank_1() {
+        // Initial: chunk 1 at max_score (1.0); chunks 2 and 3 tied at 0.5.
+        // Apply a Phase-3c-shaped boost (frac=0.40) to chunks 2 and 3.
+        // Under the old `.min(max_score)` clamp, both 2 and 3 would be
+        // promoted to exactly max_score = 1.0, tying with chunk 1 at the
+        // top. After the fix they should sit BELOW chunk 1 (since their
+        // additive boost is 0.5 + 0.40*1.0 = 0.90, still < 1.0).
+        let mut fused = vec![
+            ScoredChunkId::new(1, 1.0),
+            ScoredChunkId::new(2, 0.5),
+            ScoredChunkId::new(3, 0.5),
+        ];
+
+        apply_additive_boost(&mut fused, &[(2, 0.40), (3, 0.40)]);
+
+        // Chunk 1 must remain rank-1 with its original max score.
+        assert_eq!(fused[0].chunk_id, 1, "rank-1 must not be displaced");
+        assert!(
+            (fused[0].score - 1.0).abs() < 1e-6,
+            "rank-1 score unchanged: {}",
+            fused[0].score
+        );
+
+        // Chunks 2 and 3 each ended up at 0.5 + 0.40 = 0.90 (NOT clamped to 1.0).
+        for sc in &fused[1..] {
+            assert!(
+                (sc.score - 0.9).abs() < 1e-6,
+                "boosted chunk should be 0.90, got {} for chunk {}",
+                sc.score,
+                sc.chunk_id
+            );
+            assert!(
+                sc.score < fused[0].score,
+                "boosted chunk {} (score {}) must remain below rank-1 (score {})",
+                sc.chunk_id,
+                sc.score,
+                fused[0].score
+            );
+        }
+    }
+
+    #[test]
+    fn phase_3_boost_lifts_rank_1_above_max_score() {
+        // When rank-1 itself receives the boost, the result must exceed
+        // max_score — the clamp used to PREVENT this, leaving rank-1
+        // unchanged. Now the boost lifts it past the original ceiling.
+        let mut fused = vec![ScoredChunkId::new(1, 1.0), ScoredChunkId::new(2, 0.7)];
+
+        // Boost chunk 1 with frac = 0.20 (definition-boost magnitude).
+        apply_additive_boost(&mut fused, &[(1, 0.20)]);
+
+        // Chunk 1 must now be at 1.0 + 0.20*1.0 = 1.20 > 1.0.
+        assert_eq!(fused[0].chunk_id, 1);
+        assert!(
+            (fused[0].score - 1.2).abs() < 1e-6,
+            "rank-1 score should be 1.20 after additive boost, got {}",
+            fused[0].score
+        );
+    }
+
+    #[test]
+    fn phase_3_boost_can_overtake_when_gap_smaller_than_frac() {
+        // A chunk closely trailing rank-1 should be able to overtake it
+        // when boosted (frac=0.40, gap=0.10). Under the old clamp it would
+        // only reach max_score and TIE with rank-1; sort would then keep
+        // rank-1 on top by stable ordering.
+        let mut fused = vec![ScoredChunkId::new(1, 1.0), ScoredChunkId::new(2, 0.95)];
+
+        apply_additive_boost(&mut fused, &[(2, 0.40)]);
+
+        // Chunk 2 ends up at 0.95 + 0.40 = 1.35, overtaking chunk 1.
+        assert_eq!(fused[0].chunk_id, 2, "chunk 2 should overtake rank-1");
+        assert!(
+            (fused[0].score - 1.35).abs() < 1e-6,
+            "new rank-1 score should be 1.35, got {}",
+            fused[0].score
+        );
+    }
 
     #[test]
     fn test_rrf_identical_rankings() {

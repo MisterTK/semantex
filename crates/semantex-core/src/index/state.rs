@@ -127,7 +127,8 @@ mod tests {
             "file_count": 10,
             "chunk_count": 50,
             "embedding_model": "test",
-            "embedding_dim": 48
+            "embedding_dim": 48,
+            "use_bm25_stemmer": true,
         });
         std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
         assert_eq!(detect(tmp.path()), IndexState::Ready);
@@ -204,6 +205,7 @@ mod tests {
             chunk_count: 0,
             embedding_model: "test".to_string(),
             embedding_dim: 48,
+            use_bm25_stemmer: true,
         };
         let meta_json = serde_json::to_string(&meta).unwrap();
         std::fs::write(semantex_dir.join("meta.json"), meta_json).unwrap();

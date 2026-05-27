@@ -5,7 +5,7 @@
 //! mapped back to a semantex `chunk_id` via a postcard-encoded `Vec<u64>` mapping file.
 
 use crate::embedding::colbert::ColbertEmbedder;
-use crate::types::ScoredChunkId;
+use crate::types::{PLAID_TOMBSTONE, ScoredChunkId};
 use anyhow::Result;
 use next_plaid::{MmapIndex, SearchParameters};
 use std::path::Path;
@@ -38,16 +38,40 @@ where
 
 /// Resolve `SEMANTEX_PLAID_CENTROID_THRESHOLD` via a caller-provided env lookup.
 ///
-/// Returns `Some(threshold)`: either the parsed env value or the built-in default.
-/// The threshold is always set (never `None`) because the previous default of
-/// `None` from `SearchParameters::default()` was a less aggressive prune.
+/// Semantics (v0.4.1 W-Index #11):
+/// * env unset → `Some(DEFAULT_CENTROID_THRESHOLD)` (v0.4 default, kept for
+///   continuity).
+/// * env set to `none` / `off` / `disabled` / `0` (case-insensitive) →
+///   `None`, restoring the pre-v0.4 behaviour where `SearchParameters` ran
+///   without a centroid prune. This is the explicit opt-out callers asked
+///   for; the function used to have no way to produce `None`.
+/// * env set to a parseable f32 → `Some(that value)`.
+/// * env set to an unparseable value → warn at the tracing level and fall
+///   back to `Some(DEFAULT_CENTROID_THRESHOLD)`. The pre-W-Index behaviour
+///   silently swallowed parse failures.
 fn resolve_plaid_centroid_threshold<F>(env: F) -> Option<f32>
 where
     F: Fn(&str) -> Option<String>,
 {
-    env("SEMANTEX_PLAID_CENTROID_THRESHOLD")
-        .and_then(|v| v.parse().ok())
-        .map_or(Some(DEFAULT_CENTROID_THRESHOLD), Some)
+    let Some(raw) = env("SEMANTEX_PLAID_CENTROID_THRESHOLD") else {
+        return Some(DEFAULT_CENTROID_THRESHOLD);
+    };
+    let trimmed = raw.trim();
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled" | "0"
+    ) {
+        return None;
+    }
+    if let Ok(v) = trimmed.parse::<f32>() {
+        Some(v)
+    } else {
+        tracing::warn!(
+            env_value = %raw,
+            "SEMANTEX_PLAID_CENTROID_THRESHOLD={raw} unparseable; using default {DEFAULT_CENTROID_THRESHOLD}"
+        );
+        Some(DEFAULT_CENTROID_THRESHOLD)
+    }
 }
 
 /// Translate a chunk-ID subset into a PLAID doc-ID subset.
@@ -57,13 +81,19 @@ where
 /// of entries whose chunk ID is present in `chunk_id_subset`. Lifted out of
 /// `search_with_subset` so the translation is unit-testable without an actual
 /// PLAID index.
+///
+/// Tombstone positions (`PLAID_TOMBSTONE`, written by the incremental
+/// builder when a chunk is deleted — v0.4.1 W-Index #3) are skipped even if
+/// the caller happens to pass `PLAID_TOMBSTONE` in the subset. The sentinel
+/// is never a real chunk ID so the check is purely defensive against a
+/// caller that built the subset from `doc_to_chunk` directly.
 fn translate_chunk_subset_to_doc_subset(doc_to_chunk: &[u64], chunk_id_subset: &[u64]) -> Vec<i64> {
     let chunk_set: std::collections::HashSet<u64> = chunk_id_subset.iter().copied().collect();
     doc_to_chunk
         .iter()
         .enumerate()
         .filter_map(|(doc_idx, &cid)| {
-            if chunk_set.contains(&cid) {
+            if cid != PLAID_TOMBSTONE && chunk_set.contains(&cid) {
                 Some(doc_idx as i64)
             } else {
                 None
@@ -138,6 +168,10 @@ impl PlaidSearcher {
 
         let results = self.index.search(&query_emb, &params, None)?;
 
+        // v0.4.1 W-Index #3: skip tombstoned positions. The mapping
+        // is positional so deleted slots get `PLAID_TOMBSTONE` rather than
+        // being truncated; surfacing them here would map to a non-existent
+        // chunk.
         let mut scored: Vec<ScoredChunkId> = results
             .passage_ids
             .iter()
@@ -146,6 +180,7 @@ impl PlaidSearcher {
                 let doc_idx = doc_id as usize;
                 self.doc_to_chunk
                     .get(doc_idx)
+                    .filter(|&&cid| cid != PLAID_TOMBSTONE)
                     .map(|&chunk_id| ScoredChunkId::new(chunk_id, score))
             })
             .collect();
@@ -208,6 +243,7 @@ impl PlaidSearcher {
             .index
             .search(&query_emb, &params, plaid_subset.as_deref())?;
 
+        // v0.4.1 W-Index #3: same tombstone-skip rule as `search`.
         let mut scored: Vec<ScoredChunkId> = results
             .passage_ids
             .iter()
@@ -216,6 +252,7 @@ impl PlaidSearcher {
                 let doc_idx = doc_id as usize;
                 self.doc_to_chunk
                     .get(doc_idx)
+                    .filter(|&&cid| cid != PLAID_TOMBSTONE)
                     .map(|&chunk_id| ScoredChunkId::new(chunk_id, score))
             })
             .collect();
@@ -233,6 +270,11 @@ impl PlaidSearcher {
     /// Exposed for callers (e.g. `HybridSearcher`) that need to enumerate the
     /// indexed chunk IDs to compute a subset for `search_with_subset` without
     /// re-reading `plaid_mapping.bin` from disk.
+    ///
+    /// **v0.4.1 W-Index #3:** the returned slice MAY contain
+    /// `crate::types::PLAID_TOMBSTONE` entries — positions whose chunk was
+    /// deleted by an incremental rebuild. Callers MUST filter these out
+    /// before using a chunk_id as a SQLite lookup key.
     pub fn doc_to_chunk(&self) -> &[u64] {
         &self.doc_to_chunk
     }
@@ -294,6 +336,43 @@ mod tests {
         assert!(matches!(thr, Some(v) if (v - 0.25).abs() < 1e-6));
     }
 
+    /// v0.4.1 W-Index #11: the env var supports an explicit opt-out so the
+    /// caller can restore the pre-v0.4 "no centroid prune" behaviour. Each
+    /// recognized opt-out token (`none`, `off`, `disabled`, `0`) — and any
+    /// case/whitespace variant — must return `None`.
+    #[test]
+    fn resolve_plaid_centroid_threshold_supports_explicit_none() {
+        for token in &["none", "NONE", " None ", "off", "OFF", "disabled", "0"] {
+            let thr = resolve_plaid_centroid_threshold(|k| {
+                if k == "SEMANTEX_PLAID_CENTROID_THRESHOLD" {
+                    Some((*token).to_string())
+                } else {
+                    None
+                }
+            });
+            assert!(
+                thr.is_none(),
+                "SEMANTEX_PLAID_CENTROID_THRESHOLD={token:?} must opt out (None), got {thr:?}",
+            );
+        }
+    }
+
+    /// v0.4.1 W-Index #11: an unparseable value falls back to the default
+    /// (with a warning at the tracing level). The pre-W-Index behaviour
+    /// silently dropped the bad value; the new behaviour also defaults but
+    /// is observable via logs.
+    #[test]
+    fn resolve_plaid_centroid_threshold_unparseable_falls_back_to_default() {
+        let thr = resolve_plaid_centroid_threshold(|k| {
+            if k == "SEMANTEX_PLAID_CENTROID_THRESHOLD" {
+                Some("not-a-float".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(thr, Some(DEFAULT_CENTROID_THRESHOLD));
+    }
+
     #[test]
     fn translate_subset_emits_positional_doc_ids() {
         // doc_to_chunk: doc 0 -> chunk 100, doc 1 -> chunk 200, doc 2 -> chunk 300,
@@ -329,5 +408,24 @@ mod tests {
         let subset = [500u64, 100];
         let docs = translate_chunk_subset_to_doc_subset(&d2c, &subset);
         assert_eq!(docs, vec![0i64, 4], "doc IDs must be ascending positional");
+    }
+
+    /// v0.4.1 W-Index #3: tombstone positions in `doc_to_chunk` must NOT
+    /// emit a doc_id even if the subset happens to include
+    /// `PLAID_TOMBSTONE` (e.g., a buggy caller built the subset directly
+    /// from the mapping). The sentinel is positional metadata, not a chunk
+    /// the user wants to search.
+    #[test]
+    fn translate_subset_skips_tombstone_positions() {
+        let d2c: Vec<u64> = vec![100, PLAID_TOMBSTONE, 300, PLAID_TOMBSTONE, 500];
+        // Subset accidentally includes the sentinel + real chunk IDs.
+        let subset = [100u64, PLAID_TOMBSTONE, 300, 500];
+        let docs = translate_chunk_subset_to_doc_subset(&d2c, &subset);
+        assert_eq!(
+            docs,
+            vec![0i64, 2, 4],
+            "tombstone positions must be skipped even when the sentinel \
+             appears in the subset",
+        );
     }
 }

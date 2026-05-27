@@ -998,20 +998,32 @@ fn extract_name(node: &Node, source: &[u8]) -> Option<String> {
         }
     }
 
-    // Walk immediate children looking for identifier-like nodes
+    // First pass: canonical identifier-like child kinds shared across grammars.
+    // These win whenever they exist on the node.
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
             match child.kind() {
-                "identifier"
-                | "name"
-                | "property_identifier"
-                | "type_identifier"
-                | "value_name" => {
+                "identifier" | "name" | "property_identifier" | "type_identifier" => {
                     let text = &source[child.start_byte()..child.end_byte()];
                     return Some(String::from_utf8_lossy(text).to_string());
                 }
                 _ => {}
             }
+        }
+    }
+
+    // Second pass: language-specific identifier-like child kinds. Checked AFTER
+    // the canonical kinds so that any grammar emitting both still picks the
+    // canonical name first. Currently:
+    //   - `value_name`: OCaml-specific. Emitted as a named child of `external`,
+    //     `value_specification`, `value_path`, and `alias_pattern`. Of those,
+    //     only `external` is in our definition_node_kinds for OCaml.
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32)
+            && child.kind() == "value_name"
+        {
+            let text = &source[child.start_byte()..child.end_byte()];
+            return Some(String::from_utf8_lossy(text).to_string());
         }
     }
 
@@ -1056,7 +1068,15 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "file_scoped_namespace_declaration"
         | "module_definition"
         | "object_definition" => AstNodeKind::Module,
-        "type_alias" | "type_definition" => AstNodeKind::Other("type_alias".to_string()),
+        // `type_alias` (Dart, Haskell): always a true alias (`typedef Foo = Bar`).
+        // `type_definition` (Scala 3, OCaml): umbrella for type-level declarations
+        //   that may or may not be aliases — Scala 3 emits it for `type X = Y` and
+        //   abstract type members; OCaml emits it for records (`type r = { x: int }`),
+        //   sum types (`type t = A | B`), and aliases. Folding both into a single
+        //   `type_alias` label mislabels OCaml records/variants and Scala 3 abstract
+        //   types as aliases, so keep them distinct.
+        "type_alias" => AstNodeKind::Other("type_alias".to_string()),
+        "type_definition" => AstNodeKind::Other("type_definition".to_string()),
         "impl_item" => AstNodeKind::Other("impl".to_string()),
         "type_declaration" => AstNodeKind::Other("type".to_string()),
         "given_definition" => AstNodeKind::Other("given".to_string()),
@@ -1497,6 +1517,57 @@ let double x = x * 2
         );
     }
 
+    /// Regression test for the `value_name` precedence-ordering fix.
+    ///
+    /// `value_name` is an OCaml-specific identifier-like node kind. The fix
+    /// reorders `extract_name` so that the canonical identifier kinds
+    /// (`identifier`, `name`, `property_identifier`, `type_identifier`) are
+    /// checked BEFORE `value_name`. That way, if a future grammar emits both
+    /// kinds under the same definition node, the canonical kind wins.
+    ///
+    /// We exercise the invariant from two directions using real grammars:
+    /// 1. Rust `fn my_function`: canonical "name" field is set on
+    ///    `function_item`. The first pass returns "my_function" — `value_name`
+    ///    is never consulted (it doesn't exist in the Rust grammar anyway).
+    /// 2. OCaml `external sqrt`: `external` has no "name" field and no
+    ///    canonical identifier-kind children, only a `value_name` child. The
+    ///    second pass picks it up.
+    /// Together, these confirm the two-pass precedence works as intended.
+    #[test]
+    fn test_extract_name_canonical_kinds_take_precedence_over_value_name() {
+        let chunker = AstChunker::new(256, 64);
+
+        // (1) Canonical kinds (Rust uses "name" field) — first pass wins.
+        let rust_content = "fn my_function() { }\n";
+        let rust_chunks = chunker.chunk(Path::new("t.rs"), rust_content).unwrap();
+        let rust_name = rust_chunks
+            .iter()
+            .find_map(|c| match &c.chunk_type {
+                ChunkType::AstNode { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .expect("expected an AstNode chunk for Rust");
+        assert_eq!(
+            rust_name, "my_function",
+            "Rust function name should come from canonical 'name' field"
+        );
+
+        // (2) `value_name` fallback (OCaml `external`) — second pass picks it up.
+        let ocaml_content = "external sqrt : float -> float = \"sqrt_C_func\"\n";
+        let ocaml_chunks = chunker.chunk(Path::new("t.ml"), ocaml_content).unwrap();
+        let ocaml_name = ocaml_chunks
+            .iter()
+            .find_map(|c| match &c.chunk_type {
+                ChunkType::AstNode { name, .. } if name != "<anonymous>" => Some(name.clone()),
+                _ => None,
+            })
+            .expect("expected a named AstNode chunk for OCaml external");
+        assert_eq!(
+            ocaml_name, "sqrt",
+            "OCaml external should fall back to value_name in the second pass"
+        );
+    }
+
     #[test]
     fn test_scala3_given_extension_enum_type() {
         let chunker = AstChunker::new(256, 64);
@@ -1560,6 +1631,58 @@ type StringMap = Map[String, String]
         assert!(
             has_extension,
             "Should find extension_definition classified as Other(extension)"
+        );
+    }
+
+    /// Regression test for the `type_definition` vs `type_alias` split.
+    ///
+    /// Previously `classify_node_kind` folded both grammar kinds into a single
+    /// `Other("type_alias")` label. That misrepresents:
+    ///   - OCaml `type r = { x: int }` and `type t = A | B` (records and sum
+    ///     types, both emitted as `type_definition`, not aliases).
+    ///   - Scala 3 abstract type members (also `type_definition`).
+    /// The fix keeps the two kinds distinct: `type_alias` -> `Other("type_alias")`
+    /// (true aliases — Dart/Haskell), `type_definition` -> `Other("type_definition")`
+    /// (umbrella term; covers Scala 3 + OCaml).
+    ///
+    /// tree-sitter-scala 0.26's grammar.js emits `type_definition` for any
+    /// `type X = ...` (alias) AND for abstract type members. tree-sitter-ocaml
+    /// 0.25 emits `type_definition` for records, variants, and aliases alike.
+    #[test]
+    fn test_type_definition_kept_distinct_from_type_alias() {
+        let chunker = AstChunker::new(256, 64);
+
+        // Scala 3 `type X = ...` — grammar emits `type_definition`, not `type_alias`.
+        let scala_content = "type StringMap = Map[String, String]\n";
+        let scala_chunks = chunker.chunk(Path::new("t.scala"), scala_content).unwrap();
+        let scala_kind = scala_chunks.iter().find_map(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } if name == "StringMap" => Some(kind.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(scala_kind, Some(AstNodeKind::Other(ref s)) if s == "type_definition"),
+            "Scala 3 `type X = ...` should chunk as Other(\"type_definition\"), got: {:?}",
+            scala_kind
+        );
+
+        // OCaml record `type r = { x: int }` — grammar emits `type_definition`
+        // (NOT `type_alias`); this is a record declaration, not an alias.
+        let ocaml_content = "type point = { x : int; y : int }\n";
+        let ocaml_chunks = chunker.chunk(Path::new("t.ml"), ocaml_content).unwrap();
+        let ocaml_kind = ocaml_chunks.iter().find_map(|c| match &c.chunk_type {
+            ChunkType::AstNode { kind, .. } => match kind {
+                AstNodeKind::Other(s) if s == "type_definition" || s == "type_alias" => {
+                    Some(kind.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        assert!(
+            matches!(ocaml_kind, Some(AstNodeKind::Other(ref s)) if s == "type_definition"),
+            "OCaml `type point = {{ ... }}` (a record) must NOT be labeled \
+             type_alias; expected Other(\"type_definition\"), got: {:?}",
+            ocaml_kind
         );
     }
 

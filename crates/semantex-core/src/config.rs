@@ -60,9 +60,11 @@ pub struct SemantexConfig {
     /// benefit from disabling: with stemming on, `retry` -> `retri`,
     /// `handle` -> `handl`, which can hurt exact identifier matching.
     ///
-    /// This flag is respected at index-build time only. Toggling without a
-    /// reindex has no effect on existing indexes (no runtime warning is
-    /// emitted; see `docs/CONFIGURATION.md`).
+    /// MUST match the value the index was built with. As of v0.4.1 W-Index #4
+    /// the indexer persists this flag in `meta.json` and `SparseIndex::open`
+    /// re-validates it against the runtime config — a mismatch is a hard
+    /// error at startup, not a silent recall regression. Run
+    /// `semantex index --rebuild` after toggling.
     pub use_bm25_stemmer: bool,
 }
 

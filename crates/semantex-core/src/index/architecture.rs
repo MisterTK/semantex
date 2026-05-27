@@ -68,6 +68,17 @@ pub struct ArchOverview {
     pub boundaries: Vec<Boundary>,
 }
 
+/// Threshold below which architectural handlers switch into "tiny repo" mode:
+/// only `god_nodes` (capped at 5), no communities, no boundaries. On such tiny
+/// indexes the BFS communities/boundary tables don't yet contain meaningful
+/// signal, and emitting empty sections triggers follow-up exploration by the
+/// caller.
+///
+/// TEMPORARY: this constant duplicates `ARCH_TINY_REPO_THRESHOLD` in
+/// `search/agent.rs`. The integration captain dedupes by having agent.rs
+/// import it from here (or vice versa). Values must stay in sync.
+pub const ARCH_TINY_REPO_THRESHOLD: u64 = 500;
+
 /// Adaptive output budget for arch / exhaustive / deep-with-examples handlers.
 ///
 /// Sizes are derived from index chunk count by `budget_for_chunk_count`. The
@@ -168,6 +179,13 @@ pub fn query_top_centrality(db_path: &Path, n: usize) -> Result<Vec<(u64, f64)>>
 
 /// Hydrate top-N god nodes from the centrality table into the richer
 /// `GodNode` struct (with symbol name, file path, role).
+///
+/// Symbol names are read via `Chunk::symbol_name()` (single source of truth —
+/// matches the v0.4 hybrid.rs Phase 3d definition-boost ranking signal). For
+/// non-AstNode chunks (TextWindow / PdfPage) `symbol_name()` returns `None`
+/// and we fall back to the file path. Architecture overview is intentionally
+/// AstNode-centric — god nodes by construction are functions / classes /
+/// methods — so dropping non-AstNode symbol names here is acceptable.
 pub fn build_god_nodes(store: &ChunkStore, db_path: &Path, n: usize) -> Result<Vec<GodNode>> {
     let raw = query_top_centrality(db_path, n)?;
     let mut out = Vec::with_capacity(raw.len());
@@ -175,12 +193,17 @@ pub fn build_god_nodes(store: &ChunkStore, db_path: &Path, n: usize) -> Result<V
         let Ok(chunk) = store.get_chunk(cid) else {
             continue;
         };
-        let meta = store.get_structured_meta(cid).ok().flatten();
-        let symbol = meta
-            .as_ref()
-            .and_then(|m| m.name.clone())
-            .unwrap_or_else(|| chunk.file_path.display().to_string());
-        let semantic_role = meta
+        // Defect #15: symbol name comes from Chunk::symbol_name (writer-side
+        // truth in `chunks.chunk_type`), NOT from `structured_meta.name`.
+        // The two writers can drift; this reader must agree with Phase 3d.
+        let symbol = chunk
+            .symbol_name()
+            .map_or_else(|| chunk.file_path.display().to_string(), str::to_string);
+        // structured_meta is still the source for semantic_role.
+        let semantic_role = store
+            .get_structured_meta(cid)
+            .ok()
+            .flatten()
             .and_then(|m| m.semantic_role)
             .map(|r| r.as_label().to_string());
         out.push(GodNode {
@@ -302,10 +325,16 @@ pub fn build_communities_n(
                     member_files.push(p);
                 }
                 if entry_points.len() < 3 {
-                    let meta = store.get_structured_meta(cid).ok().flatten();
-                    let name = meta
-                        .and_then(|m| m.name)
-                        .unwrap_or_else(|| chunk.file_path.display().to_string());
+                    // Defect #15: entry-point symbol name comes from
+                    // Chunk::symbol_name (writer-side truth), NOT from
+                    // structured_meta.name. Non-AstNode chunks fall back to
+                    // the file path. Architecture community entry points are
+                    // by construction AstNode-centric (sorted by PageRank
+                    // centrality, which only scores graph-connected nodes),
+                    // so dropping non-AstNode names here is acceptable.
+                    let name = chunk
+                        .symbol_name()
+                        .map_or_else(|| chunk.file_path.display().to_string(), str::to_string);
                     entry_points.push(EntryPoint {
                         symbol: name,
                         file: chunk.file_path.display().to_string(),
@@ -690,5 +719,126 @@ mod tests {
         assert_eq!(b.boundaries, 10);
         // Item 4 zero-override is applied in handle_architecture (in
         // search/agent.rs), not here.
+    }
+
+    // --- Defect #15: symbol-name reads go through Chunk::symbol_name() -----
+
+    /// Build a synthetic AstNode chunk with a deliberately mismatched
+    /// `StructuredChunkMeta.name` so the reader's choice of writer is
+    /// observable. Both fields are persisted via `insert_chunk` — the meta
+    /// goes into the dedicated `structured_meta` column, the AST name into
+    /// the JSON-serialized `chunk_type` column.
+    #[test]
+    fn build_god_nodes_reads_symbol_from_chunk_not_structured_meta() {
+        use crate::chunking::structured_meta::StructuredChunkMeta;
+        use crate::types::{AstNodeKind, Chunk, ChunkType};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        // The two writers of "symbol name" disagree on purpose:
+        //   chunk.chunk_type.AstNode.name = "FooBar"   (Phase 3d source)
+        //   chunk.structured_meta.name    = "WrongName"
+        // If build_god_nodes ever drifts back to structured_meta.name, this
+        // test will flip and report "WrongName".
+        let mut meta = StructuredChunkMeta {
+            name: Some("WrongName".to_string()),
+            kind: Some("function".to_string()),
+            ..StructuredChunkMeta::default()
+        };
+        meta.generate_nl_summary();
+        let chunk = Chunk {
+            id: 0,
+            file_path: std::path::PathBuf::from("src/lib.rs"),
+            start_line: 1,
+            end_line: 5,
+            content: "fn FooBar() {}".to_string(),
+            chunk_type: ChunkType::AstNode {
+                name: "FooBar".to_string(),
+                kind: AstNodeKind::Function,
+                language: "rust".to_string(),
+                structured_meta: Some(Box::new(meta)),
+            },
+        };
+        let chunk_id = store.insert_chunk(&chunk, 0xfeed_face, 0).unwrap();
+
+        // Plant a chunk_centrality row so build_god_nodes selects this chunk.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chunk_centrality (
+                chunk_id INTEGER PRIMARY KEY,
+                structural_centrality REAL NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_centrality(chunk_id, structural_centrality) VALUES (?1, 0.9)",
+            rusqlite::params![chunk_id as i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let god_nodes = build_god_nodes(&store, &db_path, 5).unwrap();
+        assert_eq!(god_nodes.len(), 1, "should have one god node");
+        // Critical assertion: must come from Chunk::symbol_name (AstNode.name),
+        // NOT from StructuredChunkMeta.name.
+        assert_eq!(
+            god_nodes[0].symbol, "FooBar",
+            "build_god_nodes must read symbol via Chunk::symbol_name(), \
+             got {:?} (expected `FooBar` from chunk.chunk_type.AstNode.name)",
+            god_nodes[0].symbol
+        );
+        assert_ne!(
+            god_nodes[0].symbol, "WrongName",
+            "build_god_nodes leaked the structured_meta.name override — \
+             readers must use Chunk::symbol_name() as the writer-side truth"
+        );
+    }
+
+    /// Companion test: when the underlying chunk has no AstNode name
+    /// (e.g., a TextWindow chunk), `Chunk::symbol_name()` returns `None`
+    /// and `build_god_nodes` falls back to the file path. Documents the
+    /// intentional trade-off — architecture overview is AstNode-centric.
+    #[test]
+    fn build_god_nodes_falls_back_to_file_path_for_text_window_chunks() {
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        let chunk = Chunk {
+            id: 0,
+            file_path: std::path::PathBuf::from("docs/notes.md"),
+            start_line: 1,
+            end_line: 20,
+            content: "long-form documentation".to_string(),
+            chunk_type: ChunkType::TextWindow { window_index: 0 },
+        };
+        let chunk_id = store.insert_chunk(&chunk, 0xc0de_d00d, 0).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chunk_centrality (
+                chunk_id INTEGER PRIMARY KEY,
+                structural_centrality REAL NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_centrality(chunk_id, structural_centrality) VALUES (?1, 0.5)",
+            rusqlite::params![chunk_id as i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let god_nodes = build_god_nodes(&store, &db_path, 5).unwrap();
+        assert_eq!(god_nodes.len(), 1);
+        // TextWindow → symbol_name() = None → fall back to file path.
+        assert_eq!(
+            god_nodes[0].symbol, "docs/notes.md",
+            "non-AstNode chunks must fall back to the file path"
+        );
     }
 }

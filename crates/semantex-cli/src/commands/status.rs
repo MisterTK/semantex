@@ -33,7 +33,25 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
 
     if meta_path.exists() {
         let content = std::fs::read_to_string(&meta_path)?;
-        let meta: IndexMeta = serde_json::from_str(&content)?;
+        let Ok(meta) = serde_json::from_str::<IndexMeta>(&content) else {
+            let stale_version = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|v| v.get("schema_version").and_then(serde_json::Value::as_u64));
+            let version_label =
+                stale_version.map_or_else(|| "unreadable".to_string(), |v| format!("v{v}"));
+            println!(
+                "  {} Index at {} is stale (current schema: v{}).",
+                "!".yellow(),
+                version_label,
+                IndexMeta::CURRENT_SCHEMA_VERSION
+            );
+            println!(
+                "  Run 'semantex index {}' to rebuild (auto-rebuild also triggers on first search).",
+                path.display()
+            );
+            println!();
+            return Ok(());
+        };
 
         // Read live counts from SQLite (meta.json may be stale after incremental indexing)
         let db_path = index_dir.join("chunks.db");

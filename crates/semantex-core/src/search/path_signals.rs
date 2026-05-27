@@ -80,14 +80,30 @@ const BARREL_FILENAMES: &[&str] = &[
 
 /// Filename regex matching common test naming conventions across languages.
 ///
-/// Covers Go (`_test.go`), Ruby (`_spec.rb`, `spec_*.rb`), Dart (`_test.dart`),
-/// Vue (`.spec.vue`), JS/TS (`.test.ts`, `.spec.ts`), Python
-/// (pytest `test_*.py`, `*_test.py`), etc.
+/// Covers Go (`_test.go`), Ruby (`_spec.rb`), Dart (`_test.dart`), Vue
+/// (`.spec.vue`), JS/TS (`.test.ts`, `.spec.ts`), etc.
+///
+/// IMPORTANT: the bare-stem alternatives (`test`, `tests`, `spec`, `specs`)
+/// require an EXPLICIT `_` / `.` / `-` / `/` boundary on the left. They do
+/// NOT match at the start of the filename — otherwise a legitimate
+/// top-level file literally named `tests.rs` (or `spec.dart`, etc.) would
+/// be penalised even though it's a real source module. See defect #10.
+///
+/// Pytest-style `test_X.py` and RSpec-style `spec_X.rb` filenames are
+/// matched by a SEPARATE prefix regex (`TEST_FILENAME_PREFIX_RE`), so they
+/// can legitimately anchor at the start of the filename.
 static TEST_FILENAME_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)(^|[_./-])(test|tests|spec|specs|_test|test_[A-Za-z0-9_]+|spec_[A-Za-z0-9_]+|\.spec|\.test)\.[A-Za-z0-9]+$",
-    )
-    .expect("path_signals: test filename regex MUST compile")
+    Regex::new(r"(?i)([_./-])(test|tests|spec|specs|_test|\.spec|\.test)\.[A-Za-z0-9]+$")
+        .expect("path_signals: test filename regex MUST compile")
+});
+
+/// Filename prefix regex for pytest (`test_*.py`) and RSpec
+/// (`spec_*.rb`) conventions, which legitimately anchor at the start of
+/// the filename. Kept separate from `TEST_FILENAME_RE` so the bare-stem
+/// alternatives there can require an explicit left boundary.
+static TEST_FILENAME_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(test_|spec_)[A-Za-z0-9_]+\.[A-Za-z0-9]+$")
+        .expect("path_signals: test prefix regex MUST compile")
 });
 
 /// Returns `true` when the path penalty SHOULD be applied to the given query.
@@ -154,11 +170,18 @@ pub fn file_path_penalty(path: &Path) -> f32 {
     }
 
     // Category: test file name. Match against the filename only.
+    // We use two regexes: TEST_FILENAME_RE for boundary-anchored matches
+    // (e.g. `foo_test.go`, `bar.spec.ts`) and TEST_FILENAME_PREFIX_RE for
+    // start-anchored matches (e.g. `test_auth.py`, `spec_helper.rb`). The
+    // split exists so legitimate non-test files literally named `tests.rs`
+    // / `spec.dart` are NOT penalized — see defect #10.
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if !filename.is_empty() && TEST_FILENAME_RE.is_match(&filename) {
+    if !filename.is_empty()
+        && (TEST_FILENAME_RE.is_match(&filename) || TEST_FILENAME_PREFIX_RE.is_match(&filename))
+    {
         factor *= STRONG_PENALTY;
     }
 
@@ -206,12 +229,25 @@ const QUERY_STOPWORDS: &[&str] = &[
 /// single-word tokens that `expand_identifiers` skips (it only emits
 /// multi-part splits). Tokens are lowercased, de-duplicated (preserving
 /// first occurrence), and filtered against `QUERY_STOPWORDS`.
+///
+/// Item-16 bigram tokens (e.g. `get_user`, `by_id`) emitted by
+/// `expand_identifiers` are an INDEX-time BM25 signal only — they MUST NOT
+/// participate in path/definition stem-match logic. If they did, a stem
+/// subtoken like `gener` (>=3 chars) would prefix-match the bigram
+/// `gener_ate` and falsely award STEM_PREFIX_BOOST_FRAC. We strip any
+/// expansion token containing `_`; the raw-identifier-span pass below
+/// still supplies the clean bare sub-tokens we need.
 pub fn query_tokens_for_path_signals(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let expanded = expand_identifiers(text);
     for tok in expanded.split_whitespace() {
+        // Skip Item-16 adjacent-pair bigrams (`a_b`, `b_c`, ...). The
+        // raw-identifier pass below provides bare sub-tokens.
+        if tok.contains('_') {
+            continue;
+        }
         push_token(tok, &mut out, &mut seen);
     }
 
@@ -269,43 +305,52 @@ fn split_into_subtokens(span: &str) -> Vec<String> {
 }
 
 /// Local copy of camelCase splitting (kept private to avoid widening the
-/// `code_tokenizer` public surface for v0.4). Mirrors the algorithm used
-/// inside `code_tokenizer::expand_identifiers`.
+/// `code_tokenizer` public surface for v0.4).
+///
+/// MUST stay byte-for-byte identical to `code_tokenizer::split_camel_case`
+/// — any divergence here causes path_signals tokenization to disagree with
+/// BM25 tokenization, producing score-composition mismatches on identifiers
+/// like `OAuth`, `XMLParser`, `HTTPServer`. See defect #5 (v0.4.1).
+///
+/// Rules (mirroring `code_tokenizer::split_camel_case`):
+/// - `[a-z][A-Z]` or `[0-9][A-Z]` boundary: `getUserById` -> `get|User|By|Id`.
+/// - `[A-Z][A-Z][a-z]` boundary: `XMLParser` -> `XML|Parser`. Only splits
+///   when the uppercase prefix is at least 2 chars, so `OAuth` stays whole.
 fn split_camel_case_local(word: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let chars: Vec<char> = word.chars().collect();
-    if chars.is_empty() {
-        return parts;
+    let bytes = word.as_bytes();
+    if bytes.is_empty() {
+        return vec![];
     }
 
+    let mut parts = Vec::new();
     let mut start = 0;
-    for i in 1..chars.len() {
-        let prev = chars[i - 1];
-        let curr = chars[i];
 
-        // Transition from lowercase/digit to uppercase: split before `curr`.
-        if (prev.is_lowercase() || prev.is_ascii_digit()) && curr.is_uppercase() {
-            parts.push(&word[byte_offset(&chars, start)..byte_offset(&chars, i)]);
+    for i in 1..bytes.len() {
+        let prev = bytes[i - 1];
+        let cur = bytes[i];
+
+        // lowerUpper or digitUpper boundary
+        if (prev.is_ascii_lowercase() || prev.is_ascii_digit()) && cur.is_ascii_uppercase() {
+            parts.push(&word[start..i]);
             start = i;
+            continue;
         }
-        // Transition from uppercase to lowercase with a preceding uppercase
-        // run (e.g. `HTTPServer` → `HTTP`, `Server`): split before the prior
-        // uppercase char.
-        else if prev.is_uppercase()
-            && curr.is_lowercase()
-            && i >= 2
-            && chars[i - 2].is_uppercase()
+
+        // UPPERLower boundary (e.g., XMLParser -> XML|Parser)
+        // Only split if the uppercase prefix is at least 2 chars (so "OAuth" stays whole)
+        if i >= 2
+            && bytes[i - 2].is_ascii_uppercase()
+            && prev.is_ascii_uppercase()
+            && cur.is_ascii_lowercase()
+            && (i - 1 - start) >= 2
         {
-            parts.push(&word[byte_offset(&chars, start)..byte_offset(&chars, i - 1)]);
+            parts.push(&word[start..i - 1]);
             start = i - 1;
         }
     }
-    parts.push(&word[byte_offset(&chars, start)..]);
-    parts
-}
 
-fn byte_offset(chars: &[char], char_idx: usize) -> usize {
-    chars.iter().take(char_idx).map(|c| c.len_utf8()).sum()
+    parts.push(&word[start..]);
+    parts
 }
 
 // ---- Item 7: path stem boost -----------------------------------------------
@@ -496,6 +541,46 @@ mod tests {
         }
     }
 
+    // ---- Defect #5 regression: split_camel_case_local must match
+    //      code_tokenizer::split_camel_case byte-for-byte. ----
+
+    #[test]
+    fn split_camel_case_local_matches_code_tokenizer() {
+        // Each case below mirrors the contract of
+        // `code_tokenizer::split_camel_case` (which is module-private and so
+        // can't be imported directly). The expected values ARE the
+        // ground-truth output of that function — if the BM25 splitter changes
+        // these, this test must change in lockstep with the BM25 side.
+        let cases: &[(&str, &[&str])] = &[
+            // 2-char uppercase prefix is preserved as a single piece: "OAuth"
+            // stays whole because the (i - 1 - start) >= 2 guard rejects the
+            // UPPER+lower split when the uppercase prefix is only 1 char.
+            ("OAuth", &["OAuth"]),
+            ("OAuthClient", &["OAuth", "Client"]),
+            // 3+ char uppercase run splits before the final upper: XMLParser
+            // -> XML|Parser; HTTPServer -> HTTP|Server.
+            ("XMLParser", &["XML", "Parser"]),
+            ("HTTPServer", &["HTTP", "Server"]),
+            // Lowercase->uppercase boundary.
+            ("getUserById", &["get", "User", "By", "Id"]),
+            // Mixed lowercase+UPPER+lowercase: "MyHTTPHandler" -> My|HTTP|Handler.
+            ("MyHTTPHandler", &["My", "HTTP", "Handler"]),
+            // Digit->uppercase boundary; uppercase run too short to split.
+            ("id3Tag", &["id3", "Tag"]),
+            // Digit-in-middle case ("HTML5Parser"): "HTML5" stays together
+            // (no boundary between digit and preceding upper); "Parser"
+            // splits off because digit->upper triggers the boundary.
+            ("HTML5Parser", &["HTML5", "Parser"]),
+        ];
+        for (input, expected) in cases {
+            let got = split_camel_case_local(input);
+            assert_eq!(
+                got, *expected,
+                "split_camel_case_local({input:?}) = {got:?}, expected {expected:?}"
+            );
+        }
+    }
+
     // ---- Item 6 tests ----
 
     #[test]
@@ -574,6 +659,59 @@ mod tests {
         let p = pb("examples/quickstart/main.rs");
         let f = file_path_penalty(&p);
         assert!(approx(f, STRONG_PENALTY), "got {f}");
+    }
+
+    // ---- Defect #10 regression: bare-stem `tests.rs` at filename root
+    //      must NOT be flagged as a test file (no left boundary). ----
+
+    #[test]
+    #[allow(non_snake_case)] // Intentional: `NOT` emphasises the assertion.
+    fn item6_bare_tests_rs_at_root_does_NOT_match() {
+        // `tests.rs` is a legitimate top-level source module name in many
+        // Rust projects. The old regex matched it via the `^|` alternation
+        // on the left-boundary group, falsely awarding STRONG_PENALTY.
+        // Without an explicit `_./-` boundary on the left, the new regex
+        // must NOT match.
+        let p = pb("crates/foo/src/tests.rs");
+        let f = file_path_penalty(&p);
+        assert!(
+            approx(f, 1.0),
+            "tests.rs at filename root must not be penalised, got {f}"
+        );
+
+        // Same invariant for `spec.dart`, `test.go`, `specs.rb`.
+        for name in &["crates/foo/src/spec.dart", "src/test.go", "lib/specs.rb"] {
+            let f = file_path_penalty(&pb(name));
+            assert!(
+                approx(f, 1.0),
+                "{name} (no left boundary) must not be penalised, got {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn item6_underscore_separated_tests_still_matches() {
+        // The fix to the regex must NOT regress the canonical Go/Ruby/Dart
+        // conventions (`<base>_test.<ext>`, `<base>_spec.<ext>`) — the `_`
+        // boundary is still a left-anchor for the alternation.
+        let p = pb("src/foo_tests.rs");
+        let f = file_path_penalty(&p);
+        assert!(
+            approx(f, STRONG_PENALTY),
+            "foo_tests.rs must still be penalised, got {f}"
+        );
+
+        // Same for the `.test.<ext>` / `.spec.<ext>` JS conventions.
+        let f2 = file_path_penalty(&pb("src/foo.test.ts"));
+        assert!(
+            approx(f2, STRONG_PENALTY),
+            "foo.test.ts must still be penalised, got {f2}"
+        );
+        let f3 = file_path_penalty(&pb("src/foo.spec.vue"));
+        assert!(
+            approx(f3, STRONG_PENALTY),
+            "foo.spec.vue must still be penalised, got {f3}"
+        );
     }
 
     #[test]
@@ -671,6 +809,49 @@ mod tests {
             approx(f, STEM_EXACT_BOOST_FRAC),
             "got {f}, tokens={tokens:?}"
         );
+    }
+
+    // ---- Defect #6 regression: Item-16 bigrams must NOT leak into
+    //      query_tokens_for_path_signals output. ----
+
+    #[test]
+    fn query_tokens_excludes_bigrams_for_camelcase_input() {
+        // `expand_identifiers("getUserById")` now emits adjacent-pair bigrams
+        // (`get_user`, `user_by`, `by_id`) as part of its space-separated
+        // output. Those bigrams are an index-time BM25 signal only — they
+        // must be filtered out before the stem-prefix logic sees them, or
+        // short query tokens like "by" / "id" will spuriously prefix-match
+        // longer bigrams during path_stem_boost_factor.
+        let tokens = query_tokens_for_path_signals("getUserById");
+
+        // All four bare sub-tokens must be present.
+        for expected in ["get", "user", "by", "id"] {
+            assert!(
+                tokens.iter().any(|t| t == expected),
+                "missing expected token {expected:?}; got {tokens:?}"
+            );
+        }
+
+        // No token may contain `_` — that would mean a bigram leaked through.
+        for tok in &tokens {
+            assert!(
+                !tok.contains('_'),
+                "bigram token leaked into query tokens: {tok:?} (full: {tokens:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn query_tokens_excludes_bigrams_for_snake_case_input() {
+        // snake_case identifiers go through the same expand_identifiers path
+        // and so emit the same bigram set as camelCase.
+        let tokens = query_tokens_for_path_signals("get_user_by_id");
+        for tok in &tokens {
+            assert!(
+                !tok.contains('_'),
+                "bigram token leaked from snake_case input: {tok:?} (full: {tokens:?})"
+            );
+        }
     }
 
     // ---- Item 8 tests ----

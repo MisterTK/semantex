@@ -278,10 +278,15 @@ fn send_binary_request(
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
+    // v0.4.1 W-Index #2: the length-prefixed body is `[VERSION:1][postcard]`;
+    // `decode_binary_response` peels off the version byte and validates it
+    // against `BINARY_PROTOCOL_VERSION` before invoking postcard, so a
+    // daemon/client skew surfaces as a clean error instead of a misdecoded
+    // payload.
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
 
-    protocol::decode_binary_response(&payload)
+    protocol::decode_binary_response(&body)
         .map_err(|e| anyhow::anyhow!("Failed to decode binary response: {e}"))
 }
 
@@ -398,13 +403,15 @@ pub fn daemon_healthy_binary(port: u16) -> bool {
     }
     let len = u32::from_le_bytes(len_buf) as usize;
 
-    let mut payload = vec![0u8; len];
-    if stream.read_exact(&mut payload).is_err() {
+    // v0.4.1 W-Index #2: body is [VERSION:1][postcard]; decode validates the
+    // version internally.
+    let mut body = vec![0u8; len];
+    if stream.read_exact(&mut body).is_err() {
         return false;
     }
 
     matches!(
-        protocol::decode_binary_response(&payload),
+        protocol::decode_binary_response(&body),
         Ok(protocol::BinaryResponse::Health(
             protocol::HealthResponse { .. }
         ))
