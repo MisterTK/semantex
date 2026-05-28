@@ -24,6 +24,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 postcard = { version = "1", features = ["use-std"] }
 regex = "1"
+# LLM integration (Spec L Phase 1 — behind `llm` feature in semantex-core).
+# These are listed as non-optional in the workspace so downstream crates can
+# reference them; the `optional = true` that gates compilation lives in
+# semantex-core/Cargo.toml (the only crate that uses them).
+genai = "0.5"
+async-trait = "0.1"
+which = "8"
 # next-plaid 1.4: brings UpdateConfig.batch_size + buffer_size + force_cpu knobs,
 # the (MmapIndex, Vec<i64>) return tuple from update_or_create, and the streaming
 # encode_index_chunk / write_index_from_encoded_chunks APIs. Critical: drop the

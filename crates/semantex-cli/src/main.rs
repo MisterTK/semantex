@@ -314,7 +314,7 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
 
-        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, file_pattern
+        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern, architecture, exhaustive_structural, deep_with_examples, feature_planning
         #[arg(long)]
         route: Option<String>,
 
@@ -330,6 +330,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show LLM backend status and run a 1-token health-check classify call.
+    ///
+    /// Prints the configured backend label (or "no LLM configured"), the
+    /// provider and endpoint (if Genai), and the result of a classify call
+    /// for a standard probe query.
+    ///
+    /// Only available when built with `--features llm`.
+    #[cfg(feature = "llm")]
+    LlmStatus,
 }
 
 /// Find ONNX Runtime shared library on platform-specific paths.
@@ -808,6 +817,8 @@ fn main() -> Result<()> {
             };
             commands::skills_generate::run(out, platform_filter, force)
         }
+        #[cfg(feature = "llm")]
+        Some(Commands::LlmStatus) => commands::llm_status::run(),
         Some(Commands::Agent {
             query,
             path,
@@ -820,20 +831,23 @@ fn main() -> Result<()> {
             use semantex_core::server::protocol::AgentRequest;
             telemetry::track("agent");
 
+            // Accept any AgentRoute variant via FromStr (covers snake_case
+            // and no-separator forms). Two convenience aliases stay: "search"
+            // for semantic, "exact" for exact_symbol, "files" for file_pattern.
             let route_override = match route.as_deref() {
                 None => None,
                 Some(r) => Some(match r {
-                    "search" | "semantic" => AgentRoute::Semantic,
-                    "deep" => AgentRoute::Deep,
-                    "exact_symbol" | "exact" => AgentRoute::ExactSymbol,
-                    "structural" => AgentRoute::Structural,
-                    "regex" => AgentRoute::Regex,
-                    "analytical" => AgentRoute::Analytical,
-                    "exhaustive" => AgentRoute::Exhaustive,
-                    "file_pattern" | "files" => AgentRoute::FilePattern,
-                    other => anyhow::bail!(
-                        "Unknown route: {other}. Valid: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern"
-                    ),
+                    "search" => AgentRoute::Semantic,
+                    "exact" => AgentRoute::ExactSymbol,
+                    "files" => AgentRoute::FilePattern,
+                    other => other.parse::<AgentRoute>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Unknown route: {other}. Valid: file_pattern (files), regex, \
+                             exact_symbol (exact), structural, deep, analytical, exhaustive, \
+                             semantic (search), architecture, exhaustive_structural, \
+                             deep_with_examples, feature_planning"
+                        )
+                    })?,
                 }),
             };
 

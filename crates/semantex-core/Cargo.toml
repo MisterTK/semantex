@@ -10,6 +10,9 @@ repository.workspace = true
 [features]
 default = []
 cuda = ["ort/cuda"]
+# LLM-driven classifier + HyDE retrieval (Spec L Phase 1).
+# Default build brings in zero LLM deps; opt in with `--features llm`.
+llm = ["dep:genai", "dep:tokio", "dep:async-trait", "dep:which"]
 
 [dependencies]
 anyhow.workspace = true
@@ -100,6 +103,11 @@ regex = { workspace = true }
 rust-stemmers = "1.2"
 next-plaid.workspace = true
 next-plaid-onnx.workspace = true
+# Optional — pulled in only with `--features llm` (Spec L Phase 1)
+genai = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+which = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 # Memory-mapped files (cold-start: PLAID mapping file mmap'd on Unix; falls back
 # to read-on-open on Windows per E8 risk T5).

@@ -49,6 +49,21 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
             let shutdown_clone = shutdown.clone();
             let port_file_clone = port_file.clone();
             let project_path_clone = project_path.clone();
+            // Spec L Item 1.4: mirror the LLM init from `semantex serve` so
+            // `semantex watch`'s daemon also routes via the LLM classifier
+            // when SEMANTEX_LLM_* env vars are set. Errors degrade silently
+            // to the keyword classifier — never block the watch loop.
+            #[cfg(feature = "llm")]
+            let llm_backend = semantex_core::llm::LlmBackend::from_env()
+                .unwrap_or_else(|e| {
+                    tracing::warn!("LLM backend init failed: {e}; disabling LLM features");
+                    None
+                })
+                .map(|b| {
+                    let cap = b.into_arc();
+                    tracing::info!("LLM enabled: {}", cap.label());
+                    cap
+                });
             std::thread::spawn(move || {
                 match Listener::bind(
                     &port_file_clone,
@@ -58,6 +73,8 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
                     shutdown_clone,
                 ) {
                     Ok(listener) => {
+                        #[cfg(feature = "llm")]
+                        let listener = listener.with_llm(llm_backend);
                         println!(
                             "  {} Search daemon started on 127.0.0.1:{}",
                             "OK".green(),

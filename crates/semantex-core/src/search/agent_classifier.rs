@@ -65,6 +65,28 @@ pub enum AgentRoute {
     FeaturePlanning,
 }
 
+impl std::str::FromStr for AgentRoute {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "filepattern" | "file_pattern" => Ok(Self::FilePattern),
+            "regex" => Ok(Self::Regex),
+            "exactsymbol" | "exact_symbol" => Ok(Self::ExactSymbol),
+            "structural" => Ok(Self::Structural),
+            "deep" => Ok(Self::Deep),
+            "analytical" => Ok(Self::Analytical),
+            "exhaustive" => Ok(Self::Exhaustive),
+            "semantic" => Ok(Self::Semantic),
+            "architecture" => Ok(Self::Architecture),
+            "exhaustivestructural" | "exhaustive_structural" => Ok(Self::ExhaustiveStructural),
+            "deepwithexamples" | "deep_with_examples" => Ok(Self::DeepWithExamples),
+            "featureplanning" | "feature_planning" => Ok(Self::FeaturePlanning),
+            other => anyhow::bail!("unknown AgentRoute: {other:?}"),
+        }
+    }
+}
+
 impl std::fmt::Display for AgentRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -884,6 +906,71 @@ mod tests {
         assert_eq!(
             classify_agent_query("who calls authenticate"),
             AgentRoute::Structural
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // FromStr round-trip
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn from_str_round_trips_display() {
+        let routes = [
+            AgentRoute::FilePattern,
+            AgentRoute::Regex,
+            AgentRoute::ExactSymbol,
+            AgentRoute::Structural,
+            AgentRoute::Deep,
+            AgentRoute::Analytical,
+            AgentRoute::Exhaustive,
+            AgentRoute::Semantic,
+            AgentRoute::Architecture,
+            AgentRoute::ExhaustiveStructural,
+            AgentRoute::DeepWithExamples,
+            AgentRoute::FeaturePlanning,
+        ];
+        for route in routes {
+            let displayed = format!("{route}");
+            let parsed: AgentRoute = displayed.parse().expect("Display output must round-trip");
+            assert_eq!(
+                route, parsed,
+                "FromStr({displayed:?}) should produce {route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_unknown() {
+        let result = "totally_unknown_route".parse::<AgentRoute>();
+        assert!(result.is_err(), "Unknown route must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unknown AgentRoute"),
+            "Error message should mention unknown: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_str_accepts_camel_case_aliases() {
+        assert_eq!(
+            "ExactSymbol".parse::<AgentRoute>().unwrap(),
+            AgentRoute::ExactSymbol
+        );
+        assert_eq!(
+            "ExhaustiveStructural".parse::<AgentRoute>().unwrap(),
+            AgentRoute::ExhaustiveStructural
+        );
+        assert_eq!(
+            "DeepWithExamples".parse::<AgentRoute>().unwrap(),
+            AgentRoute::DeepWithExamples
+        );
+        assert_eq!(
+            "FeaturePlanning".parse::<AgentRoute>().unwrap(),
+            AgentRoute::FeaturePlanning
+        );
+        assert_eq!(
+            "FilePattern".parse::<AgentRoute>().unwrap(),
+            AgentRoute::FilePattern
         );
     }
 }

@@ -4,6 +4,8 @@ pub mod download;
 pub mod hooks;
 pub mod index;
 pub mod install;
+#[cfg(feature = "llm")]
+pub mod llm_status;
 pub mod mcp;
 pub mod search;
 pub mod serve;

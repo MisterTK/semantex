@@ -86,13 +86,36 @@ impl SemantexServer {
         // session-build cost. Fire-and-forget — we drop the JoinHandle.
         let _warm_handle = listener::spawn_colbert_warm_thread(&self.config);
 
+        // Spec L §5 Item 2.3 + §4 Item 1.4: initialise the LLM backend ONCE
+        // at daemon startup and inject it into every AgentPipeline. When no
+        // LLM is configured but a subscription CLI is on PATH, log a
+        // discovery hint (fires once here, never per-request).
+        #[cfg(feature = "llm")]
+        let llm_backend: Option<std::sync::Arc<dyn crate::llm::LlmCapability>> =
+            match crate::llm::LlmBackend::from_env() {
+                Ok(Some(backend)) => {
+                    let cap = backend.into_arc();
+                    tracing::info!("LLM enabled: {}", cap.label());
+                    Some(cap)
+                }
+                Ok(None) => {
+                    log_llm_discovery_hint();
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("LLM backend init failed: {e}; disabling LLM features");
+                    None
+                }
+            };
+
         // Open searcher (loads all models into memory)
         tracing::info!("Loading search index...");
         let searcher = HybridSearcher::open(&self.index_dir, &self.config)
             .context("Failed to open search index")?;
         tracing::info!("Search index loaded");
 
-        // Start listening
+        // Start listening, injecting the LLM backend (if any) into the listener
+        // so per-request handlers can chain it into AgentPipeline::with_llm.
         let listener = Listener::bind(
             &self.port_file_path(),
             searcher,
@@ -100,6 +123,9 @@ impl SemantexServer {
             self.idle_timeout,
             self.shutdown.clone(),
         )?;
+
+        #[cfg(feature = "llm")]
+        let listener = listener.with_llm(llm_backend);
 
         let result = listener.run();
 
@@ -471,6 +497,36 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn is_process_alive(_pid: u32) -> bool {
     true
+}
+
+/// Log a one-time startup hint when no LLM is configured but a subscription
+/// CLI tool is detected on PATH. This encourages users to enable LLM features
+/// without requiring them to notice a docs page.
+///
+/// Fires exactly ONCE at daemon startup (called from `run()`). Never fires on
+/// individual search requests — that would spam the log on every query.
+#[cfg(feature = "llm")]
+fn log_llm_discovery_hint() {
+    // Only suggest backends that `from_env` actually accepts. Antigravity is
+    // detected separately (the user might still want to know it's there) but
+    // its bin name is NOT a valid `cli:` value yet (Spec L §5 Item 2.4).
+    if which::which("claude").is_ok() {
+        tracing::info!(
+            "LLM features disabled. Detected Claude Code (claude on PATH). \
+             To enable: set SEMANTEX_LLM_BACKEND=cli:claude"
+        );
+    } else if which::which("codex").is_ok() {
+        tracing::info!(
+            "LLM features disabled. Detected OpenAI Codex (codex on PATH). \
+             To enable: set SEMANTEX_LLM_BACKEND=cli:codex"
+        );
+    } else if which::which("antigravity").is_ok() {
+        tracing::info!(
+            "LLM features disabled. Detected Google Antigravity (antigravity on PATH), \
+             but its headless surface isn't supported yet (Spec L §5 Item 2.4). \
+             Install claude or codex to enable LLM features."
+        );
+    }
 }
 
 /// Stop a running daemon for the given project

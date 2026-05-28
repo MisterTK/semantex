@@ -143,6 +143,12 @@ pub struct McpServer {
     /// Controls which tools are visible to `tools/list` and callable via
     /// `tools/call`. Defaults to `all`.
     toolset: String,
+    /// Optional LLM backend, initialised once at MCP server construction via
+    /// `LlmBackend::from_env()` (Spec L §4 Item 1.4). When `Some`, every
+    /// `AgentPipeline::new` call chains `.with_llm(...)`, enabling the LLM
+    /// classifier override and HyDE retrieval inside `tool_agent`.
+    #[cfg(feature = "llm")]
+    llm: Option<Arc<dyn semantex_core::llm::LlmCapability>>,
 }
 
 impl McpServer {
@@ -178,6 +184,25 @@ impl McpServer {
             );
             DEFAULT_TOOLSET.to_string()
         };
+        // Initialise the LLM backend once at MCP startup. The MCP server runs
+        // independently of the daemon (it's the in-process search path used by
+        // Claude Code, Cursor, etc.), so it needs its own backend instance to
+        // make AgentPipeline's LLM hooks reachable.
+        #[cfg(feature = "llm")]
+        let llm: Option<Arc<dyn semantex_core::llm::LlmCapability>> =
+            match semantex_core::llm::LlmBackend::from_env() {
+                Ok(Some(backend)) => {
+                    let cap = backend.into_arc();
+                    tracing::info!("MCP LLM enabled: {}", cap.label());
+                    Some(cap)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("MCP LLM backend init failed: {e}; disabling LLM features");
+                    None
+                }
+            };
+
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
@@ -186,6 +211,8 @@ impl McpServer {
             index_states: Arc::new(Mutex::new(HashMap::new())),
             log_level: Mutex::new(LogLevel::default()),
             toolset,
+            #[cfg(feature = "llm")]
+            llm,
         }
     }
 
@@ -1119,6 +1146,13 @@ impl McpServer {
         let index_dir = SemantexConfig::project_index_dir(&path);
         let cached = self.get_searcher(&index_dir)?;
         let pipeline = AgentPipeline::new(&cached.searcher, path.clone());
+        // Spec L §4 Item 1.4: inject the LLM backend so the classifier override
+        // and HyDE retrieval paths are reachable from the MCP entry point.
+        #[cfg(feature = "llm")]
+        let pipeline = match self.llm.clone() {
+            Some(llm) => pipeline.with_llm(llm),
+            None => pipeline,
+        };
 
         let budget = args
             .get("budget")

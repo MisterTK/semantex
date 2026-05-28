@@ -33,6 +33,11 @@ pub struct Listener {
     idle_timeout: Duration,
     shutdown: Arc<AtomicBool>,
     project_root: PathBuf,
+    /// Optional LLM backend; injected via [`Listener::with_llm`] at daemon
+    /// startup and passed to every `Handler` so `AgentPipeline` can use the
+    /// LLM classifier when present. Cloned per request to avoid borrow gymnastics.
+    #[cfg(feature = "llm")]
+    llm: Option<Arc<dyn crate::llm::LlmCapability>>,
 }
 
 impl Listener {
@@ -79,7 +84,19 @@ impl Listener {
             idle_timeout,
             shutdown,
             project_root,
+            #[cfg(feature = "llm")]
+            llm: None,
         })
+    }
+
+    /// Attach an LLM backend to this listener. The backend (if `Some`) is
+    /// forwarded to every per-request [`Handler`], which in turn injects it
+    /// into the `AgentPipeline` so the LLM classifier and HyDE paths are
+    /// reachable. Per Spec L §4 Item 1.4.
+    #[cfg(feature = "llm")]
+    pub fn with_llm(mut self, llm: Option<Arc<dyn crate::llm::LlmCapability>>) -> Self {
+        self.llm = llm;
+        self
     }
 
     /// Get the port this listener is bound to.
@@ -213,6 +230,29 @@ impl Listener {
         Ok(())
     }
 
+    /// Build a per-request `Handler`, threading through the optional LLM
+    /// backend when the `llm` feature is enabled. Centralising this keeps the
+    /// two protocol paths (binary + JSON) in sync on LLM injection.
+    fn build_handler(&self) -> Handler<'_> {
+        #[cfg(feature = "llm")]
+        {
+            Handler::new(
+                &self.searcher,
+                &self.search_count,
+                self.project_root.clone(),
+            )
+            .with_llm(self.llm.clone())
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            Handler::new(
+                &self.searcher,
+                &self.search_count,
+                self.project_root.clone(),
+            )
+        }
+    }
+
     #[allow(clippy::needless_pass_by_value)] // TcpStream ownership needed for set_read/write_timeout
     fn handle_connection(&self, stream: TcpStream) -> Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -264,11 +304,7 @@ impl Listener {
             Ok(bin_req) => {
                 let request: Request = bin_req.into();
                 let is_shutdown = matches!(request, Request::Shutdown);
-                let handler = Handler::new(
-                    &self.searcher,
-                    &self.search_count,
-                    self.project_root.clone(),
-                );
+                let handler = self.build_handler();
                 let resp = handler.handle(request, self.start_time);
 
                 if is_shutdown {
@@ -335,11 +371,7 @@ impl Listener {
         let response = match serde_json::from_str::<Request>(line) {
             Ok(request) => {
                 let is_shutdown = matches!(request, Request::Shutdown);
-                let handler = Handler::new(
-                    &self.searcher,
-                    &self.search_count,
-                    self.project_root.clone(),
-                );
+                let handler = self.build_handler();
                 let response = handler.handle(request, self.start_time);
 
                 if is_shutdown {

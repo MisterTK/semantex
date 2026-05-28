@@ -41,6 +41,11 @@ tempfile = "3"
 default = ["mcp", "http"]
 mcp = ["dep:semantex-mcp"]
 http = ["mcp", "dep:tokio", "semantex-mcp/http"]
+# `llm` forwards to both core (the search-side hooks) and mcp (the MCP entry
+# point that injects the backend into AgentPipeline). It implies `mcp` so
+# the MCP crate is compiled with its own `llm` feature — otherwise the
+# AgentPipeline wiring on the MCP side would be unreachable.
+llm = ["mcp", "semantex-core/llm", "semantex-mcp/llm", "dep:tokio"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/semantex-v{ version }-{ target }.tar.gz"

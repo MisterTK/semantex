@@ -19,6 +19,11 @@ pub struct Handler<'a> {
     searcher: &'a HybridSearcher,
     search_count: &'a AtomicU64,
     project_root: PathBuf,
+    /// Optional LLM backend for the agent classifier override (Spec L Item 1.4).
+    /// Populated by [`Handler::with_llm`] from the per-process backend that
+    /// the daemon constructed once via `LlmBackend::from_env`.
+    #[cfg(feature = "llm")]
+    llm: Option<std::sync::Arc<dyn crate::llm::LlmCapability>>,
 }
 
 impl<'a> Handler<'a> {
@@ -31,7 +36,22 @@ impl<'a> Handler<'a> {
             searcher,
             search_count,
             project_root,
+            #[cfg(feature = "llm")]
+            llm: None,
         }
+    }
+
+    /// Attach an LLM backend so [`Handler::handle_agent`] can construct an
+    /// `AgentPipeline` with the classifier / HyDE override path enabled.
+    ///
+    /// Accepts `Option<Arc<...>>` so callers (the daemon listener; the MCP
+    /// server) can pass the configured backend or `None` without branching at
+    /// every call site.
+    #[cfg(feature = "llm")]
+    #[must_use]
+    pub fn with_llm(mut self, llm: Option<std::sync::Arc<dyn crate::llm::LlmCapability>>) -> Self {
+        self.llm = llm;
+        self
     }
 
     pub fn handle(&self, request: Request, start_time: Instant) -> Response {
@@ -51,6 +71,11 @@ impl<'a> Handler<'a> {
     fn handle_agent(&self, req: &AgentRequest) -> Response {
         use crate::search::agent::AgentPipeline;
         let pipeline = AgentPipeline::new(self.searcher, self.project_root.clone());
+        #[cfg(feature = "llm")]
+        let pipeline = match self.llm.clone() {
+            Some(llm) => pipeline.with_llm(llm),
+            None => pipeline,
+        };
         Response::Agent(pipeline.handle(req))
     }
 
@@ -995,5 +1020,147 @@ mod adaptive_walk_tests {
         assert_eq!(o.min_callers, 5);
         assert_eq!(o.max_callers, 50);
         assert_eq!(o.depth_initial, 1);
+    }
+}
+
+// --- Spec L Item 1.4: wiring test — Handler must thread the LLM through ----
+
+/// This test exercises the full daemon-side wiring chain:
+///
+/// 1. `Handler::new(...).with_llm(Some(mock))` (the per-request constructor
+///    that the listener uses).
+/// 2. `Handler::handle_agent(...)` (the dispatch entrypoint for Agent requests).
+/// 3. The inner `AgentPipeline::new(...).with_llm(...)` chain.
+/// 4. `AgentPipeline::handle()` → `classify_route_with_llm_fallback`, which
+///    consults the LLM when `request.route` is `None`.
+///
+/// The mock returns `AgentRoute::Structural`, while the keyword classifier
+/// would return `AgentRoute::Semantic` for the query "hello world". So the
+/// response's `route` field tells us which path actually ran.
+///
+/// If this test FAILS, the wiring is disconnected: the listener built the
+/// LLM but the handler/pipeline isn't using it. That was the v0.7 review
+/// blocker that motivated this test.
+#[cfg(all(feature = "llm", test))]
+mod handler_llm_wiring_tests {
+    use super::*;
+    use crate::config::SemantexConfig;
+    use crate::llm::LlmCapability;
+    use crate::search::agent_classifier::AgentRoute;
+    use crate::search::hybrid::HybridSearcher;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use tempfile::TempDir;
+
+    /// Test double that always returns `AgentRoute::Structural` from
+    /// `classify_route`. The keyword classifier would never pick Structural
+    /// for "hello world" (it has no callers/imports/etc. keywords), so a
+    /// `Structural` route in the response proves the LLM ran.
+    struct StaticRouteLlm {
+        route: AgentRoute,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmCapability for StaticRouteLlm {
+        async fn classify_route(&self, _query: &str) -> anyhow::Result<AgentRoute> {
+            Ok(self.route)
+        }
+        async fn synthesize_hyde_doc(&self, _query: &str) -> anyhow::Result<String> {
+            Ok("fn hyde() {}".to_string())
+        }
+        fn label(&self) -> &str {
+            "static-route-llm"
+        }
+    }
+
+    /// Build a minimal HybridSearcher backed by an empty chunk store.
+    /// The handler's structural/deep/semantic fallbacks will all return
+    /// empty results — that's fine; we only inspect `response.route` to
+    /// verify the LLM classifier was reached.
+    fn build_empty_searcher() -> (TempDir, HybridSearcher) {
+        let dir = TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+        // Initialise an empty store so `open_for_search` succeeds.
+        {
+            let _store = ChunkStore::open(&db_path).expect("create empty chunk store");
+        }
+        let config = SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(&semantex_dir, &config)
+            .expect("open sparse-only searcher");
+        (dir, searcher)
+    }
+
+    /// PROVES THE WIRING: with `route: None`, the LLM mock's `Structural`
+    /// overrides the keyword classifier's `Semantic` default.
+    ///
+    /// If wiring regresses (LLM not injected into AgentPipeline), the response
+    /// route will be `Semantic` and this test will fail loudly.
+    #[test]
+    fn handle_agent_uses_injected_llm_classifier() {
+        let (_dir, searcher) = build_empty_searcher();
+        let count = AtomicU64::new(0);
+        let project_root = std::path::PathBuf::from("/tmp/wiring-test");
+
+        let mock: Arc<dyn LlmCapability> = Arc::new(StaticRouteLlm {
+            route: AgentRoute::Structural,
+        });
+
+        let handler = Handler::new(&searcher, &count, project_root).with_llm(Some(mock));
+
+        let req = AgentRequest {
+            query: "hello world".to_string(),
+            route: None, // ← critical: forces the classifier path
+            budget: Some(4_000),
+            full_code: false,
+        };
+
+        let resp = handler.handle(Request::Agent(req), Instant::now());
+        let Response::Agent(agent_resp) = resp else {
+            panic!("expected Response::Agent");
+        };
+
+        // The route in the response is set by `AgentPipeline::handle` AFTER
+        // the classifier picks. Structural here means the LLM was consulted.
+        assert_eq!(
+            agent_resp.route,
+            AgentRoute::Structural,
+            "LLM classifier was not reached — wiring is broken. \
+             Expected Structural (from mock LLM); got {:?} \
+             (which is what the keyword classifier returns for 'hello world').",
+            agent_resp.route
+        );
+    }
+
+    /// Companion negative test: when `with_llm(None)` is used (the default
+    /// state when no LLM backend is configured), the keyword classifier
+    /// runs and returns `Semantic` for "hello world".
+    #[test]
+    fn handle_agent_falls_back_to_keyword_when_no_llm() {
+        let (_dir, searcher) = build_empty_searcher();
+        let count = AtomicU64::new(0);
+        let project_root = std::path::PathBuf::from("/tmp/wiring-test-no-llm");
+
+        let handler = Handler::new(&searcher, &count, project_root).with_llm(None);
+
+        let req = AgentRequest {
+            query: "hello world".to_string(),
+            route: None,
+            budget: Some(4_000),
+            full_code: false,
+        };
+
+        let resp = handler.handle(Request::Agent(req), Instant::now());
+        let Response::Agent(agent_resp) = resp else {
+            panic!("expected Response::Agent");
+        };
+
+        assert_eq!(
+            agent_resp.route,
+            AgentRoute::Semantic,
+            "with no LLM, keyword classifier must own routing; got {:?}",
+            agent_resp.route
+        );
     }
 }

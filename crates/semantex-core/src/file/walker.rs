@@ -227,8 +227,14 @@ mod tests {
             .collect();
 
         // legitimate files included
-        assert!(rel.iter().any(|p| p == "src/main.rs"), "missing main.rs: {rel:?}");
-        assert!(rel.iter().any(|p| p == "README.md"), "missing README.md: {rel:?}");
+        assert!(
+            rel.iter().any(|p| p == "src/main.rs"),
+            "missing main.rs: {rel:?}"
+        );
+        assert!(
+            rel.iter().any(|p| p == "README.md"),
+            "missing README.md: {rel:?}"
+        );
 
         // tool outputs excluded
         for forbidden in [
@@ -263,7 +269,10 @@ mod tests {
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
             .collect();
 
-        assert!(rel.iter().any(|p| p == "src/keep.rs"), "missing keep.rs: {rel:?}");
+        assert!(
+            rel.iter().any(|p| p == "src/keep.rs"),
+            "missing keep.rs: {rel:?}"
+        );
         assert!(
             !rel.iter().any(|p| p.starts_with("vendor/")),
             ".semantexignore stopped working: {rel:?}"

@@ -15,6 +15,8 @@ pub mod config;
 pub mod embedding;
 pub mod file;
 pub mod index;
+#[cfg(feature = "llm")]
+pub mod llm;
 pub mod memory;
 pub mod search;
 pub mod server;

@@ -1354,6 +1354,132 @@ impl HybridSearcher {
     }
 }
 
+/// Default HyDE-synthesis timeout. Sized for `cli:claude` / `cli:codex` which
+/// take ~5–10 s for a 400-token synthesis (subprocess spawn + Claude inference).
+/// Override via `SEMANTEX_LLM_HYDE_TIMEOUT_MS`.
+#[cfg(feature = "llm")]
+const LLM_HYDE_TIMEOUT_DEFAULT_MS: u64 = 15_000;
+
+#[cfg(feature = "llm")]
+fn llm_hyde_timeout() -> std::time::Duration {
+    std::env::var("SEMANTEX_LLM_HYDE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or_else(
+            || std::time::Duration::from_millis(LLM_HYDE_TIMEOUT_DEFAULT_MS),
+            std::time::Duration::from_millis,
+        )
+}
+
+/// Run the base search, synthesize a HyDE doc via LLM, search again with the
+/// HyDE doc as the query, merge and dedup results by chunk ID, and re-sort.
+///
+/// On any LLM error or timeout, returns the base search results unchanged.
+///
+/// The HybridSearcher is inherently synchronous. We call `search()` directly
+/// inside this async fn (without `spawn_blocking`) because:
+///
+/// - The daemon uses a current-thread Tokio runtime, so spawning blocking work
+///   there would deadlock.
+/// - ColBERT ONNX inference is the dominant cost and runs inside rayon threads
+///   that are independent of the Tokio event loop.
+/// - Adding `Arc` wrapping to use `spawn_blocking` would change a large call
+///   surface for marginal benefit.
+///
+/// The LLM I/O (HTTP/process) is the only truly async part; `search()` is
+/// parallel-safe via rayon and does not block the async executor.
+#[cfg(feature = "llm")]
+impl HybridSearcher {
+    pub async fn search_with_hyde(
+        &self,
+        query: &super::SearchQuery,
+        llm: std::sync::Arc<dyn crate::llm::LlmCapability>,
+    ) -> anyhow::Result<super::SearchOutput> {
+        // Run base search first (sync, but fast on warm index).
+        let base = self.search(query)?;
+
+        // Synthesize a hypothetical code snippet from the LLM.
+        // On any error (timeout, LLM failure, bad response), return base unchanged.
+        let hyde_doc = match tokio::time::timeout(
+            llm_hyde_timeout(),
+            llm.synthesize_hyde_doc(&query.text),
+        )
+        .await
+        {
+            Ok(Ok(doc)) if !doc.trim().is_empty() => doc,
+            Ok(Ok(_)) => {
+                tracing::info!("HyDE doc was empty; returning base results only");
+                return Ok(base);
+            }
+            Ok(Err(e)) => {
+                tracing::info!(error = %e, "HyDE synthesis failed; returning base results only");
+                return Ok(base);
+            }
+            Err(_timeout) => {
+                tracing::info!("HyDE synthesis timed out; returning base results only");
+                return Ok(base);
+            }
+        };
+
+        let hyde_query = super::SearchQuery::new(&hyde_doc).max_results(query.max_results);
+        let hyde = match self.search(&hyde_query) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::info!(error = %e, "HyDE search failed; returning base results only");
+                return Ok(base);
+            }
+        };
+
+        let max_results = query.max_results;
+        Ok(merge_hyde_results(base, hyde, max_results))
+    }
+}
+
+/// Merge base + HyDE results, deduplicate by `chunk.id`, re-sort by score
+/// descending, and cap at `max_results`.
+///
+/// Deduplication key is `chunk.id` (the stable DB primary key), NOT the
+/// `(file_path, start_line, end_line)` triple — the triple-based key was
+/// incorrect because two chunks with identical file/line ranges but different
+/// IDs would survive dedup, producing duplicates in the output.
+#[cfg(feature = "llm")]
+fn merge_hyde_results(
+    base: super::SearchOutput,
+    hyde: super::SearchOutput,
+    max_results: usize,
+) -> super::SearchOutput {
+    use std::collections::HashSet;
+
+    // Carry base metrics forward; result_count is updated after merge.
+    let mut base_metrics = base.metrics;
+
+    let mut seen_ids: HashSet<u64> =
+        HashSet::with_capacity(base.results.len() + hyde.results.len());
+    let mut merged: Vec<crate::types::SearchResult> =
+        Vec::with_capacity(base.results.len() + hyde.results.len());
+
+    for r in base.results.into_iter().chain(hyde.results) {
+        if seen_ids.insert(r.chunk.id) {
+            merged.push(r);
+        }
+    }
+
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(max_results);
+
+    base_metrics.result_count = merged.len();
+    base_metrics.query_type = "hyde_merged".to_string();
+
+    super::SearchOutput {
+        results: merged,
+        metrics: base_metrics,
+    }
+}
+
 /// Heuristic: exhaustive queries ask for complete enumeration of all instances.
 /// Examples: "find all error handling", "list every config option", "all places where X".
 /// These benefit from wider result ranges, no per-file dedup, and lower score thresholds.
@@ -2141,5 +2267,142 @@ mod tests {
             assert_eq!(c, Confidence::Inferred);
             assert!((s - 1.0 / 3.0).abs() < 1e-5);
         }
+    }
+}
+
+// ─── Spec L: HyDE unit tests (feature-gated) ────────────────────────────────
+
+#[cfg(all(feature = "llm", test))]
+mod hyde_tests {
+    use super::merge_hyde_results;
+    use crate::search::{SearchMetrics, SearchOutput};
+    use crate::types::{AstNodeKind, Chunk, ChunkType, Confidence, SearchResult, SearchSource};
+    use std::path::PathBuf;
+
+    fn make_metrics() -> SearchMetrics {
+        SearchMetrics {
+            total_ms: 1,
+            dense_ms: None,
+            sparse_ms: None,
+            exact_ms: None,
+            fusion_ms: None,
+            rerank_ms: None,
+            dense_count: 0,
+            sparse_count: 0,
+            exact_count: 0,
+            fused_count: 0,
+            result_count: 0,
+            query_type: "semantic".to_string(),
+            response_bytes: None,
+        }
+    }
+
+    fn make_result(id: u64, score: f32) -> SearchResult {
+        SearchResult {
+            chunk: Chunk {
+                id,
+                file_path: PathBuf::from(format!("src/chunk_{id}.rs")),
+                start_line: 1,
+                end_line: 10,
+                content: format!("fn chunk_{id}() {{}}"),
+                chunk_type: ChunkType::AstNode {
+                    name: format!("chunk_{id}"),
+                    kind: AstNodeKind::Function,
+                    language: "rust".to_string(),
+                    structured_meta: None,
+                },
+            },
+            score,
+            source: SearchSource::Hybrid,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
+            confidence: Confidence::Inferred,
+            confidence_score: 0.5,
+        }
+    }
+
+    /// `merge_hyde_results` must dedup by `chunk.id`, not by `(file, start, end)`.
+    /// Chunk ID is the stable DB key and is the only correct dedup key.
+    #[test]
+    fn merge_deduplicates_by_chunk_id() {
+        let base = SearchOutput {
+            results: vec![make_result(1, 0.9), make_result(2, 0.8)],
+            metrics: make_metrics(),
+        };
+        let hyde = SearchOutput {
+            // chunk 2 duplicated, chunk 3 new
+            results: vec![make_result(2, 0.85), make_result(3, 0.7)],
+            metrics: make_metrics(),
+        };
+
+        let merged = merge_hyde_results(base, hyde, 10);
+        assert_eq!(
+            merged.results.len(),
+            3,
+            "dedup should yield 3 unique chunks"
+        );
+
+        let ids: Vec<u64> = merged.results.iter().map(|r| r.chunk.id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+    }
+
+    /// Results must be sorted by score descending after merge.
+    #[test]
+    fn merge_sorts_by_score_descending() {
+        let base = SearchOutput {
+            results: vec![make_result(1, 0.5)],
+            metrics: make_metrics(),
+        };
+        let hyde = SearchOutput {
+            results: vec![make_result(2, 0.9), make_result(3, 0.7)],
+            metrics: make_metrics(),
+        };
+
+        let merged = merge_hyde_results(base, hyde, 10);
+        let scores: Vec<f32> = merged.results.iter().map(|r| r.score).collect();
+        let mut sorted = scores.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(scores, sorted, "results must be sorted by score desc");
+    }
+
+    /// `max_results` cap must be respected.
+    #[test]
+    fn merge_caps_at_max_results() {
+        let base = SearchOutput {
+            results: (0..5)
+                .map(|i| make_result(i, 0.9 - i as f32 * 0.1))
+                .collect(),
+            metrics: make_metrics(),
+        };
+        let hyde = SearchOutput {
+            results: (5..10)
+                .map(|i| make_result(i, 0.9 - (i - 5) as f32 * 0.1))
+                .collect(),
+            metrics: make_metrics(),
+        };
+
+        let merged = merge_hyde_results(base, hyde, 4);
+        assert_eq!(merged.results.len(), 4, "should cap at max_results=4");
+    }
+
+    /// When base search is empty and HyDE fails (caller returns base unchanged),
+    /// the result must be an empty SearchOutput — no panic.
+    #[test]
+    fn merge_with_empty_base_does_not_panic() {
+        let base = SearchOutput {
+            results: vec![],
+            metrics: make_metrics(),
+        };
+        let hyde = SearchOutput {
+            results: vec![make_result(1, 0.9)],
+            metrics: make_metrics(),
+        };
+
+        let merged = merge_hyde_results(base, hyde, 10);
+        // HyDE result survives even when base is empty.
+        assert_eq!(merged.results.len(), 1);
     }
 }
