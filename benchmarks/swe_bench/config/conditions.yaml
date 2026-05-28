@@ -1,0 +1,36 @@
+# Three conditions tested against SWE-bench Verified. The agent model is the
+# same (Sonnet 4.6) across all three; only whether the semantex MCP server is
+# registered (and which feature set it's built with) differs. C3 additionally
+# enables semantex's internal LLM features (classify + HyDE) using a cheap
+# fast model.
+#
+# Agent built-in tools (terminal/file_editor/task_tracker) come from
+# openhands-tools and are identical across conditions.
+
+c1_baseline:
+  id: c1_baseline
+  label: "OpenHands baseline (no semantex)"
+  agent_model: claude-sonnet-4-6
+  semantex_enabled: false
+  semantex_features: ""
+  semantex_llm_features: false
+
+c2_semantex_no_llm:
+  id: c2_semantex_no_llm
+  label: "OpenHands + semantex (no LLM features)"
+  agent_model: claude-sonnet-4-6
+  semantex_enabled: true
+  semantex_features: ""            # default build, no genai deps
+  semantex_llm_features: false
+
+c3_semantex_with_llm:
+  id: c3_semantex_with_llm
+  label: "OpenHands + semantex (HyDE + classify)"
+  agent_model: claude-sonnet-4-6
+  semantex_enabled: true
+  semantex_features: "llm"         # build with --features llm
+  semantex_llm_features: true
+  semantex_llm_provider: anthropic
+  semantex_llm_model: claude-haiku-4-5-20251001
+  semantex_llm_fallback_provider: google
+  semantex_llm_fallback_model: gemini-2.5-flash
