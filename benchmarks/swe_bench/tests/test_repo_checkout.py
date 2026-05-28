@@ -47,3 +47,17 @@ def test_checkout_invalid_sha_raises(tmp_path, fake_repo):
     dest = tmp_path / "out"
     with pytest.raises(subprocess.CalledProcessError):
         checkout(repo_url=str(src), sha="0" * 40, dest=dest)
+
+
+def test_checkout_rejects_non_hex_sha(tmp_path, fake_repo):
+    src, _ = fake_repo
+    dest = tmp_path / "out"
+    with pytest.raises(ValueError, match="sha must be"):
+        checkout(repo_url=str(src), sha="not-a-sha", dest=dest)
+
+
+def test_checkout_rejects_repo_url_starting_with_dash(tmp_path, fake_repo):
+    _, sha = fake_repo
+    dest = tmp_path / "out"
+    with pytest.raises(ValueError, match="repo_url must not start"):
+        checkout(repo_url="--upload-pack=evil", sha=sha, dest=dest)
