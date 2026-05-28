@@ -69,9 +69,11 @@ class _OpenHandsResult:
 
 def _extract_workspace_patch(repo_path: Path) -> str:
     """``git diff HEAD`` — captures all uncommitted changes the agent made
-    to the workspace. Returns "" if the path is not a git repo."""
+    to the workspace, excluding `.semantex/` (our index dir) and `.gitignore`
+    (agents sometimes mutate it to mask `.semantex/`). Returns "" if the path
+    is not a git repo."""
     proc = subprocess.run(
-        ["git", "diff", "HEAD"],
+        ["git", "diff", "HEAD", "--", ".", ":(exclude).semantex", ":(exclude).gitignore"],
         cwd=repo_path,
         capture_output=True,
         text=True,

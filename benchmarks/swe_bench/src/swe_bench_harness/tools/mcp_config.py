@@ -37,7 +37,7 @@ def build_mcp_config(condition: Condition) -> dict | None:
     else:
         command = os.environ.get("SEMANTEX_BINARY", "semantex")
 
-    env: dict[str, str] = {}
+    env: dict[str, str] = {"SEMANTEX_QUIET_LIMITS": "1"}  # suppress mem-cap banner
     for k in _INHERIT_KEYS:
         v = os.environ.get(k)
         if v is not None:
