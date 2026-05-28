@@ -1149,10 +1149,7 @@ impl McpServer {
         // Spec L §4 Item 1.4: inject the LLM backend so the classifier override
         // and HyDE retrieval paths are reachable from the MCP entry point.
         #[cfg(feature = "llm")]
-        let pipeline = match self.llm.clone() {
-            Some(llm) => pipeline.with_llm(llm),
-            None => pipeline,
-        };
+        let pipeline = pipeline.with_llm(self.llm.clone());
 
         let budget = args
             .get("budget")

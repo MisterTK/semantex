@@ -1357,6 +1357,13 @@ impl HybridSearcher {
 /// Default HyDE-synthesis timeout. Sized for `cli:claude` / `cli:codex` which
 /// take ~5–10 s for a 400-token synthesis (subprocess spawn + Claude inference).
 /// Override via `SEMANTEX_LLM_HYDE_TIMEOUT_MS`.
+///
+/// This is the **authoritative outer timeout** for the HyDE path.
+/// `subscription_cli.rs::hyde_timeout()` reads the same env var as a
+/// defense-in-depth inner backstop on the subprocess wait; it must remain ≤
+/// (not greater than) this value in the default case so the outer cancels
+/// first.  If `SEMANTEX_LLM_HYDE_TIMEOUT_MS` is set, both layers extend
+/// identically.
 #[cfg(feature = "llm")]
 const LLM_HYDE_TIMEOUT_DEFAULT_MS: u64 = 15_000;
 

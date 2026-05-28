@@ -38,7 +38,7 @@ use crate::search::agent_classifier::AgentRoute;
 /// Constructed once at daemon startup via [`GenaiBackend::from_env`] and held
 /// as `Arc<dyn LlmCapability>`.  Thread-safe: `genai::Client` is `Clone + Send
 /// + Sync`.
-pub struct GenaiBackend {
+pub(crate) struct GenaiBackend {
     client: Client,
     model: String,
     label: String,
@@ -101,6 +101,17 @@ pub(crate) fn infer_provider(model: &str, override_: Option<&str>) -> Result<Ada
     // 2. Prefix / keyword inference.
     let lower = model.to_ascii_lowercase();
 
+    // Path-style model names (e.g. "accounts/fireworks/models/qwen-…") cannot be
+    // reliably inferred from the prefix — the caller must be explicit.
+    if lower.contains('/') {
+        anyhow::bail!(
+            "Cannot infer LLM provider from path-style model name {model:?} \
+             (contains '/').  Set SEMANTEX_LLM_PROVIDER explicitly, e.g. \
+             SEMANTEX_LLM_PROVIDER=fireworks for Fireworks paths, or \
+             SEMANTEX_LLM_PROVIDER=openai for any OpenAI-compatible gateway."
+        );
+    }
+
     // Cloud providers — well-known prefixes.
     if lower.starts_with("claude") {
         return Ok(AdapterKind::Anthropic);
@@ -110,6 +121,7 @@ pub(crate) fn infer_provider(model: &str, override_: Option<&str>) -> Result<Ada
     }
     if lower.starts_with("gpt")
         || lower.starts_with("o1")
+        || lower.starts_with("o2") // defensive: o2 series not yet released but reserved
         || lower.starts_with("o3")
         || lower.starts_with("o4")
         || lower.starts_with("chatgpt")
@@ -120,7 +132,19 @@ pub(crate) fn infer_provider(model: &str, override_: Option<&str>) -> Result<Ada
         return Ok(AdapterKind::Xai);
     }
     if lower.starts_with("command") || lower.starts_with("embed-") {
+        // command-r, command-r-plus, command-light, embed-english-… → Cohere
         return Ok(AdapterKind::Cohere);
+    }
+
+    // AWS Bedrock model names (e.g. "nova-micro", "nova-pro", "nova-lite") are
+    // not natively supported by the genai adapter.  Route through an
+    // OpenAI-compatible gateway (e.g. Bedrock's converse API behind a proxy).
+    if lower.starts_with("nova-") {
+        anyhow::bail!(
+            "AWS Bedrock model {model:?} detected (nova-* prefix). \
+             Bedrock is not directly supported; set SEMANTEX_LLM_ENDPOINT to your \
+             OpenAI-compatible gateway URL and SEMANTEX_LLM_PROVIDER=openai."
+        );
     }
 
     // Local / Ollama-hosted models — common families.
@@ -160,10 +184,14 @@ pub(crate) fn infer_provider(model: &str, override_: Option<&str>) -> Result<Ada
     }
 
     // 3. Ambiguous / unknown — ask the user to be explicit.
+    // Note: SEMANTEX_LLM_PROVIDER=openai is a valid generic fallback for any
+    // OpenAI-compatible gateway (LiteLLM proxy, vLLM, etc.).
     anyhow::bail!(
         "Cannot infer LLM provider from model name {model:?}. \
          Set SEMANTEX_LLM_PROVIDER to one of: openai, anthropic, gemini, ollama, \
-         groq, cohere, deepseek, xai, fireworks, together."
+         groq, cohere, deepseek, xai, fireworks, together. \
+         Tip: use SEMANTEX_LLM_PROVIDER=openai as a generic fallback for any \
+         OpenAI-compatible gateway (LiteLLM proxy, vLLM, LM Studio, etc.)."
     )
 }
 
@@ -492,6 +520,46 @@ mod tests {
                 model: "unknown-model-xyz",
                 provider_override: None,
                 expect: err(),
+            },
+            // o2 prefix → OpenAI (Finding 14: defensive forward-compat).
+            Case {
+                model: "o2-mini",
+                provider_override: None,
+                expect: ok(AdapterKind::OpenAI),
+            },
+            // command-r and command-r-plus → Cohere (verify Finding 12).
+            Case {
+                model: "command-r",
+                provider_override: None,
+                expect: ok(AdapterKind::Cohere),
+            },
+            Case {
+                model: "command-r-plus",
+                provider_override: None,
+                expect: ok(AdapterKind::Cohere),
+            },
+            // Path-style Fireworks model → Err with actionable message (Finding 12).
+            Case {
+                model: "accounts/fireworks/models/qwen2p5-coder-7b-instruct",
+                provider_override: None,
+                expect: err(),
+            },
+            // AWS Bedrock nova-* → Err with actionable message (Finding 12).
+            Case {
+                model: "nova-micro",
+                provider_override: None,
+                expect: err(),
+            },
+            Case {
+                model: "nova-pro",
+                provider_override: None,
+                expect: err(),
+            },
+            // Bedrock nova-* with explicit openai override → ok (user knows what they're doing).
+            Case {
+                model: "nova-pro",
+                provider_override: Some("openai"),
+                expect: ok(AdapterKind::OpenAI),
             },
         ];
 

@@ -385,6 +385,15 @@ mod cap_tests {
     /// Cargo runs different `#[test]` functions in parallel; without
     /// serialisation they race on `SEMANTEX_MAX_RSS_MB` and read each other's
     /// transient values. Combining them avoids needing a global lock.
+    ///
+    /// **Variables mutated here**: `SEMANTEX_MAX_RSS_MB` only.
+    ///
+    /// This test does NOT hold `crate::llm::TEST_ENV_LOCK` because it does not
+    /// touch `SEMANTEX_LLM_*` vars; those are guarded by `TEST_ENV_LOCK` in
+    /// `llm/genai_backend.rs` and `llm/subscription_cli.rs`. The two variable
+    /// families are disjoint, so this single-combined-test pattern is sufficient.
+    /// If a future test needs to mutate BOTH families, it must hold `TEST_ENV_LOCK`
+    /// for the entire duration.
     #[test]
     fn env_cap_behaviour_serial() {
         let orig = std::env::var("SEMANTEX_MAX_RSS_MB").ok();

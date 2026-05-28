@@ -3,14 +3,17 @@
 
 mod genai_backend;
 mod prompts;
+// `Antigravity` variant is a placeholder pending Team 1 removal; suppress
+// the dead-code lint here to avoid failing `-D warnings` in CI.
+#[allow(dead_code)]
 mod subscription_cli;
 
-pub use genai_backend::GenaiBackend;
+pub(crate) use genai_backend::GenaiBackend;
 pub(crate) use prompts::{
     CLASSIFIER_SYSTEM_PROMPT, HYDE_SYSTEM_PROMPT, build_classify_prompt, build_hyde_prompt,
     parse_route_from_llm_output,
 };
-pub use subscription_cli::{CliKind, SubscriptionCliBackend};
+pub(crate) use subscription_cli::SubscriptionCliBackend;
 
 use crate::search::agent_classifier::AgentRoute;
 
@@ -43,6 +46,12 @@ pub trait LlmCapability: Send + Sync {
 ///
 /// Constructed once at daemon startup and held in `Arc<dyn LlmCapability>`
 /// form across the rest of the codebase.
+///
+/// The inner types (`GenaiBackend`, `SubscriptionCliBackend`) are `pub(crate)`
+/// because no external caller needs to name them directly; the public API is
+/// `from_env` / `into_arc` / `as_capability`. Pattern-matching on `Genai(b)`
+/// still works in tests and integration code without naming the type.
+#[allow(private_interfaces)]
 pub enum LlmBackend {
     Genai(GenaiBackend),
     SubscriptionCli(SubscriptionCliBackend),
@@ -96,5 +105,15 @@ impl LlmBackend {
 /// test that flips `SEMANTEX_LLM_*` must serialise. `genai_backend.rs` and
 /// `subscription_cli.rs` both mutate overlapping vars — a per-file lock
 /// isn't enough.
+///
+/// **Variables guarded by this lock**: `SEMANTEX_LLM_MODEL`, `SEMANTEX_LLM_PROVIDER`,
+/// `SEMANTEX_LLM_ENDPOINT`, `SEMANTEX_LLM_BACKEND`.
+///
+/// **Independent env-mutation tests**: `memory::tests::env_cap_behaviour_serial`
+/// mutates `SEMANTEX_MAX_RSS_MB` and does NOT hold this lock — the two variable
+/// families are disjoint so they can coexist safely.  If any future test ever
+/// needs to mutate BOTH `SEMANTEX_LLM_*` vars AND `SEMANTEX_MAX_RSS_MB` in the
+/// same test function, it MUST hold `TEST_ENV_LOCK` for the whole duration to
+/// prevent races with the LLM tests.
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

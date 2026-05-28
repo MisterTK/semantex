@@ -95,7 +95,13 @@ impl SemantexServer {
             match crate::llm::LlmBackend::from_env() {
                 Ok(Some(backend)) => {
                     let cap = backend.into_arc();
-                    tracing::info!("LLM enabled: {}", cap.label());
+                    // WARN so operators see this line without needing RUST_LOG=info.
+                    // The CLI's default filter floors at WARN; INFO lines are invisible
+                    // unless the user sets RUST_LOG=info explicitly.
+                    // NOTE: crates/semantex-mcp/src/server.rs has a matching
+                    // `tracing::info!("MCP LLM enabled: ...")` line that should also
+                    // be promoted to WARN for the same visibility reason (Team 3 follow-up).
+                    tracing::warn!("LLM enabled: {}", cap.label());
                     Some(cap)
                 }
                 Ok(None) => {
@@ -511,17 +517,20 @@ fn log_llm_discovery_hint() {
     // detected separately (the user might still want to know it's there) but
     // its bin name is NOT a valid `cli:` value yet (Spec L §5 Item 2.4).
     if which::which("claude").is_ok() {
-        tracing::info!(
+        // WARN so operators see this line without needing RUST_LOG=info.
+        tracing::warn!(
             "LLM features disabled. Detected Claude Code (claude on PATH). \
              To enable: set SEMANTEX_LLM_BACKEND=cli:claude"
         );
     } else if which::which("codex").is_ok() {
-        tracing::info!(
+        // WARN so operators see this line without needing RUST_LOG=info.
+        tracing::warn!(
             "LLM features disabled. Detected OpenAI Codex (codex on PATH). \
              To enable: set SEMANTEX_LLM_BACKEND=cli:codex"
         );
     } else if which::which("antigravity").is_ok() {
-        tracing::info!(
+        // WARN so operators see this line without needing RUST_LOG=info.
+        tracing::warn!(
             "LLM features disabled. Detected Google Antigravity (antigravity on PATH), \
              but its headless surface isn't supported yet (Spec L §5 Item 2.4). \
              Install claude or codex to enable LLM features."

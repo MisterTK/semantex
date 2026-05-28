@@ -38,6 +38,13 @@ pub struct Listener {
     /// LLM classifier when present. Cloned per request to avoid borrow gymnastics.
     #[cfg(feature = "llm")]
     llm: Option<Arc<dyn crate::llm::LlmCapability>>,
+    /// Shared Tokio runtime for async LLM calls (Finding 10). Constructed once
+    /// in `Listener::bind` when the `llm` feature is enabled, then cloned
+    /// (via `Arc`) into every per-request `Handler` and `AgentPipeline`.
+    /// If runtime construction fails at bind time, this is `None` and the LLM
+    /// field is also zeroed — without a runtime we can't drive async LLM calls.
+    #[cfg(feature = "llm")]
+    llm_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl Listener {
@@ -74,6 +81,27 @@ impl Listener {
             |p| p.join(WARM_STATE_SENTINEL),
         );
 
+        // Finding 10: build the shared current-thread Tokio runtime once at
+        // bind time. If construction fails, log a warning and leave both
+        // `llm_runtime` and `llm` as `None` — without a runtime we can't drive
+        // async LLM calls anyway, so there's no point carrying the backend.
+        #[cfg(feature = "llm")]
+        let llm_runtime: Option<Arc<tokio::runtime::Runtime>> =
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => Some(Arc::new(rt)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to build shared Tokio runtime at daemon bind time; \
+                         LLM features will be disabled for this daemon instance."
+                    );
+                    None
+                }
+            };
+
         Ok(Self {
             port_file: port_file.to_path_buf(),
             sentinel_file,
@@ -86,6 +114,8 @@ impl Listener {
             project_root,
             #[cfg(feature = "llm")]
             llm: None,
+            #[cfg(feature = "llm")]
+            llm_runtime,
         })
     }
 
@@ -231,8 +261,9 @@ impl Listener {
     }
 
     /// Build a per-request `Handler`, threading through the optional LLM
-    /// backend when the `llm` feature is enabled. Centralising this keeps the
-    /// two protocol paths (binary + JSON) in sync on LLM injection.
+    /// backend and shared runtime when the `llm` feature is enabled.
+    /// Centralising this keeps the two protocol paths (binary + JSON) in sync
+    /// on LLM injection.
     fn build_handler(&self) -> Handler<'_> {
         #[cfg(feature = "llm")]
         {
@@ -242,6 +273,7 @@ impl Listener {
                 self.project_root.clone(),
             )
             .with_llm(self.llm.clone())
+            .with_runtime(self.llm_runtime.clone())
         }
         #[cfg(not(feature = "llm"))]
         {

@@ -24,6 +24,11 @@ pub struct Handler<'a> {
     /// the daemon constructed once via `LlmBackend::from_env`.
     #[cfg(feature = "llm")]
     llm: Option<std::sync::Arc<dyn crate::llm::LlmCapability>>,
+    /// Shared Tokio runtime for driving async LLM calls without per-call
+    /// construction overhead (Finding 10). Constructed once in `Listener::bind`
+    /// and forwarded here via `Listener::build_handler`.
+    #[cfg(feature = "llm")]
+    runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
 }
 
 impl<'a> Handler<'a> {
@@ -38,6 +43,8 @@ impl<'a> Handler<'a> {
             project_root,
             #[cfg(feature = "llm")]
             llm: None,
+            #[cfg(feature = "llm")]
+            runtime: None,
         }
     }
 
@@ -51,6 +58,16 @@ impl<'a> Handler<'a> {
     #[must_use]
     pub fn with_llm(mut self, llm: Option<std::sync::Arc<dyn crate::llm::LlmCapability>>) -> Self {
         self.llm = llm;
+        self
+    }
+
+    /// Attach a shared Tokio runtime for driving async LLM calls (Finding 10).
+    /// Forwarded to `AgentPipeline::with_runtime` so per-call runtime
+    /// construction is eliminated.
+    #[cfg(feature = "llm")]
+    #[must_use]
+    pub fn with_runtime(mut self, rt: Option<std::sync::Arc<tokio::runtime::Runtime>>) -> Self {
+        self.runtime = rt;
         self
     }
 
@@ -72,10 +89,9 @@ impl<'a> Handler<'a> {
         use crate::search::agent::AgentPipeline;
         let pipeline = AgentPipeline::new(self.searcher, self.project_root.clone());
         #[cfg(feature = "llm")]
-        let pipeline = match self.llm.clone() {
-            Some(llm) => pipeline.with_llm(llm),
-            None => pipeline,
-        };
+        let pipeline = pipeline
+            .with_llm(self.llm.clone())
+            .with_runtime(self.runtime.clone());
         Response::Agent(pipeline.handle(req))
     }
 
