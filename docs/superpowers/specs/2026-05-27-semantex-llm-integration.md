@@ -1,10 +1,10 @@
 # semantex LLM Integration — Phase 1 (genai) + Phase 2 (SubscriptionCli)
 
 **Date:** 2026-05-27
-**Status:** SHIPPED 2026-05-27. v0.7 (Phase 1) and v0.8 (Phase 2) landed together in merge `7eda12f`; post-tag fixes through `b14bca3`. HyDE call-site gap being patched in v0.7.1 by Team A — see §15.
-**Target releases:** v0.7 (Phase 1, genai adapter) ✅ → v0.8 (Phase 2, SubscriptionCli backend) ✅ → v0.7.1 (HyDE call-site, in progress)
+**Status:** SHIPPED 2026-05-27. v0.7 (Phase 1), v0.8 (Phase 2), v0.7.1 (HyDE call-site), and v0.7.2 (audit-findings hardening) all delivered on origin/main. Tags `v0.7` and `v0.8` both point at the squashed integration commit `8bd9a01`; v0.7.2 hardening rides on top at `64f63e7`. All 14 Team C audit findings resolved.
+**Target releases:** v0.7 (Phase 1, genai adapter) ✅ → v0.8 (Phase 2, SubscriptionCli backend) ✅ → v0.7.1 (HyDE call-site) ✅ → v0.7.2 (production hardening) ✅
 **Repository:** https://github.com/MisterTK/semantex
-**Main branch:** `main` at `b14bca3` (post-/simplify sweep) — see §15 for post-ship history.
+**Main branch:** `main` at `64f63e7` — see §15 for post-ship history including the v0.7.1 HyDE wiring and v0.7.2 audit-findings sweep.
 **Sole authoritative source:** this file. Subagents execute against this spec without further consultation. Cross-spec coordination: defers to `docs/RELEASE-SEQUENCE-2026-05.md` for ordering vs. any other v0.7+ work.
 **Supersedes:** the LLM portions (Items 9 and 12) of `docs/superpowers/specs/2026-05-26-semantex-v0.3.1-v0.5-refactor.md`, which are marked out-of-scope as of 2026-05-27.
 
@@ -58,8 +58,8 @@ Both phases share the same `LlmBackend` enum surface. Phase 1 ships first; Phase
 - **`crates/semantex-core/src/llm/genai_backend.rs`** — Phase 1 backend wrapping `rust-genai` v0.5. Reads `SEMANTEX_LLM_MODEL` (required), `SEMANTEX_LLM_PROVIDER` (optional, inferred from model name), `SEMANTEX_LLM_ENDPOINT` (optional, OpenAI-compat override). Provider API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) read directly by `genai`; semantex never touches them.
 - **`crates/semantex-core/src/llm/subscription_cli.rs`** — Phase 2 backend. Reads `SEMANTEX_LLM_BACKEND=cli:claude|cli:codex|cli:antigravity|cli:auto` and `SEMANTEX_LLM_CLI_BINARY` (optional absolute-path override). Antigravity rejected at `from_env()` with an actionable error. Includes `CliKind::extract_text` for parsing Claude's JSON output wrapper. No subprocess pooling (rational: spawn cost amortized; see file header comment).
 - **`crates/semantex-core/src/llm/prompts.rs`** — Shared `CLASSIFIER_SYSTEM_PROMPT`, `HYDE_SYSTEM_PROMPT`, `build_classify_prompt`, `build_hyde_prompt`, `parse_route_from_llm_output` (delegates to `AgentRoute::from_str`).
-- **`crates/semantex-core/src/search/agent.rs`** — `AgentPipeline` has `llm: Option<Arc<dyn LlmCapability>>` field (cfg-gated); `with_llm()` builder; `classify_route_with_llm_fallback()` wraps LLM classifier with `SEMANTEX_LLM_CLASSIFY_TIMEOUT_MS`-overridable timeout (default 8 s). The LLM is used for classification only — HyDE call-site pending v0.7.1.
-- **`crates/semantex-core/src/search/hybrid.rs`** — `search_with_hyde()` and `merge_hyde_results()` are implemented and unit-tested. Not yet called from `AgentPipeline` (call-site gap; see §15).
+- **`crates/semantex-core/src/search/agent.rs`** — `AgentPipeline` has `llm: Option<Arc<dyn LlmCapability>>` field + `runtime: Option<Arc<tokio::runtime::Runtime>>` field (both cfg-gated). `with_llm(Option<Arc>)` and `with_runtime(Option<Arc<Runtime>>)` builders. `classify_route_with_llm_fallback` and `search_semantic` both use the shared runtime when injected (per-call runtime construction is now a legacy fallback). Classifier timeout is `SEMANTEX_LLM_CLASSIFY_TIMEOUT_MS`-overridable (default 8 s). **HyDE is wired**: `handle_semantic` calls `search_semantic` which routes through `search_with_hyde` when LLM is present.
+- **`crates/semantex-core/src/search/hybrid.rs`** — `search_with_hyde()` and `merge_hyde_results()` are implemented and unit-tested. **Called from `AgentPipeline::search_semantic`** since v0.7.1. HyDE timeout is `SEMANTEX_LLM_HYDE_TIMEOUT_MS`-overridable (default 15 s, sized for cli:claude). Live-verified: 10 results (HyDE-on) vs 4 results (HyDE-off) on a natural-language flask query.
 - **`crates/semantex-core/src/server/mod.rs`** — daemon startup calls `LlmBackend::from_env()?`, logs the backend label, and passes `Arc<dyn LlmCapability>` to `AgentPipeline`. When no LLM configured, logs a discovery hint if `claude` or `codex` is on PATH (not `antigravity` — excluded per Item 2.3 to avoid suggesting a backend that fails at startup).
 - **`crates/semantex-mcp/src/server.rs`** — MCP `AgentPipeline` also receives the LLM backend via `with_llm()`. `tool_agent`/`tool_search`/`tool_deep_search` are async (required by the LLM classifier path).
 - **`crates/semantex-cli/src/commands/llm_status.rs`** — `semantex llm-status` subcommand (feature-gated). Detects backend, prints label, runs a health-check classify call with `SEMANTEX_LLM_CLASSIFY_TIMEOUT_MS`-overridable timeout (default 8 s).
@@ -97,7 +97,7 @@ Both phases share the same `LlmBackend` enum surface. Phase 1 ships first; Phase
 - ✅ Phase 1: `cargo build --features llm` clean (`b14bca3`).
 - ✅ Phase 1: `cargo test --features llm` clean.
 - ⚠️ Phase 1: end-to-end test against a real Ollama instance — the live test that validated the implementation used the Claude CLI backend (`SEMANTEX_LLM_BACKEND=cli:claude`), not Ollama. Both code paths are exercised by `llm_smoke.rs`; the Ollama-specific gate requires `SEMANTEX_LLM_TEST_OLLAMA=1` (operator-run).
-- ⚠️ Phase 1: HyDE channel produces non-empty results — `HybridSearcher::search_with_hyde()` is implemented and unit-tested, but the call-site in `AgentPipeline` is not yet wired (see §15). HyDE infrastructure ✅, call-site ⚠️ (v0.7.1).
+- ✅ Phase 1: HyDE channel produces non-empty results — `HybridSearcher::search_with_hyde()` is wired into `AgentPipeline::handle_semantic` (via `search_semantic`) since v0.7.1. Live-verified on flask + cli:claude: HyDE-on returns 10 results vs HyDE-off 4 results; HyDE adds 6 unique chunks.
 - ✅ Phase 2: subprocess invocation works for Claude + Codex; tested live against Claude CLI. Codex gated by `SEMANTEX_LLM_TEST_CLI=codex`.
 - ⚠️ Phase 2: "per-CLI version-detection in place" — the spec described flag-set detection at construction time; what shipped is a simpler startup-time resolution (find binary on PATH, reject unknown ones early). Version-specific flag-set detection was not implemented; the implementation relies on the current flag set (`--print --output-format json`) being stable. Track as a follow-up if `claude` changes its flags.
 - ✅ Phase 2: degradation path verified — missing CLI → `Err` at startup with actionable message; LLM error → keyword classifier fallback (`classify_route_with_llm_fallback`).
@@ -705,7 +705,7 @@ Cross-reference: `docs/RELEASE-SEQUENCE-2026-05.md` §7 changelog for the full f
 4. ✅ Startup banner test: discovery hint logs when `claude` or `codex` on PATH and no LLM configured; `antigravity` intentionally excluded from hint (its startup would fail at first query).
 
 ### Bench gates (deferred, user-authorized)
-- ⚠️ v0.7: aggregate CCB Δ improvement ≥3pp with `--features llm + SEMANTEX_LLM_MODEL=ollama/qwen2.5-coder:7b` vs without on 4 repos. Not yet run; requires user bench-spend authorization (~$80). Note: HyDE call-site must be wired (v0.7.1) before this gate is meaningful — without HyDE, only the LLM classifier provides lift.
+- ⚠️ v0.7: aggregate CCB Δ improvement ≥3pp with `--features llm + SEMANTEX_LLM_MODEL=ollama/qwen2.5-coder:7b` vs without on 4 repos. Not yet run; requires user bench-spend authorization (~$80). HyDE call-site is wired as of v0.7.1, so the gate is now meaningful — both the LLM classifier and the HyDE retrieval channel contribute lift.
 - ⚠️ v0.8: cli:claude vs api-key accuracy ≥95% on 100-query held-out set. Not yet run (operator-authorized; deferred).
 
 ---
@@ -866,15 +866,37 @@ The spec (§4 Item 1.4) specified `LLM_CLASSIFY_TIMEOUT = 800ms` for "fast class
 
 **Takeaway:** When a constant or type is cfg-gated, every consumer function must be identically gated. The `/simplify` review pattern caught this; running `cargo build --workspace` (without features) as a standard local gate would have caught it earlier.
 
-### 15.4 HyDE call-site gap (being patched in v0.7.1 by Team A)
+### 15.4 HyDE call-site (shipped in v0.7.1, squashed into `8bd9a01`)
 
-`HybridSearcher::search_with_hyde()` was implemented in `hybrid.rs` during W-LLM-Wire and is unit-tested. However, `AgentPipeline` in `agent.rs` only wires the LLM classifier (`classify_route_with_llm_fallback`); it does not call `search_with_hyde`. The LLM backend's `synthesize_hyde_doc` capability has no call-site in the agent dispatch path as of `b14bca3`.
+`HybridSearcher::search_with_hyde()` was implemented in `hybrid.rs` during W-LLM-Wire and is unit-tested. The call-site in `AgentPipeline::handle_semantic` was initially missing — surfaced by `/simplify` finding #11. **Fixed in v0.7.1:** `AgentPipeline::search_semantic` now routes through `search_with_hyde` when an LLM is wired, and `handle_semantic` calls `search_semantic` instead of `searcher.search()` directly. HyDE never breaks a query — any LLM error, empty doc, or timeout falls back to base search.
 
-**Status:** Team A is patching this gap in a parallel worktree (v0.7.1). Controller will merge both teams' work. Until v0.7.1 lands, LLM-enabled builds provide classifier override only; HyDE retrieval is dormant.
+Added `SEMANTEX_LLM_HYDE_TIMEOUT_MS` env override (default 15 s, sized for cli:claude HyDE synthesis ~5–10 s).
 
-**What's in place:** `HybridSearcher::with_llm()` builder and `search_with_hyde()` with proper timeout handling and result merging (dedup by chunk ID, re-sort by score) — the infrastructure is correct. Only the call-site is missing.
+**Live-verified** on `/Users/tk/dev/flask` + `cli:claude` with query "code that handles request timeouts in Flask":
+- HyDE-on: **10 results in 12.9 s** (HyDE adds 6 unique chunks the base path missed)
+- HyDE-off: **4 results in 30 ms**
 
-### 15.5 Env-var contract (normative, as of `b14bca3`)
+The full v0.7+v0.8+v0.7.1 history was squashed into a single commit `8bd9a01` and pushed; tags `v0.7` and `v0.8` were moved to point at it.
+
+### 15.5 Production-hardening sweep (v0.7.2, commit `64f63e7`)
+
+Team C's read-only audit produced 14 findings (3 HIGH, 6 MEDIUM, 5 LOW); zero BLOCKERs. All resolved in three parallel-team commits, then squashed into `64f63e7` on top of the v0.7+v0.8+v0.7.1 commit. Highlights with concrete impact:
+
+- **WARN-level LLM startup banner** (was INFO, hidden under the default WARN filter). Operators starting `semantex serve` now see `WARN LLM enabled: cli:claude` without `RUST_LOG=info`.
+- **Prompt piped via stdin** instead of argv (was `cmd.arg(prompt)`, visible in `ps aux`). Live-verified: `ps aux | grep "claude --print"` during a query shows only the flags — no prompt text in the process listing.
+- **Inner subprocess timeouts now env-overridable** (`SEMANTEX_LLM_CLASSIFY_TIMEOUT_MS`, `SEMANTEX_LLM_HYDE_TIMEOUT_MS`) — both layers extend in lockstep, preventing orphan `claude`/`codex` subprocesses when a user shortens the budget.
+- **Bounded subprocess stdout** (1 KiB classify, 50 KiB HyDE) — a malicious LLM returning multi-MB output now bails rather than OOM-ing the daemon.
+- **`CliKind::Antigravity` removed** — variant deleted; the `from_env` bail string is preserved so `SEMANTEX_LLM_BACKEND=cli:antigravity` still errors at startup with the actionable message.
+- **`AgentPipeline::with_llm(Option<Arc<...>>)`** — callers (handler, mcp, watch, llm_status) collapse to `pipeline.with_llm(self.llm.clone())`.
+- **Public LLM surface trimmed** to `LlmBackend` + `LlmCapability` only. `GenaiBackend` / `SubscriptionCliBackend` / `CliKind` are now `pub(crate)`.
+- **`Listener` owns shared tokio runtime** — `Listener::bind` constructs `Arc<Runtime>` once and threads it through `Handler::with_runtime` → `AgentPipeline::with_runtime`. The per-call current-thread runtime is now a legacy fallback that emits a one-time warning.
+- **Cross-module env-test lock** documented — `TEST_ENV_LOCK` (in `llm/mod.rs`) and `env_cap_behaviour_serial` (in `memory.rs`) guard disjoint env-var families; comments at both sites note the contract.
+- **`infer_provider` hardened** for Bedrock (`nova-*`), Fireworks/path-style names, LiteLLM/vLLM gateways, and `o2-` OpenAI prefix (defensive forward-compat).
+- **`kill_on_drop(true)` documented** as the sole guarantee subprocesses are reaped when the outer timeout future drops.
+
+Verified: 766 lib tests pass with `--features llm` (up from 761); default clippy + fmt clean; live e2e against cli:claude confirms banner visibility and argv hygiene.
+
+### 15.6 Env-var contract (normative, as of `64f63e7`)
 
 The following env vars are active in the shipped codebase. This table supplements §2 and takes precedence over the §4/§5 spec items, which describe intent, not final behavior.
 
@@ -885,7 +907,8 @@ The following env vars are active in the shipped codebase. This table supplement
 | `SEMANTEX_LLM_ENDPOINT` | GenaiBackend | provider default | OpenAI-compatible base URL (Ollama, LiteLLM, vLLM, LM Studio). |
 | `SEMANTEX_LLM_BACKEND` | SubscriptionCliBackend | unset (Phase 2 disabled) | `cli:claude`, `cli:codex`, `cli:auto`, or `cli:antigravity` (last fails at startup). |
 | `SEMANTEX_LLM_CLI_BINARY` | SubscriptionCliBackend | PATH lookup | Absolute path override; only honored when basename matches the kind's CLI name. |
-| `SEMANTEX_LLM_CLASSIFY_TIMEOUT_MS` | Both backends | 8000 | Classifier call timeout in milliseconds. Used by daemon and `llm-status`. |
+| `SEMANTEX_LLM_CLASSIFY_TIMEOUT_MS` | Both backends + `llm-status` | 8000 | Outer classifier-call budget (agent.rs) AND inner subprocess timeout (subscription_cli.rs); both layers honor it as of v0.7.2 so they extend in lockstep. |
+| `SEMANTEX_LLM_HYDE_TIMEOUT_MS` | Both backends | 15000 | Outer HyDE-synthesis budget (hybrid.rs) AND inner subprocess timeout (subscription_cli.rs). Sized for cli:claude HyDE which takes ~5–10 s end-to-end. |
 
 ---
 
