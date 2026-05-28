@@ -67,17 +67,21 @@ class _OpenHandsResult:
     turns: list[dict]
 
 
-def _extract_workspace_patch(repo_path: Path) -> str:
-    """``git diff HEAD`` — captures all uncommitted changes the agent made
-    to the workspace, excluding `.semantex/` (our index dir) and `.gitignore`
-    (agents sometimes mutate it to mask `.semantex/`). Returns "" if the path
-    is not a git repo."""
+def _extract_workspace_patch(repo_path: Path, base_commit: str) -> str:
+    """``git diff <base_commit>`` — captures both committed-since-base and
+    uncommitted working-tree changes. Excludes `.semantex/` (our index dir)
+    and `.gitignore` (agents sometimes mutate it to mask `.semantex/`).
+    Returns "" if the path is not a git repo.
+
+    Diffing against base_commit rather than HEAD is critical: agents
+    sometimes commit their fix inside the workspace, which would leave
+    `git diff HEAD` empty and silently lose the patch."""
     proc = subprocess.run(
-        ["git", "diff", "HEAD", "--", ".", ":(exclude).semantex", ":(exclude).gitignore"],
+        ["git", "diff", base_commit, "--", ".", ":(exclude).semantex", ":(exclude).gitignore"],
         cwd=repo_path,
         capture_output=True,
         text=True,
-        check=False,  # diff returns 1 if there are diffs; that's fine
+        check=False,
     )
     return proc.stdout
 
@@ -200,7 +204,7 @@ def _invoke_openhands(
                 }
             )
 
-        patch = _extract_workspace_patch(repo_path)
+        patch = _extract_workspace_patch(repo_path, instance.base_commit)
         return _OpenHandsResult(patch=patch, turns=turns)
     finally:
         # LocalConversation registers atexit for close, but explicit close
