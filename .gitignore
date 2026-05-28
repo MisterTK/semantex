@@ -32,8 +32,11 @@ CLAUDE.md
 /site
 /FASTEMBED_INTEGRATION.md
 
-# Benchmarks (contain hardcoded local paths and dev-only scripts)
-/benchmarks
+# Benchmarks (contain hardcoded local paths and dev-only scripts).
+# Ignore contents but not the directory itself, so we can carve exceptions.
+/benchmarks/*
+# Exception: SWE-bench Verified harness is a committed sub-project.
+!/benchmarks/swe_bench/
 /benches
 /bench_results
 /scripts
