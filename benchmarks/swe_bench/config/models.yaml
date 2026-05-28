@@ -1,0 +1,35 @@
+# Anthropic + Google pricing per million tokens. Snapshot — verify current
+# prices at run time. Historical runs keep their pricing snapshot for
+# reproducibility.
+#
+# Sources verified 2026-05-27:
+#   Anthropic — https://docs.anthropic.com/en/docs/about-claude/pricing
+#   Google    — https://ai.google.dev/pricing
+# (URLs documented for the reader; do not lazy-fetch from production code.)
+
+# === Agent models ===
+claude-sonnet-4-6:
+  input_per_mtok: 3.00
+  output_per_mtok: 15.00
+  cache_write_per_mtok: 3.75
+  cache_read_per_mtok: 0.30
+
+claude-opus-4-7:
+  input_per_mtok: 15.00
+  output_per_mtok: 75.00
+  cache_write_per_mtok: 18.75
+  cache_read_per_mtok: 1.50
+
+# === Internal-LLM models (semantex HyDE + classify) ===
+claude-haiku-4-5-20251001:
+  input_per_mtok: 1.00
+  output_per_mtok: 5.00
+  cache_write_per_mtok: 1.25
+  cache_read_per_mtok: 0.10
+
+gemini-2.5-flash:
+  input_per_mtok: 0.075
+  output_per_mtok: 0.30
+  # Gemini Flash has no separate cache write/read pricing — uses input rates.
+  cache_write_per_mtok: 0.075
+  cache_read_per_mtok: 0.0
