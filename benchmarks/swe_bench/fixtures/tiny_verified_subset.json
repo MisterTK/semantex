@@ -1,0 +1,7 @@
+[
+  {"instance_id":"astropy__astropy-12907","repo":"astropy/astropy","base_commit":"d16bfe05a744909de4b27f5875fe0d4ed41ce607","problem_statement":"...","patch":"","test_patch":""},
+  {"instance_id":"django__django-11099","repo":"django/django","base_commit":"d26b2424437dabeeca94d7900b37d2df4410da0c","problem_statement":"...","patch":"","test_patch":""},
+  {"instance_id":"sympy__sympy-13031","repo":"sympy/sympy","base_commit":"2dfa7457f20ee187fbb09b5b6a1631da4458388c","problem_statement":"...","patch":"","test_patch":""},
+  {"instance_id":"matplotlib__matplotlib-23314","repo":"matplotlib/matplotlib","base_commit":"97fc1154992f64cfb2f86321155a7404efeb2d8a","problem_statement":"...","patch":"","test_patch":""},
+  {"instance_id":"scikit-learn__scikit-learn-13497","repo":"scikit-learn/scikit-learn","base_commit":"26f690961a52946dd2f53bf0fdd4264b2ae5be90","problem_statement":"...","patch":"","test_patch":""}
+]
