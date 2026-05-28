@@ -34,7 +34,7 @@ def _c3() -> Condition:
 
 def test_c3_dict_validates_as_fastmcp_stdio_server(monkeypatch):
     """Our dict must parse cleanly through the same schema OpenHands uses."""
-    monkeypatch.delenv("SEMANTEX_MCP_LLM_BINARY", raising=False)
+    monkeypatch.delenv("SEMANTEX_LLM_BINARY", raising=False)
     cfg_dict = build_mcp_config(_c3())
     assert cfg_dict is not None
 
@@ -44,8 +44,8 @@ def test_c3_dict_validates_as_fastmcp_stdio_server(monkeypatch):
     assert isinstance(server, StdioMCPServer), (
         f"expected stdio transport, got {type(server).__name__}"
     )
-    assert server.command == "semantex-mcp-llm"
-    assert server.args == []
+    assert server.command == "semantex-llm"
+    assert server.args == ["mcp"]
     assert server.env["SEMANTEX_LLM_PROVIDER"] == "anthropic"
     assert server.env["SEMANTEX_LLM_MODEL"] == "claude-haiku-4-5-20251001"
 

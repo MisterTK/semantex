@@ -31,7 +31,8 @@ def test_c2_no_llm_uses_default_binary(monkeypatch):
     cfg = build_mcp_config(c2)
     assert cfg is not None
     server = cfg["mcpServers"]["semantex"]
-    assert server["command"] == "semantex-mcp"
+    assert server["command"] == "semantex"
+    assert server["args"] == ["mcp"]
     # no LLM env vars when llm_features disabled
     env = server.get("env", {})
     assert "SEMANTEX_LLM_PROVIDER" not in env
@@ -39,7 +40,7 @@ def test_c2_no_llm_uses_default_binary(monkeypatch):
 
 
 def test_c3_with_llm_uses_llm_binary_and_sets_env(monkeypatch):
-    monkeypatch.delenv("SEMANTEX_MCP_LLM_BINARY", raising=False)
+    monkeypatch.delenv("SEMANTEX_LLM_BINARY", raising=False)
     c3 = _make_condition(
         id="c3_semantex_with_llm",
         semantex_enabled=True,
@@ -52,7 +53,8 @@ def test_c3_with_llm_uses_llm_binary_and_sets_env(monkeypatch):
     )
     cfg = build_mcp_config(c3)
     server = cfg["mcpServers"]["semantex"]
-    assert server["command"] == "semantex-mcp-llm"
+    assert server["command"] == "semantex-llm"
+    assert server["args"] == ["mcp"]
     env = server["env"]
     assert env["SEMANTEX_LLM_PROVIDER"] == "anthropic"
     assert env["SEMANTEX_LLM_MODEL"] == "claude-haiku-4-5-20251001"
@@ -61,7 +63,7 @@ def test_c3_with_llm_uses_llm_binary_and_sets_env(monkeypatch):
 
 
 def test_env_overrides_binary_path(monkeypatch):
-    monkeypatch.setenv("SEMANTEX_MCP_BINARY", "/custom/path/to/semantex-mcp")
+    monkeypatch.setenv("SEMANTEX_BINARY", "/custom/path/to/semantex")
     c2 = _make_condition(
         id="c2_semantex_no_llm",
         semantex_enabled=True,
@@ -69,12 +71,13 @@ def test_env_overrides_binary_path(monkeypatch):
         semantex_llm_features=False,
     )
     cfg = build_mcp_config(c2)
-    assert cfg["mcpServers"]["semantex"]["command"] == "/custom/path/to/semantex-mcp"
+    assert cfg["mcpServers"]["semantex"]["command"] == "/custom/path/to/semantex"
 
 
 def test_inherits_api_keys_when_set(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-anthropic")
     monkeypatch.setenv("GOOGLE_API_KEY", "g-test-google")
+    monkeypatch.setenv("GEMINI_API_KEY", "g-test-gemini")
     c3 = _make_condition(
         id="c3_semantex_with_llm",
         semantex_enabled=True,
@@ -87,3 +90,4 @@ def test_inherits_api_keys_when_set(monkeypatch):
     env = cfg["mcpServers"]["semantex"]["env"]
     assert env["ANTHROPIC_API_KEY"] == "sk-test-anthropic"
     assert env["GOOGLE_API_KEY"] == "g-test-google"
+    assert env["GEMINI_API_KEY"] == "g-test-gemini"

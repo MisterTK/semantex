@@ -15,7 +15,12 @@ import os
 from swe_bench_harness.conditions import Condition
 
 
-_INHERIT_KEYS = ("SEMANTEX_MAX_RSS_MB", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY")
+_INHERIT_KEYS = (
+    "SEMANTEX_MAX_RSS_MB",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",  # rust-genai's Gemini provider reads GEMINI_API_KEY
+)
 
 
 def build_mcp_config(condition: Condition) -> dict | None:
@@ -23,10 +28,14 @@ def build_mcp_config(condition: Condition) -> dict | None:
     if not condition.semantex_enabled:
         return None
 
+    # semantex's MCP server is a subcommand of the main `semantex` binary,
+    # not a separate executable. The LLM feature requires a different cargo
+    # build (--features semantex-cli/llm); operators set _LLM_BINARY to that
+    # build's path.
     if condition.semantex_features == "llm":
-        command = os.environ.get("SEMANTEX_MCP_LLM_BINARY", "semantex-mcp-llm")
+        command = os.environ.get("SEMANTEX_LLM_BINARY", "semantex-llm")
     else:
-        command = os.environ.get("SEMANTEX_MCP_BINARY", "semantex-mcp")
+        command = os.environ.get("SEMANTEX_BINARY", "semantex")
 
     env: dict[str, str] = {}
     for k in _INHERIT_KEYS:
@@ -48,7 +57,7 @@ def build_mcp_config(condition: Condition) -> dict | None:
         "mcpServers": {
             "semantex": {
                 "command": command,
-                "args": [],
+                "args": ["mcp"],
                 "env": env,
             }
         }
