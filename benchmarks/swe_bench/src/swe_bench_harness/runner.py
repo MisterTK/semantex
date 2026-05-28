@@ -113,6 +113,13 @@ def _invoke_openhands(
     from openhands.sdk import LLM, Agent, Conversation, Tool
     from pydantic import SecretStr
 
+    # Importing these submodules triggers ToolDefinition registration via
+    # @register_tool decorators (openhands-tools 1.24.x). Without these
+    # imports the registry is empty and Agent fails resolving tool specs.
+    import openhands.tools.terminal  # noqa: F401
+    import openhands.tools.file_editor  # noqa: F401
+    import openhands.tools.task_tracker  # noqa: F401
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY env var required for runner")
@@ -126,10 +133,14 @@ def _invoke_openhands(
     # Built-in tools — same across all conditions for fair comparison.
     # Tool is a Pydantic spec (name + params); the agent resolves these
     # via openhands.sdk.tool.registry from the openhands-tools package.
+    # NOTE: tool registry names (lowercase snake_case) — these are the names
+    # the openhands-tools package uses when calling @register_tool. The class
+    # names (TerminalTool/FileEditorTool/TaskTrackerTool) are NOT the
+    # registry keys, even though Tool(name=...) silently accepts either.
     tools = [
-        Tool(name="TerminalTool"),
-        Tool(name="FileEditorTool"),
-        Tool(name="TaskTrackerTool"),
+        Tool(name="terminal"),
+        Tool(name="file_editor"),
+        Tool(name="task_tracker"),
     ]
 
     mcp_cfg = build_mcp_config(condition)
