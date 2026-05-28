@@ -2,7 +2,12 @@
 
 We register the existing crates/semantex-mcp server rather than building a
 custom OpenHands Tool. The Condition selects which binary (default vs
---features llm build) and whether to pass LLM env vars."""
+--features llm build) and whether to pass LLM env vars.
+
+Shape contract: OpenHands' Agent.mcp_config is typed `dict[str, Any]` but is
+validated by `fastmcp.mcp_config.MCPConfig.model_validate(...)` inside
+openhands.sdk.mcp.utils.create_mcp_tools — see tests/test_mcp_integration.py.
+"""
 from __future__ import annotations
 
 import os
