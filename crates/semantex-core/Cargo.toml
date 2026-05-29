@@ -24,7 +24,10 @@ tracing.workspace = true
 fastembed = "5.9"
 
 # ONNX Runtime — direct dependency for execution provider configuration (CoreML/CUDA/CPU)
-# fastembed depends on ort transitively, but we need the ep types directly
+# fastembed depends on ort transitively, but we need the ep types directly.
+# NOTE: This config works on macOS but produces broken Linux binaries — see
+# docs/superpowers/plans/2026-05-29-ort-linux-build-issue.md for the work
+# needed to make Linux builds functional.
 ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
 
 # Full-text search (BM25)
