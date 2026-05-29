@@ -38,9 +38,11 @@ def main(run_id: str, baseline: str, system_name: str):
     eval_dir = run_dir / "eval"
     eval_dir.mkdir(exist_ok=True, parents=True)
 
-    # 1. determine (condition_id, replicate) pairs present in runs_dir
+    # 1. determine (condition_id, replicate) pairs present in runs_dir.
+    # Filename format: {instance_id}__{condition_id}__{replicate}.json — instance_ids
+    # themselves contain '__' (e.g. astropy__astropy-13033), so rsplit from the right.
     pairs = sorted({
-        (jf.stem.split("__")[1], int(jf.stem.split("__")[2]))
+        (jf.stem.rsplit("__", 2)[1], int(jf.stem.rsplit("__", 2)[2]))
         for jf in runs_dir.glob("*.json")
     })
 
