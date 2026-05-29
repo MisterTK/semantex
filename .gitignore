@@ -1,5 +1,7 @@
 # Build
 /target
+# Alternate CARGO_TARGET_DIR build dirs (e.g. target-llm for feature builds)
+/target-*
 /semantex
 
 # Worktrees (parallel dev branches)

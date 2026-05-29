@@ -39,7 +39,9 @@ pub fn is_colbert_downloaded(models_dir: &Path) -> bool {
         .all(|f| model_dir.join(f).exists())
 }
 
-fn download_file(url: &str, dest: &Path) -> Result<()> {
+/// Download `url` to `dest` atomically (temp file + rename), showing a progress
+/// bar. Shared with `runtime_manager` for fetching the ONNX Runtime archive.
+pub(crate) fn download_file(url: &str, dest: &Path) -> Result<()> {
     let resp = ureq::get(url)
         .call()
         .with_context(|| format!("HTTP GET failed for {url}"))?;

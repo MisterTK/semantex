@@ -341,6 +341,84 @@ enum Commands {
     LlmStatus,
 }
 
+/// Resolve the ONNX Runtime shared library for `ort`'s load-dynamic mode.
+///
+/// The dependency graph (`next-plaid-onnx` → `ort/load-dynamic`) puts `ort` in
+/// pure dynamic-loading mode on every platform, so a real `libonnxruntime` must
+/// be located at runtime. Resolution order:
+///   1. A copy semantex previously provisioned under `~/.semantex/runtime/`.
+///   2. For commands that load ONNX Runtime in-process, download + cache the
+///      official Microsoft release matching `ort`'s required version.
+///   3. A system-installed library, as an offline fallback.
+///
+/// Returns the absolute path to set as `ORT_DYLIB_PATH`, or `None` to let `ort`
+/// fall back to the OS loader search.
+fn resolve_ort_dylib() -> Option<PathBuf> {
+    use semantex_core::embedding::runtime_manager;
+
+    // Only commands that load ONNX Runtime in-process need a dylib; lightweight
+    // read/admin subcommands never touch it (and `download-models` provisions
+    // itself), so don't set ORT_DYLIB_PATH for them.
+    if !command_wants_onnxruntime(std::env::args().skip(1)) {
+        return None;
+    }
+
+    let runtime_root = semantex_core::config::SemantexConfig::semantex_home().join("runtime");
+    if let Some(path) = runtime_manager::find_onnxruntime(&runtime_root) {
+        return Some(path);
+    }
+    // Prefer the known-good managed runtime over an unknown system library: the
+    // latter may be older than the version `ort` requires. The system path is an
+    // offline fallback only.
+    match runtime_manager::ensure_onnxruntime(&runtime_root) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!(
+                "Could not auto-provision ONNX Runtime ({e}); \
+                 falling back to a system-installed library. \
+                 Install ONNX Runtime {} or newer, or set ORT_DYLIB_PATH manually.",
+                runtime_manager::ONNXRUNTIME_VERSION
+            );
+            find_ort_dylib().map(PathBuf::from)
+        }
+    }
+}
+
+/// Whether the requested subcommand loads ONNX Runtime in-process and should
+/// therefore trigger auto-provisioning of the runtime library on first use.
+/// Mirrors [`memory_constrained_from_args`]' arg-peek style: lightweight
+/// read/admin subcommands are excluded; the default (search) plus
+/// index/watch/serve/mcp load ONNX Runtime.
+fn command_wants_onnxruntime<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            return true; // a positional search query follows
+        }
+        if !arg.starts_with('-') {
+            return !matches!(
+                arg,
+                "status"
+                    | "stop"
+                    | "validate"
+                    | "download-models"
+                    | "connect"
+                    | "disconnect"
+                    | "install-claude-code"
+                    | "install-codex"
+                    | "install-opencode"
+                    | "skills-generate"
+                    | "llm-status"
+            );
+        }
+    }
+    false
+}
+
 /// Find ONNX Runtime shared library on platform-specific paths.
 fn find_ort_dylib() -> Option<&'static str> {
     let candidates: &[&str] = if cfg!(target_os = "macos") {
@@ -411,7 +489,7 @@ where
 
 #[cfg(test)]
 mod arg_peek_tests {
-    use super::memory_constrained_from_args;
+    use super::{command_wants_onnxruntime, memory_constrained_from_args};
 
     #[test]
     fn detects_mcp_subcommand_plain() {
@@ -481,6 +559,33 @@ mod arg_peek_tests {
         // arg looks indistinguishable from "subcommand here". Acceptable
         // because the worst outcome is SEMANTEX_ORT_THREADS=4 instead of 1.
         assert!(!memory_constrained_from_args(["--max-count", "5", "mcp"]));
+    }
+
+    #[test]
+    fn ort_provision_for_search_and_heavy_subcommands() {
+        // Default search (positional query) loads ONNX Runtime in-process.
+        assert!(command_wants_onnxruntime(["how does auth work"]));
+        assert!(command_wants_onnxruntime(["index", "."]));
+        assert!(command_wants_onnxruntime(["watch", "/p"]));
+        assert!(command_wants_onnxruntime(["serve"]));
+        assert!(command_wants_onnxruntime(["mcp", "--http"]));
+        assert!(command_wants_onnxruntime(["-v", "mcp"]));
+        // A positional query after `--` is still a search.
+        assert!(command_wants_onnxruntime(["--", "status"]));
+    }
+
+    #[test]
+    fn ort_no_provision_for_lightweight_subcommands() {
+        // These never load ONNX Runtime in-process, so don't trigger a download.
+        assert!(!command_wants_onnxruntime(["status"]));
+        assert!(!command_wants_onnxruntime(["stop"]));
+        assert!(!command_wants_onnxruntime(["validate"]));
+        assert!(!command_wants_onnxruntime(["download-models"])); // provisions itself
+        assert!(!command_wants_onnxruntime(["install-claude-code"]));
+        assert!(!command_wants_onnxruntime(["connect"]));
+        // Bare invocation / pure flags (help/version): no download.
+        assert!(!command_wants_onnxruntime(Vec::<&str>::new()));
+        assert!(!command_wants_onnxruntime(["--version"]));
     }
 }
 
@@ -735,13 +840,15 @@ fn main() -> Result<()> {
         }
     }
 
-    // Auto-detect ONNX Runtime library if not explicitly set.
-    // Deferred to after the daemon fast-path: daemon queries never load ORT in-process.
-    if std::env::var("ORT_DYLIB_PATH").is_err()
-        && let Some(path) = find_ort_dylib()
+    // Resolve the ONNX Runtime shared library for `ort`'s load-dynamic mode and
+    // expose it via ORT_DYLIB_PATH. Deferred to after the daemon fast-path
+    // (daemon queries never load ORT in-process), but kept before any threads
+    // spawn so the set_var below is sound.
+    if std::env::var_os("ORT_DYLIB_PATH").is_none_or(|v| v.is_empty())
+        && let Some(path) = resolve_ort_dylib()
     {
         // SAFETY: Called at program startup before any threads are spawned.
-        unsafe { std::env::set_var("ORT_DYLIB_PATH", path) };
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", &path) };
     }
 
     // Build config with CLI overrides
