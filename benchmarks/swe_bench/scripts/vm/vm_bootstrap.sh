@@ -29,6 +29,13 @@ log "4. Building semantex (--features llm)"
 cargo build --release -p semantex-cli --features llm --target-dir target-llm 2>&1 | tail -3
 ls -lh target-llm/release/semantex
 
+log "4b. Pre-fetch model + ONNX Runtime (single-threaded)"
+# semantex runs ort in load-dynamic mode and provisions the ONNX Runtime
+# shared library (+ ColBERT model) into ~/.semantex on first use. Do it once
+# here so the parallel pre-index (8 workers) finds everything cached instead of
+# racing on the same downloads.
+./target/release/semantex download-models
+
 log "5. Python venv + harness install"
 cd "$HOME/semantex/benchmarks/swe_bench"
 python3.12 -m venv .venv

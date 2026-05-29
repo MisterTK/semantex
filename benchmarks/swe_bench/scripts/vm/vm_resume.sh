@@ -16,7 +16,11 @@ cd "$HARNESS"
 # Source env
 . .venv/bin/activate
 set -a; . "$HOME/semantex/.env"; set +a
-export ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so.1.20.1
+# NOTE: Do NOT set ORT_DYLIB_PATH. semantex auto-provisions the correct ONNX
+# Runtime (>= the version `ort` requires) into ~/.semantex/runtime on first use.
+# The old /usr/local/lib/libonnxruntime.so.1.20.1 was 1.20 — below ort rc.11's
+# 1.23 floor — and would defeat auto-provisioning (a user-set ORT_DYLIB_PATH
+# wins). `download-models` (run in vm_bootstrap.sh) pre-populates it.
 export SEMANTEX_BINARY="$HOME/semantex/target/release/semantex"
 export SEMANTEX_LLM_BINARY="$HOME/semantex/target-llm/release/semantex"
 export SWE_BENCH_REPO_CACHE="$CACHE"
@@ -39,7 +43,6 @@ if [ "$INDEXED" -lt 90 ]; then
       cd $HARNESS
       . .venv/bin/activate
       set -a; . \$HOME/semantex/.env; set +a
-      export ORT_DYLIB_PATH=$ORT_DYLIB_PATH
       export SWE_BENCH_REPO_CACHE=$CACHE
       python -m scripts.pre_index --phase a --workers 8 --semantex-bin $SEMANTEX_BINARY 2>&1 | tee \$HOME/pre_index.log
     "
@@ -74,7 +77,6 @@ if [ "$EXISTING" -lt "$TARGET" ]; then
       cd $HARNESS
       . .venv/bin/activate
       set -a; . \$HOME/semantex/.env; set +a
-      export ORT_DYLIB_PATH=$ORT_DYLIB_PATH
       export SEMANTEX_BINARY=$SEMANTEX_BINARY
       export SEMANTEX_LLM_BINARY=$SEMANTEX_LLM_BINARY
       export SWE_BENCH_REPO_CACHE=$CACHE
