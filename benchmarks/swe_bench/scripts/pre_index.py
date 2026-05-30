@@ -26,13 +26,33 @@ def _cache_dir() -> Path:
     return Path(os.environ.get("SWE_BENCH_REPO_CACHE", Path.home() / ".swe_bench_repos"))
 
 
+def _index_is_complete(semantex_dir: Path) -> bool:
+    """True iff the .semantex dir holds a finished index.
+
+    semantex writes `.semantex/meta.json` LAST — after sparse, graph, and the
+    PLAID build — so its presence marks a completed `semantex index` run. There
+    is NO separate `updated_at` marker file; `updated_at` is a FIELD *inside*
+    meta.json. (The earlier harness looked for a nonexistent `updated_at` file,
+    so it never recognized a finished index: it re-deleted and re-indexed every
+    repo on every pass and reported 0 done forever.) We additionally require a
+    positive chunk_count so a torn/empty meta.json is treated as incomplete.
+    """
+    meta = semantex_dir / "meta.json"
+    if not meta.exists():
+        return False
+    try:
+        data = json.loads(meta.read_text())
+    except (ValueError, OSError):
+        return False
+    return int(data.get("chunk_count", 0)) > 0
+
+
 def _process_one(inst: Instance, semantex_bin: str) -> dict:
     dest = _cache_dir() / inst.instance_id
     semantex_dir = dest / ".semantex"
-    marker = semantex_dir / "updated_at"
-    if marker.exists():
+    if _index_is_complete(semantex_dir):
         return {"instance_id": inst.instance_id, "status": "cached"}
-    # A .semantex dir WITHOUT the updated_at marker is a partial/aborted index
+    # A .semantex dir without a valid meta.json is a partial/aborted index
     # (e.g. sparse built but dense PLAID never finished). `semantex index` would
     # treat its chunk manifest as up-to-date and skip every file, producing 0
     # chunks and never completing. Clear it so we always do a clean full index.

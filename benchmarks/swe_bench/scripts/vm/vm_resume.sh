@@ -25,7 +25,20 @@ export SEMANTEX_BINARY="$HOME/semantex/target/release/semantex"
 export SEMANTEX_LLM_BINARY="$HOME/semantex/target-llm/release/semantex"
 export SWE_BENCH_REPO_CACHE="$CACHE"
 
-INDEXED=$(find "$CACHE" -name updated_at -type f 2>/dev/null | wc -l | tr -d ' ')
+# Ensure the release binary matches the current source. The CPU-provider fix
+# (commit 6478e2b — multi-core ColBERT embedding on Linux) only applies in a
+# freshly built binary; a stale binary embeds single-threaded (10-30x slower)
+# and large repos never finish within the timeout. Incremental build is a no-op
+# when already current, so this is cheap on reboots.
+echo "ensuring release binary is current..."
+( cd "$HOME/semantex" && PATH="$HOME/.cargo/bin:$PATH" cargo build --release -p semantex-cli ) \
+  || echo "WARNING: cargo build failed — using existing binary"
+
+# A finished index is marked by .semantex/meta.json (written LAST by `semantex
+# index`, after the PLAID build). There is no separate `updated_at` file —
+# updated_at is a field *inside* meta.json. Counting a nonexistent marker file
+# (the old bug) always returned 0, so the pipeline re-indexed everything forever.
+INDEXED=$(find "$CACHE" -path "*/.semantex/meta.json" -type f 2>/dev/null | wc -l | tr -d ' ')
 TOTAL=$(wc -l < config/instances_phase_a.txt | tr -d ' ')
 
 # Phase order:
@@ -44,15 +57,17 @@ if [ "$INDEXED" -lt 90 ]; then
       . .venv/bin/activate
       set -a; . \$HOME/semantex/.env; set +a
       export SWE_BENCH_REPO_CACHE=$CACHE
-      # Indexing is MEMORY-bound. The chunk_size_data patch fixed the k-means
-      # distance block (~26GB->~9GB on small repos), but LARGE repos (django/
-      # sympy, 40-80k chunks) still hold all token embeddings + the k-means
-      # sample tensor in RAM => 12-15 GB PER WORKER (measured via OOM at 16
-      # workers). So cap parallelism to ~6 workers: 6 x ~15 GB = ~90 GB, well
-      # under 128 GB. SEMANTEX_MAX_RSS_MB=18000 is a hard backstop — a runaway
-      # worker self-aborts (that one repo fails, retried on resume) instead of
-      # OOM-killing the whole box. NO_RLIMIT disables the 24 GB virtual cap.
+      # Indexing uses BOTH CPU (ColBERT embedding, now multi-core after the
+      # provider fix) and RAM (k-means). Balance the 32-core / 128 GB box:
+      #   workers × SEMANTEX_ORT_THREADS ≈ cores  → 6 × 4 = 24 (+ rayon for
+      #   k-means) keeps cores busy without thrashing. Memory: the chunk_size_data
+      #   patch holds k-means to ~9 GB; embedding adds ~1-2 GB. ~10-12 GB/worker
+      #   peak on big repos × 6 = ~70 GB, under 128 GB. SEMANTEX_MAX_RSS_MB=18000
+      #   is a hard per-worker backstop (a runaway self-aborts; that repo retries
+      #   on resume) instead of OOM-killing the box. NO_RLIMIT disables the 24 GB
+      #   virtual cap. SEMANTEX_ORT_BATCH defaults to 32 (good CPU throughput).
       export RAYON_NUM_THREADS=2
+      export SEMANTEX_ORT_THREADS=4
       export SEMANTEX_NO_RLIMIT=1
       export SEMANTEX_MAX_RSS_MB=18000
       export SWE_BENCH_INDEX_TIMEOUT=7200
