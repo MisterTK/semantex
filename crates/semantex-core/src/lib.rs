@@ -18,6 +18,7 @@ pub mod index;
 #[cfg(feature = "llm")]
 pub mod llm;
 pub mod memory;
+pub mod priority;
 pub mod search;
 pub mod server;
 pub mod types;

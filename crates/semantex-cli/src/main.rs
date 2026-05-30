@@ -487,9 +487,48 @@ where
     false
 }
 
+/// True for subcommands that are PURE background indexing — safe to lower the
+/// whole process to background CPU priority so it yields to the developer's
+/// foreground work. Deliberately excludes `mcp`/`serve`: those also answer
+/// search queries, and niceing them would slow query responses under load.
+fn wants_background_priority() -> bool {
+    wants_background_priority_from_args(std::env::args().skip(1))
+}
+
+fn wants_background_priority_from_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            return false;
+        }
+        if !arg.starts_with('-') {
+            return matches!(arg, "index" | "watch");
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod arg_peek_tests {
-    use super::{command_wants_onnxruntime, memory_constrained_from_args};
+    use super::{
+        command_wants_onnxruntime, memory_constrained_from_args, wants_background_priority_from_args,
+    };
+
+    #[test]
+    fn background_priority_only_for_pure_index_paths() {
+        // index/watch are pure background indexing — safe to nice the process.
+        assert!(wants_background_priority_from_args(["index", "."]));
+        assert!(wants_background_priority_from_args(["watch", "/p"]));
+        // mcp/serve answer queries — must NOT be niced.
+        assert!(!wants_background_priority_from_args(["mcp"]));
+        assert!(!wants_background_priority_from_args(["serve"]));
+        // unrelated subcommands stay normal priority.
+        assert!(!wants_background_priority_from_args(["search", "foo"]));
+    }
 
     #[test]
     fn detects_mcp_subcommand_plain() {
@@ -635,6 +674,16 @@ fn main() -> Result<()> {
 
     // Register mimalloc purge so memory module can force page return to OS.
     semantex_core::memory::register_purge_fn(mimalloc_purge);
+
+    // Pure-indexing subcommands (`index`, `watch`) run as a good background
+    // citizen: lower the whole process to background CPU priority so it yields
+    // to the developer's foreground work. Done before ORT/rayon threads spawn
+    // so they inherit the lowered priority (Linux). Skipped for `mcp`/`serve`,
+    // which answer queries. Only matters under contention — idle builds stay
+    // full speed.
+    if wants_background_priority() {
+        semantex_core::priority::lower_process_to_background();
+    }
 
     // Enable ANSI escape codes on Windows Terminal / PowerShell
     #[cfg(windows)]
