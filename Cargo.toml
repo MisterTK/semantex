@@ -61,3 +61,6 @@ panic = "abort"
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+next-plaid = { path = "vendor/next-plaid" }

@@ -582,6 +582,15 @@ impl IndexBuilder {
             // linearly with batch_size). force_cpu=true bypasses the GPU
             // K-means path; we're already CPU-only on macOS and don't have
             // CUDA configured. Same knobs on UpdateConfig below.
+            //
+            // Peak RSS during the k-means build is also bounded by next-plaid's
+            // `chunk_size_data`, which we patch from 51_200 down to 4_096 in
+            // `vendor/next-plaid` (see workspace `[patch.crates-io]`). next-plaid
+            // runs the k-means distance GEMM as `chunk_ranges.par_iter()`, so peak
+            // ≈ rayon_threads × (chunk_size_data × chunk_size_centroids × 4 B). At
+            // the upstream default that is ~2.1 GB/thread (→ ~26 GB on a 32-core
+            // box for a 4 k-chunk repo); the patch cuts the block to ~167 MB/thread
+            // (→ ~9 GB), with bit-identical centroids (pure compute tiling).
             let plaid_config = IndexConfig {
                 nbits: self.config.plaid_nbits,
                 batch_size: 1024,
