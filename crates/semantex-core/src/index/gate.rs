@@ -46,27 +46,22 @@ const FALLBACK_CONCURRENCY: usize = 1;
 
 /// Returns the maximum number of concurrent full index builds.
 ///
-/// `SEMANTEX_MAX_CONCURRENT_BUILDS` overrides (clamped to ≥ 1). Otherwise
-/// `max(1, RAM_GB / 16)`: 16 GB → 1, 32 GB → 2, 64 GB → 4. Conservative on
-/// purpose — the cost of queueing a build is latency; the cost of over-
-/// committing is an OOM that takes down the developer's whole machine.
+/// `SEMANTEX_MAX_CONCURRENT_BUILDS` overrides (a zero/invalid value falls back
+/// to the default). Otherwise `max(1, RAM_GB / 16)`: 16 GB → 1, 32 GB → 2,
+/// 64 GB → 4. Conservative on purpose — the cost of queueing a build is latency;
+/// the cost of over-committing is an OOM that takes down the whole machine.
 pub fn max_concurrent_builds() -> usize {
-    if let Some(n) = std::env::var(ENV_MAX_BUILDS)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        return n.max(1);
-    }
-    match crate::memory::system_ram_mb() {
-        Some(mb) => ((mb / 1024) / RAM_GB_PER_BUILD).max(1) as usize,
+    let ram_default = match crate::memory::system_ram_mb() {
+        Some(mb) => (((mb / 1024) / RAM_GB_PER_BUILD).max(1)) as usize,
         None => FALLBACK_CONCURRENCY,
-    }
+    };
+    crate::config::env_usize(ENV_MAX_BUILDS, ram_default)
 }
 
-/// Directory holding the slot lock files. `None` if the home dir is unknown
-/// (in which case the gate is skipped — better to build than to wedge).
-fn slots_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".semantex").join("build-slots"))
+/// Directory holding the slot lock files, under the shared semantex home (which
+/// honors `SEMANTEX_HOME` and falls back to a temp dir).
+fn slots_dir() -> PathBuf {
+    crate::config::SemantexConfig::semantex_home().join("build-slots")
 }
 
 /// A held build slot. Releasing the underlying file lock happens automatically
@@ -86,96 +81,96 @@ const MAX_WAIT: Duration = Duration::from_hours(1);
 /// Acquire one of the `max_concurrent_builds()` global build slots, blocking
 /// until one is free.
 ///
-/// Returns `None` (build proceeds ungated) only if the home directory or slots
-/// directory can't be set up — we never want a path/permission quirk to *block*
-/// indexing entirely. `log_waiting` is invoked once if the caller has to wait,
-/// so the CLI can tell the user why it's pausing.
+/// Returns `None` (build proceeds ungated) only if the slots directory or its
+/// lock files can't be created — we never want a path/permission quirk to
+/// *block* indexing entirely. `log_waiting` is invoked at most once, the first
+/// time we have to wait, so the CLI can tell the user why it's pausing.
 pub fn acquire(log_waiting: impl FnOnce()) -> Option<BuildSlot> {
-    let dir = slots_dir()?;
+    let dir = slots_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
-    let limit = max_concurrent_builds();
-
-    // First full sweep: grab any immediately-free slot without sleeping.
-    if let Some(slot) = try_sweep(&dir, limit) {
-        return Some(slot);
+    // Open every slot file ONCE, then re-probe these handles with `try_lock` on
+    // each poll — re-opening per poll would be needless syscall churn over a
+    // wait that can last minutes. A held lock is tied to the open file handle,
+    // so we keep the one we lock and drop the rest. (Ok => we hold it; Err =>
+    // held by another builder, or a lock-less FS like NFS — skip and retry.)
+    let mut files: Vec<File> = (0..max_concurrent_builds())
+        .filter_map(|i| File::create(dir.join(format!("slot-{i}.lock"))).ok())
+        .collect();
+    if files.is_empty() {
+        return None;
     }
 
-    // All slots busy — wait. Announce once, then poll.
-    log_waiting();
+    let mut log_waiting = Some(log_waiting);
     let start = Instant::now();
     loop {
-        std::thread::sleep(POLL_INTERVAL);
-        if let Some(slot) = try_sweep(&dir, limit) {
-            return Some(slot);
+        if let Some(i) = files.iter().position(|f| f.try_lock().is_ok()) {
+            return Some(BuildSlot {
+                _file: files.swap_remove(i),
+            });
+        }
+        // Announce the wait exactly once (the first time around).
+        if let Some(f) = log_waiting.take() {
+            f();
         }
         // Safety valve against a wedged slot holder that didn't release its OS
         // lock: proceed ungated rather than block a build forever.
         if start.elapsed() > MAX_WAIT {
             return None;
         }
+        std::thread::sleep(POLL_INTERVAL);
     }
-}
-
-/// Try each slot once; return the first we can lock.
-fn try_sweep(dir: &std::path::Path, limit: usize) -> Option<BuildSlot> {
-    for i in 0..limit {
-        let path = dir.join(format!("slot-{i}.lock"));
-        let Ok(file) = File::create(&path) else {
-            continue;
-        };
-        // Ok => we hold this slot. Err => held by another builder, or a
-        // filesystem that doesn't support locking (NFS); skip it. If every slot
-        // errors we fall through and the caller retries / eventually proceeds.
-        if file.try_lock().is_ok() {
-            return Some(BuildSlot { _file: file });
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // These tests mutate the process-global ENV_MAX_BUILDS, so they must not
+    // run concurrently with each other.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn env_override_is_honored_and_floored() {
-        // SAFETY: single-threaded test; restored implicitly at process exit.
+    fn env_override_is_honored() {
+        let _g = ENV_GUARD.lock().unwrap();
+        // SAFETY: serialized by ENV_GUARD; restored before releasing the lock.
         unsafe { std::env::set_var(ENV_MAX_BUILDS, "3") };
         assert_eq!(max_concurrent_builds(), 3);
+        // A nonsensical "0" falls back to the (always ≥ 1) RAM default.
         unsafe { std::env::set_var(ENV_MAX_BUILDS, "0") };
-        assert_eq!(max_concurrent_builds(), 1, "must floor at 1");
+        assert!(max_concurrent_builds() >= 1, "must stay ≥ 1");
         unsafe { std::env::remove_var(ENV_MAX_BUILDS) };
     }
 
     #[test]
     fn default_scales_with_ram_and_is_at_least_one() {
+        let _g = ENV_GUARD.lock().unwrap();
         unsafe { std::env::remove_var(ENV_MAX_BUILDS) };
         // Whatever the host RAM, the default must be a sane positive number.
         assert!(max_concurrent_builds() >= 1);
     }
 
     #[test]
-    fn acquire_then_release_lets_next_caller_in() {
-        // With the env forcing a single slot, the first guard must hold it and
-        // the second sweep must find nothing — then dropping frees it.
+    fn slot_is_held_until_dropped_then_reusable() {
+        let _g = ENV_GUARD.lock().unwrap();
         unsafe { std::env::set_var(ENV_MAX_BUILDS, "1") };
-        let dir = match slots_dir() {
-            Some(d) => d,
-            None => return, // no home dir in this sandbox; nothing to assert
-        };
-        let _ = std::fs::create_dir_all(&dir);
-        let first = try_sweep(&dir, 1);
+        let slot_path = slots_dir().join("slot-0.lock");
+
+        let first = acquire(|| {});
         assert!(first.is_some(), "first acquire should get the only slot");
-        assert!(
-            try_sweep(&dir, 1).is_none(),
-            "no slot should be free while the first is held"
-        );
+
+        // A fresh handle to the same slot must observe it locked while held.
+        let probe = File::create(&slot_path).unwrap();
+        assert!(probe.try_lock().is_err(), "slot must be locked while held");
+        drop(probe);
+
         drop(first);
+        let probe2 = File::create(&slot_path).unwrap();
         assert!(
-            try_sweep(&dir, 1).is_some(),
-            "slot should be reusable after release"
+            probe2.try_lock().is_ok(),
+            "slot should be free after the guard is dropped"
         );
         unsafe { std::env::remove_var(ENV_MAX_BUILDS) };
     }

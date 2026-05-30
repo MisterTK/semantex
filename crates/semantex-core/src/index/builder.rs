@@ -308,14 +308,29 @@ impl IndexBuilder {
                 continue;
             };
 
-            // Chunk the file
-            let chunks: Vec<Chunk> = if file_type == FileType::Pdf {
-                pdf_chunker.chunk(file_path, "")?
-            } else if file_type.supports_ast() {
-                ast_chunker.chunk(rel_path, &content)?
-            } else {
-                text_chunker.chunk(rel_path, &content)?
+            // Chunk the file. A single unparseable file must never abort the
+            // whole index: third-party parsers (pdf_extract on a malformed PDF,
+            // a tree-sitter grammar on a pathological input) can `panic!`, not
+            // just return `Err`. Contain a panic at this generic per-file
+            // boundary and skip just that file. `Err` keeps its existing
+            // propagation. (panic = "unwind" in the release profile makes the
+            // catch effective — see workspace Cargo.toml.)
+            let chunked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if file_type == FileType::Pdf {
+                    pdf_chunker.chunk(file_path, "")
+                } else if file_type.supports_ast() {
+                    ast_chunker.chunk(rel_path, &content)
+                } else {
+                    text_chunker.chunk(rel_path, &content)
+                }
+            }));
+            let Ok(chunk_result) = chunked else {
+                tracing::warn!("Skipping {}: chunker panicked", file_path.display());
+                files_skipped += 1;
+                pb.inc(1);
+                continue;
             };
+            let chunks: Vec<Chunk> = chunk_result?;
 
             if chunks.is_empty() {
                 files_skipped += 1;

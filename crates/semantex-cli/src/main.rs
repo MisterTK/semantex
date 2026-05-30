@@ -515,7 +515,8 @@ where
 #[cfg(test)]
 mod arg_peek_tests {
     use super::{
-        command_wants_onnxruntime, memory_constrained_from_args, wants_background_priority_from_args,
+        command_wants_onnxruntime, memory_constrained_from_args,
+        wants_background_priority_from_args,
     };
 
     #[test]

@@ -90,12 +90,16 @@ fn is_onnxruntime_dylib_name(name: &str) -> bool {
 /// path to the loadable library, or `None` if not present.
 pub fn find_onnxruntime(runtime_root: &Path) -> Option<PathBuf> {
     let dir = lib_dir(runtime_root);
-    fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).find(|p| {
-        p.is_file()
-            && p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(is_onnxruntime_dylib_name)
-    })
+    fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_onnxruntime_dylib_name)
+        })
 }
 
 /// Ensure the pinned ONNX Runtime shared library is available under
@@ -109,7 +113,10 @@ pub fn ensure_onnxruntime(runtime_root: &Path) -> Result<PathBuf> {
 
     let asset = asset_name()?;
     let base = std::env::var(BASE_URL_ENV).unwrap_or_else(|_| ONNXRUNTIME_RELEASE_BASE.to_string());
-    let url = format!("{}/v{ONNXRUNTIME_VERSION}/{asset}", base.trim_end_matches('/'));
+    let url = format!(
+        "{}/v{ONNXRUNTIME_VERSION}/{asset}",
+        base.trim_end_matches('/')
+    );
 
     let version_dir = runtime_root.join(ONNXRUNTIME_VERSION);
     fs::create_dir_all(&version_dir)
@@ -128,7 +135,11 @@ pub fn ensure_onnxruntime(runtime_root: &Path) -> Result<PathBuf> {
     let final_dir = lib_dir(runtime_root);
     let _ = fs::remove_dir_all(&final_dir);
     fs::rename(&partial, &final_dir).with_context(|| {
-        format!("Failed to move {} -> {}", partial.display(), final_dir.display())
+        format!(
+            "Failed to move {} -> {}",
+            partial.display(),
+            final_dir.display()
+        )
     })?;
     let _ = fs::remove_file(&archive_path);
 
@@ -144,8 +155,8 @@ fn extract_libs(archive: &Path, dest: &Path) -> Result<()> {
     use tar::Archive;
 
     fs::create_dir_all(dest)?;
-    let file = fs::File::open(archive)
-        .with_context(|| format!("Failed to open {}", archive.display()))?;
+    let file =
+        fs::File::open(archive).with_context(|| format!("Failed to open {}", archive.display()))?;
     let mut tar = Archive::new(GzDecoder::new(file));
     let mut extracted = 0usize;
     for entry in tar.entries()? {
@@ -169,7 +180,10 @@ fn extract_libs(archive: &Path, dest: &Path) -> Result<()> {
         }
     }
     if extracted == 0 {
-        bail!("no libonnxruntime entry found under lib/ in {}", archive.display());
+        bail!(
+            "no libonnxruntime entry found under lib/ in {}",
+            archive.display()
+        );
     }
     Ok(())
 }
@@ -181,8 +195,8 @@ fn extract_libs(archive: &Path, dest: &Path) -> Result<()> {
     use std::io;
 
     fs::create_dir_all(dest)?;
-    let file = fs::File::open(archive)
-        .with_context(|| format!("Failed to open {}", archive.display()))?;
+    let file =
+        fs::File::open(archive).with_context(|| format!("Failed to open {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(file)?;
     let mut extracted = 0usize;
     for i in 0..zip.len() {
@@ -193,7 +207,10 @@ fn extract_libs(archive: &Path, dest: &Path) -> Result<()> {
         let name = entry.name().replace('\\', "/");
         let in_lib = name.split('/').any(|c| c == "lib");
         let file_name = name.rsplit('/').next().unwrap_or("").to_owned();
-        if in_lib && file_name.to_ascii_lowercase().starts_with("onnxruntime") && file_name.to_ascii_lowercase().ends_with(".dll") {
+        if in_lib
+            && file_name.to_ascii_lowercase().starts_with("onnxruntime")
+            && file_name.to_ascii_lowercase().ends_with(".dll")
+        {
             let mut out = fs::File::create(dest.join(&file_name))
                 .with_context(|| format!("Failed to create {file_name}"))?;
             io::copy(&mut entry, &mut out)?;
@@ -201,7 +218,10 @@ fn extract_libs(archive: &Path, dest: &Path) -> Result<()> {
         }
     }
     if extracted == 0 {
-        bail!("no onnxruntime DLL found under lib/ in {}", archive.display());
+        bail!(
+            "no onnxruntime DLL found under lib/ in {}",
+            archive.display()
+        );
     }
     Ok(())
 }
@@ -215,9 +235,19 @@ mod tests {
         // On any supported host this resolves; assert the shape rather than a
         // fixed string so the test holds across the CI platform matrix.
         let asset = asset_name().expect("supported host platform");
-        assert!(asset.starts_with("onnxruntime-"), "unexpected asset: {asset}");
-        assert!(asset.contains(ONNXRUNTIME_VERSION), "missing version: {asset}");
-        let ext = if std::env::consts::OS == "windows" { ".zip" } else { ".tgz" };
+        assert!(
+            asset.starts_with("onnxruntime-"),
+            "unexpected asset: {asset}"
+        );
+        assert!(
+            asset.contains(ONNXRUNTIME_VERSION),
+            "missing version: {asset}"
+        );
+        let ext = if std::env::consts::OS == "windows" {
+            ".zip"
+        } else {
+            ".tgz"
+        };
         assert!(asset.ends_with(ext), "unexpected extension: {asset}");
     }
 
@@ -240,7 +270,9 @@ mod tests {
         {
             assert!(is_onnxruntime_dylib_name("onnxruntime.dll"));
             assert!(is_onnxruntime_dylib_name("ONNXRUNTIME.DLL"));
-            assert!(!is_onnxruntime_dylib_name("onnxruntime_providers_shared.dll"));
+            assert!(!is_onnxruntime_dylib_name(
+                "onnxruntime_providers_shared.dll"
+            ));
         }
     }
 
@@ -307,7 +339,11 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(entries.len(), 1, "only the shared lib should be kept: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the shared lib should be kept: {entries:?}"
+        );
         assert!(entries[0].starts_with("libonnxruntime"));
         // And the freshly-extracted lib is discoverable.
         let root = tmp.path().join("root");

@@ -30,8 +30,9 @@ impl Chunker for PdfChunker {
         // and *panics* on others (e.g. "beginbfrange exected hexstring"). With
         // `panic = "unwind"` (see workspace Cargo.toml) we catch that panic here
         // and treat it the same as a normal extraction error.
-        let extracted =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pdf_extract::extract_text(path)));
+        let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text(path)
+        }));
         let text = match extracted {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => {
@@ -148,7 +149,9 @@ mod tests {
         f.write_all(b"%PDF-1.5\n\xde\xad\xbe\xef not a real pdf body\n%%EOF")
             .unwrap();
         let chunker = PdfChunker::new(256, 32);
-        let out = chunker.chunk(f.path(), "").expect("must not propagate an error");
+        let out = chunker
+            .chunk(f.path(), "")
+            .expect("must not propagate an error");
         assert!(out.is_empty(), "unparseable PDF should yield no chunks");
     }
 }

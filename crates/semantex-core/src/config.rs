@@ -192,6 +192,20 @@ impl SemantexConfig {
     }
 }
 
+/// Read a positive `usize` tuning knob from an environment variable.
+///
+/// Returns the parsed value when `key` is set to a positive integer; a missing,
+/// unparseable, or zero/negative value falls back to `default`. Callers pass a
+/// `default` that is already a sane positive number, so the result is always
+/// usable as a thread count / batch size / concurrency limit.
+pub(crate) fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,15 +34,8 @@ const DEFAULT_ORT_BATCH: usize = 32;
 /// quickly while leaving cores for the developer's foreground work. Bounded
 /// concurrency (the `index::gate` semaphore) keeps total memory in check.
 fn index_ort_threads() -> usize {
-    if let Some(n) = std::env::var("SEMANTEX_INDEX_ORT_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    (cores / 2).clamp(2, 8)
+    crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", (cores / 2).clamp(2, 8))
 }
 
 /// ColBERT encoder wrapping LateOn-Code-edge via `next-plaid-onnx`.
@@ -99,12 +92,10 @@ impl ColbertEmbedder {
     /// Returns an error only if the model directory does not exist. ONNX session
     /// construction errors are deferred to the first encode call.
     pub fn new(model_dir: &Path) -> Result<Self> {
-        let threads: usize = std::env::var("SEMANTEX_ORT_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(4);
-        Self::with_threads(model_dir, threads)
+        Self::with_threads(
+            model_dir,
+            crate::config::env_usize("SEMANTEX_ORT_THREADS", 4),
+        )
     }
 
     /// Construct an embedder tuned for **indexing** (building the PLAID index),
@@ -176,11 +167,7 @@ impl ColbertEmbedder {
         self.build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let batch_size: usize = std::env::var("SEMANTEX_ORT_BATCH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_ORT_BATCH);
+        let batch_size = crate::config::env_usize("SEMANTEX_ORT_BATCH", DEFAULT_ORT_BATCH);
 
         #[allow(unused_mut)]
         let mut builder = Colbert::builder(&self.model_dir)
