@@ -571,7 +571,11 @@ impl IndexBuilder {
             //      which holds a working copy of the index. The pre-W-Index
             //      value (128) violated (1) and inflated peak memory.
 
-            let embedder = ColbertEmbedder::new(&colbert_model_dir)?;
+            // Indexing-tuned embedder: more ORT threads than the query path
+            // (throughput-bound, and its concurrency is bounded by the build
+            // gate below). Works even for in-process daemon builds, where the
+            // query embedder would otherwise be pinned to 1 thread.
+            let embedder = ColbertEmbedder::for_indexing(&colbert_model_dir)?;
             let plaid_dir = index_dir.join("plaid");
             let mapping_path = index_dir.join("plaid_mapping.bin");
             let plaid_dir_str = plaid_dir.to_string_lossy().into_owned();
@@ -607,6 +611,22 @@ impl IndexBuilder {
             };
 
             if plaid_missing {
+                // Bound how many FULL builds run at once across all repos (see
+                // index::gate). A full rebuild holds the token embeddings plus
+                // the k-means working set in RAM (several GB), so an unbounded
+                // thundering herd — many repos auto-indexing after a reboot —
+                // would thrash or OOM the machine. Incremental updates (the
+                // `else` branch) are cheap and skip the gate, keeping restarts
+                // instant. The slot releases when `_slot` drops (block end) or
+                // when the process exits (OS releases the advisory lock).
+                let _slot = crate::index::gate::acquire(|| {
+                    tracing::info!(
+                        "Waiting for a free index-build slot (max {} concurrent full builds; \
+                         override with SEMANTEX_MAX_CONCURRENT_BUILDS)",
+                        crate::index::gate::max_concurrent_builds()
+                    );
+                });
+
                 // Full rebuild — encode in small batches (memory bound), then
                 // make ONE call to update_or_create with all embeddings.
                 //

@@ -28,6 +28,23 @@ pub type TokenEmbeddings = Array2<f32>;
 /// scratch) or to push throughput on large machines (larger = bigger GEMMs).
 const DEFAULT_ORT_BATCH: usize = 32;
 
+/// ORT intra-op thread count for the **indexing** path (see
+/// [`ColbertEmbedder::for_indexing`]). `SEMANTEX_INDEX_ORT_THREADS` overrides;
+/// otherwise `clamp(cores / 2, 2, 8)` — enough parallelism to finish a build
+/// quickly while leaving cores for the developer's foreground work. Bounded
+/// concurrency (the `index::gate` semaphore) keeps total memory in check.
+fn index_ort_threads() -> usize {
+    if let Some(n) = std::env::var("SEMANTEX_INDEX_ORT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(2, 8)
+}
+
 /// ColBERT encoder wrapping LateOn-Code-edge via `next-plaid-onnx`.
 ///
 /// Produces per-token embeddings (N_tokens x 48d) for both queries and documents.
@@ -69,7 +86,12 @@ impl ColbertEmbedder {
     /// environment toggles. The actual ONNX session is created on the first
     /// encode call, or via [`ColbertEmbedder::warm_up`] from a background thread.
     ///
-    /// Thread count is read from `SEMANTEX_ORT_THREADS` (default 4).
+    /// Thread count is read from `SEMANTEX_ORT_THREADS` (default 4). This is the
+    /// QUERY default: daemons that serve search keep it low so N concurrent
+    /// per-project daemons don't multiply ORT intra-op scratch into an OOM. For
+    /// the indexing path use [`ColbertEmbedder::for_indexing`] instead, which
+    /// picks a higher, machine-adaptive thread count (indexing is throughput-
+    /// bound and its concurrency is bounded by the build gate, see `index::gate`).
     /// CoreML acceleration is gated behind `SEMANTEX_COREML=1`.
     ///
     /// # Errors
@@ -77,20 +99,44 @@ impl ColbertEmbedder {
     /// Returns an error only if the model directory does not exist. ONNX session
     /// construction errors are deferred to the first encode call.
     pub fn new(model_dir: &Path) -> Result<Self> {
-        if !model_dir.exists() {
-            anyhow::bail!("ColBERT model dir does not exist: {}", model_dir.display());
-        }
-
         let threads: usize = std::env::var("SEMANTEX_ORT_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
             .unwrap_or(4);
+        Self::with_threads(model_dir, threads)
+    }
+
+    /// Construct an embedder tuned for **indexing** (building the PLAID index),
+    /// as opposed to serving queries.
+    ///
+    /// Indexing encodes thousands of chunks and is throughput-bound, so it wants
+    /// real CPU parallelism — unlike the query path, which keeps threads low to
+    /// bound memory across many concurrent per-project daemons. ORT's intra-op
+    /// pool is created per session, independent of any process-global
+    /// `OMP_NUM_THREADS` pinned at daemon startup, so an in-process background
+    /// build (see `McpServer::spawn_background_index`) gets these threads even
+    /// inside a daemon launched in memory-constrained mode.
+    ///
+    /// Thread count: `SEMANTEX_INDEX_ORT_THREADS` if set, else an adaptive
+    /// `clamp(cores / 2, 2, 8)`. Half the cores (capped at 8) keeps a couple
+    /// cores free for the developer's foreground work while still finishing a
+    /// build in a fraction of the single-threaded time. Memory stays bounded
+    /// because only a few full builds run at once (the `index::gate` semaphore).
+    pub fn for_indexing(model_dir: &Path) -> Result<Self> {
+        Self::with_threads(model_dir, index_ort_threads())
+    }
+
+    fn with_threads(model_dir: &Path, threads: usize) -> Result<Self> {
+        if !model_dir.exists() {
+            anyhow::bail!("ColBERT model dir does not exist: {}", model_dir.display());
+        }
 
         let use_coreml = std::env::var("SEMANTEX_COREML").is_ok_and(|v| v == "1");
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
-            threads,
+            threads: threads.max(1),
             use_coreml,
             encoder: OnceLock::new(),
             build_lock: std::sync::Mutex::new(()),
