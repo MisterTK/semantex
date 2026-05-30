@@ -10,6 +10,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -27,9 +28,16 @@ def _cache_dir() -> Path:
 
 def _process_one(inst: Instance, semantex_bin: str) -> dict:
     dest = _cache_dir() / inst.instance_id
-    marker = dest / ".semantex" / "updated_at"
+    semantex_dir = dest / ".semantex"
+    marker = semantex_dir / "updated_at"
     if marker.exists():
         return {"instance_id": inst.instance_id, "status": "cached"}
+    # A .semantex dir WITHOUT the updated_at marker is a partial/aborted index
+    # (e.g. sparse built but dense PLAID never finished). `semantex index` would
+    # treat its chunk manifest as up-to-date and skip every file, producing 0
+    # chunks and never completing. Clear it so we always do a clean full index.
+    if semantex_dir.exists():
+        shutil.rmtree(semantex_dir, ignore_errors=True)
     t0 = time.monotonic()
     try:
         checkout(
@@ -43,7 +51,11 @@ def _process_one(inst: Instance, semantex_bin: str) -> dict:
             "status": "checkout_failed",
             "error": str(e),
         }
-    res = index_repo(repo_path=dest, semantex_binary=semantex_bin, timeout_secs=900)
+    # Large repos (e.g. django/sympy) embed tens of thousands of chunks on CPU
+    # and can take 30-60 min; the old 900s default timed them out. Override via
+    # SWE_BENCH_INDEX_TIMEOUT.
+    timeout = int(os.environ.get("SWE_BENCH_INDEX_TIMEOUT", "7200"))
+    res = index_repo(repo_path=dest, semantex_binary=semantex_bin, timeout_secs=timeout)
     return {
         "instance_id": inst.instance_id,
         "status": "indexed" if res.ok else "index_failed",

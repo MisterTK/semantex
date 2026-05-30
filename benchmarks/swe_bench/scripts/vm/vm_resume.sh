@@ -44,7 +44,15 @@ if [ "$INDEXED" -lt 90 ]; then
       . .venv/bin/activate
       set -a; . \$HOME/semantex/.env; set +a
       export SWE_BENCH_REPO_CACHE=$CACHE
-      python -m scripts.pre_index --phase a --workers 8 --semantex-bin $SEMANTEX_BINARY 2>&1 | tee \$HOME/pre_index.log
+      # Indexing is memory-bound, not CPU-bound: the next-plaid k-means distance
+      # GEMM peaks at ~rayon_threads x block. With the vendored chunk_size_data
+      # patch (block ~167MB) + RAYON_NUM_THREADS=2, each worker peaks ~4-5 GB, so
+      # ~16 parallel workers fit in 128 GB at full index quality. SEMANTEX_NO_RLIMIT
+      # disables the 24 GB virtual-address cap (irrelevant on a dedicated VM).
+      export RAYON_NUM_THREADS=2
+      export SEMANTEX_NO_RLIMIT=1
+      export SWE_BENCH_INDEX_TIMEOUT=7200
+      python -m scripts.pre_index --phase a --workers 16 --semantex-bin $SEMANTEX_BINARY 2>&1 | tee \$HOME/pre_index.log
     "
     echo "preindex tmux session started"
   fi
