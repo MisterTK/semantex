@@ -44,15 +44,19 @@ if [ "$INDEXED" -lt 90 ]; then
       . .venv/bin/activate
       set -a; . \$HOME/semantex/.env; set +a
       export SWE_BENCH_REPO_CACHE=$CACHE
-      # Indexing is memory-bound, not CPU-bound: the next-plaid k-means distance
-      # GEMM peaks at ~rayon_threads x block. With the vendored chunk_size_data
-      # patch (block ~167MB) + RAYON_NUM_THREADS=2, each worker peaks ~4-5 GB, so
-      # ~16 parallel workers fit in 128 GB at full index quality. SEMANTEX_NO_RLIMIT
-      # disables the 24 GB virtual-address cap (irrelevant on a dedicated VM).
+      # Indexing is MEMORY-bound. The chunk_size_data patch fixed the k-means
+      # distance block (~26GB->~9GB on small repos), but LARGE repos (django/
+      # sympy, 40-80k chunks) still hold all token embeddings + the k-means
+      # sample tensor in RAM => 12-15 GB PER WORKER (measured via OOM at 16
+      # workers). So cap parallelism to ~6 workers: 6 x ~15 GB = ~90 GB, well
+      # under 128 GB. SEMANTEX_MAX_RSS_MB=18000 is a hard backstop — a runaway
+      # worker self-aborts (that one repo fails, retried on resume) instead of
+      # OOM-killing the whole box. NO_RLIMIT disables the 24 GB virtual cap.
       export RAYON_NUM_THREADS=2
       export SEMANTEX_NO_RLIMIT=1
+      export SEMANTEX_MAX_RSS_MB=18000
       export SWE_BENCH_INDEX_TIMEOUT=7200
-      python -m scripts.pre_index --phase a --workers 16 --semantex-bin $SEMANTEX_BINARY 2>&1 | tee \$HOME/pre_index.log
+      python -m scripts.pre_index --phase a --workers 6 --semantex-bin $SEMANTEX_BINARY 2>&1 | tee \$HOME/pre_index.log
     "
     echo "preindex tmux session started"
   fi
