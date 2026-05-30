@@ -130,3 +130,25 @@ impl Chunker for PdfChunker {
         Ok(chunks)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A file that is not a valid PDF must never crash the chunker: whether
+    /// `pdf_extract` returns Err or panics internally, `chunk()` returns
+    /// `Ok(empty)` so the rest of the repo still indexes. (Regression for the
+    /// matplotlib/xarray bundled-PDF abort: a pdf_extract unwrap() panic with
+    /// panic="abort" took down the entire `semantex index` run.)
+    #[test]
+    fn malformed_pdf_yields_empty_not_crash() {
+        let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        // Looks like a PDF header but the body is garbage that no parser accepts.
+        f.write_all(b"%PDF-1.5\n\xde\xad\xbe\xef not a real pdf body\n%%EOF")
+            .unwrap();
+        let chunker = PdfChunker::new(256, 32);
+        let out = chunker.chunk(f.path(), "").expect("must not propagate an error");
+        assert!(out.is_empty(), "unparseable PDF should yield no chunks");
+    }
+}
