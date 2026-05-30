@@ -20,6 +20,14 @@ use std::sync::OnceLock;
 /// Per-token embedding matrix: rows = tokens, cols = embedding dimension (48).
 pub type TokenEmbeddings = Array2<f32>;
 
+/// Default per-inference document batch for the single CPU ONNX session.
+///
+/// Matches `next-plaid-onnx`'s own single-session CPU default and the indexer's
+/// outer `PLAID_BATCH`, so one outer encode batch maps to one ORT call. Override
+/// with `SEMANTEX_ORT_BATCH` on memory-constrained hosts (smaller = less peak
+/// scratch) or to push throughput on large machines (larger = bigger GEMMs).
+const DEFAULT_ORT_BATCH: usize = 32;
+
 /// ColBERT encoder wrapping LateOn-Code-edge via `next-plaid-onnx`.
 ///
 /// Produces per-token embeddings (N_tokens x 48d) for both queries and documents.
@@ -92,31 +100,52 @@ impl ColbertEmbedder {
 
     /// Build the inner ONNX session (called lazily on first encode).
     ///
-    /// Defaults: int8-quantized model, CPU execution provider, small inference
-    /// batch (2 docs), `SEMANTEX_ORT_THREADS` threads. Memory profile:
-    /// session load ~150 MB + per-encode ~50 MB scratch. The earlier OOM was
-    /// caused by `ExecutionProvider::Auto` picking CoreML on macOS, which
-    /// allocated 10+ GB of partition/buffer state on first inference.
-    /// Opt back into CoreML via `SEMANTEX_COREML=1` only if you've verified
-    /// the memory profile on your specific model + macOS version.
+    /// Defaults: int8-quantized model, **explicit CPU execution provider on
+    /// every platform**, `SEMANTEX_ORT_THREADS` intra-op threads (default 4),
+    /// and a per-inference batch of `SEMANTEX_ORT_BATCH` docs (default
+    /// [`DEFAULT_ORT_BATCH`]). Memory profile: session load ~150 MB + per-encode
+    /// scratch that scales with batch × sequence length (a few hundred MB at the
+    /// default batch). Opt into CoreML on macOS via `SEMANTEX_COREML=1`.
+    ///
+    /// # Why the explicit CPU provider matters (all platforms)
+    ///
+    /// `next-plaid-onnx`'s builder defaults to `ExecutionProvider::Auto`, and
+    /// its `build()` force-pins intra-op threads to **1** whenever the provider
+    /// is `Auto`/`Cuda` for a single session (it assumes a GPU supplies the
+    /// parallelism). On Linux/Windows — where no GPU EP is compiled — leaving
+    /// the provider at `Auto` therefore silently pinned ColBERT inference to a
+    /// **single core**, making CPU indexing 10-30x too slow (a 225-file repo
+    /// took >13 min, never finishing). Pinning `Cpu` explicitly keeps our
+    /// configured `threads` intra-op count. macOS already pinned a provider, so
+    /// it escaped this; the fix simply extends that to every platform.
+    ///
+    /// # Why batch size 32, not 2
+    ///
+    /// The previous hardcoded `2` is the library's *parallel-sessions* batch
+    /// (small batches suit many 1-thread sessions). For our single multi-thread
+    /// CPU session it produced GEMMs too small to engage the intra-op threads.
+    /// 32 matches the library's own single-session CPU default and the indexer's
+    /// outer `PLAID_BATCH`, so one outer batch maps to one ORT call.
     fn build_encoder(&self) -> Result<Colbert> {
         self.build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let batch_size: usize = std::env::var("SEMANTEX_ORT_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_ORT_BATCH);
 
         #[allow(unused_mut)]
         let mut builder = Colbert::builder(&self.model_dir)
             .with_quantized(true)
             .with_threads(self.threads)
-            // README's "Parallel CPU" best practice: small per-inference
-            // batch_size keeps ORT working set small. Documents are still
-            // grouped into our outer encode batches (PLAID_BATCH=128 in the
-            // indexer); this knob bounds the ORT-internal batch, not ours.
-            .with_batch_size(2);
+            .with_batch_size(batch_size);
 
-        // EXPLICIT CPU on macOS by default. ExecutionProvider::Auto would pick
-        // CoreML if the `coreml` feature were enabled, which on this codebase's
-        // index sizes triggered partition+buffer growth into the 10+ GB range.
-        // Users who want CoreML can set SEMANTEX_COREML=1 (gated below).
+        // Pin an explicit execution provider on EVERY platform — see the method
+        // doc comment. On macOS the user may opt into CoreML; everywhere else we
+        // force CPU so that a single session keeps its configured intra-op
+        // thread count (Auto would silently collapse it to 1).
         #[cfg(target_os = "macos")]
         {
             let provider = if self.use_coreml {
@@ -127,7 +156,10 @@ impl ColbertEmbedder {
             builder = builder.with_execution_provider(provider);
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = self.use_coreml;
+        {
+            let _ = self.use_coreml;
+            builder = builder.with_execution_provider(next_plaid_onnx::ExecutionProvider::Cpu);
+        }
 
         builder.build()
     }
