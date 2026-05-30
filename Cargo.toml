@@ -55,7 +55,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+# Unwind (not abort) so a panic inside a third-party file parser (e.g. the
+# pdf-extract crate, which unwrap()s on malformed PDFs) can be caught at the
+# per-file chunking boundary and skip just that file, instead of aborting the
+# whole `semantex index` run. semantex ingests arbitrary files from arbitrary
+# repos, so robustness to one bad file outweighs abort's marginal size win.
+panic = "unwind"
 
 [profile.release-with-debug]
 inherits = "release"

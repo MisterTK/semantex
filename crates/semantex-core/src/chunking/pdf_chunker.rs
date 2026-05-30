@@ -24,11 +24,25 @@ impl PdfChunker {
 
 impl Chunker for PdfChunker {
     fn chunk(&self, path: &Path, _content: &str) -> Result<Vec<Chunk>> {
-        // Extract text from PDF file; on failure return empty vec
-        let text = match pdf_extract::extract_text(path) {
-            Ok(t) => t,
-            Err(e) => {
+        // Extract text from PDF; on ANY failure return an empty vec so one bad
+        // PDF never blocks indexing the rest of the repo. `pdf_extract` not only
+        // returns `Err` for some malformed files, it also `unwrap()`s internally
+        // and *panics* on others (e.g. "beginbfrange exected hexstring"). With
+        // `panic = "unwind"` (see workspace Cargo.toml) we catch that panic here
+        // and treat it the same as a normal extraction error.
+        let extracted =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pdf_extract::extract_text(path)));
+        let text = match extracted {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
                 tracing::warn!("Failed to extract text from PDF {}: {}", path.display(), e);
+                return Ok(Vec::new());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "PDF text extraction panicked for {} — skipping file",
+                    path.display()
+                );
                 return Ok(Vec::new());
             }
         };
