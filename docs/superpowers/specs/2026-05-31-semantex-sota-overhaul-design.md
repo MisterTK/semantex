@@ -4,7 +4,8 @@
 - **Status:** Draft for review
 - **Target:** v0.9 (single-vector dense; schema bump → forced reindex)
 - **Authors:** design from the oxirs competitive review + 2026 code-retrieval SOTA gap analysis (see `~/.claude` project memory `oxirs-review-and-sota-gap-2026-05-31`).
-- **Execution model:** implemented by parallel subagent teams, one per work-stream, from this spec + its derived implementation plan.
+- **Execution model:** implemented by parallel subagent teams, one per work-stream, from this spec + its derived implementation plans.
+- **Plans + reconciliation:** the 8 per-stream plans live in `docs/superpowers/plans/2026-05-31-s{0..7}-*.md`. **Cross-stream interfaces, lead decisions, and corrections discovered during planning are reconciled in `docs/superpowers/plans/2026-05-31-integration-and-cutover.md` — that doc is authoritative where it differs from this spec's sketches** (notably: the real 5-field `ScoredChunkId`, schema bump to 11, the SIMD signatures, and the S5 reframe below).
 
 ---
 
@@ -191,9 +192,10 @@ Eight streams. Each lists **purpose, design, interfaces/files, config, acceptanc
 
 **Purpose:** finish the pending v0.7.1 HyDE wiring; +5 to +12 nDCG on hard/conceptual queries (ReasonIR/BRIGHT), matching the LLM-optional design.
 
-**Design:**
-- Complete the HyDE call-site in `hybrid.rs` (the `~1398-1488` HyDE path) and its wiring into the Semantic route via `agent.rs` `search_semantic`. The `LlmCapability::synthesize_hyde_doc` scaffold already exists (`llm/mod.rs`).
-- Preserve the safety contract: any LLM error/timeout (`SEMANTEX_LLM_HYDE_TIMEOUT_MS`, default 15 s) returns base results unchanged — HyDE never breaks a search. Default build remains zero-LLM-deps (feature-gated).
+**Design (corrected after the S5 planning spike):** the HyDE core (`HybridSearcher::search_with_hyde` / `merge_hyde_results`) **and the daemon TCP path are already complete and safety-correct.** The real residual gap is the **MCP in-process path** (`crates/semantex-mcp/src/server.rs`): `tool_agent` never chains `.with_runtime()`, so every MCP HyDE/classify call builds a fresh Tokio runtime per request.
+- Wire a shared Tokio runtime into the MCP server (mirror `listener.rs::bind`: add an `llm_runtime: Option<Arc<Runtime>>`, build once, chain `.with_runtime()` in `tool_agent`).
+- Fix the latent Cargo bug: `semantex-mcp`'s `llm` feature must pull tokio — `llm = ["semantex-core/llm", "dep:tokio"]` (today tokio is gated behind `http`, so `--no-default-features --features llm` won't compile).
+- Add the missing end-to-end safety tests: any LLM error/timeout (`SEMANTEX_LLM_HYDE_TIMEOUT_MS`, default 15 s) returns base results unchanged — HyDE never breaks a search. Default build remains zero-LLM-deps (feature-gated).
 
 **Acceptance gate:** with `--features llm` + a configured backend (Ollama for airgap test), HyDE-on improves hard-query nDCG on S0's reasoning-heavy slice (CoIR conceptual / BRIGHT-style); HyDE-off and LLM-error paths are byte-identical to base.
 
