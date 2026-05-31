@@ -92,6 +92,8 @@ Task 9 adds an explicit regression test for this. Do not regress it in any earli
 
 ## Task 1: SPIKE — export Qwen3-Reranker-0.6B to ONNX int8 and record the contract
 
+> **EXISTING EXPORTS — verified on HF 2026-05-31; prefer these over a cold export.** Apache-2.0 ONNX of `Qwen/Qwen3-Reranker-0.6B` already exists with the **yes/no-logit** contract this plan needs: **[`shawnw3i/Qwen3-Reranker-0.6B-ONNX`](https://huggingface.co/shawnw3i/Qwen3-Reranker-0.6B-ONNX)** and **[`zhiqing/Qwen3-Reranker-0.6B-ONNX`](https://huggingface.co/zhiqing/Qwen3-Reranker-0.6B-ONNX)**. They document the exact values this spike must record — inputs `input_ids`/`attention_mask`/**`position_ids`** (int64), output `logits` `[batch,seq,vocab]`, `token_true_id`="yes" / `token_false_id`="no", and the `<|im_start|>…<Instruct>/<Query>/<Document>…<|im_end|>` prompt template — **lift these verbatim** rather than re-deriving. Both are **float (not int8) → quantize**. Simpler alternative for CPU: **[`tomaarsen/Qwen3-Reranker-0.6B-seq-cls`](https://huggingface.co/tomaarsen/Qwen3-Reranker-0.6B-seq-cls)** (Apache-2.0, 321k dls) is a sequence-classification-head conversion → export it to ONNX for the simpler `ClassifierLogit` strategy (one logit, no vocab-wide output) and A/B the two paths. **Re-host the chosen artifact into a project-controlled Apache-2.0 repo.** Tool: **`benchmarks/onnx_models/prepare_models.py`**. Cold `optimum-cli` export below stays as the fallback.
+
 **This task produces no Rust. It records the values every later ONNX task depends on. Do it first.** Run the export offline (network + ~1.2 GB scratch); commit only the research-notes file, never the weights.
 
 **Files:**

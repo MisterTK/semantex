@@ -111,7 +111,10 @@ Phase 3 (integration):        run S0 A/B → tune → cutover decisions → sche
 
 ## 5. Human / ops prerequisites (block the relevant stream's download path)
 
-- **CodeRankEmbed int8 ONNX (S2)** and **Qwen3-Reranker-0.6B int8 ONNX (S3)** are **not pre-hosted** as ONNX. The spike tasks export + quantize them locally; a human must then **upload the artifacts to a project-controlled, permissively-licensed HF repo** and record the resolved URLs in `2026-05-31-research-notes.md` before the in-product download path works. Until then, S2/S3 default-path integration tests run against the locally-exported artifacts.
+- **ONNX artifacts EXIST on HF (verified 2026-05-31) — re-host, don't cold-export.** Permissively-licensed community ONNX exports of both models are already published:
+  - *Embedder (MIT):* `mrsladoje/CodeRankEmbed-onnx-int8` (int8) and `sirasagi62/code-rank-embed-onnx` (fp32, 896 dls).
+  - *Reranker (Apache-2.0):* `shawnw3i/Qwen3-Reranker-0.6B-ONNX` and `zhiqing/Qwen3-Reranker-0.6B-ONNX` — both **float (not int8)** and both expose the **yes/no-logit** contract (inputs `input_ids`/`attention_mask`/`position_ids`; output `logits[batch,seq,vocab]`; yes/no token ids; the `<|im_start|>…` prompt template — lift verbatim into the S3 `ModelSpec`). Simpler CPU alternative: `tomaarsen/Qwen3-Reranker-0.6B-seq-cls` (Apache-2.0, 321k dls) → export for the `ClassifierLogit` path.
+  The remaining human/ops step is to **verify parity, int8-quantize where needed, and re-host into project-controlled permissive repos** (`<org>/CodeRankEmbed-onnx-int8` MIT, `<org>/Qwen3-Reranker-0.6B-onnx-int8` Apache-2.0, with original attribution), then record the URLs in `2026-05-31-research-notes.md`. **Don't point production at third-party personal repos** (they can vanish / mutate / be unaudited). The tool **`benchmarks/onnx_models/prepare_models.py`** does download→verify→int8→re-host in one command. Until re-hosted, S2/S3 dev/tests run against the community or locally-exported artifacts.
 - **`tokenizers` C-backend:** the S2/S3 spikes must record a `tokenizers` feature set with the `onig` C dependency **disabled** (airgap / no-C-C++ rule); use the pure-Rust tokenizer path.
 
 ---

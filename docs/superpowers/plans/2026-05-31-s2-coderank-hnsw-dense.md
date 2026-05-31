@@ -100,6 +100,8 @@ Tasks 3–6 build the encoder + kernels + model provisioning (pure additions, su
 
 ### Task 1: SPIKE — export CodeRankEmbed to ONNX int8 + record model facts
 
+> **EXISTING EXPORTS — verified on HF 2026-05-31; prefer these over a cold export.** MIT-licensed ONNX of `nomic-ai/CodeRankEmbed` already exists: **[`mrsladoje/CodeRankEmbed-onnx-int8`](https://huggingface.co/mrsladoje/CodeRankEmbed-onnx-int8)** (tagged int8; `onnx/model.onnx` + `tokenizer.json` + `config.json`) and **[`sirasagi62/code-rank-embed-onnx`](https://huggingface.co/sirasagi62/code-rank-embed-onnx)** (fp32 `model.onnx`, 896 dls — most vetted). This spike should **verify one of these for parity + int8**, record dim/prefix/pooling from it, then **re-host into a project-controlled MIT repo** (don't point production at a personal repo). The tool **`benchmarks/onnx_models/prepare_models.py`** does verify→int8→re-host in one command. The cold `optimum-cli` export below stays as the fallback if parity verification fails.
+
 **Goal:** Produce `model_int8.onnx` + `tokenizer.json` for `nomic-ai/CodeRankEmbed` and RECORD the facts later tasks depend on. No Rust in this task.
 
 **Files:**
