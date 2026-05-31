@@ -5,7 +5,7 @@
 - **Target:** v0.9 (single-vector dense; schema bump → forced reindex)
 - **Authors:** design from the oxirs competitive review + 2026 code-retrieval SOTA gap analysis (see `~/.claude` project memory `oxirs-review-and-sota-gap-2026-05-31`).
 - **Execution model:** implemented by parallel subagent teams, one per work-stream, from this spec + its derived implementation plans.
-- **Plans + reconciliation:** the 8 per-stream plans live in `docs/superpowers/plans/2026-05-31-s{0..7}-*.md`. **Cross-stream interfaces, lead decisions, and corrections discovered during planning are reconciled in `docs/superpowers/plans/2026-05-31-integration-and-cutover.md` — that doc is authoritative where it differs from this spec's sketches** (notably: the real 5-field `ScoredChunkId`, schema bump to 11, the SIMD signatures, and the S5 reframe below).
+- **Plans + reconciliation:** the per-stream plans live in `docs/superpowers/plans/2026-05-31-s{0..8}-*.md` (S0–S7 written; S8 model-registry plan added in this revision). **Cross-stream interfaces, lead decisions, and corrections discovered during planning are reconciled in `docs/superpowers/plans/2026-05-31-integration-and-cutover.md` — that doc is authoritative where it differs from this spec's sketches** (notably: the real 5-field `ScoredChunkId`, schema bump to 11, the SIMD signatures, and the S5 reframe below).
 
 ---
 
@@ -31,6 +31,7 @@ The headline architectural bet (user decision): **replace the late-interaction C
 | D6 | **next-plaid streaming refactor dropped as moot** | Replacing PLAID removes the k-means build-memory problem; HNSW + int8 + streaming inserts solve build-memory natively |
 | D7 | ANN index = **HNSW + int8 vectors + fp32 rescore**, brute-force fallback for tiny indexes; **IVF-PQ deferred** | Best recall/latency at repo scale; int8 keeps memory tiny; defer PQ until a real large-repo ceiling appears |
 | D8 | Reranker = **Qwen3-Reranker-0.6B (Apache-2.0)** as the code-capable option; **bge-reranker-v2-m3** retained as the permissive, already-integrated fallback; jina-v3 excluded (NC) | Code-trained, permissive; harness decides the shipped default and whether rerank flips on |
+| D9 | **Config-driven model registry** (S8): every model (embedder/reranker/LLM) is declared as *data* in a manifest, resolved + capability-negotiated at load — models are data, not code | Future-proof modularity: run any model by config, no recompile; new models/capabilities slot in without engine refactor. Per-request routing + third-party plugins explicitly deferred (YAGNI) |
 
 ---
 
@@ -62,11 +63,13 @@ query
 
 Selected by config (`SEMANTEX_DENSE_BACKEND` / `dense_backend` in config), so the benchmark harness A/Bs them on identical corpora and we default to the proven winner.
 
+**All three model seams — dense embedder, reranker, LLM — resolve through a config-driven model registry (S8).** Models are declared as *data* in a manifest (built-in permissive defaults + optional user `models.toml`), so any model can be swapped by config with no recompile and no engine refactor. Query-time models (reranker, LLM) swap live; embedder swaps trigger a versioned, zero-downtime reindex (the re-embedding compute is inherent to changing the vector space — see §S8).
+
 ---
 
 ## 4. Work-streams
 
-Eight streams. Each lists **purpose, design, interfaces/files, config, acceptance gate, dependencies**. Interfaces and gates are designed so teams work in parallel without colliding on the same files.
+Nine streams (S0–S8). Each lists **purpose, design, interfaces/files, config, acceptance gate, dependencies**. Interfaces and gates are designed so teams work in parallel without colliding on the same files.
 
 ### S0 · Benchmark harness `benchmarks/relevance/` — *foundation; gates validation of everything*
 
@@ -233,6 +236,27 @@ Eight streams. Each lists **purpose, design, interfaces/files, config, acceptanc
 
 ---
 
+### S8 · Model Registry & Hot-Swap — *cross-cutting foundation; lands with S1 (Phase 1); S1/S2/S3 build onto it*
+
+**Purpose:** make every model (embedder, reranker, LLM) a **config-declared, swappable unit** — users run the models they want, and new/better models + capabilities slot in with no recompile and no engine refactor. This is the modularity guarantee.
+
+**Design:**
+- New module `crates/semantex-core/src/model/` — `ModelSpec`, `ModelCapabilities`, `ModelRegistry` (built-in defaults + user-manifest merge, role→spec resolution, lazy+cached loading).
+- **`ModelSpec` (data, not code):** `id`, `role` (embedder|reranker|llm), `source` (`hf:<repo>` | `local:<path>` | `url:<…>`), model/tokenizer files, and role-specific fields — *embedder:* `dims`, `max_context`, `query_prefix`, `doc_prefix`, `pooling` (mean|cls|late_interaction), `normalize`, `quant` (int8_symmetric|…); *reranker:* `score_strategy` (classifier_head|yes_no_logit) + prompt template/yes-token; *llm:* provider/model/endpoint (delegated to genai). **Every model-specific nuance lives here, never in engine code** — this is what prevents quality loss (no lowest-common-denominator flattening).
+- **`ModelCapabilities`:** `multi_vector`, `matryoshka_dims`, `produces_sparse`, `instruction_aware`, `max_batch`, … The engine **negotiates** against this: `multi_vector=true` → route to the PLAID/MaxSim backend; `false` → single-vector/HNSW; `matryoshka_dims` present → allow dim truncation; etc. **Adding a future capability = one descriptor field + one handler; existing models default it off and keep working** — this is the "new capabilities get released, no refactor" guarantee.
+- **Manifest:** compiled-in permissive defaults (CodeRankEmbed, Qwen3-Reranker, bge-v2-m3, LateOn-ColBERT, …) + an optional user `models.toml` (`~/.semantex/` or project `.semantex/`) that adds/overrides by data. Active selection by logical name via config/env (`SEMANTEX_EMBEDDER`, `SEMANTEX_RERANKER_MODEL`, `SEMANTEX_LLM_MODEL`).
+- **Versioned-index switchover (embedder swaps):** stamp each dense index with its embedder spec fingerprint (id+dims+pooling+quant+hash) in `meta.json`. On a model change, build a new versioned index dir `.semantex/dense/<backend>/<fingerprint>/` alongside the old; **flip the active pointer atomically** when complete → zero-downtime (the re-embedding compute is inherent and cannot be skipped). Generalizes the schema-version / stemmer / `DenseBackendKind` guards into one uniform "index stamped with its model; mismatch → versioned rebuild + switchover."
+- **Query-time live swap (reranker/LLM):** changing the active spec reloads the model lazily on next query (or on a daemon config-reload signal); no reindex; lazy + cached via the existing `OnceLock`/`build_lock` discipline → zero hot-path cost.
+- **Integration with S1/S2/S3 (S8 subsumes their ad-hoc selection):** S1's `DenseBackendKind` selection becomes `ModelRegistry::active_embedder()` resolving spec→backend; S2's CodeRankEmbed constants become a built-in `ModelSpec`; S3's `classifier_head|yes_no_logit` + model selection become reranker `ModelSpec` fields. **The traits/impls from S1/S2/S3 are unchanged — only *how the active model is chosen* moves into the registry.** (Reconciliation deltas for those three streams are recorded in the integration doc.)
+
+**Config/env:** `SEMANTEX_EMBEDDER`, `SEMANTEX_RERANKER_MODEL`, `SEMANTEX_LLM_MODEL` (now registry lookups); `models.toml` manifest path.
+
+**Acceptance gate:** (1) swapping the configured reranker/LLM by config alone changes behavior with **no recompile and no reindex**; (2) swapping the embedder by config triggers a versioned rebuild + atomic switchover, and a mismatched index errors cleanly; (3) a user `models.toml` entry for a **new** (second permissive) model loads + runs end-to-end with **no code changes**; (4) capability routing picks PLAID for `multi_vector=true` and HNSW for single-vector from the spec alone. All four are tests.
+
+**Dependencies:** lands in **Phase 1 alongside S1** (it is the selection foundation S1/S2/S3 consume). Satisfies CLAUDE.md rule #6 better than before (no hardcoded model names — registry/manifest; built-ins permissive).
+
+---
+
 ## 5. Sequencing & dependency graph
 
 ```
@@ -248,7 +272,7 @@ Eight streams. Each lists **purpose, design, interfaces/files, config, acceptanc
                                               Integration + harness A/B + tuning + cutover
 ```
 
-**Phase 1 (unblock):** S0 (harness) and S1 (seam) in parallel — they gate judgment and S2.
+**Phase 1 (unblock):** S0 (harness), S1 (seam), and **S8 (model registry)** in parallel — they gate judgment and S2. S1 + S8 co-design the selection API (S1 owns the trait; S8 owns spec→backend resolution); S2/S3 then consume the registry rather than building their own selection.
 **Phase 2 (parallel build):** S2, S3, S4, S5, S6, S7. **`hybrid.rs` contention:** S1 lands first; then S2 (dense channel) and S7 (fusion) coordinate — assign them to the *same* team or serialize their `hybrid.rs` edits; S4/S5 touch distinct regions but rebase on S1.
 **Phase 3 (decide):** run the full harness A/B → pick the dense-backend default (D4 cutover), decide rerank-on + model (S3), tune graph decays (S4) and fusion knobs (S7). **Only if `coderank-hnsw` wins** do we schedule ColBERT/next-plaid removal (separate follow-up PR).
 
@@ -267,6 +291,8 @@ Eight streams. Each lists **purpose, design, interfaces/files, config, acceptanc
 | `hybrid.rs` merge thrash across S2/S4/S5/S7 | Land S1 first; serialize hybrid.rs edits; golden-output test catches behavior drift |
 | CoIR full corpus too big for CPU | Logged, seeded subsets (D5); never silent-truncate; report the manifest |
 | Schema bump strands existing indexes | Forced clean reindex on version mismatch (existing pattern); documented in migration notes |
+| Model-manifest misconfiguration (bad/unknown spec) | Validate specs at load; clear errors naming the offending field; fall back to the built-in default model; never silently mis-load |
+| Registry indirection regresses quality vs hardcoded path | Specs carry every model nuance (prefix/pooling/quant/capabilities) as data; golden test asserts registry-resolved `colbert-plaid`/`coderank-hnsw` produce identical results to direct construction |
 
 ---
 
@@ -280,6 +306,8 @@ Eight streams. Each lists **purpose, design, interfaces/files, config, acceptanc
 - next-plaid streaming refactor (moot under D1/D6).
 - All oxirs speculative modules (`quantum_rag`, `consciousness/*`, `diffusion_embeddings`, NAS, the ColBERT/cross-encoder stubs).
 - Cloud/API embedders or rerankers (break local/airgap).
+- **Per-request / multi-model routing** (one daemon serving several models simultaneously, picked per query/caller/repo) — deferred; the registry makes it a later increment, not a refactor.
+- **Third-party plugin providers** (dynamically-loaded model backends via shared lib/WASM/subprocess) — deferred (airgap/security/ABI cost; YAGNI for a local CLI).
 
 ---
 
@@ -297,7 +325,7 @@ Eight streams. Each lists **purpose, design, interfaces/files, config, acceptanc
 
 ## 9. Deliverable flow
 
-This design spec → (writing-plans skill) → a **task-by-task implementation plan** with TDD steps, exact file edits, and per-task acceptance gates, organized by the S0–S7 streams above. That plan is what the subagent teams execute from, stream by stream, with the harness (S0) as the shared judge.
+This design spec → (writing-plans skill) → a **task-by-task implementation plan** with TDD steps, exact file edits, and per-task acceptance gates, organized by the S0–S8 streams above. That plan is what the subagent teams execute from, stream by stream, with the harness (S0) as the shared judge.
 
 ---
 
