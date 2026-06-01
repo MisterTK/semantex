@@ -9,7 +9,8 @@ match_mode:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .indexing import ensure_index
@@ -25,6 +26,26 @@ class RunOutput:
     relevances: list[list[int]]
     n_relevant: list[int]
     per_query: list[RankedResult]
+    # D4 instrumentation (optional; default-empty keeps unit tests stable).
+    embedder: Optional[str] = None
+    index_built: bool = False
+    index_secs: float = 0.0
+    index_peak_rss_mb: Optional[float] = None
+    latencies_ms: list[float] = field(default_factory=list)
+
+    @property
+    def cold_latency_ms(self) -> Optional[float]:
+        return self.latencies_ms[0] if self.latencies_ms else None
+
+    @property
+    def warm_latency_ms(self) -> Optional[float]:
+        """Median of all-but-first query latencies (warm path)."""
+        warm = self.latencies_ms[1:]
+        if not warm:
+            return None
+        s = sorted(warm)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def _relevance_vector(rr: RankedResult, gold: set[str], *, match_mode: str) -> list[int]:
@@ -44,7 +65,11 @@ def run_corpus(
 ) -> RunOutput:
     if corpus.corpus_dir is None:
         raise ValueError("corpus.corpus_dir must be set to index + search")
-    ensure_index(corpus_dir=corpus.corpus_dir, semantex_binary=semantex_binary)
+    # The embedder is authoritative at INDEX time (it picks + persists the dense
+    # backend in meta.json). Pass it through so arm B actually builds coderank-hnsw.
+    build = ensure_index(
+        corpus_dir=corpus.corpus_dir, semantex_binary=semantex_binary, embedder=embedder
+    )
 
     client = SemantexClient(
         semantex_binary=semantex_binary,
@@ -55,8 +80,11 @@ def run_corpus(
     relevances: list[list[int]] = []
     n_relevant: list[int] = []
     per_query: list[RankedResult] = []
+    latencies_ms: list[float] = []
     for q in corpus.queries:
+        t0 = time.monotonic()
         rr = client.search(q.query_id, q.text, ablation=ablation, k=k)
+        latencies_ms.append((time.monotonic() - t0) * 1000.0)
         gold = set(q.gold_doc_ids)
         relevances.append(_relevance_vector(rr, gold, match_mode=match_mode))
         n_relevant.append(len(gold))
@@ -68,4 +96,9 @@ def run_corpus(
         relevances=relevances,
         n_relevant=n_relevant,
         per_query=per_query,
+        embedder=embedder,
+        index_built=build.built,
+        index_secs=build.duration_secs,
+        index_peak_rss_mb=build.peak_rss_mb,
+        latencies_ms=latencies_ms,
     )
