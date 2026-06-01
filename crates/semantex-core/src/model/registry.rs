@@ -110,10 +110,13 @@ impl ModelRegistry {
     ///   keeps the S0 harness's `SEMANTEX_DENSE_BACKEND=coderank-hnsw` A/B knob
     ///   live alongside the canonical `SEMANTEX_EMBEDDER` knob.
     ///
-    /// When the alias is at its default (`colbert-plaid`) the embedder wins, so
-    /// `SEMANTEX_EMBEDDER=coderank-137m` alone (default dense_backend) correctly
-    /// routes to coderank-hnsw. The shipped all-default config resolves to
-    /// `colbert-plaid` (D4) until the Phase-3 cutover flips the default embedder.
+    /// When the alias is at its default (`colbert-plaid`, the
+    /// [`DenseBackendKind::default`] sentinel) the embedder wins, so the shipped
+    /// all-default config — `embedder = "coderank-137m"` (D4 cutover) with the
+    /// default alias — resolves to `coderank-hnsw`. To force colbert-plaid
+    /// regardless of the embedder, set `SEMANTEX_EMBEDDER=lateon-colbert` (which
+    /// capability-routes there) or the explicit `SEMANTEX_DENSE_BACKEND` alias to
+    /// any non-default backend name.
     pub fn resolve_dense_backend(
         config: &SemantexConfig,
         project_path: Option<&Path>,
@@ -142,17 +145,30 @@ mod tests {
 
     #[test]
     fn resolves_active_embedder_default() {
-        // D4: the shipped default embedder is lateon-colbert until cutover.
+        // D4 cutover: the shipped default embedder is coderank-137m.
         let reg = registry_from_builtins();
         let spec = reg.active_embedder().unwrap();
-        assert_eq!(spec.id, "lateon-colbert");
+        assert_eq!(spec.id, "coderank-137m");
         assert_eq!(spec.role, ModelRole::Embedder);
     }
 
     #[test]
-    fn active_embedder_backend_kind_is_plaid_for_default() {
-        // lateon-colbert is multi_vector → PLAID, the D4 default dense path.
+    fn active_embedder_backend_kind_is_hnsw_for_default() {
+        // coderank-137m is single_vector → coderank-hnsw, the D4 default dense path.
         let reg = registry_from_builtins();
+        assert_eq!(
+            reg.embedder_backend_kind().unwrap(),
+            DenseBackendKind::CoderankHnsw
+        );
+    }
+
+    #[test]
+    fn explicit_colbert_embedder_still_routes_to_plaid() {
+        // colbert-plaid stays fully available via SEMANTEX_EMBEDDER=lateon-colbert.
+        let mut cfg = SemantexConfig::default();
+        cfg.embedder = "lateon-colbert".to_string();
+        let reg = ModelRegistry::from_config(&cfg, None).unwrap();
+        assert_eq!(reg.active_embedder().unwrap().id, "lateon-colbert");
         assert_eq!(
             reg.embedder_backend_kind().unwrap(),
             DenseBackendKind::ColbertPlaid
@@ -187,10 +203,12 @@ mod tests {
 
     #[test]
     fn resolve_dense_backend_deprecated_alias_wins_when_nondefault() {
-        // SEMANTEX_DENSE_BACKEND=coderank-hnsw (alias) with the DEFAULT embedder
-        // must still route to coderank-hnsw (alias precedence when non-default).
+        // Alias precedence: a NON-default SEMANTEX_DENSE_BACKEND overrides the
+        // embedder. Pin embedder to lateon-colbert (→ would be colbert-plaid) but
+        // force coderank-hnsw via the alias — the alias must win.
         let mut cfg = SemantexConfig::default();
-        cfg.dense_backend = "coderank-hnsw".to_string(); // embedder stays "lateon-colbert"
+        cfg.embedder = "lateon-colbert".to_string();
+        cfg.dense_backend = "coderank-hnsw".to_string();
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::CoderankHnsw
@@ -198,13 +216,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dense_backend_all_default_is_colbert_plaid() {
-        // The shipped all-default config resolves to colbert-plaid (D4) until the
-        // Phase-3 cutover flips the default embedder.
-        let cfg = SemantexConfig::default();
+    fn resolve_dense_backend_explicit_colbert_alias_wins() {
+        // Symmetric arm: force colbert-plaid via a non-default alias even though
+        // the default embedder (coderank-137m) would route to coderank-hnsw.
+        // Note: "colbert-plaid" is the alias SENTINEL, so to FORCE it the alias
+        // can't be used; instead pin the embedder. This documents that the
+        // colbert path stays reachable post-cutover.
+        let mut cfg = SemantexConfig::default();
+        cfg.embedder = "lateon-colbert".to_string(); // dense_backend stays sentinel
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::ColbertPlaid
+        );
+    }
+
+    #[test]
+    fn resolve_dense_backend_all_default_is_coderank_hnsw() {
+        // D4 cutover: the shipped all-default config (embedder = coderank-137m,
+        // alias at its sentinel) resolves to coderank-hnsw. Evidence-based flip
+        // from colbert-plaid: nDCG meets/beats, ~28× less index RSS.
+        let cfg = SemantexConfig::default();
+        assert_eq!(
+            ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
+            DenseBackendKind::CoderankHnsw
         );
     }
 

@@ -523,7 +523,7 @@ impl IndexBuilder {
         // Selection (S2 re-point): resolve the active dense backend via the S8
         // ModelRegistry (canonical `SEMANTEX_EMBEDDER`), with the deprecated
         // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` alias honored when set
-        // non-default. Defaults still resolve to colbert-plaid (D4).
+        // non-default. D4 cutover: all-defaults now resolve to coderank-hnsw.
         let backend_kind =
             crate::model::ModelRegistry::resolve_dense_backend(&self.config, Some(&project_path))
                 .unwrap_or_default();
@@ -1033,7 +1033,9 @@ mod tests {
 
     /// S1: a fresh build must write the dense index under the per-backend
     /// subdir `.semantex/dense/colbert-plaid/` and record the backend in
-    /// meta.json. (Uses a tiny text repo; the PLAID build runs but we only
+    /// meta.json. POST-D4 the shipped DEFAULT embedder is `coderank-137m`, so
+    /// this test EXPLICITLY pins `lateon-colbert` to validate the colbert-plaid
+    /// layout + meta. (Uses a tiny text repo; the PLAID build runs but we only
     /// assert the layout + meta, which hold regardless of model availability —
     /// if the dense build is skipped the dirs simply won't exist, so we gate
     /// the dense-dir assertion on chunk creation.)
@@ -1046,7 +1048,10 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("a.rs"), "pub fn hello() -> u32 { 41 + 1 }\n").unwrap();
 
-        let cfg = SemantexConfig::default();
+        let cfg = SemantexConfig {
+            embedder: "lateon-colbert".to_string(),
+            ..SemantexConfig::default()
+        };
         IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
 
         // meta.json records the active backend.

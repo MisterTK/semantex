@@ -66,19 +66,29 @@ pub struct SemantexConfig {
     /// error at startup, not a silent recall regression. Run
     /// `semantex index --rebuild` after toggling.
     pub use_bm25_stemmer: bool,
-    /// Selected dense search backend identity (e.g. `"colbert-plaid"`).
+    /// DEPRECATED dense-backend alias / A/B knob. Empty-of-meaning at its
+    /// default `"colbert-plaid"`: that value is the [`DenseBackendKind::default`]
+    /// SENTINEL — when `dense_backend` equals the default the canonical
+    /// `embedder` selection decides the backend (see
+    /// [`ModelRegistry::resolve_dense_backend`]). Set it to an explicit,
+    /// NON-default name (e.g. via `SEMANTEX_DENSE_BACKEND=coderank-hnsw`) to
+    /// force that backend regardless of the embedder — the kept-live S0 A/B knob.
     /// MUST match the value the index was built with — `HybridSearcher::open`
     /// re-validates it against the persisted `IndexMeta.dense_backend` and
-    /// refuses to load on mismatch (mirrors `use_bm25_stemmer`). Override via
-    /// `SEMANTEX_DENSE_BACKEND`. Default `"colbert-plaid"`.
+    /// refuses to load on mismatch (mirrors `use_bm25_stemmer`).
     pub dense_backend: String,
-    /// Active embedder model id (registry lookup key). Default `"lateon-colbert"`
-    /// (D4: PLAID is the shipped dense default until the Phase-3 cutover flips
-    /// this to `"coderank-137m"`). The embedder spec id is model-descriptive and
-    /// distinct from the dense backend name it routes to via capabilities
-    /// (`lateon-colbert` → `colbert-plaid`; `coderank-137m` → `coderank-hnsw`).
-    /// Override via `SEMANTEX_EMBEDDER`. A change here triggers a versioned dense
-    /// rebuild + atomic switchover (S8) — the re-embedding compute is inherent.
+    /// Active embedder model id (registry lookup key). Default `"coderank-137m"`
+    /// (D4 cutover, evidence-based: CodeRankEmbed-137M's nDCG meets/beats
+    /// colbert-plaid everywhere in the measured A/B at ~28× less index RSS, so
+    /// coderank-hnsw is now the shipped default dense path). The embedder spec id
+    /// is model-descriptive and distinct from the dense backend name it routes to
+    /// via capabilities (`coderank-137m` → `coderank-hnsw`;
+    /// `lateon-colbert` → `colbert-plaid`, still fully available via
+    /// `SEMANTEX_EMBEDDER=lateon-colbert`). Override via `SEMANTEX_EMBEDDER`. A
+    /// change here triggers a versioned dense rebuild + atomic switchover (S8) —
+    /// the re-embedding compute is inherent. Existing colbert-plaid indexes are
+    /// detected as a backend mismatch by `verify_persisted_backend_matches` and
+    /// rebuilt cleanly (`semantex index --rebuild`), not crashed.
     pub embedder: String,
     /// Active reranker model id (registry lookup key). Default
     /// `"bge-reranker-v2-m3"`. Override via `SEMANTEX_RERANKER_MODEL`. A change
@@ -128,8 +138,13 @@ impl Default for SemantexConfig {
             colbert_model: ColbertModelChoice::default(),
             plaid_nbits: 4,
             use_bm25_stemmer: true,
+            // Sentinel default = DenseBackendKind::default() name. At this value
+            // the canonical `embedder` selection decides the backend; set
+            // non-default (SEMANTEX_DENSE_BACKEND) to force a specific backend.
             dense_backend: "colbert-plaid".to_string(),
-            embedder: "lateon-colbert".to_string(),
+            // D4 cutover: coderank-137m → coderank-hnsw is now the default dense
+            // path (nDCG meets/beats colbert-plaid, ~28× less index RSS).
+            embedder: "coderank-137m".to_string(),
             reranker_model: "bge-reranker-v2-m3".to_string(),
             llm_model: String::new(),
             hnsw_ef_search: 0, // 0 ⇒ use the preset's ef_search (default preset = 64)
@@ -311,19 +326,24 @@ mod tests {
     }
 
     #[test]
-    fn default_dense_backend_is_colbert_plaid() {
+    fn default_dense_backend_alias_is_sentinel() {
         let cfg = SemantexConfig::default();
+        // The `dense_backend` alias default is the DenseBackendKind::default()
+        // SENTINEL ("colbert-plaid") — meaning "let the embedder decide". The
+        // D4 cutover does NOT change this sentinel; it changes the `embedder`
+        // default so the all-default resolution yields coderank-hnsw. See
+        // resolve_dense_backend_all_default_is_coderank_hnsw in registry.rs.
         assert_eq!(
             cfg.dense_backend, "colbert-plaid",
-            "default dense backend must stay colbert-plaid until S2 + harness flip it (D4)"
+            "alias default stays the sentinel; the embedder default drives the backend"
         );
     }
 
     #[test]
     fn default_selection_fields() {
         let cfg = SemantexConfig::default();
-        // D4: PLAID stays the shipped dense default until the Phase-3 cutover.
-        assert_eq!(cfg.embedder, "lateon-colbert");
+        // D4 cutover: coderank-137m (→ coderank-hnsw) is the shipped default.
+        assert_eq!(cfg.embedder, "coderank-137m");
         assert_eq!(cfg.reranker_model, "bge-reranker-v2-m3");
         assert_eq!(
             cfg.llm_model, "",

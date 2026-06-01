@@ -118,8 +118,10 @@ impl HybridSearcher {
         // Load the dense backend. Selection (S2 re-point): resolve via the S8
         // ModelRegistry from the canonical `SEMANTEX_EMBEDDER` selection, with
         // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` kept as a DEPRECATED
-        // alias (alias wins only when explicitly non-default). Defaults still
-        // resolve to colbert-plaid (D4) until the Phase-3 cutover.
+        // alias (alias wins only when explicitly non-default). D4 cutover:
+        // all-defaults now resolve to coderank-hnsw. An existing colbert-plaid
+        // index opened under the new default trips verify_persisted_backend_matches
+        // below → clean `--rebuild` guidance, not a crash.
         let resolved_backend =
             crate::model::ModelRegistry::resolve_dense_backend(config, None).unwrap_or_default();
         // The persisted backend in meta.json MUST match the RESOLVED backend —

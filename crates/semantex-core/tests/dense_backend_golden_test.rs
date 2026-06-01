@@ -52,12 +52,21 @@ fn write_repo(root: &Path) {
     .unwrap();
 }
 
-/// Build the index once and return an opened searcher + the index dir.
-fn build_and_open(project: &Path) -> Result<HybridSearcher> {
-    let config = SemantexConfig {
+/// The colbert-plaid config. POST-D4 the shipped DEFAULT embedder is
+/// `coderank-137m` (→ coderank-hnsw), so this golden EXPLICITLY pins
+/// `lateon-colbert` to keep validating the colbert-plaid dense channel
+/// byte-identical regardless of the default.
+fn colbert_config() -> SemantexConfig {
+    SemantexConfig {
+        embedder: "lateon-colbert".to_string(),
         rerank: false, // dense-channel test — keep rerank out of the way
         ..SemantexConfig::default()
-    };
+    }
+}
+
+/// Build the index once and return an opened searcher + the index dir.
+fn build_and_open(project: &Path) -> Result<HybridSearcher> {
+    let config = colbert_config();
     let stats = IndexBuilder::new(&config)?.build(project)?;
     assert!(stats.chunks_created > 0, "fixture must create chunks");
     HybridSearcher::open(&project.join(".semantex"), &config)
@@ -105,11 +114,7 @@ fn colbert_plaid_dense_is_deterministic() -> Result<()> {
     let sig1 = capture_dense_signature(&s1);
 
     // Re-open the already-built index (no rebuild) and re-capture.
-    let config = SemantexConfig {
-        rerank: false,
-        ..SemantexConfig::default()
-    };
-    let s2 = HybridSearcher::open(&project.join(".semantex"), &config)?;
+    let s2 = HybridSearcher::open(&project.join(".semantex"), &colbert_config())?;
     let sig2 = capture_dense_signature(&s2);
 
     assert_eq!(
