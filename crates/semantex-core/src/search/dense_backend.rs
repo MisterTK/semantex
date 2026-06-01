@@ -117,6 +117,32 @@ pub fn verify_persisted_backend_matches(index_dir: &Path, expected: &str) -> Res
     Ok(())
 }
 
+/// Verify the persisted `embedder_fingerprint` in `<index_dir>/meta.json` matches
+/// `expected`. Mirrors [`verify_persisted_backend_matches`]: `Ok(())` when meta
+/// is missing/unparseable (production callers reach here only after
+/// `state::detect` vetted meta), `Err` on a value mismatch — pointing the user at
+/// a rebuild. This is the uniform "index stamped with its embedder; mismatch →
+/// rebuild" check that generalizes the schema/stemmer/backend guards (S8).
+pub fn verify_persisted_fingerprint_matches(index_dir: &Path, expected: &str) -> Result<()> {
+    let meta_path = index_dir.join("meta.json");
+    let Ok(meta_str) = std::fs::read_to_string(&meta_path) else {
+        return Ok(());
+    };
+    let Ok(meta) = serde_json::from_str::<crate::types::IndexMeta>(&meta_str) else {
+        return Ok(());
+    };
+    if meta.embedder_fingerprint != expected {
+        anyhow::bail!(
+            "embedder changed: index built with embedder_fingerprint={}, \
+             config's active embedder has fingerprint={}. Run \
+             `semantex index --rebuild` to re-embed under the new model.",
+            meta.embedder_fingerprint,
+            expected,
+        );
+    }
+    Ok(())
+}
+
 /// A scored chunk returned by the dense channel. Items are sorted by
 /// descending `score`. This is the project-wide `ScoredChunkId` (5 fields);
 /// dense backends populate only `chunk_id` + `score` (per-channel fields stay
@@ -240,6 +266,56 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // No meta.json written — skip the check (mirrors stemmer guard).
         verify_persisted_backend_matches(tmp.path(), "colbert-plaid").unwrap();
+    }
+
+    #[test]
+    fn verify_fingerprint_errors_on_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tmp.path();
+        write_meta_with_fingerprint(index_dir, "colbert-plaid", "OLDFP");
+        let err = verify_persisted_fingerprint_matches(index_dir, "NEWFP")
+            .expect_err("fingerprint mismatch must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("embedder changed") || msg.contains("fingerprint"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("OLDFP") && msg.contains("NEWFP"), "got: {msg}");
+    }
+
+    #[test]
+    fn verify_fingerprint_ok_on_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_meta_with_fingerprint(tmp.path(), "colbert-plaid", "SAME");
+        verify_persisted_fingerprint_matches(tmp.path(), "SAME").unwrap();
+    }
+
+    #[test]
+    fn verify_fingerprint_skips_when_meta_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        verify_persisted_fingerprint_matches(tmp.path(), "anything").unwrap();
+    }
+
+    /// Helper: write a current-shape meta.json carrying `backend` + `fingerprint`.
+    fn write_meta_with_fingerprint(index_dir: &Path, backend: &str, fingerprint: &str) {
+        let meta = crate::types::IndexMeta {
+            schema_version: crate::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: index_dir.to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+            dense_backend: backend.to_string(),
+            embedder_fingerprint: fingerprint.to_string(),
+        };
+        std::fs::write(
+            index_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
