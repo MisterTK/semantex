@@ -763,14 +763,22 @@ mod tests {
 
     #[test]
     fn brute_force_wide_shortlist_recovers_int8_misranked_topk() {
-        // FIX 4: a true top-1 (id=1) that int8 quantization scores slightly BELOW
-        // a near-duplicate (id=2) must still be recoverable. With shortlist width
-        // = k (=1) the int8 winner (id=2) alone would be rescored → wrong top-1.
-        // A wider rescore window (rescore_k ≥ 2) includes id=1 so fp32 rescue it.
-        // Per-vector scales differ (id=1 has a larger max-abs), making int8 dot a
-        // non-monotone proxy for cosine across rows.
-        let v1 = [0.96f32, 0.28, 0.0]; // closest to q in fp32
-        let v2 = [0.95f32, 0.10, 0.30]; // larger off-axis component
+        // FIX 4: int8 dot is only APPROXIMATELY monotone in cosine across rows
+        // with different per-vector scales, so it can INVERT the fp32 top-1.
+        //
+        // These vectors (verified to reproduce the inversion under the exact
+        // quantize_int8/dot_i8/dot_f32 math) make id=1 the true fp32 top-1 but
+        // the int8 LOSER vs id=2:
+        //   v1=[0.952,0.218,0.505] — large axis-2 outlier ⇒ COARSE int8 scale
+        //       (max|comp|/127) ⇒ its int8 dot is DEFLATED.
+        //   v2=[0.605,0.394,0.096] — no outlier ⇒ fine scale ⇒ inflated int8 dot.
+        // fp32 cosine(query): id1=0.8711 > id2=0.8455 (id1 wins, margin ~0.026).
+        // int8 dot(query):    id1=16245 < id2=16461   (id2 wins by 216).
+        // Stored rows are L2-normalized before quant (as the builder does).
+        let mut v1 = [0.952f32, 0.218, 0.505];
+        let mut v2 = [0.605f32, 0.394, 0.096];
+        l2_normalize(&mut v1);
+        l2_normalize(&mut v2);
         let (q1, s1) = quantize_int8(&v1);
         let (q2, s2) = quantize_int8(&v2);
         let store = Int8VectorStore {
@@ -779,13 +787,24 @@ mod tests {
             vectors: vec![q1, q2],
             chunk_ids: vec![1, 2],
         };
-        let mut query = vec![1.0f32, 0.25, 0.0];
+        let mut query = vec![1.0f32, 0.028, 0.0];
         l2_normalize(&mut query);
-        // fp32 cosine: id=1 should beat id=2.
-        let top_wide = store.brute_force(&query, 1, 4); // wide shortlist
+
+        // CONTRAST — the assertion that genuinely guards FIX 4:
+        // (a) the PRE-FIX behavior (shortlist = k = 1) int8-shortlists only the
+        //     wrong winner (id=2), so fp32 rescore can never recover id=1.
+        let narrow = store.brute_force(&query, 1, 1);
         assert_eq!(
-            top_wide[0].chunk_id, 1,
-            "wide int8 shortlist + fp32 rescore must recover the true top-1"
+            narrow[0].chunk_id, 2,
+            "with shortlist == k the int8 inversion is unrecoverable (returns the WRONG id) \
+             — this is exactly the bug FIX 4 addresses"
+        );
+        // (b) the FIXED behavior (rescore_k ≥ 2) widens the int8 shortlist so the
+        //     true fp32 top-1 (id=1) is included and fp32 rescore recovers it.
+        let wide = store.brute_force(&query, 1, 4);
+        assert_eq!(
+            wide[0].chunk_id, 1,
+            "wide int8 shortlist + fp32 rescore must recover the true fp32 top-1"
         );
     }
 
