@@ -995,29 +995,28 @@ mod tests {
         assert_eq!(meta.embedding_model, "CodeRankEmbed");
     }
 
-    /// v0.4.1 W-Index #3 — synthetic mapping contract:
+    /// v0.4.1 W-Index #3 — positional doc→chunk map reader contract:
     ///
-    /// A mapping vector with `PLAID_TOMBSTONE` at index 1 and real chunk IDs
-    /// at indices 0 and 2 must be safe to pass through the
-    /// `translate_chunk_subset_to_doc_subset` translator and through
-    /// `PlaidSearcher::search`-shape iterators without surfacing the
-    /// tombstone slot as a chunk_id 0 phantom.
+    /// A positional mapping vector with `DENSE_TOMBSTONE` at index 1 and real
+    /// chunk IDs at indices 0 and 2 must be safe to read through the
+    /// subset-construction iterator (in `hybrid.rs`, keyed off
+    /// `positional_chunk_ids()`) without surfacing the tombstone slot as a
+    /// chunk_id 0 phantom.
     ///
-    /// This is a unit-level test for the search-side reader contract; the
-    /// integration test (mapping survives a real delete+rebuild) requires
-    /// a live PLAID index and is exercised by the manual `--rebuild` flow.
+    /// This is a unit-level test for the seam reader contract; no built-in
+    /// backend keeps a positional map today (coderank-hnsw returns None), so it
+    /// guards the contract for a future positional backend.
     #[test]
     fn tombstone_skipping_in_doc_to_chunk_lookup() {
-        use crate::types::PLAID_TOMBSTONE;
+        use crate::types::DENSE_TOMBSTONE;
 
-        // Synthetic mapping: doc 0 -> chunk 100, doc 1 -> tombstone,
+        // Synthetic positional mapping: doc 0 -> chunk 100, doc 1 -> tombstone,
         // doc 2 -> chunk 300.
-        let mapping: Vec<u64> = vec![100, PLAID_TOMBSTONE, 300];
+        let mapping: Vec<u64> = vec![100, DENSE_TOMBSTONE, 300];
 
-        // Simulate the per-result filter that `PlaidSearcher::search` runs
-        // against `passage_ids` (doc_ids returned by next-plaid). The
-        // contract is: a result hitting the tombstone slot must NOT surface
-        // as a SearchResult.
+        // Simulate the per-result filter a positional backend's reader runs
+        // against the doc_ids it returns. The contract is: a result hitting the
+        // tombstone slot must NOT surface as a chunk_id.
         let passage_ids = vec![0i64, 1, 2];
         let scored: Vec<u64> = passage_ids
             .iter()
@@ -1025,7 +1024,7 @@ mod tests {
                 let doc_idx = doc_id as usize;
                 mapping
                     .get(doc_idx)
-                    .filter(|&&cid| cid != PLAID_TOMBSTONE)
+                    .filter(|&&cid| cid != DENSE_TOMBSTONE)
                     .copied()
             })
             .collect();
@@ -1037,14 +1036,14 @@ mod tests {
         );
     }
 
-    /// v0.4.1 W-Index #3: a `PLAID_TOMBSTONE` value must never be confused
+    /// v0.4.1 W-Index #3: a `DENSE_TOMBSTONE` value must never be confused
     /// with a real chunk_id. This is a documentation-as-test: SQLite
     /// AUTOINCREMENT IDs start at 1 and rowid is i64, so u64::MAX is well
     /// above the practical chunk-id space and reserved as the sentinel.
     #[test]
-    fn plaid_tombstone_is_reserved_sentinel() {
-        use crate::types::PLAID_TOMBSTONE;
-        assert_eq!(PLAID_TOMBSTONE, u64::MAX);
+    fn dense_tombstone_is_reserved_sentinel() {
+        use crate::types::DENSE_TOMBSTONE;
+        assert_eq!(DENSE_TOMBSTONE, u64::MAX);
     }
 
     #[test]

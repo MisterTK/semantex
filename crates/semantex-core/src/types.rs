@@ -3,18 +3,20 @@ use std::path::PathBuf;
 
 use crate::chunking::structured_meta::StructuredChunkMeta;
 
-/// Sentinel value written into `plaid_mapping.bin` at positions whose PLAID
-/// doc_id was deleted by an incremental rebuild (v0.4.1 W-Index #3).
+/// Reserved sentinel for a positional dense backend's doc→chunk map.
 ///
-/// The mapping is positional — `mapping[doc_id] = chunk_id`. Deleting a chunk
-/// MUST stamp `PLAID_TOMBSTONE` into the slot, not truncate the Vec or shift
-/// subsequent entries: PLAID may still reference the doc_id internally, and
-/// later positions stay positionally correct. Search-time readers
-/// (`PlaidSearcher::search`, subset-construction in `hybrid.rs`) must skip
-/// any slot equal to this sentinel rather than mapping it to a phantom
-/// chunk. `u64::MAX` is reserved because real chunk IDs are SQLite
-/// AUTOINCREMENT row ids starting at 1.
-pub const PLAID_TOMBSTONE: u64 = u64::MAX;
+/// A positional dense backend (one whose `positional_chunk_ids()` returns a
+/// `mapping[doc_id] = chunk_id` vector) marks a deleted slot with this value
+/// rather than truncating or shifting the vector: the backend may still
+/// reference the doc_id internally, and later positions must stay positionally
+/// correct. Subset construction in `hybrid.rs` (keyed off the
+/// `positional_chunk_ids()` seam) skips any slot equal to this sentinel instead
+/// of mapping it to a phantom chunk. `u64::MAX` is reserved because real chunk
+/// IDs are SQLite AUTOINCREMENT row ids starting at 1.
+///
+/// No built-in backend keeps a positional map today (coderank-hnsw returns
+/// `None`); this is seam infrastructure for a future positional backend.
+pub const DENSE_TOMBSTONE: u64 = u64::MAX;
 
 /// A chunk of text extracted from a file
 #[derive(Debug, Clone, Serialize, Deserialize)]

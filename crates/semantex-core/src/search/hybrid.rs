@@ -304,22 +304,21 @@ impl HybridSearcher {
             None
         };
 
-        // v0.4 WS-B Item 15: precompute the PLAID chunk-ID subset when the
-        // query carries an active `file_filter`. PLAID 1.3 accepts a doc-ID
-        // subset on `search()` and proportionally scales `n_ivf_probe` to
-        // compensate for the smaller candidate pool — this is meaningfully
-        // faster than scoring every doc and post-filtering when the filter
-        // matches a small fraction of files. We compute the subset once and
-        // pass it to both dense channels (original and expanded query).
+        // v0.4 WS-B Item 15: precompute the positional dense subset when the
+        // query carries an active `file_filter`. A positional dense backend can
+        // accept a doc-ID subset and scale its candidate pool accordingly —
+        // meaningfully faster than scoring every doc and post-filtering when the
+        // filter matches a small fraction of files. We compute the subset once
+        // and pass it to both dense channels (original and expanded query).
         //
-        // The subset is the set of indexed chunk_ids whose file_path passes
-        // the filter. We walk `plaid.doc_to_chunk()` (the canonical list of
-        // chunks present in the dense index) and bulk-fetch their paths from
-        // the store in bounded batches (SQLite's default parameter cap is
-        // 999 — we batch at 500 for headroom). The lock is released before
-        // we enter `thread::scope` to avoid contention with `exact_handle`,
-        // which takes the same lock.
-        let plaid_chunk_subset: Option<Vec<u64>> = match (
+        // The subset is the set of indexed chunk_ids whose file_path passes the
+        // filter. We walk the backend's positional chunk list
+        // (`positional_chunk_ids()` — the canonical list of chunks in the dense
+        // index) and bulk-fetch their paths from the store in bounded batches
+        // (SQLite's default parameter cap is 999 — we batch at 500 for
+        // headroom). The lock is released before we enter `thread::scope` to
+        // avoid contention with `exact_handle`, which takes the same lock.
+        let positional_subset: Option<Vec<u64>> = match (
             query.use_dense.then_some(()).and(self.dense.as_ref()),
             query.file_filter.as_ref().filter(|f| f.is_active()),
         ) {
@@ -338,7 +337,7 @@ impl HybridSearcher {
                         // back to an unfiltered dense search (result merge still
                         // applies the file_filter) rather than silently
                         // searching a partial candidate set.
-                        // v0.4.1 W-Index #3: pre-filter PLAID_TOMBSTONE entries
+                        // v0.4.1 W-Index #3: pre-filter DENSE_TOMBSTONE entries
                         // so we never query SQLite for a deleted-slot sentinel.
                         let subset_result: anyhow::Result<Vec<u64>> = (|| {
                             let store = self.store.lock();
@@ -347,7 +346,7 @@ impl HybridSearcher {
                                 let live: Vec<u64> = batch
                                     .iter()
                                     .copied()
-                                    .filter(|&cid| cid != crate::types::PLAID_TOMBSTONE)
+                                    .filter(|&cid| cid != crate::types::DENSE_TOMBSTONE)
                                     .collect();
                                 if live.is_empty() {
                                     continue;
@@ -385,7 +384,7 @@ impl HybridSearcher {
             }
             _ => None,
         };
-        let plaid_subset_slice: Option<&[u64]> = plaid_chunk_subset.as_deref();
+        let positional_subset_slice: Option<&[u64]> = positional_subset.as_deref();
 
         // Stage 1: Candidate retrieval — run dense, sparse, exact, and (in RRF mode)
         // the expanded-query dense + sparse channels in parallel.
@@ -409,7 +408,7 @@ impl HybridSearcher {
                     // through `search_with_subset` with the pre-computed
                     // chunk-ID subset so the backend skips work on chunks the
                     // user has filtered out.
-                    let res = if let Some(subset) = plaid_subset_slice {
+                    let res = if let Some(subset) = positional_subset_slice {
                         dense.search_with_subset(&effective_text, retrieval_candidates, subset)
                     } else {
                         dense.search(&effective_text, retrieval_candidates)
@@ -503,7 +502,7 @@ impl HybridSearcher {
                 if let Some(ref dense) = self.dense {
                     // v0.4 WS-B Item 15: same subset-aware routing as the
                     // primary dense channel.
-                    let res = if let Some(subset) = plaid_subset_slice {
+                    let res = if let Some(subset) = positional_subset_slice {
                         dense.search_with_subset(text, retrieval_candidates, subset)
                     } else {
                         dense.search(text, retrieval_candidates)
