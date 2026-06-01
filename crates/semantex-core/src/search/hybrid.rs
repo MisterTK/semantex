@@ -10,6 +10,7 @@ use crate::search::dense_backend::{
 };
 use crate::search::graph_propagation::{self, GraphPropagationConfig};
 use crate::search::path_signals;
+use crate::search::mmr;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
 use crate::search::reranker_engine::RerankerEngine;
 use crate::search::sparse_search::SparseIndex;
@@ -1192,6 +1193,38 @@ impl HybridSearcher {
             rerank_ms = Some(rerank_start.elapsed().as_millis() as u64);
         }
 
+        // Stage 3b: MMR diversity pass (S7). OFF unless SEMANTEX_MMR_LAMBDA is
+        // set and a dense backend is present. Reorders the top-K results to
+        // reduce near-duplicate clustering; does not change scores, so Stage 4
+        // adaptive sizing/threshold logic is unaffected. O(K²), K ≤ 50.
+        if let Some(lambda) = mmr_active(self.dense.as_deref()) {
+            let mmr_top_k = results.len().min(50); // O(K²) guard, K ≤ 50 per spec
+            if mmr_top_k >= 2
+                && let Some(ref dense) = self.dense
+            {
+                // Per-chunk vectors come from the S1-declared `embed_doc_vectors`
+                // seam (`Option<Vec<(u64, Vec<f32>)>>`). Collect the top-K chunk
+                // ids, ask the backend for their vectors, and fold the returned
+                // pairs into the `HashMap<u64, Vec<f32>>` that `mmr_rerank` wants.
+                // If the backend has no single-vector projection it returns None →
+                // `.map(...)` yields None and MMR no-ops.
+                let ids: Vec<u64> = results.iter().take(mmr_top_k).map(|r| r.chunk.id).collect();
+                let doc_vecs: Option<HashMap<u64, Vec<f32>>> = dense
+                    .embed_doc_vectors(&ids)
+                    .map(|pairs| pairs.into_iter().collect());
+                if let Some(doc_vectors) = doc_vecs {
+                    let before_top = results.first().map(|r| r.chunk.id);
+                    mmr::mmr_rerank(&mut results, &doc_vectors, lambda, mmr_top_k);
+                    tracing::debug!(
+                        lambda,
+                        top_k = mmr_top_k,
+                        reordered = (results.first().map(|r| r.chunk.id) != before_top),
+                        "MMR diversity pass applied (S7)"
+                    );
+                }
+            }
+        }
+
         // Stage 4: Adaptive result sizing, confidence threshold, and deduplication.
         // Exhaustive mode: widen range, skip dedup, lower threshold.
         let mut adaptive_config = self.config.adaptive_config();
@@ -1559,6 +1592,15 @@ fn weighted_rrf_params(config: &SemantexConfig, query_type: QueryType) -> (Fusio
     (query_type.fusion_weights(), config.rrf_k)
 }
 
+/// S7: resolve the active MMR lambda. MMR runs only when a valid
+/// `SEMANTEX_MMR_LAMBDA` is set AND a dense backend exists (it supplies the
+/// per-result vectors). Returns `Some(lambda)` to run, `None` to skip.
+fn mmr_active(dense: Option<&dyn crate::search::dense_backend::DenseBackend>) -> Option<f32> {
+    let lambda = mmr::mmr_lambda_from_env()?;
+    dense?; // None backend → skip
+    Some(lambda)
+}
+
 /// Heuristic: exhaustive queries ask for complete enumeration of all instances.
 /// Examples: "find all error handling", "list every config option", "all places where X".
 /// These benefit from wider result ranges, no per-file dedup, and lower score thresholds.
@@ -1785,6 +1827,26 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    /// S7: MMR runs only when (a) SEMANTEX_MMR_LAMBDA is a valid lambda AND
+    /// (b) a dense backend is present. Sparse-only opens (dense None) never MMR.
+    #[test]
+    fn mmr_active_requires_lambda_and_dense_backend() {
+        // SAFETY: process-level env mutation in a single-threaded test.
+        unsafe {
+            std::env::set_var("SEMANTEX_MMR_LAMBDA", "0.7");
+        }
+        assert_eq!(
+            mmr_active(None),
+            None,
+            "no dense backend → MMR off even with lambda set"
+        );
+        unsafe {
+            std::env::remove_var("SEMANTEX_MMR_LAMBDA");
+        }
+        // (The present-backend case is covered by the integration behavior; this
+        // guards the env+presence gate, the part that's pure.)
+    }
 
     /// S7: weighted-RRF reads config.rrf_k (previously dead) and the query-type
     /// FusionWeights. This guards the selection logic the hybrid match arm uses.
