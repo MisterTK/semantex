@@ -39,6 +39,8 @@ CLAUDE.md
 /benchmarks/*
 # Exception: SWE-bench Verified harness is a committed sub-project.
 !/benchmarks/swe_bench/
+# Exception: relevance harness is a committed sub-project (its own results/ + .venv ignored).
+!/benchmarks/relevance/
 /benches
 /bench_results
 /scripts

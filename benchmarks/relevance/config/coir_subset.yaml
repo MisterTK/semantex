@@ -1,0 +1,19 @@
+# CoIR (headline) subset — CPU-feasible sub-datasets + sample sizes.
+# Real HF ids recorded in research notes (Task 0.1 Step 4). NOTE the actual org
+# layout is NOT `<name>-{queries,corpus,qrels}`: it is one combined repo
+# `<name>-queries-corpus` (splits `corpus` + `queries`, cols `_id`/`text`) plus a
+# separate `<name>-qrels` (split `test`, cols `query_id`/`corpus_id`/`score` —
+# UNDERSCORES; load_coir_subdataset normalizes them to the hyphen keys that the
+# injectable build_corpus_from_splits expects). Each report logs kept/dropped.
+seed: 20260531
+query_size: 200          # queries evaluated per sub-dataset (subset)
+corpus_size: 5000        # corpus docs materialised + indexed per sub-dataset
+subdatasets:
+  - name: cosqa
+    queries_corpus_id: CoIR-Retrieval/cosqa-queries-corpus
+    qrels_id: CoIR-Retrieval/cosqa-qrels
+    qrels_split: test
+  - name: codesearchnet
+    queries_corpus_id: CoIR-Retrieval/CodeSearchNet-queries-corpus
+    qrels_id: CoIR-Retrieval/CodeSearchNet-qrels
+    qrels_split: test

@@ -1,0 +1,9 @@
+{
+  "name": "tiny",
+  "match_mode": "file",
+  "queries": [
+    {"query_id": "q1", "text": "user login authentication", "gold_files": ["auth.py"]},
+    {"query_id": "q2", "text": "database connection pool", "gold_files": ["db.py"]},
+    {"query_id": "q3", "text": "string formatting helper", "gold_files": ["util.py"]}
+  ]
+}
