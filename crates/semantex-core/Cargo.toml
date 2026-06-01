@@ -54,15 +54,6 @@ half = "2"
 # ORT_DYLIB_PATH. Declaring `download-binaries` here was a misleading no-op.
 ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray", "std", "load-dynamic", "half"] }
 
-# Single-vector dense path (S2): HuggingFace tokenizer for CodeRankEmbed. Already
-# in the tree transitively (via fastembed) at 0.22.x; declared directly so
-# embedding/single_vector.rs can tokenize. PURE-RUST regex backend only: the
-# `onig` (C oniguruma) + `esaxx_fast` (C++) default features are DISABLED here
-# (integration §5 / CLAUDE.md no-new-C-deps); `fancy-regex` is the pure-Rust
-# pre-tokenizer regex path. (fastembed still pulls onig transitively — that is a
-# pre-existing fastembed dependency, not one this declaration adds.)
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
-
 # Pure-Rust HNSW ANN index for the coderank-hnsw dense backend (S2 Spike 2).
 # MIT OR Apache-2.0, NO C/C++ deps (cargo tree verified). Build-once index; we
 # rebuild the in-RAM graph on open from our own int8 vector store (delete =
