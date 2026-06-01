@@ -45,6 +45,37 @@ pub fn dense_subdir(index_dir: &Path, backend: DenseBackendKind) -> PathBuf {
     index_dir.join("dense").join(backend.name())
 }
 
+/// Verify that the persisted `dense_backend` in `<index_dir>/meta.json` matches
+/// `expected` (mirrors `sparse_search::verify_persisted_stemmer_matches`).
+///
+/// Returns:
+/// * `Ok(())` if the persisted backend agrees with `expected`, OR if meta.json
+///   is missing / unparseable (production callers reach this only after
+///   `state::detect` has vetted meta.json; in-crate tests open without one).
+/// * `Err(anyhow!)` on a value mismatch, naming both backends and pointing the
+///   user at `semantex index --rebuild`.
+pub fn verify_persisted_backend_matches(index_dir: &Path, expected: &str) -> Result<()> {
+    let meta_path = index_dir.join("meta.json");
+    let Ok(meta_str) = std::fs::read_to_string(&meta_path) else {
+        return Ok(());
+    };
+    let Ok(meta) = serde_json::from_str::<crate::types::IndexMeta>(&meta_str) else {
+        // Unparseable meta.json — `state::detect` returns `Stale` for the same
+        // condition, so production callers should never reach here.
+        return Ok(());
+    };
+    if meta.dense_backend != expected {
+        anyhow::bail!(
+            "dense backend mismatch: index built with dense_backend={}, \
+             config says dense_backend={}. Run `semantex index --rebuild` \
+             to reconcile.",
+            meta.dense_backend,
+            expected,
+        );
+    }
+    Ok(())
+}
+
 /// A scored chunk returned by the dense channel. Items are sorted by
 /// descending `score`. This is the project-wide `ScoredChunkId` (5 fields);
 /// dense backends populate only `chunk_id` + `score` (per-channel fields stay
@@ -136,5 +167,58 @@ mod tests {
         let root = Path::new("/tmp/proj/.semantex");
         let p = dense_subdir(root, DenseBackendKind::ColbertPlaid);
         assert_eq!(p, Path::new("/tmp/proj/.semantex/dense/colbert-plaid"));
+    }
+
+    #[test]
+    fn verify_backend_matches_on_agreement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tmp.path();
+        write_meta_with_backend(index_dir, "colbert-plaid");
+        // Matching backend → Ok.
+        verify_persisted_backend_matches(index_dir, "colbert-plaid").unwrap();
+    }
+
+    #[test]
+    fn verify_backend_errors_on_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tmp.path();
+        write_meta_with_backend(index_dir, "colbert-plaid");
+        let err = verify_persisted_backend_matches(index_dir, "coderank-hnsw")
+            .expect_err("mismatched backend must error");
+        let msg = err.to_string();
+        assert!(msg.contains("dense backend mismatch"), "got: {msg}");
+        assert!(
+            msg.contains("colbert-plaid") && msg.contains("coderank-hnsw"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("semantex index --rebuild"), "got: {msg}");
+    }
+
+    #[test]
+    fn verify_backend_skips_when_meta_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No meta.json written — skip the check (mirrors stemmer guard).
+        verify_persisted_backend_matches(tmp.path(), "colbert-plaid").unwrap();
+    }
+
+    /// Helper: write a current-shape meta.json carrying `backend`.
+    fn write_meta_with_backend(index_dir: &Path, backend: &str) {
+        let meta = crate::types::IndexMeta {
+            schema_version: crate::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: index_dir.to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+            dense_backend: backend.to_string(),
+        };
+        std::fs::write(
+            index_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
     }
 }
