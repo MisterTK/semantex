@@ -4,6 +4,7 @@ pub mod agent_classifier;
 pub mod agent_formatter;
 pub mod code_tokenizer;
 pub mod deep;
+pub mod dense_backend;
 pub mod fastembed_reranker;
 pub mod graph_propagation;
 pub mod hybrid;
