@@ -1,0 +1,23 @@
+[project]
+name = "relevance-harness"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "click>=8.1",
+  "datasets>=2.20",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyyaml>=6.0",
+  "tabulate>=0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "pytrec_eval>=0.5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
