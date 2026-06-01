@@ -177,4 +177,15 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("bge-reranker-v2-m3"));
     }
+
+    #[cfg(feature = "llm")]
+    #[test]
+    fn llm_builtin_resolves_when_feature_on_and_selected() {
+        let mut cfg = SemantexConfig::default();
+        cfg.llm_model = "ollama-default".to_string();
+        let reg = ModelRegistry::from_config(&cfg, None).unwrap();
+        let spec = reg.active_llm().unwrap().expect("llm spec should resolve");
+        assert_eq!(spec.id, "ollama-default");
+        assert_eq!(spec.role, ModelRole::Llm);
+    }
 }

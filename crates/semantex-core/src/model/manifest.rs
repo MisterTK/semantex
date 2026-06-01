@@ -148,6 +148,38 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
 #[cfg(not(feature = "llm"))]
 fn append_builtin_llm_specs(_specs: &mut Vec<ModelSpec>) {}
 
+/// LLM-role built-ins, compiled ONLY with the `llm` feature so the default
+/// build pulls zero LLM deps. These are inert until `SEMANTEX_LLM_MODEL` selects
+/// one by id — no LLM runs by default. Users override/add via `models.toml`.
+///
+/// CLAUDE.md rule #6 forbids hardcoded model names/providers/endpoints as a
+/// *default selection*; here they are merely available manifest data (the user
+/// opts in by id), never the active model unless explicitly selected.
+#[cfg(feature = "llm")]
+fn append_builtin_llm_specs(specs: &mut Vec<ModelSpec>) {
+    use crate::model::spec::LlmSpec;
+    // An airgap-friendly Ollama default (local endpoint). Provider/model/endpoint
+    // are manifest DATA the user can override; nothing here forces a network LLM.
+    specs.push(ModelSpec {
+        id: "ollama-default".to_string(),
+        role: ModelRole::Llm,
+        // LLM weights are not fetched by semantex (genai/Ollama manage them);
+        // a Local source with the conventional Ollama dir documents that.
+        source: ModelSource::Local {
+            dir: "ollama".to_string(),
+        },
+        capabilities: ModelCapabilities {
+            instruction_aware: true,
+            ..ModelCapabilities::default()
+        },
+        role_data: RoleData::Llm(LlmSpec {
+            provider: "ollama".to_string(),
+            model: "qwen2.5-coder:7b".to_string(),
+            endpoint: String::new(),
+        }),
+    });
+}
+
 /// Wire shape of a `models.toml` document: a `[[model]]` array of specs.
 #[derive(Debug, Deserialize)]
 struct UserManifest {
