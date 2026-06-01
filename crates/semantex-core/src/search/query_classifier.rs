@@ -156,6 +156,56 @@ pub(crate) fn is_camel_case(s: &str) -> bool {
     false
 }
 
+/// True if the query expresses an *exhaustive* intent — "find every / all
+/// occurrences / callers / usages everywhere". Such queries benefit from 2-hop
+/// graph expansion so transitively related sites surface. Universal English
+/// signals only (repo-agnostic).
+#[must_use]
+pub fn is_exhaustive_query(query: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "all usages",
+        "all callers",
+        "all references",
+        "all places",
+        "all the places",
+        "every place",
+        "every usage",
+        "every caller",
+        "everywhere",
+        "find all",
+        "list all",
+        "all occurrences",
+    ];
+    let q = query.to_lowercase();
+    SIGNALS.iter().any(|s| q.contains(s))
+}
+
+/// True if the query expresses a *feature-planning / change-impact* intent —
+/// "where should I add / implement / wire up X". These benefit from 2-hop
+/// expansion to reveal the surrounding integration surface. Universal English
+/// signals only (repo-agnostic).
+#[must_use]
+pub fn is_feature_planning_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    // Require a location/how interrogative paired with an add/implement intent
+    // so we don't fire on every "how to" or "where is" question.
+    let asks_where = q.contains("where should")
+        || q.contains("where to")
+        || q.contains("where would")
+        || q.contains("where do i")
+        || q.contains("where can i")
+        || q.contains("how to")
+        || q.contains("how do i");
+    let intent_add = q.contains("add")
+        || q.contains("implement")
+        || q.contains("wire up")
+        || q.contains("hook in")
+        || q.contains("hook up")
+        || q.contains("introduce")
+        || q.contains("integrate");
+    asks_where && intent_add
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +318,51 @@ mod tests {
     fn test_mixed_weights_balanced() {
         let w = QueryType::Mixed.fusion_weights();
         assert!((w.w_dense - w.w_sparse).abs() < f32::EPSILON);
+    }
+
+    // --- route predicates (S4) ---
+
+    #[test]
+    fn test_exhaustive_query_detection() {
+        assert!(is_exhaustive_query("find all usages of the retry helper"));
+        assert!(is_exhaustive_query(
+            "every place that reads the config file"
+        ));
+        assert!(is_exhaustive_query(
+            "everywhere we open a database connection"
+        ));
+        assert!(is_exhaustive_query(
+            "list all callers of the auth middleware"
+        ));
+    }
+
+    #[test]
+    fn test_non_exhaustive_query() {
+        assert!(!is_exhaustive_query("login handler"));
+        assert!(!is_exhaustive_query("getUserById"));
+        assert!(!is_exhaustive_query("parse the request body"));
+    }
+
+    #[test]
+    fn test_feature_planning_query_detection() {
+        assert!(is_feature_planning_query(
+            "where should I add rate limiting"
+        ));
+        assert!(is_feature_planning_query(
+            "where to implement the new export endpoint"
+        ));
+        assert!(is_feature_planning_query(
+            "how to wire up a second cache layer"
+        ));
+        assert!(is_feature_planning_query(
+            "where would I hook in a metrics counter"
+        ));
+    }
+
+    #[test]
+    fn test_non_feature_planning_query() {
+        assert!(!is_feature_planning_query("connection pool"));
+        assert!(!is_feature_planning_query("error handling in the parser"));
+        assert!(!is_feature_planning_query("std::io::Read"));
     }
 }

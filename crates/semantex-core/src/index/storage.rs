@@ -1057,6 +1057,73 @@ impl ChunkStore {
         Ok(exists)
     }
 
+    /// Create the `chunk_centrality` aux table if missing and upsert one
+    /// per-chunk PageRank / structural-centrality score. Symmetric counterpart
+    /// to [`Self::get_centrality_scores`].
+    pub fn insert_centrality_score(&self, chunk_id: u64, centrality: f64) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chunk_centrality (
+                chunk_id INTEGER PRIMARY KEY,
+                structural_centrality REAL NOT NULL
+            );",
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO chunk_centrality (chunk_id, structural_centrality) \
+             VALUES (?1, ?2)",
+            params![chunk_id as i64, centrality],
+        )?;
+        Ok(())
+    }
+
+    /// Map file paths to their chunk ids. Generic accessor used by the
+    /// search-time import-cohesion expansion. Unknown paths contribute nothing;
+    /// empty input returns an empty vec.
+    pub fn get_chunk_ids_for_files(&self, file_paths: &[String]) -> Result<Vec<u64>> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for batch in file_paths.chunks(500) {
+            let placeholders: String = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id FROM chunks WHERE file_path IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = batch
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), |r| Ok(r.get::<_, i64>(0)? as u64))?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read stored PageRank / structural centrality for the given chunk ids.
+    /// Returns an empty map when the aux table is absent (older index) so the
+    /// centrality prior is a clean no-op on un-enriched indexes.
+    pub fn get_centrality_scores(&self, chunk_ids: &[u64]) -> Result<HashMap<u64, f32>> {
+        if chunk_ids.is_empty() || !self.table_exists("chunk_centrality")? {
+            return Ok(HashMap::new());
+        }
+        let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT chunk_id, structural_centrality FROM chunk_centrality \
+             WHERE chunk_id IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
+            .iter()
+            .map(|id| Box::new(*id as i64) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(std::convert::AsRef::as_ref).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, f64>(1)? as f32))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<u64, f32>>>()?)
+    }
+
     // ── v7 stats ─────────────────────────────────────────────────────
 
     /// Return statistics about the code graph tables.
@@ -1572,5 +1639,75 @@ mod delete_graph_data_tests {
         assert!(store.table_exists("chunk_annotations").unwrap());
         assert!(store.table_exists("pattern_matches").unwrap());
         assert!(store.table_exists("chunk_centrality").unwrap());
+    }
+
+    /// `get_centrality_scores` returns stored PageRank for present chunks and
+    /// omits chunks without a row (caller treats missing as 0). On an index
+    /// lacking the aux table it returns an empty map (clean no-op).
+    #[test]
+    fn get_centrality_scores_reads_stored_pagerank() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        // No aux table yet → empty map.
+        let id_probe = insert_test_chunk(&store, "a.rs");
+        assert!(
+            store.get_centrality_scores(&[id_probe]).unwrap().is_empty(),
+            "missing aux table must yield empty map"
+        );
+
+        create_v0_3_aux_tables(&store);
+        let id1 = insert_test_chunk(&store, "b.rs");
+        let id2 = insert_test_chunk(&store, "c.rs");
+        let id3 = insert_test_chunk(&store, "d.rs"); // no centrality row
+
+        for (cid, val) in [(id1, 0.80_f64), (id2, 0.20_f64)] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO chunk_centrality (chunk_id, structural_centrality) VALUES (?1, ?2)",
+                    params![cid as i64, val],
+                )
+                .unwrap();
+        }
+
+        let scores = store.get_centrality_scores(&[id1, id2, id3]).unwrap();
+        assert_eq!(scores.len(), 2, "only chunks with rows are returned");
+        assert!((scores[&id1] - 0.80).abs() < 1e-6);
+        assert!((scores[&id2] - 0.20).abs() < 1e-6);
+        assert!(!scores.contains_key(&id3), "chunk without row is absent");
+
+        // Empty input → empty map.
+        assert!(store.get_centrality_scores(&[]).unwrap().is_empty());
+    }
+
+    /// `get_chunk_ids_for_files` maps file paths to their chunk ids and ignores
+    /// unknown paths and empty input.
+    #[test]
+    fn get_chunk_ids_for_files_maps_paths_to_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        let a = insert_test_chunk(&store, "src/a.rs");
+        let b = insert_test_chunk(&store, "src/b.rs");
+
+        let mut got = store
+            .get_chunk_ids_for_files(&["src/a.rs".to_string(), "src/b.rs".to_string()])
+            .unwrap();
+        got.sort_unstable();
+        let mut want = vec![a, b];
+        want.sort_unstable();
+        assert_eq!(got, want);
+
+        // Unknown path → no ids; empty input → empty.
+        assert!(
+            store
+                .get_chunk_ids_for_files(&["nope.rs".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.get_chunk_ids_for_files(&[]).unwrap().is_empty());
     }
 }

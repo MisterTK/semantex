@@ -8,7 +8,8 @@ use crate::search::colbert_plaid_backend::ColbertPlaidBackend;
 use crate::search::dense_backend::{
     DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
 };
-use crate::search::graph_propagation::{self, GraphPropagationConfig};
+use crate::search::graph_propagation::GraphPropagationConfig;
+use crate::search::graph_stage;
 use crate::search::path_signals;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
 use crate::search::reranker_engine::RerankerEngine;
@@ -882,58 +883,22 @@ impl HybridSearcher {
             }
         }
 
-        // Phase 6: Graph propagation — expand results through code graph edges
-        let graph_config = if is_architectural_query(&effective_text, query_type) {
-            GraphPropagationConfig::architectural_mode(candidates).with_env_overrides()
-        } else {
-            GraphPropagationConfig::for_query_type(&query_type, candidates).with_env_overrides()
-        };
-        let scored_ids: Vec<ScoredChunkId> = fused.iter().take(fetch_count).cloned().collect();
-        let expanded = graph_propagation::propagate(&scored_ids, &store, &graph_config)?;
-
-        // Merge propagated chunks into fused list
-        let existing_ids: HashSet<u64> = fused.iter().map(|s| s.chunk_id).collect();
-        let new_ids: Vec<u64> = expanded
-            .iter()
-            .filter(|s| !existing_ids.contains(&s.chunk_id))
-            .map(|s| s.chunk_id)
-            .collect();
-
-        if !new_ids.is_empty() {
-            let new_chunks = store.get_chunks(&new_ids)?;
-            for chunk in new_chunks {
-                chunk_map.insert(chunk.id, chunk);
-            }
-        }
-
-        // Update scores from propagation (only if higher) and add new entries
-        {
-            let prop_scores: HashMap<u64, f32> =
-                expanded.iter().map(|s| (s.chunk_id, s.score)).collect();
-            for scored in &mut fused {
-                #[allow(clippy::collapsible_if)]
-                if let Some(&new_score) = prop_scores.get(&scored.chunk_id) {
-                    if new_score > scored.score {
-                        scored.score = new_score;
-                    }
-                }
-            }
-            for s in expanded
-                .iter()
-                .filter(|s| !existing_ids.contains(&s.chunk_id))
-            {
-                fused.push(s.clone());
-            }
-            fused.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
+        // Phase 6: Graph propagation — named stage over the fused candidates.
+        let graph_config = select_graph_config(&effective_text, query_type, candidates);
+        let new_ids: Vec<u64> = graph_stage::run_graph_stage(
+            &mut fused,
+            &mut chunk_map,
+            &store,
+            &graph_config,
+            fetch_count,
+        )?
+        .into_iter()
+        .collect();
         tracing::debug!(
-            expanded_count = expanded.len(),
             new_count = new_ids.len(),
-            "Graph propagation complete"
+            disabled = graph_config.disabled,
+            two_hop = graph_config.enable_transitive,
+            "Graph propagation stage complete"
         );
 
         // Import proximity boost for architectural Semantic/Mixed queries only
@@ -1538,6 +1503,34 @@ fn is_exhaustive_query(query: &str) -> bool {
 }
 
 /// Heuristic: architectural queries are long semantic queries about flows/pipelines/lifecycles.
+/// Pick the graph-propagation config preset for a query's route.
+///
+/// Routes (gated by repo-agnostic predicates, not new QueryType variants):
+/// - exhaustive ("find all usages…") or feature-planning ("where should I add…")
+///   → `localization_mode` (recall-oriented, 2-hop).
+/// - architectural ("how does X flow through layers") → `architectural_mode`
+///   (existing behavior, 2-hop).
+/// - otherwise → `for_query_type` (1-hop, per-type decays).
+///
+/// `with_env_overrides` is applied last so `SEMANTEX_GRAPH_*` env knobs (incl.
+/// `SEMANTEX_GRAPH_DISABLE` and `SEMANTEX_GRAPH_HOPS`) always win for tuning.
+fn select_graph_config(
+    query: &str,
+    query_type: QueryType,
+    candidates: usize,
+) -> GraphPropagationConfig {
+    let base = if query_classifier::is_exhaustive_query(query)
+        || query_classifier::is_feature_planning_query(query)
+    {
+        GraphPropagationConfig::localization_mode(candidates)
+    } else if is_architectural_query(query, query_type) {
+        GraphPropagationConfig::architectural_mode(candidates)
+    } else {
+        GraphPropagationConfig::for_query_type(&query_type, candidates)
+    };
+    base.with_env_overrides()
+}
+
 fn is_architectural_query(query: &str, query_type: QueryType) -> bool {
     if query_type != QueryType::Semantic {
         return false;
@@ -1739,6 +1732,47 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    #[test]
+    fn test_select_graph_config_localization_for_exhaustive() {
+        let cfg = select_graph_config(
+            "find all usages of the retry helper",
+            QueryType::Semantic,
+            20,
+        );
+        assert!(cfg.enable_transitive, "exhaustive should get 2-hop");
+        assert_eq!(
+            cfg.max_propagated, 20,
+            "exhaustive should use localization cap"
+        );
+    }
+
+    #[test]
+    fn test_select_graph_config_localization_for_feature_planning() {
+        let cfg = select_graph_config("where should I add rate limiting", QueryType::Semantic, 20);
+        assert!(cfg.enable_transitive, "feature-planning should get 2-hop");
+        assert_eq!(cfg.max_propagated, 20);
+    }
+
+    #[test]
+    fn test_select_graph_config_architectural_unchanged() {
+        // 4+ words + architectural signal "flow" + Semantic -> architectural_mode.
+        let cfg = select_graph_config(
+            "how does the request flow through layers",
+            QueryType::Semantic,
+            12,
+        );
+        assert!(cfg.enable_transitive);
+        assert_eq!(cfg.max_propagated, 12); // architectural_mode uses top_k
+    }
+
+    #[test]
+    fn test_select_graph_config_default_per_query_type() {
+        // A plain identifier query: no route -> per-query-type config, 1-hop.
+        let cfg = select_graph_config("getUserById", QueryType::Identifier, 20);
+        assert!(!cfg.enable_transitive);
+        assert_eq!(cfg.max_propagated, 5); // 20/4 from for_query_type(Identifier)
+    }
 
     // ---- Defect #13 regression: Phase 3 boosts must NOT clamp at
     //      max_score. The previous `.min(max_score)` ceiling collapsed
