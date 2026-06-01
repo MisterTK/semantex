@@ -114,7 +114,7 @@ impl Default for SemantexConfig {
             max_file_count: 50_000,
             chunk_size: 512,
             chunk_overlap: 128,
-            rrf_k: 30.0,
+            rrf_k: 60.0,
             rerank_candidates: 100,
             model_dir: None,
             // Adaptive result sizing
@@ -287,6 +287,18 @@ pub(crate) fn env_string(key: &str, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rrf_k_default_is_60_per_integration_doc_d_rrf_k() {
+        // Integration doc D-rrf-k: weighted-RRF default k aligns with the
+        // parameter-free RRF_K = 60.0 so A/Bs are apples-to-apples.
+        let cfg = SemantexConfig::default();
+        assert!(
+            (cfg.rrf_k - 60.0).abs() < f32::EPSILON,
+            "rrf_k default = {}",
+            cfg.rrf_k
+        );
+    }
 
     /// v0.4 Item 18: BM25 stemmer ON by default (preserves legacy behavior).
     #[test]

@@ -10,9 +10,11 @@ use crate::search::dense_backend::{
 };
 use crate::search::graph_propagation::GraphPropagationConfig;
 use crate::search::graph_stage;
+use crate::search::mmr;
 use crate::search::path_signals;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
 use crate::search::reranker_engine::RerankerEngine;
+use crate::search::semantic_cache::{self, SemanticCache};
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
 use crate::search::{query_expander, regex_semantic};
@@ -20,7 +22,7 @@ use crate::types::{Confidence, ScoredChunkId, SearchResult, SearchSource};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Hybrid searcher combining dense (pluggable `DenseBackend`), sparse (BM25),
 /// and reranking. Exact substring search is handled by SQLite LIKE queries on
@@ -33,6 +35,12 @@ pub struct HybridSearcher {
     reranker: Mutex<Option<RerankerEngine>>,
     store: Mutex<ChunkStore>,
     config: SemantexConfig,
+    /// Daemon-scoped semantic query cache (S7). OFF unless SEMANTEX_SEMANTIC_CACHE=1.
+    /// Stamped with the index's updated_at + schema_version; flushed on reindex.
+    semantic_cache: Mutex<SemanticCache>,
+    /// The index directory — used to read the current `meta.json` stamp for
+    /// cache invalidation on each search.
+    index_dir: PathBuf,
 }
 
 impl HybridSearcher {
@@ -68,6 +76,8 @@ impl HybridSearcher {
             reranker,
             store,
             config: config.clone(),
+            semantic_cache: Mutex::new(SemanticCache::new(semantic_cache::capacity_from_env())),
+            index_dir: index_dir.to_path_buf(),
         })
     }
 
@@ -183,6 +193,8 @@ impl HybridSearcher {
             reranker,
             store,
             config: config.clone(),
+            semantic_cache: Mutex::new(SemanticCache::new(semantic_cache::capacity_from_env())),
+            index_dir: index_dir.to_path_buf(),
         })
     }
 
@@ -221,6 +233,37 @@ impl HybridSearcher {
         // Grep-mode: fast path with simplified exact+sparse fusion
         if query.grep_mode {
             return self.search_grep_mode(query, search_start);
+        }
+
+        // S7: semantic-cache lookup. OFF unless SEMANTEX_SEMANTIC_CACHE=1. Only
+        // attempts when a dense backend can embed the query AND meta.json yields
+        // a current stamp. A hit returns cached (results, metrics) verbatim,
+        // skipping all retrieval/fusion/rerank. Never caches grep-mode (handled
+        // above) or queries with a regex_pattern (results depend on the pattern).
+        let cache_eligible = semantic_cache::is_enabled() && query.regex_pattern.is_none();
+        let query_cache_vec: Option<Vec<f32>> = if cache_eligible {
+            self.dense
+                .as_ref()
+                .and_then(|d| d.embed_text_vector(&query.text))
+        } else {
+            None
+        };
+        if let (Some(qvec), Some(stamp)) = (
+            &query_cache_vec,
+            semantic_cache::read_stamp(&self.index_dir),
+        ) {
+            let threshold = semantic_cache::threshold_from_env();
+            let mut cache = self.semantic_cache.lock();
+            if let Some((results, mut metrics)) = cache.lookup(&query.text, qvec, threshold, &stamp)
+            {
+                metrics.total_ms = search_start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    query = %query.text,
+                    results = results.len(),
+                    "Semantic cache hit (S7)"
+                );
+                return Ok(super::SearchOutput { results, metrics });
+            }
         }
 
         let candidates = self.config.rerank_candidates;
@@ -598,6 +641,43 @@ impl HybridSearcher {
                         dual_route =
                             !exp_dense_results.is_empty() || !exp_sparse_results.is_empty(),
                         "Triple RRF fusion complete (E2 + E4)"
+                    );
+                    rrf_results.into_iter().map(|r| r.scored).collect()
+                }
+                // S7: Weighted Triple RRF — per-channel rank-decay scaled by the
+                // query-type FusionWeights, with k = config.rrf_k (now live).
+                // Selected by SEMANTEX_FUSION=weighted-rrf; default stays Rrf.
+                FusionMode::WeightedRrf => {
+                    let (weights, k) = weighted_rrf_params(&self.config, query_type);
+                    let rrf_results: Vec<RrfFusedResult> =
+                        if !exp_dense_results.is_empty() || !exp_sparse_results.is_empty() {
+                            triple_fusion::exp4_weighted_rrf_fuse(
+                                &dense_results,
+                                &sparse_results,
+                                &exp_dense_results,
+                                &exp_sparse_results,
+                                &exact_ids,
+                                weights,
+                                k,
+                            )
+                        } else {
+                            triple_fusion::triple_weighted_rrf_fuse(
+                                &dense_results,
+                                &sparse_results,
+                                &exact_ids,
+                                weights,
+                                k,
+                            )
+                        };
+                    let labels = triple_fusion::assign_confidence(&rrf_results);
+                    for (rr, (conf, score)) in rrf_results.iter().zip(labels.iter()) {
+                        confidence_map.insert(rr.scored.chunk_id, (*conf, *score));
+                    }
+                    tracing::debug!(
+                        fused_count = rrf_results.len(),
+                        rrf_k = k,
+                        duration_ms = fusion_start.elapsed().as_millis() as u64,
+                        "Weighted Triple RRF fusion complete (S7)"
                     );
                     rrf_results.into_iter().map(|r| r.scored).collect()
                 }
@@ -1119,6 +1199,38 @@ impl HybridSearcher {
             rerank_ms = Some(rerank_start.elapsed().as_millis() as u64);
         }
 
+        // Stage 3b: MMR diversity pass (S7). OFF unless SEMANTEX_MMR_LAMBDA is
+        // set and a dense backend is present. Reorders the top-K results to
+        // reduce near-duplicate clustering; does not change scores, so Stage 4
+        // adaptive sizing/threshold logic is unaffected. O(K²), K ≤ 50.
+        if let Some(lambda) = mmr_active(self.dense.as_deref()) {
+            let mmr_top_k = results.len().min(50); // O(K²) guard, K ≤ 50 per spec
+            if mmr_top_k >= 2
+                && let Some(ref dense) = self.dense
+            {
+                // Per-chunk vectors come from the S1-declared `embed_doc_vectors`
+                // seam (`Option<Vec<(u64, Vec<f32>)>>`). Collect the top-K chunk
+                // ids, ask the backend for their vectors, and fold the returned
+                // pairs into the `HashMap<u64, Vec<f32>>` that `mmr_rerank` wants.
+                // If the backend has no single-vector projection it returns None →
+                // `.map(...)` yields None and MMR no-ops.
+                let ids: Vec<u64> = results.iter().take(mmr_top_k).map(|r| r.chunk.id).collect();
+                let doc_vecs: Option<HashMap<u64, Vec<f32>>> = dense
+                    .embed_doc_vectors(&ids)
+                    .map(|pairs| pairs.into_iter().collect());
+                if let Some(doc_vectors) = doc_vecs {
+                    let before_top = results.first().map(|r| r.chunk.id);
+                    mmr::mmr_rerank(&mut results, &doc_vectors, lambda, mmr_top_k);
+                    tracing::debug!(
+                        lambda,
+                        top_k = mmr_top_k,
+                        reordered = (results.first().map(|r| r.chunk.id) != before_top),
+                        "MMR diversity pass applied (S7)"
+                    );
+                }
+            }
+        }
+
         // Stage 4: Adaptive result sizing, confidence threshold, and deduplication.
         // Exhaustive mode: widen range, skip dedup, lower threshold.
         let mut adaptive_config = self.config.adaptive_config();
@@ -1150,7 +1262,7 @@ impl HybridSearcher {
             "Search completed successfully"
         );
 
-        Ok(super::SearchOutput {
+        let output = super::SearchOutput {
             metrics: super::SearchMetrics {
                 total_ms: total_duration.as_millis() as u64,
                 dense_ms: if query.use_dense {
@@ -1175,7 +1287,25 @@ impl HybridSearcher {
                 response_bytes: None,
             },
             results,
-        })
+        };
+
+        // S7: store this (query → results) association if the cache is engaged.
+        // Re-read the stamp at store time (cheap) so a reindex that completed
+        // mid-search still tags the entry with the post-reindex stamp (or, on
+        // mismatch, enforce_stamp flushes — correctness preserved either way).
+        if let Some(qvec) = query_cache_vec
+            && let Some(stamp) = semantic_cache::read_stamp(&self.index_dir)
+        {
+            self.semantic_cache.lock().store(
+                &query.text,
+                &qvec,
+                output.results.clone(),
+                output.metrics.clone(),
+                &stamp,
+            );
+        }
+
+        Ok(output)
     }
 
     /// Grep-mode search: exact + sparse only, no dense, no rerank, no adaptive filtering.
@@ -1478,6 +1608,23 @@ fn merge_hyde_results(
     }
 }
 
+/// S7: select the (FusionWeights, k) pair the weighted-RRF path uses.
+/// `k` comes from the previously-dead `config.rrf_k`; the weights come from the
+/// query classifier's per-type table. Extracted as a free fn so it is unit-
+/// testable without building an index.
+fn weighted_rrf_params(config: &SemantexConfig, query_type: QueryType) -> (FusionWeights, f32) {
+    (query_type.fusion_weights(), config.rrf_k)
+}
+
+/// S7: resolve the active MMR lambda. MMR runs only when a valid
+/// `SEMANTEX_MMR_LAMBDA` is set AND a dense backend exists (it supplies the
+/// per-result vectors). Returns `Some(lambda)` to run, `None` to skip.
+fn mmr_active(dense: Option<&dyn crate::search::dense_backend::DenseBackend>) -> Option<f32> {
+    let lambda = mmr::mmr_lambda_from_env()?;
+    dense?; // None backend → skip
+    Some(lambda)
+}
+
 /// Heuristic: exhaustive queries ask for complete enumeration of all instances.
 /// Examples: "find all error handling", "list every config option", "all places where X".
 /// These benefit from wider result ranges, no per-file dedup, and lower score thresholds.
@@ -1772,6 +1919,62 @@ mod tests {
         let cfg = select_graph_config("getUserById", QueryType::Identifier, 20);
         assert!(!cfg.enable_transitive);
         assert_eq!(cfg.max_propagated, 5); // 20/4 from for_query_type(Identifier)
+    }
+
+    /// S7: the cache engages only when enabled by env. Default (unset) → no
+    /// cache work regardless of dense/stamp availability.
+    #[test]
+    fn semantic_cache_gate_off_by_default() {
+        unsafe {
+            std::env::remove_var("SEMANTEX_SEMANTIC_CACHE");
+        }
+        assert!(!semantic_cache::is_enabled());
+    }
+
+    /// S7: HybridSearcher carries a daemon-scoped semantic cache, initialized
+    /// empty. open_sparse_only must construct it too (sparse-only callers just
+    /// never get cache hits, since they have no dense embedder for the query).
+    #[test]
+    fn sparse_only_constructs_empty_semantic_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(tmp.path(), &cfg).unwrap();
+        assert_eq!(searcher.semantic_cache.lock().len(), 0);
+    }
+
+    /// S7: MMR runs only when (a) SEMANTEX_MMR_LAMBDA is a valid lambda AND
+    /// (b) a dense backend is present. Sparse-only opens (dense None) never MMR.
+    #[test]
+    fn mmr_active_requires_lambda_and_dense_backend() {
+        // SAFETY: process-level env mutation in a single-threaded test.
+        unsafe {
+            std::env::set_var("SEMANTEX_MMR_LAMBDA", "0.7");
+        }
+        assert_eq!(
+            mmr_active(None),
+            None,
+            "no dense backend → MMR off even with lambda set"
+        );
+        unsafe {
+            std::env::remove_var("SEMANTEX_MMR_LAMBDA");
+        }
+        // (The present-backend case is covered by the integration behavior; this
+        // guards the env+presence gate, the part that's pure.)
+    }
+
+    /// S7: weighted-RRF reads config.rrf_k (previously dead) and the query-type
+    /// FusionWeights. This guards the selection logic the hybrid match arm uses.
+    #[test]
+    fn weighted_rrf_selection_reads_config_rrf_k_and_weights() {
+        let mut cfg = crate::config::SemantexConfig::default();
+        cfg.rrf_k = 42.0;
+        let (weights, k) = weighted_rrf_params(&cfg, query_classifier::QueryType::Identifier);
+        assert!(
+            (k - 42.0).abs() < f32::EPSILON,
+            "config.rrf_k must be live, got {k}"
+        );
+        // Identifier weights favour sparse (dead-code revival check).
+        assert!(weights.w_sparse > weights.w_dense);
     }
 
     // ---- Defect #13 regression: Phase 3 boosts must NOT clamp at
