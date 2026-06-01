@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a leaderboard-grade, pure-retrieval relevance harness `benchmarks/relevance/` that measures semantex on CoIR + CodeSearchNet + SWE-bench localization with MRR@10 / nDCG@10 / Recall@{1,5,10} / MAP, supports the `--sparse-only / --dense-only / --hybrid / --rerank` ablations and the D4 `--embedder lateon-colbert|coderank-137m` A/B (env-selected via `SEMANTEX_EMBEDDER`), and reproduces a published CSN/CoIR baseline within a stated tolerance.
+**Goal:** Build a leaderboard-grade, pure-retrieval relevance harness `benchmarks/relevance/` that measures semantex on CoIR + CodeSearchNet + SWE-bench localization (+ **CoREB**, May 2026, where HF access permits — it exposes keyword-query collapse + reranker task-asymmetry per the semantica-review SOTA check) with MRR@10 / nDCG@10 / Recall@{1,5,10} / MAP, supports the `--sparse-only / --dense-only / --hybrid / --rerank / --dense-context` ablations and the D4 `--embedder lateon-colbert|coderank-137m|qwen3-embed-0.6b` A/B (env-selected via `SEMANTEX_EMBEDDER`; `--dense-context on|off` sets `SEMANTEX_DENSE_CONTEXT` — the semantica-review dense-side-context A/B; `qwen3-embed-0.6b` is the 2026-SOTA third arm), and reproduces a published CSN/CoIR baseline within a stated tolerance.
 
 > **Per integration §4 D-env-knob, `SEMANTEX_EMBEDDER` (embedder id: `lateon-colbert` / `coderank-137m`) is canonical; `SEMANTEX_DENSE_BACKEND` (backend name: `colbert-plaid` / `coderank-hnsw`) is a kept-live deprecated alias. This harness sets `SEMANTEX_EMBEDDER`.**
 

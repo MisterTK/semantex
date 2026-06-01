@@ -1007,6 +1007,117 @@ EOF
 
 ---
 
+## Phase 4.5 — Graph-signal enrichments (centrality prior + cohesion expansion)
+
+> Both tasks are **search-time only** — they consume graph signals semantex *already produces at index time* (`chunk_centrality`, `module_edges`) and change **no** indexing/extraction code, preserving S4's backend-agnostic boundary. Both ship **off by default** (weight/decay `0.0`) and flip on only if Task S4.7 measures a net SWE-loc lift with no CoIR/CSN regression. Origin: the 2026-05-31 semantica competitive review (`~/.claude` memory `semantica-review-2026-05-31`) — centrality-as-prior and community expansion are the two code-graph levers semantica + the RepoGraph/LocAgent SOTA share that semantex had half-built.
+
+### Task S4.5: Wire the stored PageRank centrality into ranking as a tunable prior (TDD)
+
+**Files:**
+- Modify: `crates/semantex-core/src/index/storage.rs` (add a read-side centrality getter)
+- Modify: `crates/semantex-core/src/search/graph_stage.rs` (apply the prior inside the stage)
+
+**Motivation:** semantex **already computes PageRank** over the code graph at index time (`builder.rs::compute_and_store_pagerank`, ~line 981) and stores per-chunk scores in the `chunk_centrality(chunk_id, structural_centrality REAL)` table — but the **only consumer is `agent.rs`** (it *prints* "Top central symbols (PageRank-ranked)" at ~line 705); **the signal is never used in search ranking.** Centrality is the LocAgent / RepoGraph repo-level localization prior: a symbol referenced from 100 sites should outrank a textually-similar dead one. This task adds it as a small, env-tunable additive prior in the graph stage. Pure search-time; the expensive computation already exists and is stored.
+
+- [ ] **Step 1: VERIFY the centrality table + that no read-side getter exists (no commit)**
+
+```bash
+grep -n "chunk_centrality\|structural_centrality\|fn get_centrality\|fn get_pagerank\|fn centrality" \
+  crates/semantex-core/src/index/storage.rs crates/semantex-core/src/search/agent.rs
+```
+Expected: the `chunk_centrality` DDL + `INSERT`/`DELETE`/`table_exists` in `storage.rs`/`builder.rs`, and `agent.rs` reads it (record the exact path — direct SQL vs a helper). Expected: **no `get_centrality_scores`-style reader** → this task adds one. If `agent.rs` already routes through a getter, reuse it instead of adding a duplicate.
+
+- [ ] **Step 2: Write the failing getter test**
+
+In `storage.rs`'s `#[cfg(test)] mod tests`, mirror the existing aux-schema test (`compute_pagerank_writes_centrality` is the pattern — same `ChunkStore` constructor + `create_v03_aux_schema`/insert path): insert two `chunk_centrality` rows, then assert `store.get_centrality_scores(&[id1, id2])` returns both, and that a chunk with no row is absent from the map (caller treats missing as 0).
+
+- [ ] **Step 3: Run — expect failure** (`cannot find method get_centrality_scores`).
+
+- [ ] **Step 4: Implement the getter**
+
+```rust
+/// Read stored PageRank / structural centrality for the given chunk ids.
+/// Returns an empty map when the aux table is absent (older index) so the
+/// centrality prior is a clean no-op on un-enriched indexes.
+pub fn get_centrality_scores(&self, chunk_ids: &[u64]) -> Result<HashMap<u64, f32>> {
+    if chunk_ids.is_empty() || !self.table_exists("chunk_centrality")? {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; chunk_ids.len()].join(",");
+    let sql = format!(
+        "SELECT chunk_id, structural_centrality FROM chunk_centrality \
+         WHERE chunk_id IN ({placeholders})"
+    );
+    let mut stmt = self.conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        chunk_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |r| {
+        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, f64>(1)? as f32))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<u64, f32>>>()?)
+}
+```
+(Match the exact `self.conn` field name + the `i64`/`u64` chunk-id casting used by the neighboring getters like `get_call_edges_from`.)
+
+- [ ] **Step 5: Apply the prior inside `run_graph_stage` (TDD)**
+
+Add the env knob and the prior to `graph_stage.rs`. Read `SEMANTEX_GRAPH_CENTRALITY_WEIGHT` (default `0.0` → off) once at stage entry. After the existing merge + re-sort, when `weight > 0.0`:
+1. `let ids: Vec<u64> = fused.iter().map(|s| s.chunk_id).collect();`
+2. `let cen = store.get_centrality_scores(&ids)?;`
+3. min–max normalize the present centrality values to `[0,1]` (guard the all-equal / empty case → skip);
+4. for each `scored in fused`: `scored.score += weight * max_seed_score * cen_norm.get(&id).copied().unwrap_or(0.0);` — scaling by `max_seed_score` keeps the prior commensurate with propagation bonuses (same convention as `propagate`);
+5. re-sort `fused` desc.
+
+`max_seed_score` is `fused`'s top score before the prior. Write the test first: extend the call-edge store with `chunk_centrality` rows so the callee (chunk 2) has the highest centrality; assert that with `weight=0.2` chunk 2's final score is lifted by the expected amount, and with `weight=0.0` the result is byte-identical to the no-prior stage (behavior-preserving default).
+
+- [ ] **Step 6: Tune the weight on SWE-loc (measure-only; feeds S4.7)**
+
+```bash
+cargo build -p semantex-cli && export SEMANTEX_BINARY=$(pwd)/target/debug/semantex
+cd benchmarks/relevance && source .venv/bin/activate
+for W in 0.0 0.05 0.10 0.20; do
+  export SEMANTEX_GRAPH_CENTRALITY_WEIGHT=$W
+  python -m scripts.run --dataset swe-loc --ablation hybrid --run-id s4-cen$W --k 10
+done
+unset SEMANTEX_GRAPH_CENTRALITY_WEIGHT
+```
+Record SWE-loc R@{5,10}/MRR@10 per weight (vs the Task S4.0 graph-off baseline) and the CSN no-regression check for the best weight, in research-notes `## S4 code-graph fusion → centrality prior`. The winning weight is applied as the default in Task S4.8 (or left `0.0` if no lift).
+
+- [ ] **Step 7: Commit** (`feat(graph): centrality prior — wire stored PageRank into ranking (SEMANTEX_GRAPH_CENTRALITY_WEIGHT, default off)`).
+
+**Acceptance:** with the tuned weight, SWE-loc R@{5,10} ≥ centrality-off, CSN within noise; ships off-by-default if no lift. **CLAUDE.md:** `SEMANTEX_GRAPH_CENTRALITY_WEIGHT` is a universal graph parameter (like `RRF_K`), env-overridable, tuned on external benchmarks — not repo-specific.
+
+---
+
+### Task S4.10: Module-cohesion ("community") expansion for exhaustive queries (TDD)
+
+**Files:**
+- Modify: `crates/semantex-core/src/search/graph_propagation.rs` (add a `module_decay` edge class) + `graph_stage.rs` (route gate)
+
+**Motivation:** the search-time-scoped form of the "Louvain community expansion" idea from the semantica review. semantica (and graph SOTA) cluster the graph into communities and, for broad queries, surface a whole community — directly targeting semantex's weakest question type (exhaustive). semantex already stores file-level **`module_edges`** (imports) and exposes `get_import_neighbors(&[String]) -> Vec<String>` (storage.rs ~862) and `get_module_edges_for_file(&str)` (~617). For **exhaustive-route queries only**, expand top seeds to chunks in import-neighbor files (shared import cohesion ≈ same subsystem) with a `module_decay`.
+
+> **Scope note (honest):** this is *import-cohesion* expansion — a cheap, in-boundary **proxy** for community detection. True Louvain/Leiden clustering over the call+type graph (computed once at index time, stored as a `community_id` per chunk, then "expand to community") is a **heavier follow-up that crosses into the index path** (new index-time compute + schema) and is therefore **out of S4's boundary** — record it as a follow-up in the integration doc; build it only if this lightweight proxy shows a clear exhaustive-query lift.
+
+- [ ] **Step 1: VERIFY the import-edge + file→chunk APIs (no commit)**
+
+```bash
+grep -n "fn get_import_neighbors\|fn get_module_edges_for_file\|fn get_chunks_for_file\|file_path\|fn chunks_in_file" \
+  crates/semantex-core/src/index/storage.rs
+```
+Expected: `get_import_neighbors` (~862) and `get_module_edges_for_file` (~617) exist (both file-path-based). Confirm how to map a **file path → its chunk ids** (chunks carry `file_path`); record the exact method. If none exists, add a tiny `get_chunk_ids_for_files(&[String]) -> Result<Vec<u64>>` (one `SELECT id FROM chunks WHERE file_path IN (...)`) as part of Step 4 — it's a generic accessor, not repo-specific.
+
+- [ ] **Step 2–5: TDD the cohesion edge**
+
+Add `pub module_decay: f32` to `GraphPropagationConfig` (default `0.0` in every preset; non-zero only in `localization_mode`, e.g. `0.10`). In `run_graph_stage`, **only on the exhaustive route** (caller passes a flag, or the stage reads `config.module_decay > 0.0`): map seed chunk ids → file paths → `get_import_neighbors(files)` → `get_chunk_ids_for_files(neighbor_files)` → add `module_decay * norm_seed_score * max_seed_score` (accumulate-by-max, same as `propagate`), bounded by `max_propagated`, tag results `GraphExpanded`. Test on the call-edge store extended with one `module_edge` between two files: assert a chunk in the imported file surfaces only when `module_decay > 0.0`, and that `module_decay = 0.0` is byte-identical to Task S4.3's stage output.
+
+- [ ] **Step 6: Measure on SWE-loc (exhaustive slice if S0 exposes one)** — sweep `module_decay ∈ {0.0, 0.05, 0.10, 0.15}`; record lift vs S4.0 baseline + CSN guard. Off by default unless net-positive.
+
+- [ ] **Step 7: Commit** (`feat(graph): import-cohesion expansion for exhaustive queries (module_decay, default off)`).
+
+**Acceptance:** net-positive SWE-loc (or the exhaustive query slice) with no CSN regression → keep on for the localization/exhaustive route; else ship `module_decay = 0.0`. **CLAUDE.md:** `module_edges` is a generic import graph; `module_decay` is a universal parameter — no repo-specific logic.
+
+---
+
 ## Phase 5 — Tune on S0 SWE-loc; guard CoIR/CSN
 
 ### Task S4.7: Grid-tune decays + hop count on SWE-loc; verify no CoIR/CSN regression (measure-only, no crate commit)
@@ -1208,7 +1319,9 @@ Summarize for the integration controller: the SWE-loc lift vs graph-off (from S4
 - **(2) Optional 2-hop, gated per query-route:** `is_exhaustive_query` / `is_feature_planning_query` predicates (Task S4.6) + `select_graph_config` route selection (Task S4.3), choosing `localization_mode`/`architectural_mode` (both 2-hop) vs `for_query_type` (1-hop). `SEMANTEX_GRAPH_HOPS` overrides for tuning.
 - **(3) Localization expansion + GraphExpanded tag:** `localization_mode` preset (Task S4.1) drives a recall-oriented 1–2-hop expansion of the top fused seeds along call/import/type/hierarchy edges; the existing `SearchSource::GraphExpanded` tagging (`hybrid.rs` ~1038–1048) is preserved and fed by the stage's `new_ids` (Task S4.3); proven end-to-end on a real index (Task S4.4).
 - **(4) Tune on SWE-loc, no CoIR/CSN regression:** Task S4.7 (grid/hop sweep against the S0 harness) + Task S4.8 (apply winners). Baselines captured in Task S4.0.
-- **Acceptance gate:** measurable SWE-loc Recall@{5,10} lift vs graph-off (Task S4.0 baseline vs S4.7/S4.8 tuned), no net regression on CSN (and CoIR where reachable) — checked in Tasks S4.7 Step 4 / S4.8 Step 5.
+- **(5) Centrality prior (semantica-review borrow):** Task S4.5 wires the already-computed-but-unused `chunk_centrality` PageRank into the graph stage as an env-tunable additive prior (`SEMANTEX_GRAPH_CENTRALITY_WEIGHT`, default off) — the LocAgent/RepoGraph localization signal, search-time only.
+- **(6) Module-cohesion expansion (semantica-review borrow):** Task S4.10 adds import-cohesion ("community") expansion for the exhaustive route (`module_decay`, default off) over the existing `module_edges`; full index-time Louvain noted as a deferred follow-up.
+- **Acceptance gate:** measurable SWE-loc Recall@{5,10} lift vs graph-off (Task S4.0 baseline vs S4.7/S4.8 tuned), no net regression on CSN (and CoIR where reachable) — checked in Tasks S4.7 Step 4 / S4.8 Step 5. Tasks S4.5/S4.10 carry their own off-by-default → measure → keep-if-net-positive gates (S4.5 Step 6, S4.10 Step 6).
 - **Backend-agnostic:** the stage consumes `Vec<ScoredChunkId>` + `ChunkStore` graph tables only; no dense-backend coupling (Task S4.9 Step 5 handoff note).
 
 ## CLAUDE.md compliance
