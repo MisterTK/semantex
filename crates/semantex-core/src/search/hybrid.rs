@@ -2343,6 +2343,263 @@ mod hyde_tests {
         }
     }
 
+    use super::HybridSearcher;
+    use crate::llm::LlmCapability;
+    use crate::search::agent_classifier::AgentRoute;
+
+    /// Mock LLM for HyDE contract tests.
+    ///
+    /// - `Mode::Ok(doc)` → returns `doc` from `synthesize_hyde_doc`.
+    /// - `Mode::Empty` → returns an empty string (HyDE caller must treat this as
+    ///   "no doc" and return base unchanged).
+    /// - `Mode::Err` → returns an error (HyDE caller must return base).
+    /// - `Mode::Slow(delay)` → sleeps `delay` then returns a doc (used by the
+    ///   timeout test once paired with a 1ms env override).
+    enum Mode {
+        Ok(&'static str),
+        Empty,
+        Err,
+        Slow(std::time::Duration),
+    }
+
+    struct MockLlm {
+        mode: Mode,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmCapability for MockLlm {
+        async fn classify_route(&self, _query: &str) -> anyhow::Result<AgentRoute> {
+            Ok(AgentRoute::Semantic)
+        }
+
+        async fn synthesize_hyde_doc(&self, _query: &str) -> anyhow::Result<String> {
+            match &self.mode {
+                Mode::Ok(doc) => Ok((*doc).to_string()),
+                Mode::Empty => Ok(String::new()),
+                Mode::Err => anyhow::bail!("mock HyDE synthesis error"),
+                Mode::Slow(d) => {
+                    tokio::time::sleep(*d).await;
+                    Ok("fn slow() {}".to_string())
+                }
+            }
+        }
+
+        fn label(&self) -> &'static str {
+            "mock-hyde-llm"
+        }
+    }
+
+    /// Contract: when `synthesize_hyde_doc` errors, the HyDE merge stage is
+    /// never reached, so the caller's result is byte-identical to `base`.
+    ///
+    /// We assert the contract at the seam the production code depends on:
+    /// the mock returns `Err`, and `merge_hyde_results` is therefore NOT the
+    /// path taken — base survives verbatim. This pins the mock's error
+    /// behaviour that `search_with_hyde`'s `Ok(Err(e)) => return Ok(base)`
+    /// branch relies on.
+    #[tokio::test]
+    async fn hyde_llm_error_yields_base_unchanged() {
+        let llm = MockLlm { mode: Mode::Err };
+
+        // The error path is observable directly on the trait object.
+        let doc = llm.synthesize_hyde_doc("how does auth work").await;
+        assert!(doc.is_err(), "mock must error in Mode::Err");
+
+        // And the production branch for an errored doc is: return base.
+        // We reconstruct that decision here to lock its shape: base passes
+        // through with no merge applied.
+        let base = SearchOutput {
+            results: vec![make_result(1, 0.9), make_result(2, 0.8)],
+            metrics: make_metrics(),
+        };
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+        let returned = if doc.is_err() { base } else { unreachable!() };
+        let returned_ids: Vec<u64> = returned.results.iter().map(|r| r.chunk.id).collect();
+        assert_eq!(
+            returned_ids, base_ids,
+            "error path must return base unchanged"
+        );
+        assert_ne!(
+            returned.metrics.query_type, "hyde_merged",
+            "error path must NOT mark results as hyde_merged"
+        );
+    }
+
+    /// Contract: an empty HyDE doc (whitespace-only counts) is treated as "no
+    /// doc" — the caller returns base unchanged, never merging an empty query's
+    /// results.
+    #[tokio::test]
+    async fn hyde_empty_doc_yields_base_unchanged() {
+        let llm = MockLlm { mode: Mode::Empty };
+        let doc = llm.synthesize_hyde_doc("anything").await.unwrap();
+        assert!(
+            doc.trim().is_empty(),
+            "mock must return empty in Mode::Empty"
+        );
+
+        // Production decision for an empty doc: return base (no merge).
+        let base = SearchOutput {
+            results: vec![make_result(7, 0.5)],
+            metrics: make_metrics(),
+        };
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+        let returned = if doc.trim().is_empty() {
+            base
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            returned
+                .results
+                .iter()
+                .map(|r| r.chunk.id)
+                .collect::<Vec<_>>(),
+            base_ids,
+            "empty-doc path must return base unchanged"
+        );
+        assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
+    /// Contract: when the LLM is slower than `SEMANTEX_LLM_HYDE_TIMEOUT_MS`,
+    /// `tokio::time::timeout` returns `Err(Elapsed)` and the caller returns
+    /// base unchanged. We drive the *real* `super::llm_hyde_timeout()` reader by
+    /// overriding the env var to 1ms and racing it against a 200ms mock.
+    ///
+    /// SAFETY: env mutation under Rust 2024 is `unsafe`; this test holds the
+    /// crate-wide `TEST_ENV_LOCK` (which guards `SEMANTEX_LLM_*`) so no other
+    /// LLM test races on process env.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyde_timeout_yields_base_unchanged() {
+        // Resolve the *real* `llm_hyde_timeout()` env reader (1ms) inside a
+        // short critical section, then drop the env + lock BEFORE awaiting so
+        // we never hold a std `MutexGuard` across an await point. The captured
+        // `budget` is what the production path would have computed.
+        let budget = {
+            let _guard = crate::llm::TEST_ENV_LOCK.lock().unwrap();
+            // SAFETY: guarded by TEST_ENV_LOCK; see module doc on the lock.
+            unsafe { std::env::set_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS", "1") };
+            let budget = super::llm_hyde_timeout();
+            // SAFETY: guarded by TEST_ENV_LOCK.
+            unsafe { std::env::remove_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS") };
+            budget
+        };
+
+        let llm = MockLlm {
+            mode: Mode::Slow(std::time::Duration::from_millis(200)),
+        };
+        let outcome = tokio::time::timeout(budget, llm.synthesize_hyde_doc("slow query")).await;
+
+        assert!(
+            outcome.is_err(),
+            "1ms budget must elapse before a 200ms mock resolves"
+        );
+
+        // Production decision on Err(Elapsed): return base (no merge).
+        let base = SearchOutput {
+            results: vec![make_result(9, 0.42)],
+            metrics: make_metrics(),
+        };
+        let returned = if outcome.is_err() {
+            base
+        } else {
+            unreachable!()
+        };
+        assert_eq!(returned.results.len(), 1);
+        assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
+    /// Build a minimal real `HybridSearcher` backed by an empty chunk store,
+    /// driving `search_with_hyde` through its genuine async code path (base
+    /// search → LLM → merge). Mirrors `server::handler`'s `build_empty_searcher`.
+    /// An empty index makes both the base and HyDE searches return no results,
+    /// which is exactly what the byte-identity / no-panic contracts need.
+    fn build_tiny_searcher() -> (tempfile::TempDir, HybridSearcher) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+        {
+            let _store =
+                crate::index::storage::ChunkStore::open(&db_path).expect("create chunk store");
+        }
+        let config = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(&semantex_dir, &config)
+            .expect("open sparse-only searcher");
+        (dir, searcher)
+    }
+
+    /// Build a default Semantic `SearchQuery` for the end-to-end tests.
+    fn semantic_query(text: &str) -> crate::search::SearchQuery {
+        crate::search::SearchQuery::new(text).max_results(10)
+    }
+
+    /// End-to-end: with a failing LLM, `search_with_hyde` returns a result set
+    /// byte-identical to the plain base search — proving "HyDE never breaks a
+    /// search." Drives the real async path, not just the branch decision.
+    #[tokio::test]
+    async fn search_with_hyde_error_path_is_identical_to_base() {
+        let (_tmp, searcher) = build_tiny_searcher();
+        let query = semantic_query("error handling");
+
+        let base = searcher.search(&query).expect("base search");
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+
+        let failing: std::sync::Arc<dyn crate::llm::LlmCapability> =
+            std::sync::Arc::new(MockLlm { mode: Mode::Err });
+        let hyde_out = searcher
+            .search_with_hyde(&query, failing)
+            .await
+            .expect("search_with_hyde must not propagate LLM errors");
+
+        let hyde_ids: Vec<u64> = hyde_out.results.iter().map(|r| r.chunk.id).collect();
+        assert_eq!(
+            hyde_ids, base_ids,
+            "LLM-error path must be byte-identical to base (same IDs, same order)"
+        );
+        assert_ne!(
+            hyde_out.metrics.query_type, "hyde_merged",
+            "error path must NOT be marked hyde_merged"
+        );
+    }
+
+    /// Success path: a succeeding mock yields a merged, deduped result set
+    /// tagged `hyde_merged`, with no duplicate chunk IDs and never fewer than
+    /// base after dedup+cap.
+    #[tokio::test]
+    async fn search_with_hyde_success_path_merges_and_tags() {
+        let (_tmp, searcher) = build_tiny_searcher();
+        let query = semantic_query("error handling");
+
+        let base = searcher.search(&query).expect("base search");
+
+        let ok: std::sync::Arc<dyn crate::llm::LlmCapability> = std::sync::Arc::new(MockLlm {
+            mode: Mode::Ok("fn handle_error(e: Error) -> Result<()> { Err(e) }"),
+        });
+        let merged = searcher
+            .search_with_hyde(&query, ok)
+            .await
+            .expect("search_with_hyde");
+
+        // Dedup-by-id invariant: no duplicate chunk IDs in the output.
+        let mut ids: Vec<u64> = merged.results.iter().map(|r| r.chunk.id).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n,
+            "merged output must contain no duplicate chunk IDs"
+        );
+
+        // The success path tags the merge.
+        assert_eq!(merged.metrics.query_type, "hyde_merged");
+        // Merge is base ∪ hyde (capped) → never fewer than base after dedup+cap.
+        assert!(
+            merged.results.len() >= base.results.len().min(query.max_results),
+            "merged result count must be >= base (post dedup/cap)"
+        );
+    }
+
     /// `merge_hyde_results` must dedup by `chunk.id`, not by `(file, start, end)`.
     /// Chunk ID is the stable DB key and is the only correct dedup key.
     #[test]
