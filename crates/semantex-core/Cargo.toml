@@ -23,6 +23,14 @@ tracing.workspace = true
 # FastEmbed for cross-encoder reranking (TextRerank)
 fastembed = "5.9"
 
+# Tokenizer for the generic ONNX cross-encoder reranker (search/onnx_reranker.rs).
+# `from_file` + `encode` are all we use. PURE-RUST tokenizer path (integration §5):
+# `default-features = false` drops the `onig`/`onig_sys` C dependency (and the
+# `progressbar`/`esaxx_fast` C++ defaults), and `fancy-regex` provides the
+# required pure-Rust regex backend (tokenizers requires exactly one of
+# `onig`/`fancy-regex`). No new C/C++ vendor surface — airgap-safe.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
 # ONNX Runtime — direct dependency for execution provider configuration (CoreML/CUDA/CPU);
 # fastembed depends on ort transitively, but we need the `ort::ep` types directly.
 #
