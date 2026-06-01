@@ -25,8 +25,20 @@ pub struct SemantexConfig {
     pub chunk_overlap: usize,
     /// RRF fusion constant k
     pub rrf_k: f32,
-    /// Number of candidates to fetch before reranking
+    /// Base retrieval-candidate pool width. This is the number of fused
+    /// candidates retrieval targets for EVERY query (then oversampled per query
+    /// type — Identifier ×5, Keyword ×2, Semantic ×2–3, Mixed ×1 — see
+    /// `hybrid.rs`). Despite the name it is NOT rerank-specific: it governs the
+    /// default (rerank-off) search path too. Distinct from `rerank_top_n`, which
+    /// is the cross-encoder scoring window. Do not conflate the two.
     pub rerank_candidates: usize,
+    /// Number of top fused candidates the cross-encoder reranker scores. Rerank
+    /// latency is ~linear in this value, so it bounds the (CPU-bound) rerank
+    /// cost. Only used when reranking is enabled (`rerank` + per-query
+    /// `use_rerank`); never scores fewer than `max_count` (we never rerank fewer
+    /// than we return). Tune via `SEMANTEX_RERANK_CANDIDATES`. Distinct from
+    /// `rerank_candidates`, which is the pre-rerank retrieval pool width.
+    pub rerank_top_n: usize,
     /// Custom model directory override
     pub model_dir: Option<PathBuf>,
     /// Enable adaptive result sizing (dynamically adjust result count based on score distribution)
@@ -107,6 +119,7 @@ impl Default for SemantexConfig {
             chunk_overlap: 128,
             rrf_k: 60.0,
             rerank_candidates: 100,
+            rerank_top_n: 25,
             model_dir: None,
             // Adaptive result sizing
             adaptive_sizing: true,
@@ -168,6 +181,9 @@ impl SemantexConfig {
         if let Ok(v) = std::env::var("SEMANTEX_RERANK") {
             config.rerank = v != "0" && v.to_lowercase() != "false";
         }
+        // Bounds the cross-encoder scoring window (NOT the retrieval pool, which
+        // stays `rerank_candidates`). Rerank latency is ~linear in this value.
+        config.rerank_top_n = env_usize("SEMANTEX_RERANK_CANDIDATES", config.rerank_top_n);
         if let Ok(v) = std::env::var("SEMANTEX_MAX_FILE_SIZE") {
             config.max_file_size = v.parse().unwrap_or(config.max_file_size);
         }
@@ -346,5 +362,53 @@ mod tests {
             env_string("SEMANTEX_DENSE_BACKEND_TEST_UNSET_KEY", "coderank-hnsw"),
             "coderank-hnsw"
         );
+    }
+
+    #[test]
+    fn rerank_top_n_default_is_25() {
+        // The cross-encoder scoring window defaults to 25 so reranking fits a
+        // deployable latency budget (latency is ~linear in this value).
+        let cfg = SemantexConfig::default();
+        assert_eq!(cfg.rerank_top_n, 25);
+    }
+
+    #[test]
+    fn rerank_candidates_default_is_still_100() {
+        // INVARIANT: the rerank scoring window is decoupled from the retrieval
+        // pool. Introducing `rerank_top_n` must NOT shrink the base
+        // retrieval-candidate pool used by the default (rerank-off) search path.
+        let cfg = SemantexConfig::default();
+        assert_eq!(
+            cfg.rerank_candidates, 100,
+            "retrieval pool width must remain 100 (default search path unchanged)"
+        );
+    }
+
+    #[test]
+    fn semantex_rerank_candidates_env_sets_rerank_top_n() {
+        // `SEMANTEX_RERANK_CANDIDATES` overlays `rerank_top_n` (the scoring
+        // window), NOT `rerank_candidates` (the retrieval pool). Serialize env
+        // mutation against the shared reranker test lock to avoid flakiness.
+        let _g = crate::search::RERANKER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_RERANK_CANDIDATES").ok();
+        // SAFETY: guarded by RERANKER_TEST_ENV_LOCK.
+        unsafe {
+            std::env::set_var("SEMANTEX_RERANK_CANDIDATES", "12");
+        }
+        let cfg = SemantexConfig::load(None).expect("load");
+        // SAFETY: guarded by RERANKER_TEST_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_RERANK_CANDIDATES", v),
+                None => std::env::remove_var("SEMANTEX_RERANK_CANDIDATES"),
+            }
+        }
+        // The "env doesn't clobber the retrieval pool" invariant is covered by
+        // `rerank_candidates_default_is_still_100` (uses `default()`, immune to
+        // any global config file); asserting the pool here would be fragile
+        // because `load(None)` also reads the global config file.
+        assert_eq!(cfg.rerank_top_n, 12, "env overlay sets the scoring window");
     }
 }

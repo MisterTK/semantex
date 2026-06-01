@@ -1555,7 +1555,11 @@ impl McpServer {
             }
         ));
         status.push(format!(
-            "  Rerank candidates: {}",
+            "  Rerank scoring window: {} (SEMANTEX_RERANK_CANDIDATES)",
+            self.config.rerank_top_n
+        ));
+        status.push(format!(
+            "  Retrieval pool: {}",
             self.config.rerank_candidates
         ));
 
