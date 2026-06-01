@@ -247,6 +247,8 @@ mod scalar {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
+    // Wildcard is idiomatic for the std::arch intrinsic namespace.
+    #[allow(clippy::wildcard_imports)]
     use std::arch::x86_64::*;
 
     /// Horizontal sum of an 8-lane f32 AVX register → scalar f32.
@@ -371,11 +373,32 @@ mod avx2 {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
+    // Wildcard is idiomatic for the std::arch intrinsic namespace.
+    #[allow(clippy::wildcard_imports)]
+    use std::arch::aarch64::*;
+
     /// # Safety
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
     #[target_feature(enable = "neon")]
     pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-        super::scalar::dot_f32(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !3; // 4 f32 per NEON q-register
+            let mut acc = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                acc = vfmaq_f32(acc, va, vb); // acc += va * vb (fused)
+                i += 4;
+            }
+            let mut result = vaddvq_f32(acc); // horizontal add of 4 lanes
+            while i < len {
+                result += a[i] * b[i];
+                i += 1;
+            }
+            result
+        }
     }
     /// # Safety
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
@@ -387,7 +410,26 @@ mod neon {
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
     #[target_feature(enable = "neon")]
     pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
-        super::scalar::l2_f32(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !3;
+            let mut acc = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                let diff = vsubq_f32(va, vb);
+                acc = vfmaq_f32(acc, diff, diff); // acc += diff²
+                i += 4;
+            }
+            let mut sumsq = vaddvq_f32(acc);
+            while i < len {
+                let d = a[i] - b[i];
+                sumsq += d * d;
+                i += 1;
+            }
+            sumsq.sqrt()
+        }
     }
     /// # Safety
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
@@ -520,6 +562,22 @@ mod tests {
             assert_close(d, scalar::dot_f32(&a, &b));
             assert_close(l, scalar::l2_f32(&a, &b));
             assert_close(c, scalar::cosine_f32(&a, &b));
+        }
+    }
+
+    /// aarch64-only: directly exercise the NEON dot/L2 kernels vs scalar. NEON is
+    /// mandatory on aarch64, so no runtime skip is needed. `#[cfg]`-gated so it
+    /// compiles only on aarch64; on x86_64 hosts this test is absent.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_dot_l2_match_scalar() {
+        for &len in &[4usize, 7, 8, 9, 64, 768, 769] {
+            let a = make_vec(len, 0x55 ^ len as u64);
+            let b = make_vec(len, 0xAA ^ len as u64);
+            // SAFETY: NEON is mandatory on aarch64; equal-length slices.
+            let (d, l) = unsafe { (neon::dot_f32(&a, &b), neon::l2_f32(&a, &b)) };
+            assert_close(d, scalar::dot_f32(&a, &b));
+            assert_close(l, scalar::l2_f32(&a, &b));
         }
     }
 
