@@ -151,3 +151,22 @@ dep here (no skip needed), but the test keeps `importorskip` for portability.
 - CoIR: `CoIR-Retrieval/<name>-queries-corpus` (splits corpus/queries) + `CoIR-Retrieval/<name>-qrels` (split test, cols query_id/corpus_id/score — underscores; adapter normalizes to hyphens).
 - pytrec_eval measures: `recip_rank, ndcg_cut_10, recall_10, map`.
 - swe_bench: `Instance` lacks `patch`; `index_repo(*, repo_path, semantex_binary, timeout_secs)`→`IndexResult(ok,path,error,duration_secs)`.
+
+### S0 addendum — CoIR loader verified live + subset-coherence caveat
+`load_coir_subdataset(name='cosqa', queries_corpus_id='CoIR-Retrieval/cosqa-queries-corpus',
+qrels_id='CoIR-Retrieval/cosqa-qrels', corpus_size=None, query_size=10)` verified
+end-to-end against live HF on 2026-05-31: 20,604 corpus docs materialised, 10
+queries selected, **all gold docs present in the materialised corpus**, sample
+gold id `d20145__doc_11275.txt:1-...`. The underscore→hyphen qrels normalization
+in `_normalize_qrel_rows` works.
+**CAVEAT (load-bearing for CoIR runs):** capping `corpus_size` while selecting
+queries by `query_size` can ORPHAN queries whose gold corpus doc falls outside
+the first-N corpus slice (observed: `corpus_size=200` → 0 surviving queries,
+because cosqa qrels are diagonal q_i↔d_i with i in the 20k range). The plan's
+loader correctly DROPS orphaned queries (no silent gold loss), but to get a
+non-empty CoIR eval either set `corpus_size: null` (index the full corpus) or
+make corpus subsetting gold-aware (retain every selected query's gold doc) — a
+follow-up refinement. The injectable `build_corpus_from_splits` + its unit tests
+are unaffected (they use a tiny coherent fixture). `config/coir_subset.yaml`
+ships `corpus_size: 5000`; bump to `null` for a real cosqa headline run, or wire
+gold-aware corpus subsetting first.
