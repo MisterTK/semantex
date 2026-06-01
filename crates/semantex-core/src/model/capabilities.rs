@@ -61,16 +61,15 @@ impl BackendKind {
     /// Map to S1's on-disk/selection enum. The only coupling point between the
     /// registry and the `DenseBackend` seam.
     ///
-    /// INTERIM (Phase 1, pre-S2): S1's `DenseBackendKind` currently has ONLY the
-    /// `ColbertPlaid` variant — S2 owns adding `CoderankHnsw`. So this conversion
-    /// is fallible: `ColbertPlaid` maps cleanly; `CoderankHnsw` errors until S2
-    /// lands its variant + the post-S2 reconciliation pass makes this total.
+    /// TOTAL (post-S2): both `BackendKind`s now map to a representable
+    /// `DenseBackendKind`. (Pre-S2 this was fallible because S1's enum lacked the
+    /// `CoderankHnsw` variant; S2 added it, so the conversion is infallible.) The
+    /// `Result` return is kept for source stability with the existing call sites
+    /// — it now never returns `Err`.
     pub fn dense_kind(self) -> Result<DenseBackendKind> {
         match self {
             BackendKind::ColbertPlaid => Ok(DenseBackendKind::ColbertPlaid),
-            BackendKind::CoderankHnsw => {
-                anyhow::bail!("coderank-hnsw backend not available until S2")
-            }
+            BackendKind::CoderankHnsw => Ok(DenseBackendKind::CoderankHnsw),
         }
     }
 }
@@ -103,14 +102,12 @@ mod tests {
     }
 
     #[test]
-    fn coderank_hnsw_dense_kind_errors_until_s2() {
-        // INTERIM Phase-1 contract: S1's DenseBackendKind has no CoderankHnsw
-        // variant yet, so the conversion is fallible and errors honestly. The
-        // post-S2 reconciliation pass makes this total.
-        let err = BackendKind::CoderankHnsw
-            .dense_kind()
-            .expect_err("coderank-hnsw must error until S2 lands the variant");
-        assert!(err.to_string().contains("S2"), "got: {err}");
+    fn coderank_hnsw_dense_kind_maps_to_s1_dense_kind() {
+        // Post-S2: the single-vector backend now maps totally to the S1 enum.
+        assert_eq!(
+            BackendKind::CoderankHnsw.dense_kind().unwrap(),
+            DenseBackendKind::CoderankHnsw
+        );
     }
 
     #[test]

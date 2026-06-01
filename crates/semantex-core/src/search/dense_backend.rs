@@ -16,6 +16,8 @@ pub enum DenseBackendKind {
     /// ColBERT late-interaction over a vendored next-plaid PLAID index.
     #[default]
     ColbertPlaid,
+    /// CodeRankEmbed single-vector embeddings over a pure-Rust HNSW index (S2).
+    CoderankHnsw,
 }
 
 impl DenseBackendKind {
@@ -23,6 +25,7 @@ impl DenseBackendKind {
     pub fn name(self) -> &'static str {
         match self {
             DenseBackendKind::ColbertPlaid => "colbert-plaid",
+            DenseBackendKind::CoderankHnsw => "coderank-hnsw",
         }
     }
 
@@ -32,6 +35,7 @@ impl DenseBackendKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "colbert-plaid" => Some(DenseBackendKind::ColbertPlaid),
+            "coderank-hnsw" => Some(DenseBackendKind::CoderankHnsw),
             _ => None,
         }
     }
@@ -236,6 +240,25 @@ mod tests {
         let root = Path::new("/tmp/proj/.semantex");
         let p = dense_subdir(root, DenseBackendKind::ColbertPlaid);
         assert_eq!(p, Path::new("/tmp/proj/.semantex/dense/colbert-plaid"));
+    }
+
+    #[test]
+    fn parse_coderank_hnsw_backend() {
+        assert_eq!(
+            DenseBackendKind::parse("coderank-hnsw"),
+            Some(DenseBackendKind::CoderankHnsw)
+        );
+        assert_eq!(
+            DenseBackendKind::parse("  Coderank-HNSW "),
+            Some(DenseBackendKind::CoderankHnsw)
+        );
+        assert_eq!(DenseBackendKind::CoderankHnsw.name(), "coderank-hnsw");
+    }
+
+    #[test]
+    fn coderank_dense_subdir() {
+        let p = dense_subdir(Path::new("/x/.semantex"), DenseBackendKind::CoderankHnsw);
+        assert_eq!(p, Path::new("/x/.semantex/dense/coderank-hnsw"));
     }
 
     #[test]

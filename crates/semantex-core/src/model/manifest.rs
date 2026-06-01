@@ -52,7 +52,10 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 // RECORDED EXACT, trailing space included.
                 query_prefix: "Represent this query for searching relevant code: ".to_string(),
                 doc_prefix: String::new(),
-                pooling: Pooling::Cls,
+                // RECORDED: mean (mask-weighted) pooling, NOT CLS — see
+                // research-notes (S2 — CodeRankEmbed). The single_vector.rs
+                // encoder mean-pools to match.
+                pooling: Pooling::Mean,
                 normalize: true,
                 quant: QuantKind::Int8Symmetric,
             }),
@@ -350,7 +353,8 @@ mod tests {
         };
         // S2 Spike 1 recorded values (arctic-embed-m-long base).
         assert_eq!(e.dims, 768);
-        assert_eq!(e.pooling, Pooling::Cls);
+        // RECORDED: mean (mask-weighted) pooling, NOT CLS.
+        assert_eq!(e.pooling, Pooling::Mean);
         assert_eq!(e.quant, QuantKind::Int8Symmetric);
         assert!(
             e.query_prefix.ends_with(' '),

@@ -87,6 +87,20 @@ pub struct SemantexConfig {
     /// Active LLM model id (registry lookup key). Empty = none. Override via
     /// `SEMANTEX_LLM_MODEL`. Only meaningful with the `llm` feature.
     pub llm_model: String,
+    /// HNSW `ef_search` OVERRIDE for the coderank-hnsw backend (higher = better
+    /// recall, slower). `0` ⇒ "use the preset's ef_search" (the `default` preset
+    /// is 64). Set explicitly via `SEMANTEX_HNSW_EF_SEARCH` to override the
+    /// preset. Kept `0` by default so `SEMANTEX_HNSW_PRESET=high_recall` actually
+    /// takes effect (ef_search bakes into the graph at build time, so a silent
+    /// clobber would discard the preset's recall intent).
+    pub hnsw_ef_search: usize,
+    /// HNSW tuning preset: `default | high_recall | low_latency | memory_optimized`.
+    /// Override via `SEMANTEX_HNSW_PRESET`. The preset's `ef_search` is used
+    /// unless `SEMANTEX_HNSW_EF_SEARCH` is set non-zero (which then overrides it).
+    pub hnsw_preset: String,
+    /// fp32-rescore the top `dense_rescore_k` ANN candidates. `0` ⇒ derive 4×k
+    /// at query time. Override via `SEMANTEX_DENSE_RESCORE_K`.
+    pub dense_rescore_k: usize,
 }
 
 impl Default for SemantexConfig {
@@ -118,6 +132,9 @@ impl Default for SemantexConfig {
             embedder: "lateon-colbert".to_string(),
             reranker_model: "bge-reranker-v2-m3".to_string(),
             llm_model: String::new(),
+            hnsw_ef_search: 0, // 0 ⇒ use the preset's ef_search (default preset = 64)
+            hnsw_preset: "default".to_string(),
+            dense_rescore_k: 0,
         }
     }
 }
@@ -175,6 +192,16 @@ impl SemantexConfig {
         config.embedder = env_string("SEMANTEX_EMBEDDER", &config.embedder);
         config.reranker_model = env_string("SEMANTEX_RERANKER_MODEL", &config.reranker_model);
         config.llm_model = env_string("SEMANTEX_LLM_MODEL", &config.llm_model);
+
+        // S2: coderank-hnsw tuning knobs.
+        config.hnsw_ef_search = env_usize("SEMANTEX_HNSW_EF_SEARCH", config.hnsw_ef_search);
+        config.hnsw_preset = env_string("SEMANTEX_HNSW_PRESET", &config.hnsw_preset);
+        // `dense_rescore_k` uses a raw parse because `0` is a meaningful value
+        // (= derive 4×k at query time) that `env_usize` would reject.
+        config.dense_rescore_k = std::env::var("SEMANTEX_DENSE_RESCORE_K")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(config.dense_rescore_k);
 
         Ok(config)
     }
@@ -290,6 +317,17 @@ mod tests {
             cfg.llm_model, "",
             "no LLM selected by default (zero-LLM-deps build)"
         );
+    }
+
+    #[test]
+    fn dense_tuning_defaults() {
+        let cfg = SemantexConfig::default();
+        assert_eq!(
+            cfg.hnsw_ef_search, 0,
+            "0 means 'use the preset's ef_search' so SEMANTEX_HNSW_PRESET is honored"
+        );
+        assert_eq!(cfg.hnsw_preset, "default");
+        assert_eq!(cfg.dense_rescore_k, 0, "0 means derive 4×k at query time");
     }
 
     #[test]

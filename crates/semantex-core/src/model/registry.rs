@@ -78,15 +78,13 @@ impl ModelRegistry {
     }
 
     /// The dense backend the active embedder's capabilities select — the value
-    /// S1's `hybrid.rs`/`builder.rs` selection will consume in place of
-    /// `DenseBackendKind::parse(&config.dense_backend)` (post-S2 reconciliation).
+    /// `hybrid.rs::open()` + `builder.rs` consume (via [`Self::resolve_dense_backend`])
+    /// in place of `DenseBackendKind::parse(&config.dense_backend)`.
     ///
-    /// INTERIM (Phase 1, pre-S2): the underlying `BackendKind::dense_kind` is
-    /// fallible because S1's `DenseBackendKind` has only the `ColbertPlaid`
-    /// variant today. A multi-vector embedder (e.g. the default `lateon-colbert`)
+    /// TOTAL (post-S2): a multi-vector embedder (e.g. the default `lateon-colbert`)
     /// resolves to `Ok(ColbertPlaid)`; a single-vector embedder (e.g.
-    /// `coderank-137m`) errors with "coderank-hnsw backend not available until
-    /// S2". S2 + the reconciliation pass make this total.
+    /// `coderank-137m` / `qwen3-embed-0.6b`) resolves to `Ok(CoderankHnsw)`. The
+    /// `Result` is retained for the wrong-role / unknown-id error arms.
     pub fn embedder_backend_kind(&self) -> Result<DenseBackendKind> {
         let spec = self.active_embedder()?;
         // Defensive: an embedder spec always carries EmbedderSpec data (validate
@@ -96,6 +94,40 @@ impl ModelRegistry {
             _ => anyhow::bail!("active embedder `{}` is not an embedder spec", spec.id),
         }
         backend_for(&spec.capabilities).dense_kind()
+    }
+
+    /// Resolve the effective dense backend for a config, honoring the canonical
+    /// `SEMANTEX_EMBEDDER` selection AND the DEPRECATED `SEMANTEX_DENSE_BACKEND`
+    /// / `config.dense_backend` alias.
+    ///
+    /// Selection (post-S2 cutover gate):
+    /// * Canonical path: the active embedder (`config.embedder`) routes via its
+    ///   capabilities to a backend (`lateon-colbert` → colbert-plaid;
+    ///   `coderank-137m` / `qwen3-embed-0.6b` → coderank-hnsw).
+    /// * Deprecated alias: if `config.dense_backend` was set to an explicit,
+    ///   non-default backend name (i.e. NOT the `colbert-plaid` default), that
+    ///   alias WINS — it maps directly to the matching `DenseBackendKind`. This
+    ///   keeps the S0 harness's `SEMANTEX_DENSE_BACKEND=coderank-hnsw` A/B knob
+    ///   live alongside the canonical `SEMANTEX_EMBEDDER` knob.
+    ///
+    /// When the alias is at its default (`colbert-plaid`) the embedder wins, so
+    /// `SEMANTEX_EMBEDDER=coderank-137m` alone (default dense_backend) correctly
+    /// routes to coderank-hnsw. The shipped all-default config resolves to
+    /// `colbert-plaid` (D4) until the Phase-3 cutover flips the default embedder.
+    pub fn resolve_dense_backend(
+        config: &SemantexConfig,
+        project_path: Option<&Path>,
+    ) -> Result<DenseBackendKind> {
+        // Deprecated alias takes precedence ONLY when explicitly non-default.
+        if let Some(kind) = DenseBackendKind::parse(&config.dense_backend)
+            && kind != DenseBackendKind::default()
+        {
+            return Ok(kind);
+        }
+        // Canonical: route through the active embedder's capabilities (a project
+        // `models.toml` may add/override embedder specs).
+        let registry = Self::from_config(config, project_path)?;
+        registry.embedder_backend_kind()
     }
 }
 
@@ -128,18 +160,52 @@ mod tests {
     }
 
     #[test]
-    fn coderank_selection_errors_until_s2() {
-        // INTERIM Phase-1: the single-vector embedder routes to the coderank-hnsw
-        // backend, which S1's DenseBackendKind cannot represent until S2 lands.
-        // So `embedder_backend_kind` errors honestly — the spec still resolves.
+    fn coderank_selection_routes_to_hnsw() {
+        // Post-S2: the single-vector embedder routes to the coderank-hnsw backend,
+        // now representable in S1's DenseBackendKind (totalized in capabilities.rs).
         let mut cfg = SemantexConfig::default();
         cfg.embedder = "coderank-137m".to_string();
         let reg = ModelRegistry::from_config(&cfg, None).unwrap();
         assert_eq!(reg.active_embedder().unwrap().id, "coderank-137m");
-        let err = reg
-            .embedder_backend_kind()
-            .expect_err("coderank-hnsw must error until S2");
-        assert!(err.to_string().contains("S2"), "got: {err}");
+        assert_eq!(
+            reg.embedder_backend_kind().unwrap(),
+            DenseBackendKind::CoderankHnsw
+        );
+    }
+
+    #[test]
+    fn resolve_dense_backend_canonical_embedder_path() {
+        // SEMANTEX_EMBEDDER=coderank-137m (canonical) with the DEFAULT dense_backend
+        // alias must route to coderank-hnsw via capabilities.
+        let mut cfg = SemantexConfig::default();
+        cfg.embedder = "coderank-137m".to_string(); // dense_backend stays "colbert-plaid"
+        assert_eq!(
+            ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
+            DenseBackendKind::CoderankHnsw
+        );
+    }
+
+    #[test]
+    fn resolve_dense_backend_deprecated_alias_wins_when_nondefault() {
+        // SEMANTEX_DENSE_BACKEND=coderank-hnsw (alias) with the DEFAULT embedder
+        // must still route to coderank-hnsw (alias precedence when non-default).
+        let mut cfg = SemantexConfig::default();
+        cfg.dense_backend = "coderank-hnsw".to_string(); // embedder stays "lateon-colbert"
+        assert_eq!(
+            ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
+            DenseBackendKind::CoderankHnsw
+        );
+    }
+
+    #[test]
+    fn resolve_dense_backend_all_default_is_colbert_plaid() {
+        // The shipped all-default config resolves to colbert-plaid (D4) until the
+        // Phase-3 cutover flips the default embedder.
+        let cfg = SemantexConfig::default();
+        assert_eq!(
+            ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
+            DenseBackendKind::ColbertPlaid
+        );
     }
 
     #[test]

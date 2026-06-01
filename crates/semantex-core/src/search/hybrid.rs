@@ -104,15 +104,18 @@ impl HybridSearcher {
             None
         };
 
-        // Load the dense backend (S1). Selection: config.dense_backend (which
-        // SEMANTEX_DENSE_BACKEND already overlaid in SemantexConfig::load).
-        // The persisted backend in meta.json MUST match — verify and refuse on
-        // mismatch (mirrors the BM25 stemmer guard).
-        verify_persisted_backend_matches(index_dir, &config.dense_backend)?;
-        let dense: Option<Box<dyn DenseBackend>> = match DenseBackendKind::parse(
-            &config.dense_backend,
-        ) {
-            Some(DenseBackendKind::ColbertPlaid) => {
+        // Load the dense backend. Selection (S2 re-point): resolve via the S8
+        // ModelRegistry from the canonical `SEMANTEX_EMBEDDER` selection, with
+        // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` kept as a DEPRECATED
+        // alias (alias wins only when explicitly non-default). Defaults still
+        // resolve to colbert-plaid (D4) until the Phase-3 cutover.
+        let resolved_backend =
+            crate::model::ModelRegistry::resolve_dense_backend(config, None).unwrap_or_default();
+        // The persisted backend in meta.json MUST match the RESOLVED backend —
+        // verify and refuse on mismatch (mirrors the BM25 stemmer guard).
+        verify_persisted_backend_matches(index_dir, resolved_backend.name())?;
+        let dense: Option<Box<dyn DenseBackend>> = match resolved_backend {
+            DenseBackendKind::ColbertPlaid => {
                 // Per-backend subdir is canonical; fall back to the legacy
                 // top-level `plaid/` layout for indexes built before S1.
                 let backend_dir = dense_subdir(index_dir, DenseBackendKind::ColbertPlaid);
@@ -140,12 +143,33 @@ impl HybridSearcher {
                     None
                 }
             }
-            None => {
-                tracing::warn!(
-                    "Unknown dense_backend '{}' — dense channel disabled (falling back to sparse+exact)",
-                    config.dense_backend
-                );
-                None
+            DenseBackendKind::CoderankHnsw => {
+                use crate::index::hnsw_index::{CoderankHnswBackend, HnswParams};
+                let backend_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
+                if backend_dir.join("vectors.bin").exists() {
+                    let params = HnswParams::resolve(
+                        &config.hnsw_preset,
+                        config.hnsw_ef_search,
+                        config.dense_rescore_k,
+                    );
+                    let model_dir = crate::embedding::single_vector_model::ensure_coderank_model(
+                        &config.models_dir(),
+                    );
+                    match model_dir
+                        .and_then(|d| CoderankHnswBackend::open(&backend_dir, &d, params))
+                    {
+                        Ok(b) => {
+                            tracing::info!("Dense backend loaded: coderank-hnsw");
+                            Some(Box::new(b) as Box<dyn DenseBackend>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("coderank-hnsw backend failed to load: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
             }
         };
 

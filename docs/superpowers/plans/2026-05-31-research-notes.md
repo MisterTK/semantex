@@ -14,6 +14,77 @@
 - **ONNX I/O:** inputs `input_ids`, `attention_mask` (int64) [+ `token_type_ids`→zeros if the graph declares it]; output `last_hidden_state [batch, seq, hidden]` → mean-pool (if a future export already pools to `[batch, hidden]`, use directly).
 - **Verified (CPU smoke):** sim(query, relevant code) = **0.656** vs sim(query, unrelated) = **0.104**.
 
+## S2 Spike 2 — HNSW crate selection (RECORDED 2026-06-01)
+
+- **CHOSEN: `instant-distance` v0.6.1**
+- **License:** MIT OR Apache-2.0 (permissive ✓).
+- **C/C++ deps:** none. `cargo tree` verified pure-Rust (deps: `num_cpus`, `ordered-float`,
+  `parking_lot`, `rand 0.8`, `rayon`, `serde`; the only FFI is `libc` bindings — no `cc`,
+  no `*-sys`, no `bindgen`/`cmake`). Airgap/offline-buildable. Leaner than `hnsw_rs 0.3.4`
+  (which pulls `anndists`, `env_logger`, `jiff`, `sysctl` — also pure-Rust/clean, but heavier).
+- **Metric used:** custom `Point::distance` returning **`1.0 - dot`** over **L2-normalized**
+  vectors (== `1 - cosine`). Smaller distance = closer. We feed dequantized-then-renormalized
+  f32 rows into the graph, and the encoder L2-normalizes the query, so dot == cosine.
+- **Delete support:** NONE native (build-once index). → **rebuild-on-mutate strategy** (matches
+  the plan's Task 8 design): we persist our OWN `Int8VectorStore` (postcard) + chunk_id map and
+  **rebuild the in-RAM graph from the store on open / after every insert/delete** (delete compacts
+  the store, drops the removed ids, re-persists; graph rebuilds next open). No tombstones.
+- **Serialize support:** native (`#[cfg_attr(feature="serde", derive(Serialize,Deserialize))]` on
+  `Hnsw`/`HnswMap`, needs the `with-serde`/`serde`+`serde-big-array` feature) — **but we DON'T use
+  it**: persistence is our own int8 store, graph is rebuilt on open. Keeps persistence
+  crate-independent + int8-compact (the design's intent), so no `serde` feature on the dep.
+- **`M` (max connections):** **NOT configurable** — `instant-distance` hardcodes `const M: usize
+  = 32` internally. So `HnswParams.m` is INFORMATIONAL/ignored for this crate (M is effectively
+  fixed at 32, a good high-recall default). Documented at the build site. `ef_construction` and
+  `ef_search` ARE configurable via `Builder::ef_construction(n)` / `Builder::ef_search(n)`.
+- **`ef_search` is baked at BUILD time** (stored on `Hnsw`; `Search` inherits it). Since we
+  rebuild the graph on open with `config.hnsw_ef_search`, changing ef_search just rebuilds —
+  fine for our open-time graph construction. (rescore_k is applied by us post-search.)
+- **EXACT API (real signatures, verified by compiling+running a 1000×8-dim smoke):**
+    - construct: `instant_distance::Builder::default().ef_construction(ef_c).ef_search(ef_s).build(points: Vec<P>, values: Vec<V>) -> HnswMap<P, V>`
+      where `P: Point + Clone` (our newtype over `Vec<f32>`/`[f32]`), `V: Clone` (we use `V = usize` = store row index).
+    - search:    `map.search(&query_point, &mut Search::default()) -> impl Iterator<Item = MapItem<P, usize>> + ExactSizeIterator`;
+      `MapItem { distance: f32, pid: PointId, point: &P, value: &usize }`. Take top-N, map `*item.value` → store row idx.
+    - `Search`:  `instant_distance::Search::default()` (reusable scratch; one per query).
+    - `Point` trait: `fn distance(&self, other: &Self) -> f32;` — we implement `1.0 - dot(self,other)`.
+    - insert/delete: **n/a** (build-once) → rebuild-on-mutate via our store (see above).
+    - id type:   the value `V` is arbitrary `Clone`; we store `usize` = `Int8VectorStore` row idx,
+      then map row idx → `chunk_ids[idx]: u64` (the PLAID `doc_to_chunk` pattern). graph point id
+      `PointId(u32)` is internal; we never persist it.
+    - distance orientation: smaller = closer (`1 - cosine`). We DON'T use the ANN distance as the
+      score — ANN only yields candidate row idxs; we **fp32-rescore via `dot_f32`** (cosine, larger
+      = better) and return that as `DenseHit.score`.
+- **Smoke result:** 1000 random 8-dim L2-normalized vectors → `HnswMap<V, usize>` built + searched
+  top-5 cleanly; values returned are store row idxs. Compiled + ran offline on macOS arm64.
+- **Fallback note (unused):** if instant-distance had failed, vendor oxirs-vec HNSW
+  (engine/oxirs-vec/src/hnsw/, Apache/MIT, attribute; parallel_construction.rs is a sequential
+  stub). Not needed — instant-distance passes every hard criterion except native delete, which the
+  rebuild-on-mutate design (already in the plan) covers.
+
+## S2 — encoder I/O CORRECTION (verified against the downloaded graph, 2026-06-01)
+
+> The Spike-1 recorded I/O said output `last_hidden_state [batch, seq, hidden]`. The ACTUAL
+> hosted `MisterTK/CodeRankEmbed-onnx-int8` graph (probed live after download + run) differs —
+> recorded here so the encoder constants are non-hallucinated. The S2 e2e gate PASSES with these.
+
+- **Inputs (confirmed):** `input_ids`, `attention_mask` only (int64). **NO `token_type_ids`**
+  (the graph does not declare it) — the encoder feeds exactly these two tensors.
+- **Outputs (CORRECTION):** the export emits TWO outputs:
+  - **`sentence_embedding` `[batch, hidden=768]`** — already mask-mean-pooled (the
+    sentence-transformers head). **The encoder PREFERS this** (matches RECORDED pooling=mean) and
+    only L2-normalizes it. There is **NO `last_hidden_state` output** (the draft name was wrong).
+  - **`token_embeddings` `[batch, seq, hidden]`** — the raw per-token states; the encoder falls
+    back to mask-mean-pooling THESE if a future export drops `sentence_embedding`.
+  `single_vector.rs` probes `["sentence_embedding"]` then `["token_embeddings","last_hidden_state"]`
+  and uses the first present, so it is robust to either export shape.
+- **E2E VERIFIED 2026-06-01** (real model, ORT_DYLIB_PATH=homebrew libonnxruntime 1.26):
+  `coderank_hnsw_dense_search_is_relevant` (fibonacci query → fib.rs ranks #1),
+  `coderank_hnsw_dense_is_deterministic`, `coderank_hnsw_alias_selection_builds_and_searches`,
+  `coderank_hnsw_build_writes_subdir_and_meta` (meta: model=CodeRankEmbed, dim=768, backend
+  coderank-hnsw, schema 11), and `vector_accessor_methods_return_some_on_built_index` ALL PASS.
+  The 4-file external-data download (`model_int8.onnx` 1.2MB + `model_int8.onnx.data` 274MB +
+  tokenizer.json + config.json) provisions cleanly on first use.
+
 ## S3 — Qwen3-Reranker-0.6B reranker (DONE: hosted + verified)
 
 - **ModelSpec.source:** `hf:MisterTK/Qwen3-Reranker-0.6B-onnx` (Apache-2.0)

@@ -226,7 +226,11 @@ impl IndexMeta {
     /// S8: adds `embedder_fingerprint`. No version bump beyond S1's 10 — an older
     /// meta.json lacking the field fails the strict deserialize and is treated as
     /// `Stale` (same mechanism as the v9→v10 `dense_backend` add).
-    pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+    ///
+    /// v11 (S2): the single-vector dense backend (`coderank-hnsw`) introduces a
+    /// new on-disk layout (`dense/coderank-hnsw/vectors.bin`). Bumping forces a
+    /// clean reindex so an old PLAID-only index isn't half-read by the new path.
+    pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 }
 
 /// File metadata for incremental indexing
@@ -313,9 +317,11 @@ mod tests {
     /// stay incompatible (rebuild via the stale-detection path).
     /// S1: schema bumped 9 → 10 to add the persisted `dense_backend` field.
     /// Older v9 indexes (which lack the field) become `Stale` and rebuild.
+    /// S2: schema bumped 10 → 11 for the single-vector dense on-disk layout
+    /// (`dense/coderank-hnsw/vectors.bin`). Older indexes become `Stale`.
     #[test]
-    fn current_schema_version_is_10() {
-        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 10);
+    fn current_schema_version_is_11() {
+        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 11);
     }
 
     #[test]
@@ -336,7 +342,7 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: IndexMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dense_backend, "colbert-plaid");
-        assert_eq!(back.schema_version, 10);
+        assert_eq!(back.schema_version, 11);
     }
 
     #[test]

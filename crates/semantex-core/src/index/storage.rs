@@ -430,6 +430,35 @@ impl ChunkStore {
         Ok(ids.into_iter().map(|id| id as u64).collect())
     }
 
+    /// Fetch persisted NL annotations (E3 `chunk_annotations`) for the given
+    /// chunk ids, as a `chunk_id → annotation` map. Only ids that HAVE a stored
+    /// annotation appear. Used by the coderank-hnsw `SEMANTEX_DENSE_CONTEXT` A/B
+    /// to embed `format!("{annotation}\n{code}")`. Returns an empty map if the
+    /// `chunk_annotations` table is absent (older index) or no ids match.
+    pub fn get_annotations(&self, ids: &[u64]) -> Result<std::collections::HashMap<u64, String>> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() || !self.table_exists("chunk_annotations")? {
+            return Ok(out);
+        }
+        // Chunk into SQLite-variable-safe batches (mirrors get_chunks).
+        for batch in ids.chunks(900) {
+            let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT chunk_id, nl_annotation FROM chunk_annotations WHERE chunk_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<i64> = batch.iter().map(|&id| id as i64).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (id, ann) = r?;
+                out.insert(id, ann);
+            }
+        }
+        Ok(out)
+    }
+
     /// Begin a transaction for batch operations
     pub fn begin_transaction(&self) -> Result<()> {
         self.conn.execute_batch("BEGIN TRANSACTION")?;
