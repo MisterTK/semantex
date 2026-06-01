@@ -9,8 +9,8 @@ license = "Apache-2.0"
 rust-version = "1.91"
 repository = "https://github.com/MisterTK/semantex"
 homepage = "https://semantex.dev"
-description = "Semantex — semantic code search — hybrid ColBERT + BM25 retrieval engine"
-keywords = ["search", "semantic", "code", "embedding", "colbert"]
+description = "Semantex — semantic code search — hybrid dense + BM25 retrieval engine"
+keywords = ["search", "semantic", "code", "embedding", "retrieval"]
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
@@ -31,15 +31,6 @@ regex = "1"
 genai = "0.5"
 async-trait = "0.1"
 which = "8"
-# next-plaid 1.4: brings UpdateConfig.batch_size + buffer_size + force_cpu knobs,
-# the (MmapIndex, Vec<i64>) return tuple from update_or_create, and the streaming
-# encode_index_chunk / write_index_from_encoded_chunks APIs. Critical: drop the
-# coreml feature — on macOS it loaded CoreMLExecutionProvider even when not
-# explicitly opted in, and CoreML's partition+buffer pattern allocated 10+ GB on
-# 2 k-chunk repos. CPU is the default; opt back in to GPU via the SEMANTEX_COREML
-# env var (gated in colbert.rs builder) if/when CoreML's memory profile improves.
-next-plaid = "1.3"
-next-plaid-onnx = "1.3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -66,6 +57,3 @@ panic = "unwind"
 inherits = "release"
 debug = true
 strip = false
-
-[patch.crates-io]
-next-plaid = { path = "vendor/next-plaid" }
