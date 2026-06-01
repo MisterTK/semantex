@@ -1,10 +1,8 @@
 use crate::config::SemantexConfig;
-use crate::embedding::model_manager;
 use crate::index::file_classifier::FileRole;
 use crate::index::storage::ChunkStore;
 use crate::search::SearchQuery;
 use crate::search::adaptive;
-use crate::search::colbert_plaid_backend::ColbertPlaidBackend;
 use crate::search::dense_backend::{
     DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
 };
@@ -115,47 +113,19 @@ impl HybridSearcher {
             None
         };
 
-        // Load the dense backend. Selection (S2 re-point): resolve via the S8
-        // ModelRegistry from the canonical `SEMANTEX_EMBEDDER` selection, with
+        // Load the dense backend. Selection: resolve via the S8 ModelRegistry
+        // from the canonical `SEMANTEX_EMBEDDER` selection, with
         // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` kept as a DEPRECATED
-        // alias (alias wins only when explicitly non-default). D4 cutover:
-        // all-defaults now resolve to coderank-hnsw. An existing colbert-plaid
-        // index opened under the new default trips verify_persisted_backend_matches
-        // below → clean `--rebuild` guidance, not a crash.
+        // alias. D4: the sole built-in backend is coderank-hnsw. An old index
+        // built with a removed backend (e.g. colbert-plaid) trips
+        // verify_persisted_backend_matches below → clean `--rebuild` guidance,
+        // not a crash (and the schema bump forces such stragglers Stale anyway).
         let resolved_backend =
             crate::model::ModelRegistry::resolve_dense_backend(config, None).unwrap_or_default();
         // The persisted backend in meta.json MUST match the RESOLVED backend —
         // verify and refuse on mismatch (mirrors the BM25 stemmer guard).
         verify_persisted_backend_matches(index_dir, resolved_backend.name())?;
         let dense: Option<Box<dyn DenseBackend>> = match resolved_backend {
-            DenseBackendKind::ColbertPlaid => {
-                // Per-backend subdir is canonical; fall back to the legacy
-                // top-level `plaid/` layout for indexes built before S1.
-                let backend_dir = dense_subdir(index_dir, DenseBackendKind::ColbertPlaid);
-                let legacy_dir = index_dir.join("plaid");
-                let (plaid_dir, mapping_path) = if backend_dir.exists() {
-                    (backend_dir.clone(), backend_dir.join("plaid_mapping.bin"))
-                } else {
-                    (legacy_dir, index_dir.join("plaid_mapping.bin"))
-                };
-                if plaid_dir.exists() && mapping_path.exists() {
-                    let model_dir = model_manager::ensure_colbert_model(&config.models_dir());
-                    match model_dir
-                        .and_then(|d| ColbertPlaidBackend::open(&plaid_dir, &mapping_path, &d))
-                    {
-                        Ok(b) => {
-                            tracing::info!("Dense backend loaded: colbert-plaid");
-                            Some(Box::new(b) as Box<dyn DenseBackend>)
-                        }
-                        Err(e) => {
-                            tracing::warn!("colbert-plaid backend failed to load: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
             DenseBackendKind::CoderankHnsw => {
                 use crate::index::hnsw_index::{CoderankHnswBackend, HnswParams};
                 let backend_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
@@ -355,9 +325,10 @@ impl HybridSearcher {
         ) {
             (Some(dense), Some(filter)) => {
                 // The subset is computed from the dense index's positional
-                // chunk list. Only colbert-plaid exposes one today; backends
-                // without positional docs (None) skip subset prep and let the
-                // result-merge file_filter handle scoping.
+                // chunk list. No built-in backend exposes one today (coderank-hnsw
+                // returns None), so this branch no-ops and the result-merge
+                // file_filter handles scoping; the seam stays for a future
+                // positional backend.
                 match dense.positional_chunk_ids() {
                     None => None, // backend has no positional docs — subset N/A
                     Some([]) => Some(Vec::new()),

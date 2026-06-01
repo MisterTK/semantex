@@ -15,7 +15,6 @@ use crate::index::page_rank;
 use crate::index::pattern_catalog::{self, PatternCatalog, PatternLang};
 use crate::index::storage::ChunkStore;
 use crate::search::code_tokenizer;
-use crate::search::colbert_plaid_backend::ColbertPlaidIndexBuilder;
 use crate::search::dense_backend::{DenseBackendKind, DenseIndexBuilder, dense_subdir};
 use crate::search::sparse_search::SparseIndex;
 use crate::types::{Chunk, ChunkType, FileEntry, IndexMeta};
@@ -528,17 +527,12 @@ impl IndexBuilder {
             crate::model::ModelRegistry::resolve_dense_backend(&self.config, Some(&project_path))
                 .unwrap_or_default();
 
-        // The dense index sentinel file is backend-specific: colbert-plaid writes
-        // `plaid_mapping.bin`, coderank-hnsw writes `vectors.bin`. The dense index
-        // may live in the per-backend subdir (`dense/<backend>/`) or, for
-        // colbert-plaid only, the legacy top-level `plaid/`. Treat dense as
-        // "missing" (forcing a rebuild) only when no layout has the sentinel.
+        // The dense index sentinel file is backend-specific: coderank-hnsw writes
+        // `vectors.bin` into the per-backend subdir (`dense/<backend>/`). Treat
+        // dense as "missing" (forcing a rebuild) when the sentinel is absent.
         let dense_sentinel = dense_sentinel_file(backend_kind);
         let dense_dir_for_check = dense_subdir(&index_dir, backend_kind);
-        let legacy_plaid_present =
-            backend_kind == DenseBackendKind::ColbertPlaid && index_dir.join("plaid").exists();
-        let dense_missing_for_early_return =
-            !dense_dir_for_check.join(dense_sentinel).exists() && !legacy_plaid_present;
+        let dense_missing_for_early_return = !dense_dir_for_check.join(dense_sentinel).exists();
 
         if total_chunks == 0 && total_removals == 0 && !dense_missing_for_early_return {
             tracing::info!(
@@ -574,67 +568,6 @@ impl IndexBuilder {
 
         if let Err(e) = (|| -> Result<()> {
             match backend_kind {
-                DenseBackendKind::ColbertPlaid => {
-                    let mut dense_builder =
-                        ColbertPlaidIndexBuilder::new(&dense_dir, self.config.plaid_nbits)
-                            .with_models_dir(self.config.models_dir());
-                    if dense_missing {
-                        // Full rebuild — gate concurrency (same `index::gate`
-                        // semaphore as the pre-seam code) and stream the corpus
-                        // through the dense builder one PLAID_BATCH at a time.
-                        //
-                        // Memory strategy: never load all chunks at once. The
-                        // builder pulls each ≤32-id batch's content via the
-                        // closure below (well under SQLite's variable limit),
-                        // encodes it, and drops it before the next batch — only
-                        // one batch's content is ever live. This preserves the
-                        // PLAID index-build memory bound (the 26GB→9GB fix) that
-                        // a single `get_chunks(&all_ids)` materialization broke,
-                        // while still issuing one `update_or_create` internally
-                        // (byte-identical to the pre-seam index).
-                        let _slot = crate::index::gate::acquire(|| {
-                            tracing::info!(
-                                "Waiting for a free index-build slot (max {} concurrent full builds; \
-                                 override with SEMANTEX_MAX_CONCURRENT_BUILDS)",
-                                crate::index::gate::max_concurrent_builds()
-                            );
-                        });
-                        let all_ids = store.get_all_chunk_ids()?;
-                        if all_ids.is_empty() {
-                            return Ok(());
-                        }
-                        dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
-                            let mut chunks = store.get_chunks(batch_ids)?;
-                            // `get_chunks` (WHERE id IN (...)) does not ORDER BY;
-                            // sort by id so the per-batch order is deterministic
-                            // and matches the ascending `all_ids` ordering, keeping
-                            // the resulting PLAID index byte-stable.
-                            chunks.sort_by_key(|c| c.id);
-                            Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
-                        })?;
-                    } else {
-                        // Incremental — delete removed, insert new. New chunks
-                        // stream in PLAID_BATCH-sized store reads too, so a large
-                        // incremental add never materializes all content at once
-                        // and never passes >32 ids to a single `get_chunks`.
-                        if !removed_chunk_ids.is_empty() {
-                            dense_builder.delete(&removed_chunk_ids)?;
-                        }
-                        if !new_chunk_ids.is_empty() {
-                            dense_builder.insert_streaming_ids(&new_chunk_ids, |batch_ids| {
-                                let chunks = store.get_chunks(batch_ids)?;
-                                Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
-                            })?;
-                        }
-                    }
-                    dense_builder.persist(&dense_dir)?;
-                    tracing::info!(
-                        added = new_chunk_ids.len(),
-                        removed = removed_chunk_ids.len(),
-                        "Dense index ({}) build complete",
-                        backend_kind.name()
-                    );
-                }
                 DenseBackendKind::CoderankHnsw => {
                     use crate::index::hnsw_index::{CoderankHnswIndexBuilder, HnswParams};
                     let params = HnswParams::resolve(
@@ -749,7 +682,6 @@ impl IndexBuilder {
         // selection (canonical SEMANTEX_EMBEDDER may differ from the deprecated
         // dense_backend alias default).
         let (embedding_model, embedding_dim) = match backend_kind {
-            DenseBackendKind::ColbertPlaid => ("LateOn-Code-edge".to_string(), 48u32),
             DenseBackendKind::CoderankHnsw => (
                 "CodeRankEmbed".to_string(),
                 crate::embedding::single_vector::SingleVectorEmbedder::embedding_dim() as u32,
@@ -795,12 +727,11 @@ impl IndexBuilder {
     }
 }
 
-/// The per-backend "dense index present" sentinel file. colbert-plaid writes
-/// `plaid_mapping.bin`; coderank-hnsw writes `vectors.bin`. Its presence in the
-/// per-backend subdir marks the dense index as built (else: rebuild).
+/// The per-backend "dense index present" sentinel file. coderank-hnsw writes
+/// `vectors.bin`. Its presence in the per-backend subdir marks the dense index
+/// as built (else: rebuild).
 fn dense_sentinel_file(backend: DenseBackendKind) -> &'static str {
     match backend {
-        DenseBackendKind::ColbertPlaid => "plaid_mapping.bin",
         DenseBackendKind::CoderankHnsw => "vectors.bin",
     }
 }
@@ -1031,37 +962,7 @@ mod tests {
         }
     }
 
-    /// S1: a fresh build must write the dense index under the per-backend
-    /// subdir `.semantex/dense/colbert-plaid/` and record the backend in
-    /// meta.json. POST-D4 the shipped DEFAULT embedder is `coderank-137m`, so
-    /// this test EXPLICITLY pins `lateon-colbert` to validate the colbert-plaid
-    /// layout + meta. (Uses a tiny text repo; the PLAID build runs but we only
-    /// assert the layout + meta, which hold regardless of model availability —
-    /// if the dense build is skipped the dirs simply won't exist, so we gate
-    /// the dense-dir assertion on chunk creation.)
-    #[test]
-    #[ignore] // builds an index; run with --ignored
-    fn fresh_build_uses_per_backend_dense_subdir_and_records_meta() {
-        use crate::config::SemantexConfig;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let project = tmp.path().join("repo");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("a.rs"), "pub fn hello() -> u32 { 41 + 1 }\n").unwrap();
-
-        let cfg = SemantexConfig {
-            embedder: "lateon-colbert".to_string(),
-            ..SemantexConfig::default()
-        };
-        IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
-
-        // meta.json records the active backend.
-        let meta_str = std::fs::read_to_string(project.join(".semantex/meta.json")).unwrap();
-        let meta: crate::types::IndexMeta = serde_json::from_str(&meta_str).unwrap();
-        assert_eq!(meta.dense_backend, "colbert-plaid");
-        assert_eq!(meta.schema_version, 11);
-    }
-
-    /// S2: building with the coderank-137m embedder (→ coderank-hnsw backend)
+    /// Building with the coderank-137m embedder (→ coderank-hnsw backend)
     /// writes the per-backend subdir `.semantex/dense/coderank-hnsw/vectors.bin`
     /// and records the model + dim + resolved backend in meta.json. `#[ignore]`
     /// — needs the CodeRankEmbed model download.

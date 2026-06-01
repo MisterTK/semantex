@@ -2,7 +2,7 @@
 //!
 //! Indexing is background work a developer shouldn't feel. The portable first
 //! line of defense is using only a fraction of the cores (see
-//! [`ColbertEmbedder::for_indexing`](crate::embedding::colbert::ColbertEmbedder::for_indexing)).
+//! [`SingleVectorEmbedder::for_indexing`](crate::embedding::single_vector::SingleVectorEmbedder::for_indexing)).
 //! On top of that, a *pure* indexing process (the `semantex index` / `watch`
 //! CLI, or a future subprocess-isolated daemon build) can lower its whole-process
 //! CPU priority so it yields to the developer's editor/compiler under load.

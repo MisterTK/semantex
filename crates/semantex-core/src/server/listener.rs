@@ -3,7 +3,8 @@ use super::protocol::{
     self, BINARY_MAGIC, BinaryFrameError, BinaryResponse, ErrorResponse, Request, Response,
 };
 use crate::config::SemantexConfig;
-use crate::embedding::{colbert::ColbertEmbedder, model_manager};
+use crate::embedding::single_vector::SingleVectorEmbedder;
+use crate::embedding::single_vector_model;
 use crate::index::storage::{self, PrefetchOutcome};
 use crate::search::hybrid::HybridSearcher;
 use anyhow::{Context, Result};
@@ -578,54 +579,56 @@ pub fn prefetch_index(index_dir: &Path) -> PrefetchOutcome {
     outcome
 }
 
-/// Spawn the background ColBERT warm thread (E8c).
+/// Spawn the background dense-embedder warm thread (E8c).
 ///
 /// The thread is fire-and-forget: it materializes the ONNX session in the
-/// global `ColbertEmbedder` singleton and runs a dummy encode, so the first
-/// real user query doesn't pay the ~200-300ms session-build cost. Errors
+/// global `SingleVectorEmbedder` (coderank-hnsw) singleton via a dummy encode,
+/// so the first real user query doesn't pay the session-build cost. Errors
 /// are logged and otherwise ignored — cold start still works if warm-up
 /// fails (first query just pays the cost itself).
 ///
 /// Returns the spawned thread handle; the caller may detach (drop) it or
 /// join it. Production daemon paths detach.
-pub fn spawn_colbert_warm_thread(config: &SemantexConfig) -> std::thread::JoinHandle<()> {
+pub fn spawn_embedder_warm_thread(config: &SemantexConfig) -> std::thread::JoinHandle<()> {
     let models_root = config.models_dir();
     std::thread::Builder::new()
-        .name("semantex-colbert-warmup".to_string())
+        .name("semantex-embedder-warmup".to_string())
         .spawn(move || {
             let t = Instant::now();
-            match model_manager::ensure_colbert_model(&models_root) {
-                Ok(model_dir) => match ColbertEmbedder::global(&model_dir) {
-                    Ok(embedder) => match embedder.warm_up() {
-                        Ok(()) => {
+            match single_vector_model::ensure_coderank_model(&models_root) {
+                Ok(model_dir) => match SingleVectorEmbedder::global(&model_dir) {
+                    // A dummy query encode builds the ONNX session + tokenizer
+                    // in the global singleton (there is no separate warm_up()).
+                    Ok(embedder) => match embedder.encode_query("warmup") {
+                        Ok(_) => {
                             tracing::info!(
                                 elapsed_ms = t.elapsed().as_millis(),
-                                "E8(c) ColBERT background warm-up complete",
+                                "E8(c) dense embedder background warm-up complete",
                             );
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "E8(c) ColBERT warm-up failed (first query will pay the cost)",
+                                "E8(c) dense embedder warm-up failed (first query will pay the cost)",
                             );
                         }
                     },
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "E8(c) ColBERT global init failed during warm-up",
+                            "E8(c) dense embedder global init failed during warm-up",
                         );
                     }
                 },
                 Err(e) => {
                     tracing::debug!(
                         error = %e,
-                        "E8(c) ColBERT model not available for warm-up",
+                        "E8(c) dense embedder model not available for warm-up",
                     );
                 }
             }
         })
-        .expect("failed to spawn ColBERT warm-up thread")
+        .expect("failed to spawn dense embedder warm-up thread")
 }
 
 /// Check whether the warm-state sentinel exists and points to a live PID (E8d).

@@ -60,34 +60,6 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 quant: QuantKind::Int8Symmetric,
             }),
         },
-        // LateOn-Code-edge ColBERT — today's late-interaction path + shipped
-        // default (D4). The spec id is model-descriptive (`lateon-colbert`); its
-        // capabilities (multi-vector) route it to the `colbert-plaid` BACKEND.
-        ModelSpec {
-            id: "lateon-colbert".to_string(),
-            role: ModelRole::Embedder,
-            source: ModelSource::Hf {
-                repo: "lightonai/LateOn-Code-edge".to_string(),
-                files: vec![
-                    "model_int8.onnx".to_string(),
-                    "tokenizer.json".to_string(),
-                    "onnx_config.json".to_string(),
-                ],
-            },
-            capabilities: ModelCapabilities {
-                multi_vector: true,
-                ..ModelCapabilities::default()
-            },
-            role_data: RoleData::Embedder(EmbedderSpec {
-                dims: 48,
-                max_context: 512,
-                query_prefix: String::new(),
-                doc_prefix: String::new(),
-                pooling: Pooling::LateInteraction,
-                normalize: true,
-                quant: QuantKind::Int8Symmetric,
-            }),
-        },
         // Qwen3-Embedding-0.6B (Apache-2.0) — the 2026-SOTA single-vector A/B
         // candidate (semantica review). Single-vector → capabilities route it to
         // the `coderank-hnsw` BACKEND exactly like coderank-137m (no S2 dep). The
@@ -358,13 +330,18 @@ mod tests {
             "missing coderank-137m: {ids:?}"
         );
         assert!(
-            ids.contains(&"lateon-colbert"),
-            "missing lateon-colbert: {ids:?}"
+            ids.contains(&"qwen3-embed-0.6b"),
+            "missing qwen3-embed-0.6b: {ids:?}"
         );
         assert!(ids.contains(&"bge-reranker-v2-m3"), "missing bge: {ids:?}");
         assert!(
             ids.contains(&"qwen3-reranker-0.6b"),
             "missing qwen3: {ids:?}"
+        );
+        // D4: the ColBERT/PLAID embedder built-in was removed.
+        assert!(
+            !ids.contains(&"lateon-colbert"),
+            "lateon-colbert must be removed (D4): {ids:?}"
         );
     }
 
@@ -411,20 +388,23 @@ mod tests {
         // Single-vector → routes to the coderank-hnsw backend (no S2 dep).
         assert!(!s.capabilities.multi_vector);
         assert!(s.capabilities.instruction_aware);
-        assert_eq!(backend_for(&s.capabilities), BackendKind::CoderankHnsw);
+        assert_eq!(
+            backend_for(&s.capabilities).unwrap(),
+            BackendKind::CoderankHnsw
+        );
     }
 
     #[test]
-    fn colbert_embedder_is_multi_vector_late_interaction() {
-        let s = builtin_specs()
-            .into_iter()
-            .find(|s| s.id == "lateon-colbert")
-            .unwrap();
-        let RoleData::Embedder(e) = &s.role_data else {
-            panic!("lateon-colbert must be an embedder");
-        };
-        assert_eq!(e.pooling, Pooling::LateInteraction);
-        assert!(s.capabilities.multi_vector, "ColBERT is multi-vector");
+    fn no_builtin_is_multi_vector() {
+        // D4: the ColBERT/PLAID multi-vector built-in was removed, so every
+        // built-in embedder is single-vector (routes to coderank-hnsw).
+        for s in builtin_specs() {
+            assert!(
+                !s.capabilities.multi_vector,
+                "built-in `{}` must not be multi-vector after D4",
+                s.id
+            );
+        }
     }
 
     #[test]
