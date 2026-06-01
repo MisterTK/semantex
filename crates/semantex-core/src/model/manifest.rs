@@ -139,6 +139,8 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
             capabilities: ModelCapabilities::default(),
             role_data: RoleData::Reranker(RerankerSpec {
                 score_strategy: ScoreStrategyKind::ClassifierHead,
+                // bge-reranker-v2-m3 is trained at 512 tokens; truncate there.
+                max_context: 512,
                 prompt_prefix: String::new(),
                 prompt_middle: String::new(),
                 prompt_suffix: String::new(),
@@ -164,12 +166,37 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
             capabilities: ModelCapabilities::default(),
             role_data: RoleData::Reranker(RerankerSpec {
                 score_strategy: ScoreStrategyKind::YesNoLogit,
-                // RECORDED verbatim (S3 Spike 1, prompt template).
-                prompt_prefix:
-                    "<Instruct>: Given a code search query, judge whether the document is relevant.\n<Query>: "
-                        .to_string(),
+                // Cap the prompt-wrapped total so the O(seq^2) 0.6B model stays
+                // CPU-sane. Qwen3-Reranker's trained context is large, but for a
+                // code-search reranker a 2048-token window (query + chunk +
+                // chat-control wrapper) is ample and bounds latency/memory.
+                max_context: 2048,
+                // VERBATIM verified chat template (S3 Spike 1, CPU-verified
+                // P(yes|relevant)=0.990; recorded in research-notes ## S3). The
+                // <|im_start|>/<|im_end|> control tokens and the trailing
+                // assistant/<think> terminator are load-bearing: omitting them
+                // collapses P(yes) and silently breaks the YesNoLogit score.
+                // prefix = system block + user header up to "<Query>: " (the
+                // instruction is baked in since PromptTemplate has no separate
+                // instruction slot); middle injects the document; suffix closes
+                // the user turn and opens the assistant turn so the next-token
+                // logit is the yes/no judgment.
+                prompt_prefix: concat!(
+                    "<|im_start|>system\n",
+                    "Judge whether the Document meets the requirements based on the Query and the Instruct provided. ",
+                    "Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n",
+                    "<|im_start|>user\n",
+                    "<Instruct>: Given a code search query, judge whether the document is relevant.\n",
+                    "<Query>: "
+                )
+                .to_string(),
                 prompt_middle: "\n<Document>: ".to_string(),
-                prompt_suffix: "\n<Relevant>:".to_string(),
+                prompt_suffix: concat!(
+                    "<|im_end|>\n",
+                    "<|im_start|>assistant\n",
+                    "<think>\n\n</think>\n\n"
+                )
+                .to_string(),
                 // RECORDED yes/no token ids (S3 Spike 1).
                 yes_token_id: Some(9693),
                 no_token_id: Some(2152),

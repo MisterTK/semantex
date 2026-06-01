@@ -8,10 +8,10 @@ use crate::search::colbert_plaid_backend::ColbertPlaidBackend;
 use crate::search::dense_backend::{
     DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
 };
-use crate::search::fastembed_reranker::FastembedReranker;
 use crate::search::graph_propagation::{self, GraphPropagationConfig};
 use crate::search::path_signals;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
+use crate::search::reranker_engine::RerankerEngine;
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
 use crate::search::{query_expander, regex_semantic};
@@ -29,7 +29,7 @@ pub struct HybridSearcher {
     /// Pluggable dense channel (S1). `None` when dense is unavailable
     /// (sparse-only open, or the dense index failed to load).
     dense: Option<Box<dyn DenseBackend>>,
-    reranker: Mutex<Option<FastembedReranker>>,
+    reranker: Mutex<Option<RerankerEngine>>,
     store: Mutex<ChunkStore>,
     config: SemantexConfig,
 }
@@ -1115,7 +1115,9 @@ impl HybridSearcher {
             // enables it; when disabled, rerank() is an identity pass-through.
             if reranker_guard.is_none() {
                 tracing::info!("Loading reranker model (first use)...");
-                match FastembedReranker::new_default(false) {
+                // Resolve the active reranker through S8's ModelRegistry (single
+                // read of config.reranker_model == SEMANTEX_RERANKER_MODEL).
+                match RerankerEngine::from_config(&self.config, false) {
                     Ok(r) => *reranker_guard = Some(r),
                     Err(e) => {
                         tracing::warn!("Failed to initialize reranker: {}", e);

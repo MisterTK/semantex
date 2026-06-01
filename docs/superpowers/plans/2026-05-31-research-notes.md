@@ -93,6 +93,8 @@
 - **ScoreStrategy = YesNoLogit:** chat-format the prompt, run, take `logits[:, -1, :]`, softmax over the `yes`/`no` token logits → P(yes) is the relevance score.
 - **Token ids (Qwen tokenizer):** `yes` = **9693**, `no` = **2152**.
 - **ONNX I/O:** inputs `input_ids`, `attention_mask`, **`position_ids`** (all int64); output `logits [batch, seq, vocab]`.
+- **Output dtype = FLOAT16** (verified 2026-06-01 via `onnx.load` introspection of `MisterTK/Qwen3-Reranker-0.6B-onnx/model.onnx`: `logits: FLOAT16 shape=[batch, sequence, 151669]`). The fp16 source export keeps fp16 logits. **Code MUST extract fp16, not f32** — a fixed `try_extract_tensor::<f32>()` ERRORS on this node, hybrid.rs swallows the error, and the reranker silently no-ops (identity). `onnx_reranker::extract_logits_f32` dispatches on `value.data_type()`: `Float32` → copy; `Float16` → `try_extract_tensor::<half::f16>()` then `to_f32()`. Requires ort's `half` feature + `half` direct dep.
+- **max_context / truncation (Fix 1):** both shipped tokenizer.json have `"truncation": null`. `OnnxReranker::new` sets `with_truncation(max_length = max_context)`. Caps: **bge-reranker-v2-m3 = 512** (its trained positional range — past it logits are garbage); **Qwen3-Reranker-0.6B = 2048** (its trained context is large, but the model is O(seq²) on CPU; 2048 bounds query+chunk+chat-wrapper latency/memory while staying ample for code-search chunks ≤512-token AST targets). Carried as `RerankerSpec.max_context` (manifest data) → `OnnxModelSpec.max_context` → `OnnxReranker`.
 - **Prompt template (verified):**
   ```
   <|im_start|>system
@@ -109,6 +111,29 @@
   ```
 - **Verified (CPU smoke):** P(yes | relevant) = **0.990** vs P(yes | irrelevant) = **0.000**.
 - Reranker stays **off by default** (D8); this is the opt-in code-capable option, bge-reranker-v2-m3 remains the permissive fallback.
+
+### S3 — how S0 decides the rerank default
+- S0 harness (`benchmarks/relevance/`) runs the `rerank` ablation:
+  `python -m scripts.run --dataset csn --ablation rerank` and the CoIR/in-domain
+  equivalents. The harness sets `SEMANTEX_RERANKER=on` (+ `SEMANTEX_RERANKER_MODEL`)
+  in the subprocess env and passes `--rerank` to the CLI.
+- Compare each reranker (bge-v2-m3 fastembed; qwen3-reranker-0.6b ONNX) vs
+  rerank-off on nDCG@10 / MRR@10 / Recall@10, AND record per-query latency
+  (rerank_ms from SearchMetrics; budget stated by S0, e.g. warm p50 < X ms over
+  rerank_candidates=100).
+- ACCEPTANCE (spec §4 S3): a reranker is shippable iff net-positive nDCG@10/MRR
+  vs rerank-off on CoIR + CSN + in-domain WITHIN the stated latency budget.
+  If yes -> flip `SEMANTEX_RERANKER` on by default with the winning
+  `SEMANTEX_RERANKER_MODEL` (a one-line config/default change, separate PR). If no
+  -> leave OFF; record the numbers here.
+- The default-OFF gate in code STAYS until S0 reports a win. Flipping it is NOT
+  part of S3 (it is gated on harness output).
+- S3 code wiring (DONE): the reranker spec (score_strategy / prompt / yes-no
+  token ids / ONNX session file / download coords) is read from S8's
+  `ModelRegistry` as DATA via `RerankerChoice::from_spec(registry.active_reranker())`
+  — so S0 selects a reranker purely by setting `SEMANTEX_RERANKER_MODEL`
+  (== `config.reranker_model`); no S3 code change is needed to A/B a new
+  permissive reranker that is added to the manifest.
 
 ## S0 relevance harness
 

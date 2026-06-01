@@ -9,12 +9,16 @@ pub mod dense_backend;
 pub mod fastembed_reranker;
 pub mod graph_propagation;
 pub mod hybrid;
+pub mod onnx_reranker;
 pub mod path_signals;
 pub mod plaid_search;
 pub mod planner;
 pub mod query_classifier;
 pub mod query_expander;
 pub mod regex_semantic;
+pub mod reranker_download;
+pub mod reranker_engine;
+pub mod reranker_model;
 pub mod ripgrep_fallback;
 pub mod simd;
 pub mod sparse_search;
@@ -23,6 +27,16 @@ pub mod triple_fusion;
 
 use crate::types::{FileFilter, SearchResult};
 use anyhow::Result;
+
+/// One process-wide test mutex serializing every `with_env` helper that mutates
+/// the shared `SEMANTEX_RERANKER` / `SEMANTEX_RERANKER_MODEL` env vars across the
+/// reranker test modules (`fastembed_reranker`, `onnx_reranker`, `reranker_model`,
+/// `reranker_engine`). Per-module `static`s do NOT serialize each other within
+/// one test binary, which made env-mutating reranker tests flaky; all four helpers
+/// lock THIS one. (Mirrors the `crate::llm::TEST_ENV_LOCK` pattern, but lives here
+/// so it is available on the default, no-`llm` build.)
+#[cfg(test)]
+pub(crate) static RERANKER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use serde::{Deserialize, Serialize};
 
 /// Measured performance metrics from a single search invocation.
