@@ -2343,6 +2343,7 @@ mod hyde_tests {
         }
     }
 
+    use super::HybridSearcher;
     use crate::llm::LlmCapability;
     use crate::search::agent_classifier::AgentRoute;
 
@@ -2484,6 +2485,94 @@ mod hyde_tests {
         let returned = if outcome.is_err() { base } else { unreachable!() };
         assert_eq!(returned.results.len(), 1);
         assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
+    /// Build a minimal real `HybridSearcher` backed by an empty chunk store,
+    /// driving `search_with_hyde` through its genuine async code path (base
+    /// search → LLM → merge). Mirrors `server::handler`'s `build_empty_searcher`.
+    /// An empty index makes both the base and HyDE searches return no results,
+    /// which is exactly what the byte-identity / no-panic contracts need.
+    fn build_tiny_searcher() -> (tempfile::TempDir, HybridSearcher) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+        {
+            let _store =
+                crate::index::storage::ChunkStore::open(&db_path).expect("create chunk store");
+        }
+        let config = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(&semantex_dir, &config)
+            .expect("open sparse-only searcher");
+        (dir, searcher)
+    }
+
+    /// Build a default Semantic `SearchQuery` for the end-to-end tests.
+    fn semantic_query(text: &str) -> crate::search::SearchQuery {
+        crate::search::SearchQuery::new(text).max_results(10)
+    }
+
+    /// End-to-end: with a failing LLM, `search_with_hyde` returns a result set
+    /// byte-identical to the plain base search — proving "HyDE never breaks a
+    /// search." Drives the real async path, not just the branch decision.
+    #[tokio::test]
+    async fn search_with_hyde_error_path_is_identical_to_base() {
+        let (_tmp, searcher) = build_tiny_searcher();
+        let query = semantic_query("error handling");
+
+        let base = searcher.search(&query).expect("base search");
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+
+        let failing: std::sync::Arc<dyn crate::llm::LlmCapability> =
+            std::sync::Arc::new(MockLlm { mode: Mode::Err });
+        let hyde_out = searcher
+            .search_with_hyde(&query, failing)
+            .await
+            .expect("search_with_hyde must not propagate LLM errors");
+
+        let hyde_ids: Vec<u64> = hyde_out.results.iter().map(|r| r.chunk.id).collect();
+        assert_eq!(
+            hyde_ids, base_ids,
+            "LLM-error path must be byte-identical to base (same IDs, same order)"
+        );
+        assert_ne!(
+            hyde_out.metrics.query_type, "hyde_merged",
+            "error path must NOT be marked hyde_merged"
+        );
+    }
+
+    /// Success path: a succeeding mock yields a merged, deduped result set
+    /// tagged `hyde_merged`, with no duplicate chunk IDs and never fewer than
+    /// base after dedup+cap.
+    #[tokio::test]
+    async fn search_with_hyde_success_path_merges_and_tags() {
+        let (_tmp, searcher) = build_tiny_searcher();
+        let query = semantic_query("error handling");
+
+        let base = searcher.search(&query).expect("base search");
+
+        let ok: std::sync::Arc<dyn crate::llm::LlmCapability> = std::sync::Arc::new(MockLlm {
+            mode: Mode::Ok("fn handle_error(e: Error) -> Result<()> { Err(e) }"),
+        });
+        let merged = searcher
+            .search_with_hyde(&query, ok)
+            .await
+            .expect("search_with_hyde");
+
+        // Dedup-by-id invariant: no duplicate chunk IDs in the output.
+        let mut ids: Vec<u64> = merged.results.iter().map(|r| r.chunk.id).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "merged output must contain no duplicate chunk IDs");
+
+        // The success path tags the merge.
+        assert_eq!(merged.metrics.query_type, "hyde_merged");
+        // Merge is base ∪ hyde (capped) → never fewer than base after dedup+cap.
+        assert!(
+            merged.results.len() >= base.results.len().min(query.max_results),
+            "merged result count must be >= base (post dedup/cap)"
+        );
     }
 
     /// `merge_hyde_results` must dedup by `chunk.id`, not by `(file, start, end)`.
