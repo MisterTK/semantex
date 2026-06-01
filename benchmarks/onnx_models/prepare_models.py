@@ -110,7 +110,7 @@ def _download(source_repo: str, dest: Path) -> Path:
     from huggingface_hub import snapshot_download
 
     click.echo(f"  downloading {source_repo} → {dest}")
-    snapshot_download(repo_id=source_repo, local_dir=str(dest), local_dir_use_symlinks=False)
+    snapshot_download(repo_id=source_repo, local_dir=str(dest))
     return dest
 
 

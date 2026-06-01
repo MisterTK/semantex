@@ -25,7 +25,9 @@ artifact is stable, audited, and can't vanish or change under us.
 ```bash
 cd benchmarks/onnx_models
 python -m venv .venv && source .venv/bin/activate
-pip install "huggingface_hub>=0.23" onnx "onnxruntime>=1.17" "tokenizers>=0.15" numpy click
+pip install "huggingface_hub>=0.23" onnx "onnxruntime>=1.17" "tokenizers>=0.15" numpy click sympy
+# sympy is required by onnxruntime's quantizer (symbolic shape inference).
+# huggingface_hub 1.x ships the `hf` CLI (no [cli] extra); auth via: hf auth login --token <WRITE_TOKEN>
 huggingface-cli login        # only needed for --upload
 ```
 
