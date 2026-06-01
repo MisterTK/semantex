@@ -414,4 +414,82 @@ mod tests {
             .is_err()
         );
     }
+
+    /// rerank() must be an identity pass-through (no session built) when the
+    /// master switch is off — exactly like FastembedReranker. We assert this
+    /// without a model by checking the disabled branch returns ascending
+    /// indices with score 0.0 and never touches the (absent) ONNX file.
+    #[test]
+    fn rerank_is_identity_when_disabled() {
+        use crate::search::fastembed_reranker::ENV_ENABLE;
+        with_env(&[(ENV_ENABLE, None)], || {
+            let tmp = tempfile::TempDir::new().unwrap();
+            // Write a minimal valid tokenizer.json so construction succeeds.
+            std::fs::write(tmp.path().join("tokenizer.json"), MINIMAL_TOKENIZER_JSON).unwrap();
+            let r = OnnxReranker::new(
+                tmp.path(),
+                "model_int8.onnx",
+                ScoreStrategy::ClassifierLogit,
+                2,
+                false,
+            )
+            .expect("construct with tokenizer present");
+            let docs = ["a", "b", "c"];
+            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let out = r.rerank("q", &docs_ref, 2).expect("identity rerank");
+            assert_eq!(out, vec![(0, 0.0_f32), (1, 0.0_f32)]);
+        });
+    }
+
+    /// Smallest tokenizer.json the `tokenizers` crate will load: a WordLevel
+    /// model with a minimal vocab and whitespace pre-tokenizer. Enough for
+    /// `Tokenizer::from_file` to succeed in the disabled-path test (we never
+    /// actually encode through it there).
+    const MINIMAL_TOKENIZER_JSON: &str = r#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "Whitespace"},
+      "post_processor": null,
+      "decoder": null,
+      "model": {"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"}
+    }"#;
+
+    /// Env scrub/restore helper (copied verbatim from `fastembed_reranker.rs`
+    /// test module — tests can't share a private fn across files).
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
+            .collect();
+        // SAFETY: env vars are guarded by ENV_LOCK above.
+        unsafe {
+            for (k, v) in vars {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: env vars are guarded by ENV_LOCK above.
+        unsafe {
+            for (k, v) in &prior {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 }
