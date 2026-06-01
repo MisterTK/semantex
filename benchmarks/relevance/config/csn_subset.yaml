@@ -1,0 +1,17 @@
+# CodeSearchNet subset for CPU-feasible relevance runs.
+# Each language indexes `corpus_size` functions and evaluates `query_size`
+# queries drawn from functions that HAVE a docstring. Seed is fixed; the report
+# logs exactly which query ids were kept/dropped.
+#
+# dataset_id confirmed in research notes (Task 0.1 Step 3): the legacy bare
+# `code_search_net` id is dead on huggingface_hub 1.17.0; the official parquet
+# mirror `code-search-net/code_search_net` works WITHOUT trust_remote_code.
+dataset_id: code-search-net/code_search_net
+trust_remote_code: false
+seed: 20260531
+languages:
+  - python
+  - javascript
+  - go
+corpus_size: 1000                # functions indexed per language
+query_size: 200                  # queries evaluated per language (subset of corpus)
