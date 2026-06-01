@@ -55,14 +55,18 @@ class SemantexClient:
     def _build_args(self, query: str, *, ablation: str, k: int) -> list[str]:
         if ablation not in _ABLATIONS:
             raise ValueError(f"unknown ablation {ablation!r}; expected one of {_ABLATIONS}")
-        args = [self.binary, query, "--json", "--no-content", "-m", str(k)]
+        args = [self.binary, "--json", "--no-content", "-m", str(k)]
         if ablation == "sparse-only":
             args.append("--sparse-only")
         elif ablation == "dense-only":
             args.append("--dense-only")
         elif ablation == "rerank":
             args.append("--rerank")
-        # hybrid: no extra flag
+        # hybrid: no extra flag.
+        # Put the query LAST, after a `--` end-of-options separator, so a query
+        # that starts with dashes (real CSN docstrings can, e.g. "---- utils ----")
+        # is never mis-parsed by clap as a CLI flag.
+        args += ["--", query]
         return args
 
     def _build_env(self) -> dict:

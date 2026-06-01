@@ -43,6 +43,23 @@ def test_search_builds_hybrid_command_and_env():
     assert "--rerank" not in args
     assert mr.call_args.kwargs["cwd"] == "/tmp/corpus"
     assert rr.ranked_files == ("auth.py", "db.py")
+    # the query is passed AFTER a `--` end-of-options separator, and is the last
+    # arg, so a query that starts with dashes is never parsed as a CLI flag.
+    assert "--" in args
+    assert args[-1] == "auth handler"
+    assert args.index("--") < args.index("auth handler")
+
+
+def test_search_dash_leading_query_not_parsed_as_flag():
+    # real CSN docstrings can start with dashes (e.g. "---- utils ----"); they
+    # must reach semantex as the positional query, guarded by `--`.
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        client.search("q1", "---- utils ----", ablation="hybrid", k=5)
+    args = mr.call_args.args[0]
+    assert args[-1] == "---- utils ----"
+    assert args[args.index("--") + 1] == "---- utils ----"
 
 
 def test_search_sparse_only_flag():
