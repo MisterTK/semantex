@@ -66,6 +66,12 @@ pub struct SemantexConfig {
     /// error at startup, not a silent recall regression. Run
     /// `semantex index --rebuild` after toggling.
     pub use_bm25_stemmer: bool,
+    /// Selected dense search backend identity (e.g. `"colbert-plaid"`).
+    /// MUST match the value the index was built with — `HybridSearcher::open`
+    /// re-validates it against the persisted `IndexMeta.dense_backend` and
+    /// refuses to load on mismatch (mirrors `use_bm25_stemmer`). Override via
+    /// `SEMANTEX_DENSE_BACKEND`. Default `"colbert-plaid"`.
+    pub dense_backend: String,
 }
 
 impl Default for SemantexConfig {
@@ -93,6 +99,7 @@ impl Default for SemantexConfig {
             colbert_model: ColbertModelChoice::default(),
             plaid_nbits: 4,
             use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
         }
     }
 }
@@ -138,6 +145,12 @@ impl SemantexConfig {
         }
         if let Ok(v) = std::env::var("SEMANTEX_MODEL_DIR") {
             config.model_dir = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("SEMANTEX_DENSE_BACKEND") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                config.dense_backend = trimmed.to_string();
+            }
         }
 
         Ok(config)
@@ -206,6 +219,21 @@ pub(crate) fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Read a non-empty string tuning knob from an environment variable.
+///
+/// Returns the trimmed value when `key` is set to a non-empty string; a
+/// missing or whitespace-only value falls back to `default`.
+// Added in S1 for S8's ModelRegistry selection (per integration §3 item 5);
+// no production caller in this stream yet — only the unit test exercises it.
+#[allow(dead_code)]
+pub(crate) fn env_string(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +245,24 @@ mod tests {
         assert!(
             cfg.use_bm25_stemmer,
             "Default must preserve legacy stemming behavior (true) per v0.4 spec §9.2.3"
+        );
+    }
+
+    #[test]
+    fn default_dense_backend_is_colbert_plaid() {
+        let cfg = SemantexConfig::default();
+        assert_eq!(
+            cfg.dense_backend, "colbert-plaid",
+            "default dense backend must stay colbert-plaid until S2 + harness flip it (D4)"
+        );
+    }
+
+    #[test]
+    fn env_string_reads_value_or_default() {
+        // Unset key falls back to the provided default.
+        assert_eq!(
+            env_string("SEMANTEX_DENSE_BACKEND_TEST_UNSET_KEY", "colbert-plaid"),
+            "colbert-plaid"
         );
     }
 }
