@@ -395,7 +395,11 @@ mod tests {
             .embed_text_vector("open a database connection")
             .expect("query projection must be Some for a non-empty query");
         // ColBERT model dim is 48 (see colbert.rs / IndexMeta.embedding_dim).
-        assert_eq!(v.len(), 48, "mean-pooled query vector must have the model dim");
+        assert_eq!(
+            v.len(),
+            48,
+            "mean-pooled query vector must have the model dim"
+        );
         // L2-normalized → unit length (within float tolerance).
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(

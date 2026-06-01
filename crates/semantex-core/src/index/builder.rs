@@ -6,8 +6,6 @@ use crate::chunking::semantic_role::synthesize_nl_annotation;
 use crate::chunking::structured_meta::TypeRefContext;
 use crate::chunking::text_chunker::TextChunker;
 use crate::config::SemantexConfig;
-use crate::search::colbert_plaid_backend::ColbertPlaidIndexBuilder;
-use crate::search::dense_backend::{DenseBackendKind, DenseIndexBuilder, dense_subdir};
 use crate::file::detector::FileType;
 use crate::file::hasher;
 use crate::file::walker::FileWalker;
@@ -17,6 +15,8 @@ use crate::index::page_rank;
 use crate::index::pattern_catalog::{self, PatternCatalog, PatternLang};
 use crate::index::storage::ChunkStore;
 use crate::search::code_tokenizer;
+use crate::search::colbert_plaid_backend::ColbertPlaidIndexBuilder;
+use crate::search::dense_backend::{DenseBackendKind, DenseIndexBuilder, dense_subdir};
 use crate::search::sparse_search::SparseIndex;
 use crate::types::{Chunk, ChunkType, FileEntry, IndexMeta};
 use anyhow::{Context, Result};
@@ -523,10 +523,13 @@ impl IndexBuilder {
         // S1: the dense index may live in the per-backend subdir
         // (`dense/<backend>/`) or the legacy top-level `plaid/`. Treat dense as
         // "missing" (forcing a rebuild) only when NEITHER layout has a mapping.
-        let dense_dir_for_check =
-            dense_subdir(&index_dir, DenseBackendKind::parse(&self.config.dense_backend).unwrap_or_default());
-        let dense_missing_for_early_return = !dense_dir_for_check.join("plaid_mapping.bin").exists()
-            && !index_dir.join("plaid").exists();
+        let dense_dir_for_check = dense_subdir(
+            &index_dir,
+            DenseBackendKind::parse(&self.config.dense_backend).unwrap_or_default(),
+        );
+        let dense_missing_for_early_return =
+            !dense_dir_for_check.join("plaid_mapping.bin").exists()
+                && !index_dir.join("plaid").exists();
 
         if total_chunks == 0 && total_removals == 0 && !dense_missing_for_early_return {
             tracing::info!(

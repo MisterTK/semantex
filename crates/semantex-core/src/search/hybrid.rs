@@ -290,7 +290,7 @@ impl HybridSearcher {
                 // result-merge file_filter handle scoping.
                 match dense.positional_chunk_ids() {
                     None => None, // backend has no positional docs — subset N/A
-                    Some(all_indexed) if all_indexed.is_empty() => Some(Vec::new()),
+                    Some([]) => Some(Vec::new()),
                     Some(all_indexed) => {
                         const FILTER_BATCH: usize = 500;
                         // v0.4.1 W-Index #7: propagate SQLite errors and fall
