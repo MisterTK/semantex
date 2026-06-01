@@ -18,7 +18,10 @@ fn write_file(dir: &Path, name: &str, body: &str) {
 }
 
 fn build_index(project_dir: &Path, config: &SemantexConfig) {
-    IndexBuilder::new(config).unwrap().build(project_dir).unwrap();
+    IndexBuilder::new(config)
+        .unwrap()
+        .build(project_dir)
+        .unwrap();
 }
 
 #[test]

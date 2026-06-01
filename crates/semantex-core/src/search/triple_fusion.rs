@@ -786,9 +786,21 @@ mod tests {
 
         let c1 = &scores[&1];
         let c2 = &scores[&2];
-        assert!((c1.total - 2.0 / 31.0).abs() < 1e-6, "rank0 total = {}", c1.total);
-        assert!((c1.dense - 2.0 / 31.0).abs() < 1e-6, "rank0 dense = {}", c1.dense);
-        assert!((c2.total - 2.0 / 32.0).abs() < 1e-6, "rank1 total = {}", c2.total);
+        assert!(
+            (c1.total - 2.0 / 31.0).abs() < 1e-6,
+            "rank0 total = {}",
+            c1.total
+        );
+        assert!(
+            (c1.dense - 2.0 / 31.0).abs() < 1e-6,
+            "rank0 dense = {}",
+            c1.dense
+        );
+        assert!(
+            (c2.total - 2.0 / 32.0).abs() < 1e-6,
+            "rank1 total = {}",
+            c2.total
+        );
         assert_eq!(c1.channels_hit_mask, 0b001);
     }
 
@@ -806,7 +818,10 @@ mod tests {
         // Identifier-style weights: dense 0.2, sparse 1.0. A chunk found ONLY by
         // sparse (high sparse weight) should outrank a chunk found ONLY by dense
         // at the same rank (low dense weight). Parameter-free RRF would tie them.
-        let weights = FusionWeights { w_dense: 0.2, w_sparse: 1.0 };
+        let weights = FusionWeights {
+            w_dense: 0.2,
+            w_sparse: 1.0,
+        };
         let dense = vec![s(1, 0.9)]; // chunk 1: dense only, rank 0
         let sparse = vec![s(2, 10.0)]; // chunk 2: sparse only, rank 0
         let k = 60.0;
@@ -814,7 +829,10 @@ mod tests {
         let fused = triple_weighted_rrf_fuse(&dense, &sparse, &[], weights, k);
         // chunk 2 (sparse, w=1.0): 1.0/(60+0+1) = 1/61
         // chunk 1 (dense,  w=0.2): 0.2/(60+0+1) = 0.2/61
-        assert_eq!(fused[0].scored.chunk_id, 2, "sparse-weighted chunk must win");
+        assert_eq!(
+            fused[0].scored.chunk_id, 2,
+            "sparse-weighted chunk must win"
+        );
         assert!(fused[0].scored.score > fused[1].scored.score);
     }
 
@@ -822,7 +840,10 @@ mod tests {
     fn test_triple_weighted_rrf_consensus_and_confidence_preserved() {
         // Consensus chunk (all 3 channels) must still win and be Extracted —
         // weighting does not break the E6 channel-agreement contract.
-        let weights = FusionWeights { w_dense: 0.5, w_sparse: 0.5 };
+        let weights = FusionWeights {
+            w_dense: 0.5,
+            w_sparse: 0.5,
+        };
         let dense = vec![s(5, 0.9), s(10, 0.5)];
         let sparse = vec![s(5, 10.0), s(20, 5.0)];
         let exact = vec![5u64, 30];
@@ -837,7 +858,10 @@ mod tests {
     fn test_exp4_weighted_rrf_falls_back_on_empty_expansion() {
         // Empty expanded slices → same unique-chunk set + channels_fired as the
         // triple weighted path on the original three channels.
-        let weights = FusionWeights { w_dense: 0.4, w_sparse: 0.8 };
+        let weights = FusionWeights {
+            w_dense: 0.4,
+            w_sparse: 0.8,
+        };
         let dense = vec![s(5, 0.9)];
         let sparse = vec![s(7, 10.0)];
         let exact = vec![5u64];

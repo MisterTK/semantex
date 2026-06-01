@@ -9,11 +9,11 @@ use crate::search::dense_backend::{
     DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
 };
 use crate::search::graph_propagation::{self, GraphPropagationConfig};
-use crate::search::path_signals;
 use crate::search::mmr;
+use crate::search::path_signals;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
-use crate::search::semantic_cache::{self, SemanticCache};
 use crate::search::reranker_engine::RerankerEngine;
+use crate::search::semantic_cache::{self, SemanticCache};
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
 use crate::search::{query_expander, regex_semantic};
@@ -247,13 +247,13 @@ impl HybridSearcher {
         } else {
             None
         };
-        if let (Some(qvec), Some(stamp)) =
-            (&query_cache_vec, semantic_cache::read_stamp(&self.index_dir))
-        {
+        if let (Some(qvec), Some(stamp)) = (
+            &query_cache_vec,
+            semantic_cache::read_stamp(&self.index_dir),
+        ) {
             let threshold = semantic_cache::threshold_from_env();
             let mut cache = self.semantic_cache.lock();
-            if let Some((results, mut metrics)) =
-                cache.lookup(&query.text, qvec, threshold, &stamp)
+            if let Some((results, mut metrics)) = cache.lookup(&query.text, qvec, threshold, &stamp)
             {
                 metrics.total_ms = search_start.elapsed().as_millis() as u64;
                 tracing::debug!(
@@ -648,27 +648,26 @@ impl HybridSearcher {
                 // Selected by SEMANTEX_FUSION=weighted-rrf; default stays Rrf.
                 FusionMode::WeightedRrf => {
                     let (weights, k) = weighted_rrf_params(&self.config, query_type);
-                    let rrf_results: Vec<RrfFusedResult> = if !exp_dense_results.is_empty()
-                        || !exp_sparse_results.is_empty()
-                    {
-                        triple_fusion::exp4_weighted_rrf_fuse(
-                            &dense_results,
-                            &sparse_results,
-                            &exp_dense_results,
-                            &exp_sparse_results,
-                            &exact_ids,
-                            weights,
-                            k,
-                        )
-                    } else {
-                        triple_fusion::triple_weighted_rrf_fuse(
-                            &dense_results,
-                            &sparse_results,
-                            &exact_ids,
-                            weights,
-                            k,
-                        )
-                    };
+                    let rrf_results: Vec<RrfFusedResult> =
+                        if !exp_dense_results.is_empty() || !exp_sparse_results.is_empty() {
+                            triple_fusion::exp4_weighted_rrf_fuse(
+                                &dense_results,
+                                &sparse_results,
+                                &exp_dense_results,
+                                &exp_sparse_results,
+                                &exact_ids,
+                                weights,
+                                k,
+                            )
+                        } else {
+                            triple_fusion::triple_weighted_rrf_fuse(
+                                &dense_results,
+                                &sparse_results,
+                                &exact_ids,
+                                weights,
+                                k,
+                            )
+                        };
                     let labels = triple_fusion::assign_confidence(&rrf_results);
                     for (rr, (conf, score)) in rrf_results.iter().zip(labels.iter()) {
                         confidence_map.insert(rr.scored.chunk_id, (*conf, *score));
@@ -1936,7 +1935,10 @@ mod tests {
         let mut cfg = crate::config::SemantexConfig::default();
         cfg.rrf_k = 42.0;
         let (weights, k) = weighted_rrf_params(&cfg, query_classifier::QueryType::Identifier);
-        assert!((k - 42.0).abs() < f32::EPSILON, "config.rrf_k must be live, got {k}");
+        assert!(
+            (k - 42.0).abs() < f32::EPSILON,
+            "config.rrf_k must be live, got {k}"
+        );
         // Identifier weights favour sparse (dead-code revival check).
         assert!(weights.w_sparse > weights.w_dense);
     }

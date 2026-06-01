@@ -51,6 +51,7 @@ pub fn mmr_lambda_from_env() -> Option<f32> {
 /// never reorder on partial similarity information. Relevance is the current
 /// `result.score` (post-rerank). This function does not change scores, only
 /// order, so downstream adaptive sizing/threshold logic is unaffected.
+#[allow(clippy::implicit_hasher)] // signature locked by the S7 plan; call site passes std HashMap
 pub fn mmr_rerank(
     results: &mut Vec<SearchResult>,
     doc_vectors: &HashMap<u64, Vec<f32>>,
@@ -152,8 +153,14 @@ mod tests {
         vecs.insert(2, vec![0.99, 0.01]); // ~parallel to r1
         vecs.insert(3, vec![0.0, 1.0]); // orthogonal to r1
         mmr_rerank(&mut results, &vecs, 0.3, 10);
-        assert_eq!(results[0].chunk.id, 1, "rank-1 (highest relevance) stays first");
-        assert_eq!(results[1].chunk.id, 3, "distinct result promoted over near-dup");
+        assert_eq!(
+            results[0].chunk.id, 1,
+            "rank-1 (highest relevance) stays first"
+        );
+        assert_eq!(
+            results[1].chunk.id, 3,
+            "distinct result promoted over near-dup"
+        );
         assert_eq!(results[2].chunk.id, 2);
     }
 
@@ -199,7 +206,11 @@ mod tests {
         unsafe {
             std::env::set_var("SEMANTEX_MMR_LAMBDA", "9.0");
         } // out of range
-        assert_eq!(mmr_lambda_from_env(), None, "out-of-[0,1] lambda is rejected");
+        assert_eq!(
+            mmr_lambda_from_env(),
+            None,
+            "out-of-[0,1] lambda is rejected"
+        );
         unsafe {
             std::env::remove_var("SEMANTEX_MMR_LAMBDA");
         }

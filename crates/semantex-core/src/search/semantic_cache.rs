@@ -158,8 +158,7 @@ pub fn read_stamp(index_dir: &Path) -> Option<CacheStamp> {
 /// env until A/B'd). Enabled by `SEMANTEX_SEMANTIC_CACHE=1` (or `true`).
 pub fn is_enabled() -> bool {
     std::env::var("SEMANTEX_SEMANTIC_CACHE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 /// Cosine threshold for a semantic hit. Default 0.85 (spec S7). Override with
@@ -235,8 +234,16 @@ mod tests {
         let mut cache = SemanticCache::new(10);
         let st = stamp("100");
         cache.store("auth flow", &[1.0, 0.0], one_result(7), metrics(), &st);
-        let hit = cache.lookup("auth flow", &[0.0, 1.0] /* wrong vec; exact path wins */, 0.85, &st);
-        assert!(hit.is_some(), "identical query text must hit via exact-match fast path");
+        let hit = cache.lookup(
+            "auth flow",
+            &[0.0, 1.0], /* wrong vec; exact path wins */
+            0.85,
+            &st,
+        );
+        assert!(
+            hit.is_some(),
+            "identical query text must hit via exact-match fast path"
+        );
         assert_eq!(hit.unwrap().0[0].chunk.id, 7);
     }
 
@@ -244,10 +251,19 @@ mod tests {
     fn cosine_near_match_hits_above_threshold() {
         let mut cache = SemanticCache::new(10);
         let st = stamp("100");
-        cache.store("how is auth handled", &[1.0, 0.0], one_result(9), metrics(), &st);
+        cache.store(
+            "how is auth handled",
+            &[1.0, 0.0],
+            one_result(9),
+            metrics(),
+            &st,
+        );
         // Different text, near-parallel embedding (cos ≈ 0.9995 > 0.85) → hit.
         let hit = cache.lookup("auth handling overview", &[0.999, 0.01], 0.85, &st);
-        assert!(hit.is_some(), "near-parallel embedding above threshold must hit");
+        assert!(
+            hit.is_some(),
+            "near-parallel embedding above threshold must hit"
+        );
         assert_eq!(hit.unwrap().0[0].chunk.id, 9);
     }
 
@@ -255,7 +271,13 @@ mod tests {
     fn cosine_below_threshold_misses() {
         let mut cache = SemanticCache::new(10);
         let st = stamp("100");
-        cache.store("how is auth handled", &[1.0, 0.0], one_result(9), metrics(), &st);
+        cache.store(
+            "how is auth handled",
+            &[1.0, 0.0],
+            one_result(9),
+            metrics(),
+            &st,
+        );
         // Orthogonal embedding (cos = 0) < 0.85 → miss.
         let hit = cache.lookup("database migrations", &[0.0, 1.0], 0.85, &st);
         assert!(hit.is_none());
@@ -282,12 +304,18 @@ mod tests {
         let mut cache = SemanticCache::new(10);
         let st_old = stamp("100");
         cache.store("auth flow", &[1.0, 0.0], one_result(7), metrics(), &st_old);
-        assert!(cache.lookup("auth flow", &[1.0, 0.0], 0.85, &st_old).is_some());
+        assert!(
+            cache
+                .lookup("auth flow", &[1.0, 0.0], 0.85, &st_old)
+                .is_some()
+        );
 
         // Reindex bumps updated_at → new stamp.
         let st_new = stamp("200");
         assert!(
-            cache.lookup("auth flow", &[1.0, 0.0], 0.85, &st_new).is_none(),
+            cache
+                .lookup("auth flow", &[1.0, 0.0], 0.85, &st_new)
+                .is_none(),
             "reindex (new updated_at) MUST invalidate the cache"
         );
         assert_eq!(cache.len(), 0, "stamp change flushes all entries");
@@ -325,10 +353,17 @@ mod tests {
             dense_backend: "colbert-plaid".to_string(), // S1 field
             embedder_fingerprint: "test-fp".to_string(), // S8 field
         };
-        std::fs::write(index_dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        std::fs::write(
+            index_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
         let st = read_stamp(index_dir).expect("meta.json present → Some stamp");
         assert_eq!(st.updated_at, "1717000000");
-        assert_eq!(st.schema_version, crate::types::IndexMeta::CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            st.schema_version,
+            crate::types::IndexMeta::CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
