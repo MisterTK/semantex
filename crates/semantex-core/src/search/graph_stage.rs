@@ -73,7 +73,79 @@ pub fn run_graph_stage(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Optional centrality prior (off by default; SEMANTEX_GRAPH_CENTRALITY_WEIGHT).
+    let centrality_weight = centrality_weight_from_env();
+    if centrality_weight > 0.0 {
+        apply_centrality_prior(fused, store, centrality_weight)?;
+    }
+
     Ok(new_ids.into_iter().collect())
+}
+
+/// Read the centrality-prior weight from `SEMANTEX_GRAPH_CENTRALITY_WEIGHT`.
+/// Default `0.0` (off). Negative or unparseable values are treated as off.
+fn centrality_weight_from_env() -> f32 {
+    std::env::var("SEMANTEX_GRAPH_CENTRALITY_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|w| *w > 0.0)
+        .unwrap_or(0.0)
+}
+
+/// Apply the stored-PageRank centrality prior to `fused` in place.
+///
+/// Min–max normalizes the present centrality values to `[0,1]` and adds
+/// `weight * max_seed_score * normalized_centrality` to each chunk's score,
+/// keeping the prior commensurate with the propagation bonuses (same
+/// `max_seed_score` convention as `propagate`). Re-sorts `fused` desc.
+///
+/// No-op when `weight <= 0.0`, when no centrality rows exist, or when all
+/// present centrality values are equal (degenerate normalization).
+fn apply_centrality_prior(
+    fused: &mut [ScoredChunkId],
+    store: &ChunkStore,
+    weight: f32,
+) -> Result<()> {
+    if weight <= 0.0 || fused.is_empty() {
+        return Ok(());
+    }
+    let max_seed_score = fused
+        .iter()
+        .map(|s| s.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_seed_score <= 0.0 {
+        return Ok(());
+    }
+
+    let ids: Vec<u64> = fused.iter().map(|s| s.chunk_id).collect();
+    let cen = store.get_centrality_scores(&ids)?;
+    if cen.is_empty() {
+        return Ok(());
+    }
+
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in cen.values() {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let span = hi - lo;
+    if span <= f32::EPSILON {
+        // All present centralities equal → no discriminative signal.
+        return Ok(());
+    }
+
+    for scored in fused.iter_mut() {
+        if let Some(&v) = cen.get(&scored.chunk_id) {
+            let norm = (v - lo) / span;
+            scored.score += weight * max_seed_score * norm;
+        }
+    }
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -110,6 +182,11 @@ pub(crate) mod test_support {
             .store_call_graph_edge(id1, "callee_fn", Some(id2))
             .unwrap();
         store
+    }
+
+    /// Seed a PageRank centrality row (creating the aux table on first call).
+    pub fn add_centrality(store: &ChunkStore, chunk_id: u64, value: f64) {
+        store.insert_centrality_score(chunk_id, value).unwrap();
     }
 }
 
@@ -169,5 +246,47 @@ mod tests {
         let new_ids = run_graph_stage(&mut fused, &mut chunk_map, &store, &config, 10).unwrap();
         assert!(new_ids.is_empty());
         assert_eq!(fused.len(), 1);
+    }
+
+    #[test]
+    fn test_centrality_prior_weight_zero_is_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_call_edge(tmp.path());
+        test_support::add_centrality(&store, 2, 0.9);
+        test_support::add_centrality(&store, 1, 0.1);
+
+        let mut fused = vec![ScoredChunkId::new(1, 10.0), ScoredChunkId::new(2, 4.0)];
+        let before = fused.clone();
+        // weight 0.0 → no-op, scores unchanged.
+        apply_centrality_prior(&mut fused, &store, 0.0).unwrap();
+        assert_eq!(fused.len(), before.len());
+        for (a, b) in fused.iter().zip(before.iter()) {
+            assert_eq!(a.chunk_id, b.chunk_id);
+            assert!((a.score - b.score).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_centrality_prior_lifts_high_centrality_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_call_edge(tmp.path());
+        // chunk 2 has the highest centrality; chunk 1 the lowest.
+        test_support::add_centrality(&store, 2, 1.0);
+        test_support::add_centrality(&store, 1, 0.0);
+
+        let mut fused = vec![ScoredChunkId::new(1, 10.0), ScoredChunkId::new(2, 4.0)];
+        let max_seed = 10.0_f32;
+        let weight = 0.2_f32;
+        apply_centrality_prior(&mut fused, &store, weight).unwrap();
+
+        // min–max normalized centrality: chunk2 -> 1.0, chunk1 -> 0.0.
+        // chunk2 score = 4.0 + weight * max_seed * 1.0 = 4.0 + 2.0 = 6.0.
+        let s2 = fused.iter().find(|s| s.chunk_id == 2).unwrap().score;
+        let s1 = fused.iter().find(|s| s.chunk_id == 1).unwrap().score;
+        assert!((s2 - (4.0 + weight * max_seed)).abs() < 1e-4, "got {s2}");
+        // chunk1 has normalized centrality 0 → unchanged.
+        assert!((s1 - 10.0).abs() < f32::EPSILON, "got {s1}");
+        // re-sorted desc: chunk1 (10.0) still first.
+        assert_eq!(fused[0].chunk_id, 1);
     }
 }
