@@ -45,6 +45,47 @@ pub fn dense_subdir(index_dir: &Path, backend: DenseBackendKind) -> PathBuf {
     index_dir.join("dense").join(backend.name())
 }
 
+/// The versioned dense index dir for a specific embedder fingerprint:
+/// `<index_dir>/dense/<backend>/<fingerprint>/`. A new embedder builds here
+/// alongside the old one, so the live index is never disturbed mid-rebuild (S8
+/// zero-downtime switchover).
+pub fn active_dense_dir(index_dir: &Path, backend: DenseBackendKind, fingerprint: &str) -> PathBuf {
+    dense_subdir(index_dir, backend).join(fingerprint)
+}
+
+/// Path of the active-pointer file for a backend: `<index_dir>/dense/<backend>/ACTIVE`.
+/// Its contents are the fingerprint of the currently-live versioned dir.
+fn active_pointer_path(index_dir: &Path, backend: DenseBackendKind) -> PathBuf {
+    dense_subdir(index_dir, backend).join("ACTIVE")
+}
+
+/// Read the currently-active fingerprint for `backend`, or `None` if no pointer
+/// exists yet (fresh index).
+pub fn read_active_pointer(index_dir: &Path, backend: DenseBackendKind) -> Option<String> {
+    std::fs::read_to_string(active_pointer_path(index_dir, backend))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Flip the active pointer to `fingerprint` atomically (write a temp file in the
+/// same dir, then rename — rename is atomic on the same filesystem). The new
+/// versioned dir must already be fully built before this is called, so readers
+/// either see the old fingerprint or the new one, never a partial index.
+pub fn write_active_pointer(
+    index_dir: &Path,
+    backend: DenseBackendKind,
+    fingerprint: &str,
+) -> Result<()> {
+    let dir = dense_subdir(index_dir, backend);
+    std::fs::create_dir_all(&dir)?;
+    let final_path = dir.join("ACTIVE");
+    let tmp_path = dir.join(".ACTIVE.tmp");
+    std::fs::write(&tmp_path, fingerprint.as_bytes())?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
 /// Verify that the persisted `dense_backend` in `<index_dir>/meta.json` matches
 /// `expected` (mirrors `sparse_search::verify_persisted_stemmer_matches`).
 ///
@@ -199,6 +240,36 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // No meta.json written — skip the check (mirrors stemmer guard).
         verify_persisted_backend_matches(tmp.path(), "colbert-plaid").unwrap();
+    }
+
+    #[test]
+    fn versioned_dir_nests_fingerprint_under_backend() {
+        let root = Path::new("/tmp/proj/.semantex");
+        let p = active_dense_dir(root, DenseBackendKind::ColbertPlaid, "deadbeef");
+        assert_eq!(
+            p,
+            Path::new("/tmp/proj/.semantex/dense/colbert-plaid/deadbeef")
+        );
+    }
+
+    #[test]
+    fn active_pointer_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // No pointer yet → None.
+        assert_eq!(read_active_pointer(root, DenseBackendKind::ColbertPlaid), None);
+        // Write then read back.
+        write_active_pointer(root, DenseBackendKind::ColbertPlaid, "abc123").unwrap();
+        assert_eq!(
+            read_active_pointer(root, DenseBackendKind::ColbertPlaid),
+            Some("abc123".to_string())
+        );
+        // Overwrite flips atomically.
+        write_active_pointer(root, DenseBackendKind::ColbertPlaid, "def456").unwrap();
+        assert_eq!(
+            read_active_pointer(root, DenseBackendKind::ColbertPlaid),
+            Some("def456".to_string())
+        );
     }
 
     /// Helper: write a current-shape meta.json carrying `backend`.
