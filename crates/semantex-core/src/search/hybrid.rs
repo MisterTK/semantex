@@ -2349,12 +2349,12 @@ mod hyde_tests {
 
     /// Mock LLM for HyDE contract tests.
     ///
-    /// - `Mode::Ok(doc)`      → returns `doc` from `synthesize_hyde_doc`.
-    /// - `Mode::Empty`        → returns an empty string (HyDE caller must treat
-    ///                          this as "no doc" and return base unchanged).
-    /// - `Mode::Err`          → returns an error (HyDE caller must return base).
-    /// - `Mode::Slow(delay)`  → sleeps `delay` then returns a doc (used by the
-    ///                          timeout test once paired with a 1ms env override).
+    /// - `Mode::Ok(doc)` → returns `doc` from `synthesize_hyde_doc`.
+    /// - `Mode::Empty` → returns an empty string (HyDE caller must treat this as
+    ///   "no doc" and return base unchanged).
+    /// - `Mode::Err` → returns an error (HyDE caller must return base).
+    /// - `Mode::Slow(delay)` → sleeps `delay` then returns a doc (used by the
+    ///   timeout test once paired with a 1ms env override).
     enum Mode {
         Ok(&'static str),
         Empty,
@@ -2384,7 +2384,7 @@ mod hyde_tests {
             }
         }
 
-        fn label(&self) -> &str {
+        fn label(&self) -> &'static str {
             "mock-hyde-llm"
         }
     }
@@ -2415,7 +2415,10 @@ mod hyde_tests {
         let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
         let returned = if doc.is_err() { base } else { unreachable!() };
         let returned_ids: Vec<u64> = returned.results.iter().map(|r| r.chunk.id).collect();
-        assert_eq!(returned_ids, base_ids, "error path must return base unchanged");
+        assert_eq!(
+            returned_ids, base_ids,
+            "error path must return base unchanged"
+        );
         assert_ne!(
             returned.metrics.query_type, "hyde_merged",
             "error path must NOT mark results as hyde_merged"
@@ -2429,7 +2432,10 @@ mod hyde_tests {
     async fn hyde_empty_doc_yields_base_unchanged() {
         let llm = MockLlm { mode: Mode::Empty };
         let doc = llm.synthesize_hyde_doc("anything").await.unwrap();
-        assert!(doc.trim().is_empty(), "mock must return empty in Mode::Empty");
+        assert!(
+            doc.trim().is_empty(),
+            "mock must return empty in Mode::Empty"
+        );
 
         // Production decision for an empty doc: return base (no merge).
         let base = SearchOutput {
@@ -2437,9 +2443,17 @@ mod hyde_tests {
             metrics: make_metrics(),
         };
         let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
-        let returned = if doc.trim().is_empty() { base } else { unreachable!() };
+        let returned = if doc.trim().is_empty() {
+            base
+        } else {
+            unreachable!()
+        };
         assert_eq!(
-            returned.results.iter().map(|r| r.chunk.id).collect::<Vec<_>>(),
+            returned
+                .results
+                .iter()
+                .map(|r| r.chunk.id)
+                .collect::<Vec<_>>(),
             base_ids,
             "empty-doc path must return base unchanged"
         );
@@ -2456,21 +2470,24 @@ mod hyde_tests {
     /// LLM test races on process env.
     #[tokio::test(flavor = "current_thread")]
     async fn hyde_timeout_yields_base_unchanged() {
-        let _guard = crate::llm::TEST_ENV_LOCK.lock().unwrap();
-        // SAFETY: guarded by TEST_ENV_LOCK; see module doc on the lock.
-        unsafe { std::env::set_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS", "1") };
+        // Resolve the *real* `llm_hyde_timeout()` env reader (1ms) inside a
+        // short critical section, then drop the env + lock BEFORE awaiting so
+        // we never hold a std `MutexGuard` across an await point. The captured
+        // `budget` is what the production path would have computed.
+        let budget = {
+            let _guard = crate::llm::TEST_ENV_LOCK.lock().unwrap();
+            // SAFETY: guarded by TEST_ENV_LOCK; see module doc on the lock.
+            unsafe { std::env::set_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS", "1") };
+            let budget = super::llm_hyde_timeout();
+            // SAFETY: guarded by TEST_ENV_LOCK.
+            unsafe { std::env::remove_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS") };
+            budget
+        };
 
         let llm = MockLlm {
             mode: Mode::Slow(std::time::Duration::from_millis(200)),
         };
-        let outcome = tokio::time::timeout(
-            super::llm_hyde_timeout(),
-            llm.synthesize_hyde_doc("slow query"),
-        )
-        .await;
-
-        // SAFETY: guarded by TEST_ENV_LOCK.
-        unsafe { std::env::remove_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS") };
+        let outcome = tokio::time::timeout(budget, llm.synthesize_hyde_doc("slow query")).await;
 
         assert!(
             outcome.is_err(),
@@ -2482,7 +2499,11 @@ mod hyde_tests {
             results: vec![make_result(9, 0.42)],
             metrics: make_metrics(),
         };
-        let returned = if outcome.is_err() { base } else { unreachable!() };
+        let returned = if outcome.is_err() {
+            base
+        } else {
+            unreachable!()
+        };
         assert_eq!(returned.results.len(), 1);
         assert_ne!(returned.metrics.query_type, "hyde_merged");
     }
@@ -2564,7 +2585,11 @@ mod hyde_tests {
         let n = ids.len();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), n, "merged output must contain no duplicate chunk IDs");
+        assert_eq!(
+            ids.len(),
+            n,
+            "merged output must contain no duplicate chunk IDs"
+        );
 
         // The success path tags the merge.
         assert_eq!(merged.metrics.query_type, "hyde_merged");

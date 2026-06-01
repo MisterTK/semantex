@@ -3700,7 +3700,9 @@ mod llm_runtime_wiring_tests {
     /// minimal env-driven backend to exercise the runtime-build path.
     #[test]
     fn mcp_server_builds_shared_runtime() {
-        let _guard = MCP_LLM_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MCP_LLM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: guarded by MCP_LLM_ENV_LOCK; restored before the lock drops.
         // A model name is enough for GenaiBackend::from_env() to yield Some,
         // which makes McpServer build the shared runtime. No network is used.
