@@ -44,6 +44,7 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
             },
             capabilities: ModelCapabilities {
                 multi_vector: false,
+                ..ModelCapabilities::default()
             },
             role_data: RoleData::Embedder(EmbedderSpec {
                 dims: 768,
@@ -72,6 +73,7 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
             },
             capabilities: ModelCapabilities {
                 multi_vector: true,
+                ..ModelCapabilities::default()
             },
             role_data: RoleData::Embedder(EmbedderSpec {
                 dims: 48,

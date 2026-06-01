@@ -10,7 +10,7 @@ pub mod manifest;
 pub mod registry;
 pub mod spec;
 
-pub use capabilities::ModelCapabilities;
+pub use capabilities::{BackendKind, ModelCapabilities, backend_for};
 pub use spec::{
     EmbedderSpec, LlmSpec, ModelRole, ModelSource, ModelSpec, Pooling, QuantKind, RerankerSpec,
     RoleData, ScoreStrategyKind,
