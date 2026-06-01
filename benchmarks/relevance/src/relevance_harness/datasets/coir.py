@@ -74,7 +74,7 @@ def build_corpus_from_splits(
             {"query_id": r["_id"], "text": r["text"], "gold_doc_ids": tuple(gold_doc_ids)}
         )
 
-    kept, _manifest = select_queries(
+    kept, manifest = select_queries(
         candidate_queries, n=query_size, seed=seed, dataset=f"coir/{name}"
     )
     queries = tuple(
@@ -86,6 +86,7 @@ def build_corpus_from_splits(
         documents=tuple(documents),
         queries=queries,
         corpus_dir=corpus_dir,
+        manifest=manifest,
     )
 
 

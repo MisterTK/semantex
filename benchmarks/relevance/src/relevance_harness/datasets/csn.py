@@ -59,7 +59,7 @@ def build_corpus_from_rows(
                 {"query_id": r["func_code_url"], "text": doc, "gold_doc_id": doc_id}
             )
 
-    kept, _manifest = select_queries(
+    kept, manifest = select_queries(
         candidate_queries, n=query_size, seed=seed, dataset=f"csn/{language}"
     )
     queries = tuple(
@@ -71,6 +71,7 @@ def build_corpus_from_rows(
         documents=tuple(documents),
         queries=queries,
         corpus_dir=corpus_dir,
+        manifest=manifest,
     )
 
 

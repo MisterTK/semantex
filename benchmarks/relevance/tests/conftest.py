@@ -5,6 +5,9 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+# Make the entrypoint scripts (scripts/) importable so the gate protocol logic
+# can be unit-tested without a subprocess.
+sys.path.insert(0, str(ROOT))
 
 # Make the sibling swe_bench harness importable for SWE-loc reuse.
 SWE_BENCH_SRC = ROOT.parent / "swe_bench" / "src"

@@ -72,6 +72,8 @@ def main(dataset, ablation, embedder, k, run_id, semantex_bin):
             out = run_corpus(corpus, ablation=ablation, k=k, semantex_binary=semantex_bin,
                              embedder=embedder, match_mode="doc_id")
             rows.append(compute_metrics_row(out, k=k))
+            if corpus.manifest is not None:
+                manifests.append(corpus.manifest.to_dict())
     elif dataset == "swe-loc":
         queries = load_swe_loc_queries(instance_ids=_phase_a_ids())
         agg_rel: list[list[int]] = []

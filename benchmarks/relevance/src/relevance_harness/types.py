@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .subset import SubsetManifest
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,9 @@ class EvalCorpus:
     documents: tuple[Document, ...]
     queries: tuple[Query, ...]
     corpus_dir: Optional[Path]
+    # The subset manifest (kept/dropped query ids) for this corpus, if the loader
+    # subsetted its queries. Reports surface it so every number carries provenance.
+    manifest: Optional["SubsetManifest"] = None
 
     def qrels(self) -> dict[str, dict[str, int]]:
         """{query_id: {gold_doc_id: 1}} — binary relevance."""
