@@ -455,7 +455,13 @@ impl McpServer {
             .any(|marker| cwd.join(marker).exists());
 
             if looks_like_project {
-                let idx_state = state::detect(&cwd);
+                // S8: detect_for_config so an embedder/embedding-text change also
+                // marks the index Stale and kicks off a background rebuild here.
+                // initialize runs once per MCP session — not a hot path — so the
+                // one registry resolution is affordable (the per-search
+                // `detect_state_fast` stays schema-only to keep the warm path
+                // sub-microsecond; this is its session-level backstop).
+                let idx_state = state::detect_for_config(&cwd, &self.config);
                 if idx_state == IndexState::NotIndexed || idx_state == IndexState::Stale {
                     self.spawn_background_index(&cwd);
                 }
@@ -610,6 +616,15 @@ impl McpServer {
     /// reporting) should still use `state::detect` directly; this helper is
     /// intended only for the search-path tool handlers (`tool_agent`,
     /// `tool_search`, `tool_deep_search`, and the M1-M6 structural tools).
+    ///
+    /// S8 note: this path is DELIBERATELY schema-only and does NOT fold in the
+    /// embedder fingerprint (`detect_for_config`).
+    /// It runs on every search call, and resolving the model registry (merge
+    /// built-ins + optional `models.toml` + validate every spec) is not free;
+    /// adding it here would defeat the sub-microsecond warm fast path.
+    /// The embedder-change auto-rebuild trigger is handled once per session in
+    /// `handle_initialize` (and surfaced in `tool_status`), both of which call
+    /// `state::detect_for_config`.
     fn detect_state_fast(path: &std::path::Path) -> IndexState {
         let index_dir = path.join(".semantex");
         if warm_state_ready(&index_dir) {
@@ -1430,11 +1445,14 @@ impl McpServer {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let display = canonical.display();
 
-        let idx_state = state::detect(&canonical);
+        // S8: detect_for_config so STALE in the status report also reflects an
+        // embedder-fingerprint change (model/embedding-text swap), not only a
+        // schema mismatch. Status is a diagnostic path, not a hot loop.
+        let idx_state = state::detect_for_config(&canonical, &self.config);
         let state_label = match idx_state {
             IndexState::NotIndexed => "NOT INDEXED",
             IndexState::Building => "BUILDING",
-            IndexState::Stale => "STALE (schema mismatch)",
+            IndexState::Stale => "STALE (schema or embedder change)",
             IndexState::Ready => "READY",
         };
 

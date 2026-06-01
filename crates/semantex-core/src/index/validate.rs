@@ -215,10 +215,12 @@ fn check_stale_files(index_dir: &Path, project_path: &Path) -> CheckResult {
 /// Check 3: Dense index integrity — the coderank-hnsw vector store sentinel
 /// (`dense/coderank-hnsw/vectors.bin`).
 fn check_dense_index(index_dir: &Path) -> CheckResult {
-    use crate::search::dense_backend::{DenseBackendKind, dense_subdir};
+    use crate::search::dense_backend::{DenseBackendKind, resolve_active_dense_dir};
     let name = "dense_index".to_string();
 
-    let dense_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
+    // S8: validate the LIVE store dir — the ACTIVE versioned dir when a pointer
+    // exists, else the legacy plain layout (so pre-versioned indexes still pass).
+    let dense_dir = resolve_active_dense_dir(index_dir, DenseBackendKind::CoderankHnsw);
     let vectors_file = dense_dir.join("vectors.bin");
 
     if !vectors_file.exists() {

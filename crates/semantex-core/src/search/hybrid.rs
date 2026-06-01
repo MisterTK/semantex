@@ -4,7 +4,7 @@ use crate::index::storage::ChunkStore;
 use crate::search::SearchQuery;
 use crate::search::adaptive;
 use crate::search::dense_backend::{
-    DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
+    DenseBackend, DenseBackendKind, resolve_active_dense_dir, verify_persisted_backend_matches,
 };
 use crate::search::graph_propagation::GraphPropagationConfig;
 use crate::search::graph_stage;
@@ -128,7 +128,11 @@ impl HybridSearcher {
         let dense: Option<Box<dyn DenseBackend>> = match resolved_backend {
             DenseBackendKind::CoderankHnsw => {
                 use crate::index::hnsw_index::{CoderankHnswBackend, HnswParams};
-                let backend_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
+                // S8: resolve the LIVE store dir via the ACTIVE pointer
+                // (`dense/<backend>/<fingerprint>/`), falling back to the legacy
+                // plain layout (`dense/<backend>/`) for pre-versioned indexes.
+                let backend_dir =
+                    resolve_active_dense_dir(index_dir, DenseBackendKind::CoderankHnsw);
                 if backend_dir.join("vectors.bin").exists() {
                     let params = HnswParams::resolve(
                         &config.hnsw_preset,

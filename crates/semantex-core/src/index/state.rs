@@ -1,6 +1,7 @@
 //! Index state detection — determines whether a project's semantex index is ready,
 //! currently being built, stale (schema mismatch), or absent.
 
+use crate::config::SemantexConfig;
 use crate::types::IndexMeta;
 use std::path::Path;
 
@@ -49,6 +50,38 @@ pub fn detect(project_path: &Path) -> IndexState {
     IndexState::Ready
 }
 
+/// Detect the index state, additionally treating an embedder-fingerprint change
+/// as `Stale` so it AUTO-REBUILDS (S8). Identical to [`detect`] except the
+/// staleness test also compares the persisted `meta.embedder_fingerprint` to the
+/// fingerprint the active config's embedder resolves to.
+///
+/// The expected fingerprint is computed from the model registry
+/// (`ModelRegistry::resolve_embedder_fingerprint`, mirroring `builder.rs`). If
+/// the registry CANNOT resolve a fingerprint (any error — a malformed
+/// `models.toml`, an unknown embedder id, etc.), this falls back to the
+/// schema-only [`detect`] and NEVER returns `Stale` spuriously on a registry
+/// error: a transient config problem must not nuke a perfectly good index.
+pub fn detect_for_config(project_path: &Path, config: &SemantexConfig) -> IndexState {
+    let base = detect(project_path);
+    // Only the Ready arm can be "downgraded" to Stale by a fingerprint change —
+    // NotIndexed/Building/Stale already short-circuit any rebuild decision.
+    if base != IndexState::Ready {
+        return base;
+    }
+    // Resolve the expected fingerprint; on ANY registry error, keep the
+    // schema-only verdict (Ready) — never spuriously Stale.
+    let Ok(expected) =
+        crate::model::ModelRegistry::resolve_embedder_fingerprint(config, Some(project_path))
+    else {
+        return base;
+    };
+    let meta_path = project_path.join(".semantex").join("meta.json");
+    if is_stale_for_embedder(&meta_path, &expected) {
+        return IndexState::Stale;
+    }
+    base
+}
+
 /// Returns the age of the index in seconds since its last update, or `None` if
 /// no index exists or the timestamp cannot be parsed.
 pub fn index_age_secs(project_path: &Path) -> Option<u64> {
@@ -78,6 +111,29 @@ pub fn is_stale(meta_path: &Path) -> bool {
         Err(_) => return true, // unparseable meta → treat as stale
     };
     meta.schema_version != IndexMeta::CURRENT_SCHEMA_VERSION
+}
+
+/// Check staleness for a SPECIFIC embedder: stale if [`is_stale`] (schema
+/// mismatch / unreadable meta) OR the persisted `meta.embedder_fingerprint`
+/// differs from `expected_fingerprint`. The latter means the index was embedded
+/// under a different vector space (e.g. a model swap or toggling
+/// `SEMANTEX_DENSE_CONTEXT`), so it must be re-embedded (S8 auto-rebuild path).
+///
+/// PURE — takes the expected fingerprint as a string; the caller (which has the
+/// config) supplies it, so this stays free of any model/registry import and is
+/// cheap to call.
+pub fn is_stale_for_embedder(meta_path: &Path, expected_fingerprint: &str) -> bool {
+    if is_stale(meta_path) {
+        return true;
+    }
+    // is_stale already proved meta is readable + parseable + schema-current.
+    let Ok(content) = std::fs::read_to_string(meta_path) else {
+        return true;
+    };
+    match serde_json::from_str::<IndexMeta>(&content) {
+        Ok(meta) => meta.embedder_fingerprint != expected_fingerprint,
+        Err(_) => true,
+    }
 }
 
 /// Try to acquire a non-blocking exclusive lock on the file.
@@ -215,5 +271,183 @@ mod tests {
         std::fs::write(semantex_dir.join("meta.json"), meta_json).unwrap();
 
         assert_eq!(detect(tmp.path()), IndexState::Stale);
+    }
+
+    /// Helper: write a current-schema meta.json carrying `fingerprint` into
+    /// `<project>/.semantex/` and return the project dir.
+    fn write_meta_with_fp(tmp: &TempDir, fingerprint: &str) {
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let meta = IndexMeta {
+            schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: tmp.path().to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 1,
+            chunk_count: 1,
+            embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+            dense_backend: "coderank-hnsw".to_string(),
+            embedder_fingerprint: fingerprint.to_string(),
+        };
+        std::fs::write(
+            semantex_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn is_stale_for_embedder_true_on_fingerprint_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        write_meta_with_fp(&tmp, "OLDFP");
+        let meta_path = tmp.path().join(".semantex").join("meta.json");
+        // Schema is current but the fingerprint differs → stale.
+        assert!(is_stale_for_embedder(&meta_path, "NEWFP"));
+    }
+
+    #[test]
+    fn is_stale_for_embedder_false_on_fingerprint_match() {
+        let tmp = TempDir::new().unwrap();
+        write_meta_with_fp(&tmp, "SAMEFP");
+        let meta_path = tmp.path().join(".semantex").join("meta.json");
+        assert!(!is_stale_for_embedder(&meta_path, "SAMEFP"));
+    }
+
+    #[test]
+    fn is_stale_for_embedder_true_when_schema_stale_regardless_of_fp() {
+        // Schema mismatch dominates: even a "matching" fingerprint is stale.
+        let tmp = TempDir::new().unwrap();
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "project_path": tmp.path(),
+            "created_at": "0", "updated_at": "0",
+            "file_count": 1, "chunk_count": 1,
+            "embedding_model": "test", "embedding_dim": 48,
+            "use_bm25_stemmer": true,
+            "dense_backend": "coderank-hnsw",
+            "embedder_fingerprint": "SAMEFP",
+        });
+        std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
+        let meta_path = semantex_dir.join("meta.json");
+        assert!(is_stale_for_embedder(&meta_path, "SAMEFP"));
+    }
+
+    #[test]
+    fn detect_for_config_stale_on_fingerprint_mismatch() {
+        // A meta.json with a fingerprint that does NOT match the config's active
+        // embedder must come back Stale (S8 auto-rebuild trigger).
+        let tmp = TempDir::new().unwrap();
+        write_meta_with_fp(&tmp, "definitely-not-the-real-fingerprint");
+        let cfg = crate::config::SemantexConfig::default();
+        assert_eq!(detect_for_config(tmp.path(), &cfg), IndexState::Stale);
+    }
+
+    #[test]
+    fn detect_for_config_ready_on_fingerprint_match() {
+        // Stamp the REAL fingerprint the default config resolves to → Ready.
+        // `resolve_embedder_fingerprint` reads SEMANTEX_DENSE_CONTEXT, so hold the
+        // env lock to avoid racing the ctx-flip test (which mutates that var).
+        let _g = DENSE_CONTEXT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        let expected =
+            crate::model::ModelRegistry::resolve_embedder_fingerprint(&cfg, Some(tmp.path()))
+                .expect("default embedder must resolve a fingerprint");
+        write_meta_with_fp(&tmp, &expected);
+        assert_eq!(detect_for_config(tmp.path(), &cfg), IndexState::Ready);
+    }
+
+    #[test]
+    fn detect_for_config_falls_back_to_schema_only_on_registry_error() {
+        // A malformed project models.toml makes the registry fail to resolve a
+        // fingerprint. detect_for_config MUST NOT spuriously return Stale on a
+        // registry error — it falls back to schema-only detect (Ready here).
+        let tmp = TempDir::new().unwrap();
+        // Stamp a fingerprint that would MISMATCH the default, to prove the
+        // verdict comes from the schema-only fallback (Ready) and not from a
+        // fingerprint comparison (which would say Stale).
+        write_meta_with_fp(&tmp, "some-fingerprint-that-would-mismatch");
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::write(
+            semantex_dir.join("models.toml"),
+            // Invalid: not valid TOML for the manifest schema.
+            "this is = = not valid toml [[[",
+        )
+        .unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        // Sanity: the registry really does error for this project.
+        assert!(
+            crate::model::ModelRegistry::resolve_embedder_fingerprint(&cfg, Some(tmp.path()))
+                .is_err(),
+            "test precondition: malformed models.toml must fail registry resolution"
+        );
+        assert_eq!(detect_for_config(tmp.path(), &cfg), IndexState::Ready);
+    }
+
+    /// Serialize SEMANTEX_DENSE_CONTEXT env mutation across tests (process-global
+    /// env is not thread-safe). Local to this module — no other test touches this
+    /// var, so a private lock suffices.
+    static DENSE_CONTEXT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn detect_for_config_stale_when_dense_context_differs_from_build() {
+        // F5 core: an index built under one SEMANTEX_DENSE_CONTEXT setting must
+        // be detected Stale (→ auto-rebuild) when the runtime flag is flipped,
+        // because the flag is part of the embedder fingerprint (it changes the
+        // embedded text → the vector space).
+        let _g = DENSE_CONTEXT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_DENSE_CONTEXT").ok();
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+
+        // Build-time fingerprint: dense_context OFF.
+        // SAFETY: guarded by DENSE_CONTEXT_ENV_LOCK.
+        unsafe { std::env::remove_var("SEMANTEX_DENSE_CONTEXT") };
+        let fp_off =
+            crate::model::ModelRegistry::resolve_embedder_fingerprint(&cfg, Some(tmp.path()))
+                .expect("resolve fp (ctx off)");
+        write_meta_with_fp(&tmp, &fp_off);
+        // Same setting → Ready.
+        assert_eq!(
+            detect_for_config(tmp.path(), &cfg),
+            IndexState::Ready,
+            "same dense_context setting must be Ready"
+        );
+
+        // Flip the runtime flag ON → the expected fingerprint changes → Stale.
+        // SAFETY: guarded by DENSE_CONTEXT_ENV_LOCK.
+        unsafe { std::env::set_var("SEMANTEX_DENSE_CONTEXT", "1") };
+        let fp_on =
+            crate::model::ModelRegistry::resolve_embedder_fingerprint(&cfg, Some(tmp.path()))
+                .expect("resolve fp (ctx on)");
+        assert_ne!(
+            fp_off, fp_on,
+            "dense_context must change the resolved fingerprint"
+        );
+        let verdict = detect_for_config(tmp.path(), &cfg);
+
+        // Restore env BEFORE asserting so a failure can't leak the var.
+        // SAFETY: guarded by DENSE_CONTEXT_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_DENSE_CONTEXT", v),
+                None => std::env::remove_var("SEMANTEX_DENSE_CONTEXT"),
+            }
+        }
+
+        assert_eq!(
+            verdict,
+            IndexState::Stale,
+            "flipping SEMANTEX_DENSE_CONTEXT must mark the index Stale (auto-rebuild)"
+        );
     }
 }

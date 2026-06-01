@@ -124,6 +124,53 @@ impl ModelRegistry {
         let registry = Self::from_config(config, project_path)?;
         registry.embedder_backend_kind()
     }
+
+    /// The fingerprint of the active embedder (covering id, dims, pooling, quant,
+    /// normalization, prefixes, AND the runtime `SEMANTEX_DENSE_CONTEXT` flag).
+    /// This is the value `builder.rs` stamps into `meta.json` and that
+    /// `state::is_stale_for_embedder` / the S8 versioned-dir selection compare
+    /// against: a change here means a different vector space, so the index must be
+    /// re-embedded. Backend-agnostic (does not depend on the dense backend arm).
+    ///
+    /// The `dense_context` flag is read HERE, once, from the environment via
+    /// [`dense_context_enabled`] — the SINGLE env-read site for the fingerprint —
+    /// so the builder's write-time fingerprint and `detect_for_config`'s
+    /// open-time expected fingerprint can never disagree about it.
+    pub fn active_embedder_fingerprint(&self) -> Result<String> {
+        let spec = self.active_embedder()?;
+        let RoleData::Embedder(data) = &spec.role_data else {
+            anyhow::bail!("active embedder `{}` is not an embedder spec", spec.id);
+        };
+        Ok(crate::model::EmbedderFingerprint::compute(
+            &spec.id,
+            data,
+            dense_context_enabled(),
+        ))
+    }
+
+    /// Resolve the active embedder fingerprint straight from a `config`
+    /// (+ optional project path for a local `models.toml`). Convenience wrapper
+    /// over `from_config(..).active_embedder_fingerprint()` for the staleness /
+    /// builder call sites.
+    pub fn resolve_embedder_fingerprint(
+        config: &SemantexConfig,
+        project_path: Option<&Path>,
+    ) -> Result<String> {
+        Self::from_config(config, project_path)?.active_embedder_fingerprint()
+    }
+}
+
+/// Whether the `SEMANTEX_DENSE_CONTEXT` A/B flag is enabled (default OFF). The
+/// SINGLE canonical parse of this env var: `"1"` or a case-insensitive `"true"`.
+///
+/// Both the embedder fingerprint ([`ModelRegistry::active_embedder_fingerprint`])
+/// and the builder's document-text selection read the flag through this one
+/// function, so the embedded text and the fingerprint that stamps the index can
+/// never drift apart (the F5 silent-wrong-index guarantee).
+#[must_use]
+pub fn dense_context_enabled() -> bool {
+    std::env::var("SEMANTEX_DENSE_CONTEXT")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]

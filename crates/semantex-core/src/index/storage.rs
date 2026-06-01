@@ -1267,7 +1267,10 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
     // in `hybrid.rs`; here we warm the sole built-in backend's store file
     // directly (a best-effort page-cache touch — a missing file just yields
     // dense_ok=false, exactly as the old plaid path did when absent).
-    let dense_store = crate::search::dense_backend::dense_subdir(
+    // S8: warm the LIVE store the daemon will open — resolve via the ACTIVE
+    // pointer (versioned dir), falling back to the legacy plain layout for
+    // pre-versioned indexes.
+    let dense_store = crate::search::dense_backend::resolve_active_dense_dir(
         index_dir,
         crate::search::dense_backend::DenseBackendKind::CoderankHnsw,
     )
