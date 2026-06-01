@@ -12,6 +12,7 @@ use crate::search::graph_propagation::{self, GraphPropagationConfig};
 use crate::search::path_signals;
 use crate::search::mmr;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
+use crate::search::semantic_cache::{self, SemanticCache};
 use crate::search::reranker_engine::RerankerEngine;
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
@@ -20,7 +21,7 @@ use crate::types::{Confidence, ScoredChunkId, SearchResult, SearchSource};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Hybrid searcher combining dense (pluggable `DenseBackend`), sparse (BM25),
 /// and reranking. Exact substring search is handled by SQLite LIKE queries on
@@ -33,6 +34,12 @@ pub struct HybridSearcher {
     reranker: Mutex<Option<RerankerEngine>>,
     store: Mutex<ChunkStore>,
     config: SemantexConfig,
+    /// Daemon-scoped semantic query cache (S7). OFF unless SEMANTEX_SEMANTIC_CACHE=1.
+    /// Stamped with the index's updated_at + schema_version; flushed on reindex.
+    semantic_cache: Mutex<SemanticCache>,
+    /// The index directory — used to read the current `meta.json` stamp for
+    /// cache invalidation on each search.
+    index_dir: PathBuf,
 }
 
 impl HybridSearcher {
@@ -68,6 +75,8 @@ impl HybridSearcher {
             reranker,
             store,
             config: config.clone(),
+            semantic_cache: Mutex::new(SemanticCache::new(semantic_cache::capacity_from_env())),
+            index_dir: index_dir.to_path_buf(),
         })
     }
 
@@ -183,6 +192,8 @@ impl HybridSearcher {
             reranker,
             store,
             config: config.clone(),
+            semantic_cache: Mutex::new(SemanticCache::new(semantic_cache::capacity_from_env())),
+            index_dir: index_dir.to_path_buf(),
         })
     }
 
@@ -1827,6 +1838,17 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    /// S7: HybridSearcher carries a daemon-scoped semantic cache, initialized
+    /// empty. open_sparse_only must construct it too (sparse-only callers just
+    /// never get cache hits, since they have no dense embedder for the query).
+    #[test]
+    fn sparse_only_constructs_empty_semantic_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(tmp.path(), &cfg).unwrap();
+        assert_eq!(searcher.semantic_cache.lock().len(), 0);
+    }
 
     /// S7: MMR runs only when (a) SEMANTEX_MMR_LAMBDA is a valid lambda AND
     /// (b) a dense backend is present. Sparse-only opens (dense None) never MMR.
