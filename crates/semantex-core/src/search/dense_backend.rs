@@ -1,6 +1,9 @@
 //! The `DenseBackend` seam: a trait abstraction over the dense search/build
-//! channel so multiple dense backends (today: `colbert-plaid`) can coexist and
-//! be selected by config/env. See `docs/superpowers/specs/2026-05-31-semantex-sota-overhaul-design.md` §3/§4 S1.
+//! channel so dense backends can be selected by config/env and future backends
+//! slot in without touching call sites. Today the sole built-in backend is
+//! `coderank-hnsw` (CodeRankEmbed single-vector + instant-distance HNSW); the
+//! enum is kept so a new backend is one variant + one match arm away. See
+//! `docs/superpowers/specs/2026-05-31-semantex-sota-overhaul-design.md` §3/§4 S1.
 
 use crate::types::ScoredChunkId;
 use anyhow::Result;
@@ -8,15 +11,13 @@ use std::path::{Path, PathBuf};
 
 /// Identity of a dense backend — drives config selection and on-disk paths.
 ///
-/// Today only `colbert-plaid` exists (the ColBERT late-interaction + vendored
-/// next-plaid path). S2 adds `coderank-hnsw`. The string form is what gets
-/// written into `meta.json` and read from `SEMANTEX_DENSE_BACKEND`.
+/// Single-variant today (`coderank-hnsw`), but kept an enum behind the seam so a
+/// future backend slots in. The string form is what gets written into
+/// `meta.json` and read from `SEMANTEX_DENSE_BACKEND`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DenseBackendKind {
-    /// ColBERT late-interaction over a vendored next-plaid PLAID index.
+    /// CodeRankEmbed single-vector embeddings over a pure-Rust HNSW index.
     #[default]
-    ColbertPlaid,
-    /// CodeRankEmbed single-vector embeddings over a pure-Rust HNSW index (S2).
     CoderankHnsw,
 }
 
@@ -24,17 +25,16 @@ impl DenseBackendKind {
     /// Stable on-disk / config identity. MUST stay in sync with `parse`.
     pub fn name(self) -> &'static str {
         match self {
-            DenseBackendKind::ColbertPlaid => "colbert-plaid",
             DenseBackendKind::CoderankHnsw => "coderank-hnsw",
         }
     }
 
     /// Parse a backend name (case-insensitive, whitespace-trimmed).
-    /// Returns `None` for an unknown name so callers can fall back to the
-    /// default and warn, rather than panicking on a typo'd env var.
+    /// Returns `None` for an unknown name (e.g. a stale `colbert-plaid` from an
+    /// old config, or a typo) so callers fall back to the default rather than
+    /// panicking — old indexes degrade to a clean rebuild, not a crash.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "colbert-plaid" => Some(DenseBackendKind::ColbertPlaid),
             "coderank-hnsw" => Some(DenseBackendKind::CoderankHnsw),
             _ => None,
         }
@@ -43,8 +43,8 @@ impl DenseBackendKind {
 
 /// The per-backend on-disk directory: `<index_dir>/dense/<backend>/`.
 ///
-/// Per-backend isolation lets `colbert-plaid` and a future `coderank-hnsw`
-/// index coexist on disk during the S2 A/B without clobbering each other.
+/// Per-backend isolation lets multiple backends coexist on disk (e.g. a future
+/// A/B) without clobbering each other.
 pub fn dense_subdir(index_dir: &Path, backend: DenseBackendKind) -> PathBuf {
     index_dir.join("dense").join(backend.name())
 }
@@ -170,14 +170,14 @@ pub trait DenseBackend: Send + Sync {
     /// `file_filter` prefilter). An empty subset MUST yield an empty result.
     fn search_with_subset(&self, query: &str, k: usize, subset: &[u64]) -> Result<Vec<DenseHit>>;
 
-    /// Positional doc→chunk mapping, if this backend keeps one (colbert-plaid
-    /// does; HNSW will not). Used by `hybrid.rs` to build the `file_filter`
-    /// candidate subset. Returns `None` for backends without positional docs.
+    /// Positional doc→chunk mapping, if this backend keeps one. Used by
+    /// `hybrid.rs` to build the `file_filter` candidate subset. Returns `None`
+    /// for backends without positional docs (coderank-hnsw does not keep one).
     fn positional_chunk_ids(&self) -> Option<&[u64]> {
         None
     }
 
-    // optional vector accessors for S7 (MMR / semantic cache); colbert-plaid provides a mean-pooled+L2-normalized projection, coderank-hnsw (S2) returns its exact int8-store vectors.
+    // optional vector accessors for S7 (MMR / semantic cache); coderank-hnsw returns its exact int8-store vectors.
     fn embed_text_vector(&self, _query: &str) -> Option<Vec<f32>> {
         None
     }
@@ -187,7 +187,7 @@ pub trait DenseBackend: Send + Sync {
 }
 
 /// Build-time dense index builder. Mirrors the dense build/update lifecycle
-/// the PLAID block in `index/builder.rs` performs today.
+/// the dense block in `index/builder.rs` performs today.
 pub trait DenseIndexBuilder: Send + Sync {
     /// Backend identity (matches the query-side `DenseBackend::name`).
     fn name(&self) -> &'static str;
@@ -234,35 +234,17 @@ mod tests {
     }
 
     #[test]
-    fn dense_backend_kind_default_is_colbert_plaid() {
-        assert_eq!(DenseBackendKind::default(), DenseBackendKind::ColbertPlaid);
-        assert_eq!(DenseBackendKind::default().name(), "colbert-plaid");
-    }
-
-    #[test]
-    fn parse_known_backend_names() {
-        assert_eq!(
-            DenseBackendKind::parse("colbert-plaid"),
-            Some(DenseBackendKind::ColbertPlaid)
-        );
-        // Whitespace + case are normalized.
-        assert_eq!(
-            DenseBackendKind::parse("  Colbert-Plaid  "),
-            Some(DenseBackendKind::ColbertPlaid)
-        );
+    fn dense_backend_kind_default_is_coderank_hnsw() {
+        assert_eq!(DenseBackendKind::default(), DenseBackendKind::CoderankHnsw);
+        assert_eq!(DenseBackendKind::default().name(), "coderank-hnsw");
     }
 
     #[test]
     fn parse_unknown_backend_is_none() {
+        // A removed/stale backend name no longer parses → falls back to default.
+        assert_eq!(DenseBackendKind::parse("colbert-plaid"), None);
         assert_eq!(DenseBackendKind::parse("totally-made-up"), None);
         assert_eq!(DenseBackendKind::parse(""), None);
-    }
-
-    #[test]
-    fn dense_subdir_is_per_backend() {
-        let root = Path::new("/tmp/proj/.semantex");
-        let p = dense_subdir(root, DenseBackendKind::ColbertPlaid);
-        assert_eq!(p, Path::new("/tmp/proj/.semantex/dense/colbert-plaid"));
     }
 
     #[test]
@@ -288,13 +270,17 @@ mod tests {
     fn verify_backend_matches_on_agreement() {
         let tmp = tempfile::TempDir::new().unwrap();
         let index_dir = tmp.path();
-        write_meta_with_backend(index_dir, "colbert-plaid");
+        write_meta_with_backend(index_dir, "coderank-hnsw");
         // Matching backend → Ok.
-        verify_persisted_backend_matches(index_dir, "colbert-plaid").unwrap();
+        verify_persisted_backend_matches(index_dir, "coderank-hnsw").unwrap();
     }
 
     #[test]
     fn verify_backend_errors_on_mismatch() {
+        // An old index built with a now-removed backend (`colbert-plaid`) opened
+        // under the current default (`coderank-hnsw`) must error CLEANLY with
+        // rebuild guidance — NOT panic. This is the graceful-degradation guard
+        // for stragglers that survived the schema bump.
         let tmp = tempfile::TempDir::new().unwrap();
         let index_dir = tmp.path();
         write_meta_with_backend(index_dir, "colbert-plaid");
@@ -313,14 +299,14 @@ mod tests {
     fn verify_backend_skips_when_meta_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         // No meta.json written — skip the check (mirrors stemmer guard).
-        verify_persisted_backend_matches(tmp.path(), "colbert-plaid").unwrap();
+        verify_persisted_backend_matches(tmp.path(), "coderank-hnsw").unwrap();
     }
 
     #[test]
     fn verify_fingerprint_errors_on_mismatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let index_dir = tmp.path();
-        write_meta_with_fingerprint(index_dir, "colbert-plaid", "OLDFP");
+        write_meta_with_fingerprint(index_dir, "coderank-hnsw", "OLDFP");
         let err = verify_persisted_fingerprint_matches(index_dir, "NEWFP")
             .expect_err("fingerprint mismatch must error");
         let msg = err.to_string();
@@ -334,7 +320,7 @@ mod tests {
     #[test]
     fn verify_fingerprint_ok_on_match() {
         let tmp = tempfile::TempDir::new().unwrap();
-        write_meta_with_fingerprint(tmp.path(), "colbert-plaid", "SAME");
+        write_meta_with_fingerprint(tmp.path(), "coderank-hnsw", "SAME");
         verify_persisted_fingerprint_matches(tmp.path(), "SAME").unwrap();
     }
 
@@ -369,10 +355,10 @@ mod tests {
     #[test]
     fn versioned_dir_nests_fingerprint_under_backend() {
         let root = Path::new("/tmp/proj/.semantex");
-        let p = active_dense_dir(root, DenseBackendKind::ColbertPlaid, "deadbeef");
+        let p = active_dense_dir(root, DenseBackendKind::CoderankHnsw, "deadbeef");
         assert_eq!(
             p,
-            Path::new("/tmp/proj/.semantex/dense/colbert-plaid/deadbeef")
+            Path::new("/tmp/proj/.semantex/dense/coderank-hnsw/deadbeef")
         );
     }
 
@@ -382,19 +368,19 @@ mod tests {
         let root = tmp.path();
         // No pointer yet → None.
         assert_eq!(
-            read_active_pointer(root, DenseBackendKind::ColbertPlaid),
+            read_active_pointer(root, DenseBackendKind::CoderankHnsw),
             None
         );
         // Write then read back.
-        write_active_pointer(root, DenseBackendKind::ColbertPlaid, "abc123").unwrap();
+        write_active_pointer(root, DenseBackendKind::CoderankHnsw, "abc123").unwrap();
         assert_eq!(
-            read_active_pointer(root, DenseBackendKind::ColbertPlaid),
+            read_active_pointer(root, DenseBackendKind::CoderankHnsw),
             Some("abc123".to_string())
         );
         // Overwrite flips atomically.
-        write_active_pointer(root, DenseBackendKind::ColbertPlaid, "def456").unwrap();
+        write_active_pointer(root, DenseBackendKind::CoderankHnsw, "def456").unwrap();
         assert_eq!(
-            read_active_pointer(root, DenseBackendKind::ColbertPlaid),
+            read_active_pointer(root, DenseBackendKind::CoderankHnsw),
             Some("def456".to_string())
         );
     }

@@ -12,7 +12,7 @@
 //! The historical mitigation was to cripple every build to a single ORT thread
 //! so many could coexist. That made indexing pathologically slow. We instead
 //! **bound how many heavy builds run at once** and then let each one use real
-//! CPU ([`ColbertEmbedder::for_indexing`](crate::embedding::colbert::ColbertEmbedder::for_indexing)).
+//! CPU ([`SingleVectorEmbedder::for_indexing`](crate::embedding::single_vector::SingleVectorEmbedder::for_indexing)).
 //! Few-fast-serialized beats many-slow-parallel on wall-clock, peak memory, and
 //! the common single-repo case.
 //!

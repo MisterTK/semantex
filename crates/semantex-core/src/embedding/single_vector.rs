@@ -1,9 +1,9 @@
 //! Single-vector dense encoder for the `coderank-hnsw` backend.
 //!
 //! Wraps CodeRankEmbed (int8 ONNX) via a raw `ort::Session`. Lazy session init,
-//! CPU execution provider pinned, threads from `SEMANTEX_(INDEX_)ORT_THREADS` —
-//! the same rationale as `colbert.rs` (a single multi-thread CPU session; `Auto`
-//! would collapse to 1 thread on non-macOS, see colbert.rs).
+//! CPU execution provider pinned, threads from `SEMANTEX_(INDEX_)ORT_THREADS`:
+//! we build a single multi-thread CPU session because `Auto` would silently
+//! collapse to 1 thread on non-macOS where no GPU EP is compiled.
 //!
 //! Pipeline: tokenize → forward → **mean-pool over the attention mask** (RECORDED
 //! in research-notes, S2 — CodeRankEmbed) → L2-normalize. Documents embed RAW
@@ -89,20 +89,18 @@ pub(crate) fn prefix_document(d: &str) -> &str {
     d
 }
 
-/// Query-tuned ORT intra-op threads (low; many concurrent daemons). Mirrors
-/// `colbert.rs` query default.
+/// Query-tuned ORT intra-op threads (low default — many concurrent daemons).
 fn query_threads() -> usize {
     crate::config::env_usize("SEMANTEX_ORT_THREADS", 4)
 }
 /// Indexing-tuned ORT intra-op threads (throughput-bound; gated by index::gate).
-/// Mirrors `colbert.rs::index_ort_threads`.
 fn index_threads() -> usize {
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", (cores / 2).clamp(2, 8))
 }
 
 /// Lazy single-vector encoder. The ONNX session is built on first encode
-/// (double-checked locking), exactly like `ColbertEmbedder`.
+/// (double-checked locking).
 pub struct SingleVectorEmbedder {
     model_dir: PathBuf,
     threads: usize,
@@ -148,9 +146,9 @@ impl SingleVectorEmbedder {
         })
     }
 
-    /// Process-global singleton (query path), mirroring `ColbertEmbedder::global`.
-    /// The first caller's `model_dir` wins; subsequent calls return the same
-    /// instance regardless of their `model_dir` argument.
+    /// Process-global singleton (query path). The first caller's `model_dir`
+    /// wins; subsequent calls return the same instance regardless of their
+    /// `model_dir` argument.
     pub fn global(model_dir: &Path) -> Result<&'static SingleVectorEmbedder> {
         if let Some(e) = GLOBAL.get() {
             return Ok(e);
@@ -169,9 +167,9 @@ impl SingleVectorEmbedder {
     }
 
     /// CPU execution provider pinned on every platform (CoreML only via
-    /// `SEMANTEX_COREML` on macOS) — same rationale as `colbert.rs`: a single
-    /// multi-thread CPU session; `Auto` would silently collapse to 1 thread on
-    /// Linux/Windows where no GPU EP is compiled.
+    /// `SEMANTEX_COREML` on macOS): a single multi-thread CPU session, because
+    /// `Auto` would silently collapse to 1 thread on Linux/Windows where no GPU
+    /// EP is compiled.
     fn execution_providers(&self) -> Vec<ort::ep::ExecutionProviderDispatch> {
         let mut providers = Vec::new();
         #[cfg(target_os = "macos")]

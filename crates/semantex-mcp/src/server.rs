@@ -1497,7 +1497,7 @@ impl McpServer {
 
     #[tracing::instrument(skip(self, _args), fields(tool = "health"))]
     fn tool_health(&self, _args: &serde_json::Value) -> Result<String> {
-        use semantex_core::embedding::model_manager;
+        use semantex_core::embedding::single_vector_model;
 
         let mut status = Vec::new();
         status.push(format!(
@@ -1509,12 +1509,12 @@ impl McpServer {
         let models_dir = self.config.models_dir();
         status.push(format!("\nModels Directory: {}", models_dir.display()));
 
-        if model_manager::is_colbert_downloaded(&models_dir) {
-            let model_dir = models_dir.join("LateOn-Code-edge");
+        if single_vector_model::is_coderank_downloaded(&models_dir) {
+            let model_dir = models_dir.join("CodeRankEmbed");
             let model_path = model_dir.join("model_int8.onnx");
             let tokenizer_path = model_dir.join("tokenizer.json");
-            status.push("\nColBERT Model: OK".to_string());
-            status.push("  Name: LateOn-Code-edge".to_string());
+            status.push("\nDense Embedder Model: OK".to_string());
+            status.push("  Name: CodeRankEmbed".to_string());
             status.push(format!("  Path: {}", model_dir.display()));
             status.push(format!(
                 "  Model file: {}",
@@ -1533,7 +1533,7 @@ impl McpServer {
                 }
             ));
         } else {
-            status.push("\nColBERT Model: NOT DOWNLOADED".to_string());
+            status.push("\nDense Embedder Model: NOT DOWNLOADED".to_string());
             status.push("  Run 'semantex download-models' to download".to_string());
         }
 
@@ -3011,7 +3011,7 @@ mod tests {
             // open-time mismatch detection can refuse to load a mis-tuned
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
-            dense_backend: "colbert-plaid".to_string(),
+            dense_backend: "coderank-hnsw".to_string(),
             embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
@@ -3330,7 +3330,7 @@ mod tests {
             // open-time mismatch detection can refuse to load a mis-tuned
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
-            dense_backend: "colbert-plaid".to_string(),
+            dense_backend: "coderank-hnsw".to_string(),
             embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
@@ -3609,7 +3609,7 @@ mod tests {
             // open-time mismatch detection can refuse to load a mis-tuned
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
-            dense_backend: "colbert-plaid".to_string(),
+            dense_backend: "coderank-hnsw".to_string(),
             embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(

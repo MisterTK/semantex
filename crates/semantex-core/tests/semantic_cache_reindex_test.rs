@@ -28,8 +28,8 @@ fn build_index(project_dir: &Path, config: &SemantexConfig) {
 #[ignore = "requires ONNX runtime + builds full index; run explicitly with ORT_DYLIB_PATH set"]
 fn reindex_invalidates_semantic_cache() {
     // The cache only engages with a dense backend + enabled env. This test
-    // requires the ColBERT model to be available (same precondition as the
-    // existing search_accuracy_test.rs integration tests). If the model can't
+    // requires the dense embedder model to be available (same precondition as
+    // the existing search_accuracy_test.rs integration tests). If the model can't
     // load, the dense channel is absent and the cache no-ops — in that case the
     // assertions on cache invalidation are vacuously safe (results recomputed
     // every time). We still assert correctness of the returned content.

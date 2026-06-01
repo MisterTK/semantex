@@ -1,6 +1,6 @@
 //! Search-time score propagation through the code graph.
 //!
-//! After standard retrieval (BM25 + ColBERT + fusion), propagate scores
+//! After standard retrieval (BM25 + dense + fusion), propagate scores
 //! through call edges, type references, and type hierarchy to discover
 //! structurally related but textually dissimilar chunks.
 

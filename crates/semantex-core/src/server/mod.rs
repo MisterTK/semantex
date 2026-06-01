@@ -75,16 +75,16 @@ impl SemantexServer {
         install_signal_handler(self.shutdown.clone())?;
 
         // E8(b): page-cache prefetch — fan out reads for SQLite, Tantivy, and
-        // PLAID files in parallel via rayon::join3 so the subsequent
+        // the dense index files in parallel via rayon::join3 so the subsequent
         // `HybridSearcher::open` does cache-warm sequential reads. Best-effort.
         let _prefetch = listener::prefetch_index(&self.index_dir);
 
-        // E8(c): kick off the background ColBERT warm thread BEFORE opening
-        // the searcher. The warm thread materializes the ONNX session in the
-        // global ColbertEmbedder singleton, so the first user query (which
-        // arrives after `Listener::run` starts accepting) doesn't pay the
-        // session-build cost. Fire-and-forget — we drop the JoinHandle.
-        let _warm_handle = listener::spawn_colbert_warm_thread(&self.config);
+        // E8(c): kick off the background dense-embedder warm thread BEFORE
+        // opening the searcher. The warm thread materializes the ONNX session in
+        // the global SingleVectorEmbedder (coderank-hnsw) singleton, so the first
+        // user query (which arrives after `Listener::run` starts accepting)
+        // doesn't pay the session-build cost. Fire-and-forget — drop the handle.
+        let _warm_handle = listener::spawn_embedder_warm_thread(&self.config);
 
         // Spec L §5 Item 2.3 + §4 Item 1.4: initialise the LLM backend ONCE
         // at daemon startup and inject it into every AgentPipeline. When no

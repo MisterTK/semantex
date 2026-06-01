@@ -82,8 +82,8 @@ impl RerankerEngine {
 
     /// Download the ONNX model (per its spec coordinates) and build an
     /// `OnnxReranker` with the concrete score strategy. Threads come from
-    /// `SEMANTEX_ORT_THREADS` (query default 4, same as ColbertEmbedder); CoreML
-    /// opt-in via `SEMANTEX_COREML`.
+    /// `SEMANTEX_ORT_THREADS` (query default 4, same as the dense embedder);
+    /// CoreML opt-in via `SEMANTEX_COREML`.
     fn build_onnx(config: &SemantexConfig, spec: &OnnxModelSpec) -> Result<OnnxReranker> {
         let model_dir = crate::search::reranker_download::ensure_reranker_model(
             &config.models_dir(),

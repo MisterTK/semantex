@@ -347,10 +347,10 @@ mod tests {
             updated_at: "1717000000".to_string(),
             file_count: 1,
             chunk_count: 2,
-            embedding_model: "LateOn-Code-edge".to_string(),
+            embedding_model: "CodeRankEmbed".to_string(),
             embedding_dim: 48,
             use_bm25_stemmer: true,
-            dense_backend: "colbert-plaid".to_string(), // S1 field
+            dense_backend: "coderank-hnsw".to_string(), // S1 field
             embedder_fingerprint: "test-fp".to_string(), // S8 field
         };
         std::fs::write(

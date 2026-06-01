@@ -129,7 +129,7 @@ mod tests {
             "embedding_model": "test",
             "embedding_dim": 48,
             "use_bm25_stemmer": true,
-            "dense_backend": "colbert-plaid",
+            "dense_backend": "coderank-hnsw",
             "embedder_fingerprint": "test",
         });
         std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
@@ -208,7 +208,7 @@ mod tests {
             embedding_model: "test".to_string(),
             embedding_dim: 48,
             use_bm25_stemmer: true,
-            dense_backend: "colbert-plaid".to_string(),
+            dense_backend: "coderank-hnsw".to_string(),
             embedder_fingerprint: "test".to_string(),
         };
         let meta_json = serde_json::to_string(&meta).unwrap();

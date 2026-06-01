@@ -29,7 +29,7 @@ fastembed = "5.9"
 # dependency edge adds NO net-new C/C++ vendor surface (no `progressbar`/
 # `esaxx_fast` C++ defaults of our own). NOTE: `onig`/`onig_sys` are NOT removed
 # from the build — `cargo tree -i onig` still shows them, because `fastembed 5.9`
-# (and `next-plaid-onnx`) pull the same `tokenizers` crate WITH the `onig`
+# pulls the same `tokenizers` crate WITH the `onig`
 # feature, and Cargo unifies features across the graph onto the shared crate.
 # So onig is unavoidable via fastembed's feature unification; it is airgap-safe
 # because it is already vendored transitively (S3 introduces no new requirement).
@@ -45,10 +45,10 @@ half = "2"
 # ONNX Runtime — direct dependency for execution provider configuration (CoreML/CUDA/CPU);
 # fastembed depends on ort transitively, but we need the `ort::ep` types directly.
 #
-# We declare `load-dynamic` (NOT download-binaries) to match reality: `next-plaid-onnx`
-# pulls `ort` with the `load-dynamic` feature (→ `ort-sys/disable-linking`), and because
-# Cargo features are additive across the graph, the binary is ALWAYS in dynamic-loading
-# mode — `ort-sys`'s build script early-returns on `disable-linking`, so nothing is ever
+# We declare `load-dynamic` (NOT download-binaries) deliberately: this crate OWNS the
+# `ort` configuration. The `load-dynamic` feature (→ `ort-sys/disable-linking`) means
+# the binary is ALWAYS in dynamic-loading mode — `ort-sys`'s build script early-returns
+# on `disable-linking`, so nothing is ever
 # statically linked or downloaded at build time. The ONNX Runtime shared library is
 # instead provisioned at runtime (see embedding/runtime_manager.rs) and located via
 # ORT_DYLIB_PATH. Declaring `download-binaries` here was a misleading no-op.
@@ -140,15 +140,13 @@ postcard = { workspace = true }
 parking_lot = "0.12"
 regex = { workspace = true }
 rust-stemmers = "1.2"
-next-plaid.workspace = true
-next-plaid-onnx.workspace = true
 # Optional — pulled in only with `--features llm` (Spec L Phase 1)
 genai = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 which = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
-# Memory-mapped files (cold-start: PLAID mapping file mmap'd on Unix; falls back
+# Memory-mapped files (cold-start: dense mapping file mmap'd on Unix; falls back
 # to read-on-open on Windows per E8 risk T5).
 # flate2 + tar: extract the official ONNX Runtime `.tgz` release (runtime_manager.rs).
 [target.'cfg(not(target_os = "windows"))'.dependencies]

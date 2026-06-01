@@ -1,5 +1,5 @@
-//! Download + cache ONNX reranker weights, mirroring
-//! `embedding/model_manager::ensure_colbert_model`. Model coordinates are
+//! Download + cache ONNX reranker weights via the shared
+//! `embedding/model_manager::download_file` primitive. Model coordinates are
 //! passed in as data (`ModelFiles`) so nothing here is tied to a specific
 //! model or path. Coordinates ultimately come from S8's `ModelRegistry`
 //! (`ModelSource::Hf`/`Url`) via `RerankerChoice::from_spec`.
@@ -28,7 +28,7 @@ pub struct ModelFiles {
 /// Ensure the reranker model's files are present under
 /// `<models_dir>/<spec.subdir>`, downloading any missing ones. Returns the
 /// model directory. Idempotent: a no-op when the sentinel (`files[0]`) exists.
-#[allow(clippy::similar_names)] // model_dir vs models_dir mirrors ensure_colbert_model
+#[allow(clippy::similar_names)] // model_dir vs models_dir read closely but differ
 pub fn ensure_reranker_model(models_dir: &Path, spec: &ModelFiles) -> Result<PathBuf> {
     let model_dir = models_dir.join(&spec.subdir);
     let sentinel = spec

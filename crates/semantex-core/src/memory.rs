@@ -172,7 +172,7 @@ pub fn system_ram_mb() -> Option<u64> {
 }
 
 /// Absolute floor: never let the cap drop below this. A tiny cap would render
-/// the indexer non-functional (the ColBERT model alone is ~17 MB, the embedder
+/// the indexer non-functional (the dense embedder model is ~137 MB, its ONNX
 /// session can spike to a few hundred MB, Tantivy's write buffer defaults to
 /// 50 MB). 1024 MB is the smallest cap at which semantex actually works.
 pub const ABSOLUTE_FLOOR_MB: u64 = 1024;

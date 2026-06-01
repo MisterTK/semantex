@@ -1,10 +1,10 @@
 //! Download-on-first-use provisioning for the CodeRankEmbed single-vector ONNX
-//! model. Mirrors `model_manager.rs` (the ColBERT downloader). The HF repo +
-//! file list are the values RECORDED in
+//! model. Uses the shared `model_manager::download_file` primitive. The HF repo
+//! and file list are the values RECORDED in
 //! `docs/superpowers/plans/2026-05-31-research-notes.md` (S2 — CodeRankEmbed):
 //! the int8 graph ships in ONNX **external-data** format, so the `.onnx` graph
 //! AND its co-located `.onnx.data` weights file BOTH must be fetched, alongside
-//! the tokenizer + config.
+//! the tokenizer and config.
 
 use anyhow::{Context, Result};
 use std::fs;

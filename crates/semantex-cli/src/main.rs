@@ -343,9 +343,9 @@ enum Commands {
 
 /// Resolve the ONNX Runtime shared library for `ort`'s load-dynamic mode.
 ///
-/// The dependency graph (`next-plaid-onnx` → `ort/load-dynamic`) puts `ort` in
-/// pure dynamic-loading mode on every platform, so a real `libonnxruntime` must
-/// be located at runtime. Resolution order:
+/// semantex-core declares `ort` with the `load-dynamic` feature, which puts
+/// `ort` in pure dynamic-loading mode on every platform, so a real
+/// `libonnxruntime` must be located at runtime. Resolution order:
 ///   1. A copy semantex previously provisioned under `~/.semantex/runtime/`.
 ///   2. For commands that load ONNX Runtime in-process, download + cache the
 ///      official Microsoft release matching `ort`'s required version.
@@ -458,9 +458,9 @@ fn find_ort_dylib() -> Option<&'static str> {
 /// running, which is real UB on platforms with strict env-var thread rules.
 /// Returns true when the requested subcommand is memory-heavy enough that
 /// we want to cap ORT threads aggressively. Currently: `mcp` (many parallel
-/// sessions, each loading ColBERT), `index` (large batch encoding under
-/// PLAID rebuild — verified to spike to 10 GB on a 2 k-chunk repo with
-/// 4 threads), `watch` (continuous incremental encoding).
+/// sessions, each loading the dense embedder), `index` (large batch encoding —
+/// verified to spike to 10 GB on a 2 k-chunk repo with 4 threads), `watch`
+/// (continuous incremental encoding).
 ///
 /// On a 12-core machine, fastembed's default of "all cores" allocates
 /// ~1 GB of ORT inference workspace per thread on first encode. 1 thread
@@ -736,7 +736,7 @@ fn main() -> Result<()> {
             //
             // Applied to: mcp (many parallel sessions, each ~1 GB ORT scratch),
             // index (verified 10 GB spike with 4 threads on a 2 k-chunk repo
-            // due to PLAID rebuild + ORT scratch), watch (continuous encoding),
+            // due to dense rebuild + ORT scratch), watch (continuous encoding),
             // serve (similar memory profile). One-off CLI search keeps the
             // higher default (4) since it pays the cost once.
             if memory_constrained_mode_requested() && std::env::var("SEMANTEX_ORT_THREADS").is_err()
