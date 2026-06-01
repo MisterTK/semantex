@@ -1,4 +1,3 @@
-import pytest
 
 from relevance_harness.types import (
     Document, EvalCorpus, Query, RankedResult,

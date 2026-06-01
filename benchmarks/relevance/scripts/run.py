@@ -59,7 +59,6 @@ def main(dataset, ablation, embedder, k, run_id, semantex_bin):
 
     rows: list[dict] = []
     manifests: list[dict] = []
-    match_mode = "doc_id"
 
     if dataset == "csn":
         cfg = yaml.safe_load((CONFIG / "csn_subset.yaml").read_text())
@@ -74,7 +73,6 @@ def main(dataset, ablation, embedder, k, run_id, semantex_bin):
                              embedder=embedder, match_mode="doc_id")
             rows.append(compute_metrics_row(out, k=k))
     elif dataset == "swe-loc":
-        match_mode = "file"
         queries = load_swe_loc_queries(instance_ids=_phase_a_ids())
         agg_rel: list[list[int]] = []
         agg_nrel: list[int] = []

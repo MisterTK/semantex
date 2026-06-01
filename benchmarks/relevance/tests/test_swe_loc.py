@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 
 from relevance_harness.datasets.swe_loc import (
     changed_files_from_patch, load_swe_loc_queries,

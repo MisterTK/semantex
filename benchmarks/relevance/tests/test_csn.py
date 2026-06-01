@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from relevance_harness.datasets.csn import build_corpus_from_rows
 

@@ -21,3 +21,11 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# Entrypoint scripts bootstrap sys.path (src/ + sibling swe_bench) before importing
+# the harness, so module-level imports legitimately follow runtime code.
+"scripts/*.py" = ["E402"]
+# This test calls pytest.importorskip("pytrec_eval") before importing metrics, so
+# the import deliberately follows the skip guard.
+"tests/test_metrics_vs_pytrec_eval.py" = ["E402"]
