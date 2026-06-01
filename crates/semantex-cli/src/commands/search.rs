@@ -575,7 +575,7 @@ fn spawn_daemon_if_needed(project_path: &std::path::Path) {
         return;
     }
 
-    let _ = std::process::Command::new("semantex")
+    let _ = std::process::Command::new(super::self_exe())
         .arg("serve")
         .arg(project_path)
         .stdin(std::process::Stdio::null())
