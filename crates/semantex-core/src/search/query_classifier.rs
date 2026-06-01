@@ -162,7 +162,6 @@ pub(crate) fn is_camel_case(s: &str) -> bool {
 /// signals only (repo-agnostic).
 #[must_use]
 pub fn is_exhaustive_query(query: &str) -> bool {
-    let q = query.to_lowercase();
     const SIGNALS: &[&str] = &[
         "all usages",
         "all callers",
@@ -177,6 +176,7 @@ pub fn is_exhaustive_query(query: &str) -> bool {
         "list all",
         "all occurrences",
     ];
+    let q = query.to_lowercase();
     SIGNALS.iter().any(|s| q.contains(s))
 }
 
@@ -325,9 +325,15 @@ mod tests {
     #[test]
     fn test_exhaustive_query_detection() {
         assert!(is_exhaustive_query("find all usages of the retry helper"));
-        assert!(is_exhaustive_query("every place that reads the config file"));
-        assert!(is_exhaustive_query("everywhere we open a database connection"));
-        assert!(is_exhaustive_query("list all callers of the auth middleware"));
+        assert!(is_exhaustive_query(
+            "every place that reads the config file"
+        ));
+        assert!(is_exhaustive_query(
+            "everywhere we open a database connection"
+        ));
+        assert!(is_exhaustive_query(
+            "list all callers of the auth middleware"
+        ));
     }
 
     #[test]
@@ -339,7 +345,9 @@ mod tests {
 
     #[test]
     fn test_feature_planning_query_detection() {
-        assert!(is_feature_planning_query("where should I add rate limiting"));
+        assert!(is_feature_planning_query(
+            "where should I add rate limiting"
+        ));
         assert!(is_feature_planning_query(
             "where to implement the new export endpoint"
         ));

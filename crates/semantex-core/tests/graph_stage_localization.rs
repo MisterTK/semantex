@@ -59,7 +59,10 @@ fn graph_stage_expands_real_index_seeds() {
     assert!(fused.len() > before, "fused list did not grow");
     // Every newly-introduced id has a fetched chunk (for GraphExpanded tagging).
     for id in &new_ids {
-        assert!(chunk_map.contains_key(id), "new id {id} missing from chunk_map");
+        assert!(
+            chunk_map.contains_key(id),
+            "new id {id} missing from chunk_map"
+        );
     }
     // Seed retains a presence in the ranking.
     assert!(fused.iter().any(|s| s.chunk_id == seed_id));

@@ -497,13 +497,10 @@ mod tests {
             QueryType::Mixed,
         ] {
             assert!(
-                (GraphPropagationConfig::for_query_type(&qt, 10).module_decay).abs()
-                    < f32::EPSILON,
+                (GraphPropagationConfig::for_query_type(&qt, 10).module_decay).abs() < f32::EPSILON,
             );
         }
-        assert!(
-            (GraphPropagationConfig::architectural_mode(10).module_decay).abs() < f32::EPSILON,
-        );
+        assert!((GraphPropagationConfig::architectural_mode(10).module_decay).abs() < f32::EPSILON,);
         assert!(
             (GraphPropagationConfig::localization_mode(10).module_decay).abs() < f32::EPSILON,
             "localization_mode must also default module_decay to 0 (off by default)"
@@ -540,8 +537,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("SEMANTEX_GRAPH_HOPS", "2") };
         // Start from a 1-hop preset; hops=2 must turn transitive ON.
-        let config = GraphPropagationConfig::for_query_type(&QueryType::Identifier, 10)
-            .with_env_overrides();
+        let config =
+            GraphPropagationConfig::for_query_type(&QueryType::Identifier, 10).with_env_overrides();
         unsafe { std::env::remove_var("SEMANTEX_GRAPH_HOPS") };
         assert!(config.enable_transitive, "hops=2 must enable 2-hop");
     }
@@ -550,8 +547,8 @@ mod tests {
     fn test_disable_env_sets_disabled() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("SEMANTEX_GRAPH_DISABLE", "1") };
-        let config = GraphPropagationConfig::for_query_type(&QueryType::Semantic, 10)
-            .with_env_overrides();
+        let config =
+            GraphPropagationConfig::for_query_type(&QueryType::Semantic, 10).with_env_overrides();
         unsafe { std::env::remove_var("SEMANTEX_GRAPH_DISABLE") };
         assert!(config.disabled);
     }

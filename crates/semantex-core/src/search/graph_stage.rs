@@ -24,6 +24,7 @@ use crate::types::{Chunk, ScoredChunkId};
 ///
 /// Returns an empty set with `fused` untouched when the config is disabled or
 /// no new chunks are discovered.
+#[allow(clippy::implicit_hasher)]
 pub fn run_graph_stage(
     fused: &mut Vec<ScoredChunkId>,
     chunk_map: &mut HashMap<u64, Chunk>,
@@ -55,10 +56,10 @@ pub fn run_graph_stage(
     // Update scores from propagation (only if higher) and add new entries.
     let prop_scores: HashMap<u64, f32> = expanded.iter().map(|s| (s.chunk_id, s.score)).collect();
     for scored in fused.iter_mut() {
-        if let Some(&new_score) = prop_scores.get(&scored.chunk_id) {
-            if new_score > scored.score {
-                scored.score = new_score;
-            }
+        if let Some(&new_score) = prop_scores.get(&scored.chunk_id)
+            && new_score > scored.score
+        {
+            scored.score = new_score;
         }
     }
     for s in expanded
@@ -263,8 +264,12 @@ pub(crate) mod test_support {
     pub fn build_call_edge_store(dir: &Path) -> ChunkStore {
         let db_path = dir.join("chunks.db");
         let store = ChunkStore::open(&db_path).unwrap();
-        let id1 = store.insert_chunk(&chunk("src/caller.rs"), 0x1111, 0).unwrap();
-        let id2 = store.insert_chunk(&chunk("src/callee.rs"), 0x2222, 0).unwrap();
+        let id1 = store
+            .insert_chunk(&chunk("src/caller.rs"), 0x1111, 0)
+            .unwrap();
+        let id2 = store
+            .insert_chunk(&chunk("src/callee.rs"), 0x2222, 0)
+            .unwrap();
         let _id3 = store
             .insert_chunk(&chunk("src/unrelated.rs"), 0x3333, 0)
             .unwrap();
@@ -282,7 +287,9 @@ pub(crate) mod test_support {
 
     /// Record a module-level import edge (importer imports imported).
     pub fn add_module_edge(store: &ChunkStore, importer: &str, imported: &str) {
-        store.insert_module_edge(importer, imported, "import").unwrap();
+        store
+            .insert_module_edge(importer, imported, "import")
+            .unwrap();
     }
 }
 

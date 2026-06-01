@@ -1653,10 +1653,7 @@ mod delete_graph_data_tests {
         // No aux table yet → empty map.
         let id_probe = insert_test_chunk(&store, "a.rs");
         assert!(
-            store
-                .get_centrality_scores(&[id_probe])
-                .unwrap()
-                .is_empty(),
+            store.get_centrality_scores(&[id_probe]).unwrap().is_empty(),
             "missing aux table must yield empty map"
         );
 
