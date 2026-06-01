@@ -41,7 +41,16 @@ pub struct SemantexConfig {
     pub rerank_top_n: usize,
     /// Custom model directory override
     pub model_dir: Option<PathBuf>,
-    /// Enable adaptive result sizing (dynamically adjust result count based on score distribution)
+    /// Enable adaptive result sizing. Runs post-fusion for ALL searches (including
+    /// `--sparse-only`), applying three stages: (1) confidence-threshold filtering
+    /// (drops results below `top_score × min_score_<type>`), (2) per-file
+    /// deduplication (keeps only the top chunk per file unless scores are close),
+    /// and (3) elbow-detection output cap (≤ 15 results non-exhaustive, ≤ 25
+    /// exhaustive). Stages are applied identically across all A/B arms, so
+    /// relative comparisons remain fair — but absolute Recall@k is bounded by the
+    /// cap regardless of `-m k`. Set `SEMANTEX_ADAPTIVE_SIZING=0` (or `false`) to
+    /// disable for clean Recall@k measurement; any other value (including `1` /
+    /// `true`) re-enables it. Default: `true`.
     pub adaptive_sizing: bool,
     /// Enable per-file deduplication (keep only top chunk per file unless scores are close)
     pub adaptive_dedup: bool,
@@ -180,6 +189,9 @@ impl SemantexConfig {
         }
         if let Ok(v) = std::env::var("SEMANTEX_RERANK") {
             config.rerank = v != "0" && v.to_lowercase() != "false";
+        }
+        if let Ok(v) = std::env::var("SEMANTEX_ADAPTIVE_SIZING") {
+            config.adaptive_sizing = v != "0" && !v.eq_ignore_ascii_case("false");
         }
         // Bounds the cross-encoder scoring window (NOT the retrieval pool, which
         // stays `rerank_candidates`). Rerank latency is ~linear in this value.
@@ -382,6 +394,64 @@ mod tests {
             cfg.rerank_candidates, 100,
             "retrieval pool width must remain 100 (default search path unchanged)"
         );
+    }
+
+    /// Default adaptive_sizing is true; SEMANTEX_ADAPTIVE_SIZING env overlay works.
+    #[test]
+    fn adaptive_sizing_default_and_env_overlay() {
+        // Default must be true — the cap is on by default.
+        let cfg = SemantexConfig::default();
+        assert!(
+            cfg.adaptive_sizing,
+            "adaptive_sizing default must be true (post-fusion cap is on by default)"
+        );
+
+        // Serialize env mutations with the shared reranker lock (same global env).
+        let _g = crate::search::RERANKER_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_ADAPTIVE_SIZING").ok();
+
+        let assert_load = |val: &str| -> bool {
+            // SAFETY: guarded by RERANKER_TEST_ENV_LOCK.
+            unsafe { std::env::set_var("SEMANTEX_ADAPTIVE_SIZING", val) };
+            SemantexConfig::load(None).expect("load").adaptive_sizing
+        };
+
+        // Falsy values disable adaptive sizing.
+        assert!(!assert_load("0"), "\"0\" should disable adaptive_sizing");
+        assert!(
+            !assert_load("false"),
+            "\"false\" should disable adaptive_sizing"
+        );
+        assert!(
+            !assert_load("False"),
+            "\"False\" (mixed-case) should disable adaptive_sizing"
+        );
+        assert!(
+            !assert_load("FALSE"),
+            "\"FALSE\" should disable adaptive_sizing"
+        );
+
+        // Truthy values keep it enabled.
+        assert!(assert_load("1"), "\"1\" should enable adaptive_sizing");
+        assert!(
+            assert_load("true"),
+            "\"true\" should enable adaptive_sizing"
+        );
+        assert!(
+            assert_load("True"),
+            "\"True\" should enable adaptive_sizing"
+        );
+
+        // Restore original env state.
+        // SAFETY: guarded by RERANKER_TEST_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_ADAPTIVE_SIZING", v),
+                None => std::env::remove_var("SEMANTEX_ADAPTIVE_SIZING"),
+            }
+        }
     }
 
     #[test]
