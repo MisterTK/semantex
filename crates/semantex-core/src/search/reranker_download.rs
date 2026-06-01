@@ -28,6 +28,7 @@ pub struct ModelFiles {
 /// Ensure the reranker model's files are present under
 /// `<models_dir>/<spec.subdir>`, downloading any missing ones. Returns the
 /// model directory. Idempotent: a no-op when the sentinel (`files[0]`) exists.
+#[allow(clippy::similar_names)] // model_dir vs models_dir mirrors ensure_colbert_model
 pub fn ensure_reranker_model(models_dir: &Path, spec: &ModelFiles) -> Result<PathBuf> {
     let model_dir = models_dir.join(&spec.subdir);
     let sentinel = spec

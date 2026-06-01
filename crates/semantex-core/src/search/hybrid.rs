@@ -9,9 +9,9 @@ use crate::search::dense_backend::{
     DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
 };
 use crate::search::graph_propagation::{self, GraphPropagationConfig};
-use crate::search::reranker_engine::RerankerEngine;
 use crate::search::path_signals;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
+use crate::search::reranker_engine::RerankerEngine;
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
 use crate::search::{query_expander, regex_semantic};

@@ -18,7 +18,7 @@
 //! is deliberately NO alias for jina-reranker-v3 (non-commercial license).
 
 use crate::model::spec::{ModelRole, ModelSource, ModelSpec, RoleData, ScoreStrategyKind};
-use crate::search::fastembed_reranker::{select_model_from_env, ENV_MODEL};
+use crate::search::fastembed_reranker::{ENV_MODEL, select_model_from_env};
 use crate::search::onnx_reranker::{PromptTemplate, ScoreStrategy};
 use crate::search::reranker_download::ModelFiles;
 use anyhow::{Context, Result};
@@ -121,9 +121,7 @@ fn fastembed_model_for_id(id: &str) -> Option<fastembed::RerankerModel> {
         "bge-reranker-v2-m3" | "bge-v2-m3" => Some(M::BGERerankerV2M3),
         "bge-reranker-base" | "bge-base" => Some(M::BGERerankerBase),
         "jina-reranker-v1-turbo-en" | "jina-v1" => Some(M::JINARerankerV1TurboEn),
-        "jina-reranker-v2-base-multilingual" | "jina-v2" => {
-            Some(M::JINARerankerV2BaseMultiligual)
-        }
+        "jina-reranker-v2-base-multilingual" | "jina-v2" => Some(M::JINARerankerV2BaseMultiligual),
         _ => None,
     }
 }
@@ -225,13 +223,15 @@ fn bge_v2_m3_onnx() -> OnnxModelSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelRegistry;
     use crate::config::SemantexConfig;
+    use crate::model::ModelRegistry;
 
     fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = std::env::var(key).ok();
         // SAFETY: guarded by LOCK.
         unsafe {
@@ -258,41 +258,43 @@ mod tests {
     #[test]
     fn qwen3_aliases_route_to_onnx_yesno() {
         for alias in ["qwen3", "Qwen3-Reranker-0.6B", "qwen3-reranker"] {
-            with_env(ENV_MODEL, Some(alias), || {
-                match select_reranker_choice_from_env() {
+            with_env(
+                ENV_MODEL,
+                Some(alias),
+                || match select_reranker_choice_from_env() {
                     RerankerChoice::Onnx(spec) => {
                         assert!(matches!(spec.strategy, ScoreStrategy::YesNoLogit { .. }));
                         assert_eq!(spec.session_file, "model.onnx");
                         assert_eq!(spec.files.subdir, "Qwen3-Reranker-0.6B-onnx");
                     }
                     other => panic!("expected Onnx for {alias}, got {other:?}"),
-                }
-            });
+                },
+            );
         }
     }
 
     #[test]
     fn bge_onnx_alias_routes_to_onnx_classifier() {
-        with_env(ENV_MODEL, Some("bge-onnx"), || {
-            match select_reranker_choice_from_env() {
+        with_env(
+            ENV_MODEL,
+            Some("bge-onnx"),
+            || match select_reranker_choice_from_env() {
                 RerankerChoice::Onnx(spec) => {
                     assert!(matches!(spec.strategy, ScoreStrategy::ClassifierLogit));
                 }
                 other => panic!("expected Onnx classifier, got {other:?}"),
-            }
-        });
+            },
+        );
     }
 
     #[test]
     fn default_and_unknown_route_to_fastembed_bge() {
         for v in [None, Some(""), Some("garbage"), Some("bge-reranker-v2-m3")] {
-            with_env(ENV_MODEL, v, || {
-                match select_reranker_choice_from_env() {
-                    RerankerChoice::Fastembed(m) => {
-                        assert_eq!(m, fastembed::RerankerModel::BGERerankerV2M3);
-                    }
-                    other => panic!("expected Fastembed bge for {v:?}, got {other:?}"),
+            with_env(ENV_MODEL, v, || match select_reranker_choice_from_env() {
+                RerankerChoice::Fastembed(m) => {
+                    assert_eq!(m, fastembed::RerankerModel::BGERerankerV2M3);
                 }
+                other => panic!("expected Fastembed bge for {v:?}, got {other:?}"),
             });
         }
     }
@@ -334,7 +336,11 @@ mod tests {
             RerankerChoice::Onnx(o) => {
                 // Strategy + coordinates come from the registry spec as DATA.
                 match o.strategy {
-                    ScoreStrategy::YesNoLogit { yes_id, no_id, prompt } => {
+                    ScoreStrategy::YesNoLogit {
+                        yes_id,
+                        no_id,
+                        prompt,
+                    } => {
                         assert_eq!(yes_id, 9693);
                         assert_eq!(no_id, 2152);
                         assert!(prompt.suffix.contains("Relevant") || !prompt.suffix.is_empty());
@@ -343,7 +349,11 @@ mod tests {
                 }
                 assert_eq!(o.session_file, "model.onnx");
                 assert_eq!(o.files.subdir, "Qwen3-Reranker-0.6B-onnx");
-                assert!(o.files.base_url.contains("MisterTK/Qwen3-Reranker-0.6B-onnx"));
+                assert!(
+                    o.files
+                        .base_url
+                        .contains("MisterTK/Qwen3-Reranker-0.6B-onnx")
+                );
             }
             other => panic!("expected Onnx for qwen3 registry spec, got {other:?}"),
         }

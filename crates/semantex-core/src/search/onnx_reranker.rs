@@ -88,10 +88,16 @@ pub(crate) fn yes_no_score_from_logits(
     no_id: usize,
 ) -> Result<f32> {
     let l_yes = *final_pos_logits.get(yes_id).with_context(|| {
-        format!("yes_id {yes_id} out of range (vocab {})", final_pos_logits.len())
+        format!(
+            "yes_id {yes_id} out of range (vocab {})",
+            final_pos_logits.len()
+        )
     })?;
     let l_no = *final_pos_logits.get(no_id).with_context(|| {
-        format!("no_id {no_id} out of range (vocab {})", final_pos_logits.len())
+        format!(
+            "no_id {no_id} out of range (vocab {})",
+            final_pos_logits.len()
+        )
     })?;
     let m = l_yes.max(l_no);
     let e_yes = (l_yes - m).exp();
@@ -242,8 +248,8 @@ impl OnnxReranker {
         let (ids, mask) = self.encode_pair(query, document)?;
         let seq = ids.len();
         let shape = vec![1_i64, seq as i64];
-        let id_tensor = Tensor::from_array((shape.clone(), ids))
-            .context("failed to build input_ids tensor")?;
+        let id_tensor =
+            Tensor::from_array((shape.clone(), ids)).context("failed to build input_ids tensor")?;
         let mask_tensor = Tensor::from_array((shape.clone(), mask))
             .context("failed to build attention_mask tensor")?;
 
@@ -285,7 +291,10 @@ impl OnnxReranker {
                 let vocab = out_shape[out_shape.len() - 1] as usize;
                 anyhow::ensure!(vocab > 0, "reranker output has zero-width vocab dim");
                 let n = logits.len();
-                anyhow::ensure!(n >= vocab, "reranker logits ({n}) shorter than vocab ({vocab})");
+                anyhow::ensure!(
+                    n >= vocab,
+                    "reranker logits ({n}) shorter than vocab ({vocab})"
+                );
                 let final_pos = &logits[n - vocab..];
                 yes_no_score_from_logits(final_pos, *yes_id, *no_id)
             }
@@ -400,7 +409,10 @@ mod tests {
             2,
             false,
         );
-        assert!(r.is_err(), "missing tokenizer.json should fail at construction");
+        assert!(
+            r.is_err(),
+            "missing tokenizer.json should fail at construction"
+        );
 
         let missing = std::path::Path::new("/no/such/reranker/dir");
         assert!(
@@ -469,7 +481,7 @@ mod tests {
         use crate::config::SemantexConfig;
         use crate::search::fastembed_reranker::ENV_ENABLE;
         use crate::search::reranker_download::ensure_reranker_model;
-        use crate::search::reranker_model::{select_reranker_choice_from_env, RerankerChoice};
+        use crate::search::reranker_model::{RerankerChoice, select_reranker_choice_from_env};
 
         with_env(&[(ENV_ENABLE, Some("on"))], || {
             // Force the ONNX classifier alias.
@@ -483,8 +495,14 @@ mod tests {
             let dir = ensure_reranker_model(&config.models_dir(), &spec.files)
                 .expect("download (offline?)");
             // The bge ONNX export ships `model.onnx` (carried in spec.session_file).
-            let r = OnnxReranker::new(&dir, &spec.session_file, ScoreStrategy::ClassifierLogit, 4, false)
-                .expect("construct");
+            let r = OnnxReranker::new(
+                &dir,
+                &spec.session_file,
+                ScoreStrategy::ClassifierLogit,
+                4,
+                false,
+            )
+            .expect("construct");
             let docs = [
                 "Pizza is a popular Italian dish.",
                 "fn binary_search(a: &[i32], t: i32) -> Option<usize> { /* ... */ }",

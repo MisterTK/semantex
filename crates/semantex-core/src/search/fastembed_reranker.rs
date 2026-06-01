@@ -24,6 +24,7 @@
 //!     - **generic ONNX loader** (`search::onnx_reranker`): `qwen3-reranker-0.6b`
 //!       (Apache-2.0, code-capable, yes/no-logit), `bge-reranker-v2-m3-onnx`
 //!       (classifier-logit smoke target).
+//!
 //!   Unknown values warn and fall back to `bge-reranker-v2-m3` (fastembed).
 //!
 //! When the master switch is off, `FastembedReranker::rerank` returns an

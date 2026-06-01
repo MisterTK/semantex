@@ -51,7 +51,9 @@ fn rerank_off_by_default_produces_no_reranked_source() {
 
     // No result may carry the Reranked source — the stage was a no-op.
     assert!(
-        out.results.iter().all(|r| r.source != SearchSource::Reranked),
+        out.results
+            .iter()
+            .all(|r| r.source != SearchSource::Reranked),
         "rerank must be a no-op when SEMANTEX_RERANKER is unset"
     );
 }

@@ -16,10 +16,10 @@ use anyhow::Result;
 
 use crate::config::SemantexConfig;
 use crate::model::ModelRegistry;
-use crate::search::fastembed_reranker::{reranker_enabled, FastembedReranker};
+use crate::search::fastembed_reranker::{FastembedReranker, reranker_enabled};
 use crate::search::onnx_reranker::OnnxReranker;
 use crate::search::reranker_model::{
-    select_reranker_choice_from_env, OnnxModelSpec, RerankerChoice,
+    OnnxModelSpec, RerankerChoice, select_reranker_choice_from_env,
 };
 
 /// Either reranker implementation, behind a uniform `rerank` API.
@@ -122,7 +122,9 @@ mod tests {
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
