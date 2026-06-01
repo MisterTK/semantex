@@ -1,4 +1,4 @@
-use crate::search::query_classifier::QueryType;
+use crate::search::query_classifier::{FusionWeights, QueryType};
 use crate::types::{Confidence, ScoredChunkId};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -544,30 +544,7 @@ pub fn triple_rrf_fuse(
     }
 
     let channels_fired = u32::from(dense_fired) + u32::from(sparse_fired) + u32::from(exact_fired);
-
-    let mut fused: Vec<RrfFusedResult> = scores
-        .into_iter()
-        .map(|(chunk_id, acc)| {
-            let channels_hit = acc.channels_hit_mask.count_ones();
-            RrfFusedResult {
-                scored: ScoredChunkId {
-                    chunk_id,
-                    score: acc.total,
-                    score_dense: acc.dense,
-                    score_sparse: acc.sparse,
-                    score_exact: acc.exact,
-                },
-                channels_hit,
-                channels_fired,
-            }
-        })
-        .collect();
-
-    // Defensive against Finding 15: use `total_cmp` so a NaN score (e.g. from a
-    // pathological env-var override or upstream channel input) sorts to a stable
-    // position instead of triggering a panic in Rust ≥ 1.81's sort.
-    fused.sort_by(|a, b| b.scored.score.total_cmp(&a.scored.score));
-    fused
+    finalize_rrf(scores, channels_fired)
 }
 
 /// Exp4Fuse dual-route RRF (E4): five channels.
@@ -621,7 +598,137 @@ pub fn exp4_rrf_fuse(
         + u32::from(exp_dense_active)
         + u32::from(exp_sparse_active)
         + u32::from(exact_active);
+    finalize_rrf(scores, channels_fired)
+}
 
+/// Weighted Triple RRF (S7): `Σ wᵢ · 1/(k + rank_c + 1)` across channels.
+///
+/// Unlike the parameter-free `triple_rrf_fuse`, this scales each channel's
+/// rank-decay by the query-type `FusionWeights` (dense/sparse) and uses a
+/// configurable `k` (`config.rrf_k`). The exact channel keeps weight 1.0 (it
+/// has no `FusionWeights` slot). Channel-agreement counts are computed exactly
+/// as in the unweighted path, so E6 confidence labels are unchanged.
+///
+/// Selected by `SEMANTEX_FUSION=weighted-rrf`. The default remains parameter-free
+/// RRF until the S0 harness proves weighted-RRF a net win.
+pub fn triple_weighted_rrf_fuse(
+    dense_list: &[ScoredChunkId],
+    sparse_list: &[ScoredChunkId],
+    exact_ids: &[u64],
+    weights: FusionWeights,
+    k: f32,
+) -> Vec<RrfFusedResult> {
+    let mut scores: HashMap<u64, RrfAccum> = HashMap::new();
+
+    let dense_fired = !dense_list.is_empty();
+    let sparse_fired = !sparse_list.is_empty();
+    let exact_fired = !exact_ids.is_empty();
+
+    if dense_fired {
+        accumulate_weighted_rrf_channel(
+            &mut scores,
+            dense_list,
+            0b001,
+            ChannelKind::Dense,
+            weights.w_dense,
+            k,
+        );
+    }
+    if sparse_fired {
+        accumulate_weighted_rrf_channel(
+            &mut scores,
+            sparse_list,
+            0b010,
+            ChannelKind::Sparse,
+            weights.w_sparse,
+            k,
+        );
+    }
+    if exact_fired {
+        accumulate_weighted_rrf_exact(&mut scores, exact_ids, 0b100, 1.0, k);
+    }
+
+    let channels_fired = u32::from(dense_fired) + u32::from(sparse_fired) + u32::from(exact_fired);
+    finalize_rrf(scores, channels_fired)
+}
+
+/// Weighted Exp4Fuse (S7): five channels, each scaled by `FusionWeights`.
+/// Original + expanded dense channels share `w_dense`; original + expanded
+/// sparse channels share `w_sparse`; the shared exact channel keeps weight 1.0.
+/// Pass empty slices for any expanded channel to fall back to the triple path.
+pub fn exp4_weighted_rrf_fuse(
+    orig_dense: &[ScoredChunkId],
+    orig_sparse: &[ScoredChunkId],
+    exp_dense: &[ScoredChunkId],
+    exp_sparse: &[ScoredChunkId],
+    exact_ids: &[u64],
+    weights: FusionWeights,
+    k: f32,
+) -> Vec<RrfFusedResult> {
+    let mut scores: HashMap<u64, RrfAccum> = HashMap::new();
+
+    let orig_dense_active = !orig_dense.is_empty();
+    let orig_sparse_active = !orig_sparse.is_empty();
+    let exp_dense_active = !exp_dense.is_empty();
+    let exp_sparse_active = !exp_sparse.is_empty();
+    let exact_active = !exact_ids.is_empty();
+
+    if orig_dense_active {
+        accumulate_weighted_rrf_channel(
+            &mut scores,
+            orig_dense,
+            0b0_0001,
+            ChannelKind::Dense,
+            weights.w_dense,
+            k,
+        );
+    }
+    if orig_sparse_active {
+        accumulate_weighted_rrf_channel(
+            &mut scores,
+            orig_sparse,
+            0b0_0010,
+            ChannelKind::Sparse,
+            weights.w_sparse,
+            k,
+        );
+    }
+    if exp_dense_active {
+        accumulate_weighted_rrf_channel(
+            &mut scores,
+            exp_dense,
+            0b0_0100,
+            ChannelKind::Dense,
+            weights.w_dense,
+            k,
+        );
+    }
+    if exp_sparse_active {
+        accumulate_weighted_rrf_channel(
+            &mut scores,
+            exp_sparse,
+            0b0_1000,
+            ChannelKind::Sparse,
+            weights.w_sparse,
+            k,
+        );
+    }
+    if exact_active {
+        accumulate_weighted_rrf_exact(&mut scores, exact_ids, 0b1_0000, 1.0, k);
+    }
+
+    let channels_fired = u32::from(orig_dense_active)
+        + u32::from(orig_sparse_active)
+        + u32::from(exp_dense_active)
+        + u32::from(exp_sparse_active)
+        + u32::from(exact_active);
+    finalize_rrf(scores, channels_fired)
+}
+
+/// Shared finalizer: convert the accumulator map into a sorted `Vec<RrfFusedResult>`.
+/// Extracted so the weighted + parameter-free paths produce byte-identical
+/// downstream shapes. `total_cmp` keeps the sort total-order-safe on NaN.
+fn finalize_rrf(scores: HashMap<u64, RrfAccum>, channels_fired: u32) -> Vec<RrfFusedResult> {
     let mut fused: Vec<RrfFusedResult> = scores
         .into_iter()
         .map(|(chunk_id, acc)| {
@@ -639,8 +746,6 @@ pub fn exp4_rrf_fuse(
             }
         })
         .collect();
-
-    // Defensive against Finding 15 (see triple_rrf_fuse).
     fused.sort_by(|a, b| b.scored.score.total_cmp(&a.scored.score));
     fused
 }
@@ -694,6 +799,53 @@ mod tests {
         // rank-0 (id 42): 3.0 * 1/(60+0+1) = 3/61
         assert!((scores[&42].total - 3.0 / 61.0).abs() < 1e-6);
         assert!((scores[&42].exact - 3.0 / 61.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_triple_weighted_rrf_sparse_weight_lifts_sparse_only_chunk() {
+        // Identifier-style weights: dense 0.2, sparse 1.0. A chunk found ONLY by
+        // sparse (high sparse weight) should outrank a chunk found ONLY by dense
+        // at the same rank (low dense weight). Parameter-free RRF would tie them.
+        let weights = FusionWeights { w_dense: 0.2, w_sparse: 1.0 };
+        let dense = vec![s(1, 0.9)]; // chunk 1: dense only, rank 0
+        let sparse = vec![s(2, 10.0)]; // chunk 2: sparse only, rank 0
+        let k = 60.0;
+
+        let fused = triple_weighted_rrf_fuse(&dense, &sparse, &[], weights, k);
+        // chunk 2 (sparse, w=1.0): 1.0/(60+0+1) = 1/61
+        // chunk 1 (dense,  w=0.2): 0.2/(60+0+1) = 0.2/61
+        assert_eq!(fused[0].scored.chunk_id, 2, "sparse-weighted chunk must win");
+        assert!(fused[0].scored.score > fused[1].scored.score);
+    }
+
+    #[test]
+    fn test_triple_weighted_rrf_consensus_and_confidence_preserved() {
+        // Consensus chunk (all 3 channels) must still win and be Extracted —
+        // weighting does not break the E6 channel-agreement contract.
+        let weights = FusionWeights { w_dense: 0.5, w_sparse: 0.5 };
+        let dense = vec![s(5, 0.9), s(10, 0.5)];
+        let sparse = vec![s(5, 10.0), s(20, 5.0)];
+        let exact = vec![5u64, 30];
+        let fused = triple_weighted_rrf_fuse(&dense, &sparse, &exact, weights, 60.0);
+        assert_eq!(fused[0].scored.chunk_id, 5);
+        assert_eq!(fused[0].channels_hit, 3);
+        assert_eq!(fused[0].channels_fired, 3);
+        assert_eq!(fused[0].confidence(None), Confidence::Extracted);
+    }
+
+    #[test]
+    fn test_exp4_weighted_rrf_falls_back_on_empty_expansion() {
+        // Empty expanded slices → same unique-chunk set + channels_fired as the
+        // triple weighted path on the original three channels.
+        let weights = FusionWeights { w_dense: 0.4, w_sparse: 0.8 };
+        let dense = vec![s(5, 0.9)];
+        let sparse = vec![s(7, 10.0)];
+        let exact = vec![5u64];
+        let triple = triple_weighted_rrf_fuse(&dense, &sparse, &exact, weights, 60.0);
+        let exp4 = exp4_weighted_rrf_fuse(&dense, &sparse, &[], &[], &exact, weights, 60.0);
+        assert_eq!(triple.len(), exp4.len());
+        assert_eq!(triple[0].channels_fired, exp4[0].channels_fired);
+        assert_eq!(triple[0].channels_fired, 3);
     }
 
     // --- top_score_normalize tests ---
