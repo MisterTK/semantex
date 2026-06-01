@@ -298,11 +298,10 @@ impl CoderankHnswBackend {
         // this asserts `positional_chunk_ids()`, which never touches the
         // embedder — so a lazy global against a temp dir is fine (no session
         // built; the dir merely needs to exist).
-        let index =
-            HnswDenseIndex::load(dir, HnswParams::default()).expect("test store loads");
+        let index = HnswDenseIndex::load(dir, HnswParams::default()).expect("test store loads");
         let tmp = std::env::temp_dir();
-        let embedder = SingleVectorEmbedder::global(&tmp)
-            .expect("global embedder (lazy; no session built)");
+        let embedder =
+            SingleVectorEmbedder::global(&tmp).expect("global embedder (lazy; no session built)");
         Self { index, embedder }
     }
 }
@@ -605,8 +604,7 @@ mod tests {
         store.push(42, q, s);
         let path = tmp.path().join("vectors.bin");
         std::fs::write(&path, postcard::to_stdvec(&store).unwrap()).unwrap();
-        let back: Int8VectorStore =
-            postcard::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        let back: Int8VectorStore = postcard::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(back.chunk_ids, vec![42]);
         assert_eq!(back.dim, 2);
     }
@@ -649,7 +647,10 @@ mod tests {
             assert_eq!(v.len(), store.dim);
             let row = store.chunk_ids.iter().position(|c| c == id).unwrap();
             let expected = dequantize_int8(&store.vectors[row], store.scales[row]);
-            assert_eq!(v, &expected, "vectors_for must round-trip the stored int8 row");
+            assert_eq!(
+                v, &expected,
+                "vectors_for must round-trip the stored int8 row"
+            );
         }
     }
 
@@ -723,7 +724,10 @@ mod tests {
         }
         let params = HnswParams::default();
         let graph = HnswDenseIndex::build_graph(&store, params);
-        assert!(graph.is_some(), "graph must build above the lowered threshold");
+        assert!(
+            graph.is_some(),
+            "graph must build above the lowered threshold"
+        );
         let idx = HnswDenseIndex {
             store: store.clone(),
             params,
@@ -732,7 +736,11 @@ mod tests {
         let mut query = vec![1.0f32, 0.5, -0.3, 0.2];
         l2_normalize(&mut query);
         let hnsw_hits: Vec<u64> = idx.search(&query, 5).iter().map(|h| h.chunk_id).collect();
-        let bf_hits: Vec<u64> = store.brute_force(&query, 5).iter().map(|h| h.chunk_id).collect();
+        let bf_hits: Vec<u64> = store
+            .brute_force(&query, 5)
+            .iter()
+            .map(|h| h.chunk_id)
+            .collect();
         assert_eq!(
             hnsw_hits, bf_hits,
             "HNSW (with fp32 rescore) must agree with brute-force on a tiny corpus"

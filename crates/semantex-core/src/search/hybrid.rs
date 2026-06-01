@@ -110,8 +110,7 @@ impl HybridSearcher {
         // alias (alias wins only when explicitly non-default). Defaults still
         // resolve to colbert-plaid (D4) until the Phase-3 cutover.
         let resolved_backend =
-            crate::model::ModelRegistry::resolve_dense_backend(config, None)
-                .unwrap_or_default();
+            crate::model::ModelRegistry::resolve_dense_backend(config, None).unwrap_or_default();
         // The persisted backend in meta.json MUST match the RESOLVED backend —
         // verify and refuse on mismatch (mirrors the BM25 stemmer guard).
         verify_persisted_backend_matches(index_dir, resolved_backend.name())?;

@@ -148,6 +148,9 @@ fn coderank_hnsw_alias_selection_builds_and_searches() -> Result<()> {
         .max_results(3)
         .dense_only();
     let res = searcher.search(&q)?;
-    assert!(!res.results.is_empty(), "alias dense search returned nothing");
+    assert!(
+        !res.results.is_empty(),
+        "alias dense search returned nothing"
+    );
     Ok(())
 }

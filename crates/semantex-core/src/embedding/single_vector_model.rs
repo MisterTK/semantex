@@ -34,28 +34,28 @@ pub(crate) const CODERANK_ONNX: &str = "model_int8.onnx";
 /// Download the CodeRankEmbed int8 model if not already cached. Returns the
 /// model directory (containing the graph + `.onnx.data` weights + tokenizer).
 pub fn ensure_coderank_model(models_dir: &Path) -> Result<PathBuf> {
-    let model_dir = models_dir.join(CODERANK_DIR);
+    let dir = models_dir.join(CODERANK_DIR);
     if is_coderank_downloaded(models_dir) {
-        return Ok(model_dir);
+        return Ok(dir);
     }
-    fs::create_dir_all(&model_dir)
-        .with_context(|| format!("Failed to create model dir: {}", model_dir.display()))?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create model dir: {}", dir.display()))?;
     tracing::info!("Downloading CodeRankEmbed single-vector ONNX model...");
     for file_name in CODERANK_FILES {
-        let dest = model_dir.join(file_name);
+        let dest = dir.join(file_name);
         if !dest.exists() {
             let url = format!("{CODERANK_BASE_URL}/{file_name}");
             crate::embedding::model_manager::download_file(&url, &dest)
                 .with_context(|| format!("Failed to download {file_name} for CodeRankEmbed"))?;
         }
     }
-    Ok(model_dir)
+    Ok(dir)
 }
 
 /// True if every CodeRankEmbed file is present under `models_dir`.
 pub fn is_coderank_downloaded(models_dir: &Path) -> bool {
-    let model_dir = models_dir.join(CODERANK_DIR);
-    CODERANK_FILES.iter().all(|f| model_dir.join(f).exists())
+    let dir = models_dir.join(CODERANK_DIR);
+    CODERANK_FILES.iter().all(|f| dir.join(f).exists())
 }
 
 #[cfg(test)]

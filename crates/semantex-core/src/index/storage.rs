@@ -435,10 +435,7 @@ impl ChunkStore {
     /// annotation appear. Used by the coderank-hnsw `SEMANTEX_DENSE_CONTEXT` A/B
     /// to embed `format!("{annotation}\n{code}")`. Returns an empty map if the
     /// `chunk_annotations` table is absent (older index) or no ids match.
-    pub fn get_annotations(
-        &self,
-        ids: &[u64],
-    ) -> Result<std::collections::HashMap<u64, String>> {
+    pub fn get_annotations(&self, ids: &[u64]) -> Result<std::collections::HashMap<u64, String>> {
         let mut out = std::collections::HashMap::new();
         if ids.is_empty() || !self.table_exists("chunk_annotations")? {
             return Ok(out);

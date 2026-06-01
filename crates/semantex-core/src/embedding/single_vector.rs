@@ -289,7 +289,7 @@ impl SingleVectorEmbedder {
             }
         }
         if count > 0.0 {
-            for p in pooled.iter_mut() {
+            for p in &mut pooled {
                 *p /= count;
             }
         }

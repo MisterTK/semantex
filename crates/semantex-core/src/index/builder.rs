@@ -535,8 +535,8 @@ impl IndexBuilder {
         // "missing" (forcing a rebuild) only when no layout has the sentinel.
         let dense_sentinel = dense_sentinel_file(backend_kind);
         let dense_dir_for_check = dense_subdir(&index_dir, backend_kind);
-        let legacy_plaid_present = backend_kind == DenseBackendKind::ColbertPlaid
-            && index_dir.join("plaid").exists();
+        let legacy_plaid_present =
+            backend_kind == DenseBackendKind::ColbertPlaid && index_dir.join("plaid").exists();
         let dense_missing_for_early_return =
             !dense_dir_for_check.join(dense_sentinel).exists() && !legacy_plaid_present;
 
@@ -647,8 +647,7 @@ impl IndexBuilder {
                     // embedded text changes the embedder_fingerprint, so on/off
                     // are separate indexes (the harness builds each independently).
                     let dense_context = std::env::var("SEMANTEX_DENSE_CONTEXT")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
+                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
                     if dense_missing {
                         let _slot = crate::index::gate::acquire(|| {
@@ -697,8 +696,8 @@ impl IndexBuilder {
                                 .iter()
                                 .map(|c| (c.id, c.content.as_str()))
                                 .collect();
-                            dense_builder = dense_builder
-                                .with_context_annotations(dense_context, annotations);
+                            dense_builder =
+                                dense_builder.with_context_annotations(dense_context, annotations);
                             dense_builder.insert(&pairs)?;
                         }
                     }
