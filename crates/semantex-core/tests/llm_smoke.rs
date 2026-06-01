@@ -17,7 +17,7 @@
 
 #![cfg(feature = "llm")]
 
-use semantex_core::llm::{LlmBackend, LlmCapability as _};
+use semantex_core::llm::LlmBackend;
 
 /// End-to-end probe: classify a structural query and synthesize a HyDE doc.
 ///
@@ -41,16 +41,11 @@ async fn smoke_classify_and_hyde() {
         .expect("LlmBackend::from_env() failed")
         .expect("expected Some(backend) — set SEMANTEX_LLM_MODEL or SEMANTEX_LLM_BACKEND");
 
-    let cap = match backend {
-        LlmBackend::Genai(b) => {
-            eprintln!("Smoke test against Genai backend: {}", b.label());
-            std::sync::Arc::new(b) as std::sync::Arc<dyn semantex_core::llm::LlmCapability>
-        }
-        LlmBackend::SubscriptionCli(b) => {
-            eprintln!("Smoke test against CLI backend: {}", b.label());
-            std::sync::Arc::new(b) as std::sync::Arc<dyn semantex_core::llm::LlmCapability>
-        }
-    };
+    // The inner backend types are `pub(crate)`; external callers must use the
+    // public `into_arc()` accessor rather than pattern-matching the variants
+    // (see `LlmBackend` doc comment). Label first via the trait object.
+    let cap: std::sync::Arc<dyn semantex_core::llm::LlmCapability> = backend.into_arc();
+    eprintln!("Smoke test against backend: {}", cap.label());
 
     // ── classify ─────────────────────────────────────────────────────────────
     let route = cap
