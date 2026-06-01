@@ -12,6 +12,7 @@ pub mod hybrid;
 pub mod onnx_reranker;
 pub mod path_signals;
 pub mod reranker_download;
+pub mod reranker_engine;
 pub mod reranker_model;
 pub mod plaid_search;
 pub mod planner;
