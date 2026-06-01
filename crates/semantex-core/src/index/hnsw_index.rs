@@ -32,6 +32,11 @@ const HNSW_MIN_VECTORS_DEFAULT: usize = 2_000;
 /// On-disk file name for the int8 vector store + chunk_id map.
 const STORE_FILE: &str = "vectors.bin";
 
+/// Streaming-build batch size: at most this many chunks' content is fetched +
+/// encoded at once, so only one batch's text is ever resident (the D6 build-RSS
+/// bound — mirrors PLAID's `PLAID_BATCH`). Well under SQLite's variable limit.
+const ENCODE_BATCH: usize = 32;
+
 /// HNSW + rescore tuning. Presets mirror the oxirs config-preset idea.
 ///
 /// NB on `m`: the chosen ANN crate (`instant-distance`) hardcodes its max-degree
@@ -83,6 +88,20 @@ impl HnswParams {
             },
             _ => Self::default(), // "default" and unknown
         }
+    }
+
+    /// Resolve the effective params from a preset name + optional config
+    /// overrides. `ef_search_override = 0` means "keep the preset's ef_search"
+    /// (so `SEMANTEX_HNSW_PRESET=high_recall` is honored without also setting
+    /// `SEMANTEX_HNSW_EF_SEARCH`); a non-zero override wins. `rescore_k_override`
+    /// is applied as-is (0 = derive 4×k at query time).
+    pub fn resolve(preset: &str, ef_search_override: usize, rescore_k_override: usize) -> Self {
+        let mut p = Self::preset(preset);
+        if ef_search_override != 0 {
+            p.ef_search = ef_search_override;
+        }
+        p.rescore_k = rescore_k_override;
+        p
     }
 }
 
@@ -140,13 +159,19 @@ impl Int8VectorStore {
         f
     }
 
-    /// Exact brute-force top-k over int8 (used below `HNSW_MIN_VECTORS`). Scores
-    /// via int8 dot (monotonic in cosine for L2-normalized inputs) to shortlist,
-    /// then ALWAYS fp32-rescores the shortlist for exact ranking.
-    fn brute_force(&self, query: &[f32], k: usize) -> Vec<DenseHit> {
+    /// Brute-force top-k over int8 (used below `HNSW_MIN_VECTORS`). Shortlists
+    /// the top `rescore_k` by int8 dot, then fp32-rescores down to `k`.
+    ///
+    /// FIX 4: the int8 shortlist width is `rescore_k.max(k)`, NOT just `k`. int8
+    /// dot is only APPROXIMATELY monotonic in cosine across per-vector scales, so
+    /// a true top-k item int8-misranked just past `k` would be unrecoverable if
+    /// we shortlisted only `k`. Widening to `rescore_k` mirrors the HNSW path's
+    /// candidate window and makes the two paths' recall behavior consistent.
+    fn brute_force(&self, query: &[f32], k: usize, rescore_k: usize) -> Vec<DenseHit> {
         if self.vectors.is_empty() {
             return Vec::new();
         }
+        let shortlist = rescore_k.max(k).max(1);
         let (q8, _qs) = quantize_int8(query);
         let mut scored: Vec<(usize, f32)> = self
             .vectors
@@ -155,7 +180,7 @@ impl Int8VectorStore {
             .map(|(i, v)| (i, dot_i8(&q8, v)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k.max(1));
+        scored.truncate(shortlist);
         let positions: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
         self.fp32_rescore(query, &positions, k)
     }
@@ -166,11 +191,12 @@ impl Int8VectorStore {
         let mut hits: Vec<DenseHit> = positions
             .iter()
             .filter_map(|&i| {
-                let v = self.vectors.get(i)?;
                 let scale = *self.scales.get(i)?;
-                let f = dequantize_int8(v, scale);
-                // Stored vectors were L2-normalized before quantization; query is
-                // normalized by the encoder. dot == cosine.
+                let mut f = dequantize_int8(self.vectors.get(i)?, scale);
+                // Re-normalize: int8 round-trip leaves the dequantized vector at
+                // norm ≈0.99, so re-unit it (FIX 5) → dot == cosine exactly. The
+                // query is already unit from the encoder.
+                l2_normalize(&mut f);
                 let score = dot_f32(query, &f);
                 Some(ScoredChunkId::new(self.chunk_ids[i], score))
             })
@@ -187,6 +213,11 @@ impl Int8VectorStore {
     /// Dequantize the stored int8 vectors for the given `chunk_ids` back to f32,
     /// preserving the requested order and SKIPPING any id not present (no faked
     /// rows). Powers `DenseBackend::embed_doc_vectors` (S7 MMR + semantic cache).
+    ///
+    /// FIX 5: the returned vectors are RE-NORMALIZED to unit length (via
+    /// `dequant_row`), so they match `embed_text_vector`'s exactly-unit query
+    /// vector — S7's cosine(query, doc) is symmetric (both sides unit, dot ==
+    /// cosine), not skewed by the int8 round-trip's ≈0.99 norm.
     fn vectors_for(&self, chunk_ids: &[u64]) -> Vec<(u64, Vec<f32>)> {
         use std::collections::HashMap;
         let pos: HashMap<u64, usize> = self
@@ -199,7 +230,7 @@ impl Int8VectorStore {
             .iter()
             .filter_map(|id| {
                 let &i = pos.get(id)?;
-                Some((*id, dequantize_int8(&self.vectors[i], self.scales[i])))
+                Some((*id, self.dequant_row(i)))
             })
             .collect()
     }
@@ -212,9 +243,23 @@ pub struct HnswDenseIndex {
     /// In-RAM HNSW graph, built from `store` on open when len ≥ HNSW_MIN_VECTORS.
     /// `None` ⇒ brute-force path.
     graph: Option<HnswGraph>,
+    /// The ef_search actually BAKED into `graph` at build time. instant-distance
+    /// bakes ef_search into the index, so its search iterator yields at most this
+    /// many candidates — the rescore window cannot exceed it (FIX 3). We raise
+    /// the baked value to cover an explicit `rescore_k`, and clamp+warn at query
+    /// time when a derived `4×k` window would overrun it.
+    baked_ef_search: usize,
 }
 
 impl HnswDenseIndex {
+    /// The ef_search to bake into the graph: the configured `ef_search`, raised
+    /// to cover an explicit `rescore_k` so the candidate pool actually spans the
+    /// rescore window. (`rescore_k = 0` ⇒ derived 4×k at query time, which is
+    /// clamped to the baked value in `search`, since k is not known here.)
+    fn baked_ef_search(params: HnswParams) -> usize {
+        params.ef_search.max(params.rescore_k).max(1)
+    }
+
     /// Build the in-RAM graph from the store (dequantized + renormalized f32
     /// vectors), or return `None` for a small store (brute-force path). The
     /// graph value at row `i` is the store row index `i`.
@@ -228,7 +273,7 @@ impl HnswDenseIndex {
         let values: Vec<usize> = (0..store.len()).collect();
         let graph = Builder::default()
             .ef_construction(params.ef_construction.max(1))
-            .ef_search(params.ef_search.max(1))
+            .ef_search(Self::baked_ef_search(params))
             .build(points, values);
         Some(graph)
     }
@@ -241,6 +286,7 @@ impl HnswDenseIndex {
             store,
             params,
             graph,
+            baked_ef_search: Self::baked_ef_search(params),
         })
     }
 
@@ -262,13 +308,26 @@ impl HnswDenseIndex {
         }
         .max(k);
         match &self.graph {
-            None => self.store.brute_force(query, k),
+            None => self.store.brute_force(query, k, rescore_k),
             Some(graph) => {
+                // The graph's search yields at most `baked_ef_search` candidates,
+                // so the rescore window can't exceed it. Clamp (and warn once when
+                // a derived 4×k window would overrun the baked ef_search — raise
+                // SEMANTEX_HNSW_EF_SEARCH / use a higher preset for larger k).
+                let effective = rescore_k.min(self.baked_ef_search);
+                if rescore_k > self.baked_ef_search {
+                    tracing::debug!(
+                        rescore_k,
+                        baked_ef_search = self.baked_ef_search,
+                        "coderank-hnsw rescore window capped by baked ef_search; \
+                         raise SEMANTEX_HNSW_EF_SEARCH or use a higher-recall preset"
+                    );
+                }
                 let mut search = Search::default();
                 let qpoint = HnswPoint(query.to_vec());
                 let positions: Vec<usize> = graph
                     .search(&qpoint, &mut search)
-                    .take(rescore_k)
+                    .take(effective)
                     .map(|item| *item.value)
                     .collect();
                 self.store.fp32_rescore(query, &positions, k)
@@ -411,15 +470,16 @@ impl CoderankHnswIndexBuilder {
         self
     }
 
-    /// Encode + quantize a batch into the store, with an RSS check at each batch
-    /// boundary (the streaming build-memory bound).
+    /// Encode + quantize one already-fetched batch into the store. The caller is
+    /// responsible for the RSS check + dropping the batch's content before the
+    /// next fetch (see [`Self::encode_streaming_ids`]). Kept for the in-memory
+    /// `build`/`insert` trait entry points (small corpora / tests).
     fn encode_into_store(
         &mut self,
         embedder: &SingleVectorEmbedder,
         chunks: &[(u64, &str)],
     ) -> Result<()> {
-        const BATCH: usize = 32;
-        for batch in chunks.chunks(BATCH) {
+        for batch in chunks.chunks(ENCODE_BATCH) {
             if let Err(e) = crate::memory::check_rss_or_abort("HNSW encode batch") {
                 anyhow::bail!("Indexing aborted: {e}");
             }
@@ -434,6 +494,85 @@ impl CoderankHnswIndexBuilder {
                 self.store.push(chunk_id, q, scale);
             }
         }
+        Ok(())
+    }
+
+    /// Stream content batch-by-batch and encode→quantize→push into the store,
+    /// checking the RSS failsafe at each batch boundary. `fetch` pulls only one
+    /// `ENCODE_BATCH`-sized slice of `(id, content)` from the store at a time, so
+    /// only ONE batch's chunk text is ever resident — the D6 build-memory bound
+    /// (mirrors `ColbertPlaidIndexBuilder::build_streaming_ids`). The whole
+    /// corpus is NEVER materialized.
+    fn encode_streaming_ids<F>(
+        &mut self,
+        embedder: &SingleVectorEmbedder,
+        chunk_ids: &[u64],
+        mut fetch: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
+    {
+        for batch_ids in chunk_ids.chunks(ENCODE_BATCH) {
+            if let Err(e) = crate::memory::check_rss_or_abort("HNSW encode batch") {
+                anyhow::bail!("Indexing aborted: {e}");
+            }
+            // Fetch only this batch's content (≤ENCODE_BATCH ids).
+            let batch = fetch(batch_ids)?;
+            for (chunk_id, content) in &batch {
+                let emb = if self.dense_context {
+                    let ctx = self.context_by_id.get(chunk_id).map_or("", String::as_str);
+                    embedder.encode_document_with_context(ctx, content)?
+                } else {
+                    embedder.encode_document(content)?
+                };
+                let (q, scale) = quantize_int8(&emb);
+                self.store.push(*chunk_id, q, scale);
+            }
+            // `batch` (and its content Strings) drop here → only one batch's
+            // content is ever live at a time.
+        }
+        Ok(())
+    }
+
+    /// Fresh full build over `chunk_ids`, streaming content via `fetch` (one
+    /// batch resident at a time). This is the RSS-bounded entry the builder uses
+    /// on a fresh dense build — it never holds the whole corpus in RAM.
+    pub fn build_streaming_ids<F>(&mut self, chunk_ids: &[u64], mut fetch: F) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
+    {
+        if chunk_ids.is_empty() {
+            tracing::info!("No chunks to encode for coderank-hnsw index");
+            return Ok(());
+        }
+        let embedder = self.make_embedder()?;
+        // Fresh full build.
+        self.store = Int8VectorStore {
+            dim: EMBEDDING_DIM,
+            ..Default::default()
+        };
+        self.encode_streaming_ids(&embedder, chunk_ids, &mut fetch)?;
+        crate::memory::purge_allocator();
+        let dir = self.dir.clone();
+        HnswDenseIndex::save(&self.store, &dir)?;
+        tracing::info!("coderank-hnsw index built ({} vectors)", self.store.len());
+        Ok(())
+    }
+
+    /// Incremental add of `chunk_ids`, streaming content via `fetch` (one batch
+    /// resident at a time). RSS-bounded counterpart to `insert`.
+    pub fn insert_streaming_ids<F>(&mut self, chunk_ids: &[u64], mut fetch: F) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
+    {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        }
+        let embedder = self.make_embedder()?;
+        self.store = self.load_existing_store();
+        self.encode_streaming_ids(&embedder, chunk_ids, &mut fetch)?;
+        let dir = self.dir.clone();
+        HnswDenseIndex::save(&self.store, &dir)?;
         Ok(())
     }
 
@@ -537,6 +676,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_keeps_preset_ef_search_when_override_is_zero() {
+        // FIX 2: preset=high_recall with no explicit ef_search override (0) must
+        // KEEP the preset's ef_search (200), not silently fall back to 64.
+        let p = HnswParams::resolve("high_recall", 0, 0);
+        assert_eq!(
+            p.ef_search, 200,
+            "preset ef_search must survive a 0 override"
+        );
+        assert_eq!(p.rescore_k, 0);
+        // An explicit non-zero override wins.
+        let p2 = HnswParams::resolve("high_recall", 96, 0);
+        assert_eq!(p2.ef_search, 96, "explicit ef_search override must win");
+        // default preset with no override keeps 64.
+        assert_eq!(HnswParams::resolve("default", 0, 0).ef_search, 64);
+        // rescore_k override is applied as-is.
+        assert_eq!(HnswParams::resolve("default", 0, 256).rescore_k, 256);
+    }
+
+    #[test]
+    fn baked_ef_search_covers_explicit_rescore_k() {
+        // FIX 3: an explicit rescore_k larger than ef_search must widen the
+        // graph's baked ef_search so the candidate pool spans the rescore window.
+        let params = HnswParams {
+            ef_search: 64,
+            rescore_k: 300,
+            ..HnswParams::default()
+        };
+        assert_eq!(HnswDenseIndex::baked_ef_search(params), 300);
+        // When rescore_k ≤ ef_search, ef_search stands.
+        let params2 = HnswParams {
+            ef_search: 200,
+            rescore_k: 50,
+            ..HnswParams::default()
+        };
+        assert_eq!(HnswDenseIndex::baked_ef_search(params2), 200);
+    }
+
+    #[test]
     fn brute_force_ranks_by_cosine_descending() {
         let store = Int8VectorStore {
             dim: 2,
@@ -549,7 +726,7 @@ mod tests {
             chunk_ids: vec![10, 20, 30],
         };
         let q = vec![1.0f32, 0.0];
-        let hits = store.brute_force(&q, 3);
+        let hits = store.brute_force(&q, 3, 0);
         assert_eq!(
             hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
             vec![10, 20, 30]
@@ -565,7 +742,7 @@ mod tests {
             vectors: vec![],
             chunk_ids: vec![],
         };
-        assert!(store.brute_force(&[0.0, 0.0, 0.0, 0.0], 5).is_empty());
+        assert!(store.brute_force(&[0.0, 0.0, 0.0, 0.0], 5, 0).is_empty());
     }
 
     #[test]
@@ -582,6 +759,34 @@ mod tests {
         let q = vec![1.0f32, 0.0, 0.0];
         let hits = store.fp32_rescore(&q, &[0, 1], 2);
         assert_eq!(hits[0].chunk_id, 1);
+    }
+
+    #[test]
+    fn brute_force_wide_shortlist_recovers_int8_misranked_topk() {
+        // FIX 4: a true top-1 (id=1) that int8 quantization scores slightly BELOW
+        // a near-duplicate (id=2) must still be recoverable. With shortlist width
+        // = k (=1) the int8 winner (id=2) alone would be rescored → wrong top-1.
+        // A wider rescore window (rescore_k ≥ 2) includes id=1 so fp32 rescue it.
+        // Per-vector scales differ (id=1 has a larger max-abs), making int8 dot a
+        // non-monotone proxy for cosine across rows.
+        let v1 = [0.96f32, 0.28, 0.0]; // closest to q in fp32
+        let v2 = [0.95f32, 0.10, 0.30]; // larger off-axis component
+        let (q1, s1) = quantize_int8(&v1);
+        let (q2, s2) = quantize_int8(&v2);
+        let store = Int8VectorStore {
+            dim: 3,
+            scales: vec![s1, s2],
+            vectors: vec![q1, q2],
+            chunk_ids: vec![1, 2],
+        };
+        let mut query = vec![1.0f32, 0.25, 0.0];
+        l2_normalize(&mut query);
+        // fp32 cosine: id=1 should beat id=2.
+        let top_wide = store.brute_force(&query, 1, 4); // wide shortlist
+        assert_eq!(
+            top_wide[0].chunk_id, 1,
+            "wide int8 shortlist + fp32 rescore must recover the true top-1"
+        );
     }
 
     #[test]
@@ -646,10 +851,18 @@ mod tests {
         for (id, v) in &got {
             assert_eq!(v.len(), store.dim);
             let row = store.chunk_ids.iter().position(|c| c == id).unwrap();
-            let expected = dequantize_int8(&store.vectors[row], store.scales[row]);
+            // FIX 5: vectors_for re-normalizes the dequantized row to unit norm
+            // (== dequant_row), so it must equal the re-normalized stored row and
+            // be unit-length (matching embed_text_vector's unit query vector).
+            let expected = store.dequant_row(row);
             assert_eq!(
                 v, &expected,
-                "vectors_for must round-trip the stored int8 row"
+                "vectors_for must return the re-normalized stored int8 row"
+            );
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "embed_doc_vectors row must be unit-norm (FIX 5), got {norm}"
             );
         }
     }
@@ -732,12 +945,15 @@ mod tests {
             store: store.clone(),
             params,
             graph,
+            baked_ef_search: HnswDenseIndex::baked_ef_search(params),
         };
         let mut query = vec![1.0f32, 0.5, -0.3, 0.2];
         l2_normalize(&mut query);
         let hnsw_hits: Vec<u64> = idx.search(&query, 5).iter().map(|h| h.chunk_id).collect();
+        // Mirror search()'s rescore window (rescore_k = 4×k for the default
+        // params) so the two paths shortlist the same candidate set.
         let bf_hits: Vec<u64> = store
-            .brute_force(&query, 5)
+            .brute_force(&query, 5, 4 * 5)
             .iter()
             .map(|h| h.chunk_id)
             .collect();

@@ -637,9 +637,11 @@ impl IndexBuilder {
                 }
                 DenseBackendKind::CoderankHnsw => {
                     use crate::index::hnsw_index::{CoderankHnswIndexBuilder, HnswParams};
-                    let mut params = HnswParams::preset(&self.config.hnsw_preset);
-                    params.ef_search = self.config.hnsw_ef_search;
-                    params.rescore_k = self.config.dense_rescore_k;
+                    let params = HnswParams::resolve(
+                        &self.config.hnsw_preset,
+                        self.config.hnsw_ef_search,
+                        self.config.dense_rescore_k,
+                    );
                     // SEMANTEX_DENSE_CONTEXT (default OFF): when on, embed
                     // `format!("{annotation}\n{code}")` using the graph-derived NL
                     // annotation already persisted for BM25 (E3). The harness
@@ -660,6 +662,9 @@ impl IndexBuilder {
                         if all_ids.is_empty() {
                             return Ok(());
                         }
+                        // Annotations (E3 NL strings) are small — fetch the id→text
+                        // map up front; the heavy CHUNK CONTENT is streamed per
+                        // batch below, never materialized whole.
                         let annotations = if dense_context {
                             store.get_annotations(&all_ids)?
                         } else {
@@ -668,37 +673,38 @@ impl IndexBuilder {
                         let mut dense_builder = CoderankHnswIndexBuilder::new(&dense_dir, params)
                             .with_models_dir(self.config.models_dir())
                             .with_context_annotations(dense_context, annotations);
-                        // Stream the full corpus through the dense builder one
-                        // batch at a time (RSS-bounded; never materialize all
-                        // chunk content at once) — same memory discipline as the
-                        // PLAID arm.
-                        let mut all_chunks = store.get_chunks(&all_ids)?;
-                        all_chunks.sort_by_key(|c| c.id);
-                        let pairs: Vec<(u64, &str)> = all_chunks
-                            .iter()
-                            .map(|c| (c.id, c.content.as_str()))
-                            .collect();
-                        dense_builder.build(&pairs)?;
+                        // Stream the full corpus one ENCODE_BATCH at a time
+                        // (RSS-bounded; never materialize all chunk content at
+                        // once) — same memory discipline as the PLAID arm. The
+                        // closure pulls each ≤32-id batch's content and drops it
+                        // before the next, so only one batch's text is ever live.
+                        dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
+                            let mut chunks = store.get_chunks(batch_ids)?;
+                            // `get_chunks` (WHERE id IN (...)) is unordered; sort
+                            // by id so per-batch order is deterministic and matches
+                            // the ascending all_ids order (stable vector store).
+                            chunks.sort_by_key(|c| c.id);
+                            Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                        })?;
                     } else {
+                        let annotations = if dense_context && !new_chunk_ids.is_empty() {
+                            store.get_annotations(&new_chunk_ids)?
+                        } else {
+                            std::collections::HashMap::new()
+                        };
                         let mut dense_builder = CoderankHnswIndexBuilder::new(&dense_dir, params)
-                            .with_models_dir(self.config.models_dir());
+                            .with_models_dir(self.config.models_dir())
+                            .with_context_annotations(dense_context, annotations);
                         if !removed_chunk_ids.is_empty() {
                             dense_builder.delete(&removed_chunk_ids)?;
                         }
                         if !new_chunk_ids.is_empty() {
-                            let annotations = if dense_context {
-                                store.get_annotations(&new_chunk_ids)?
-                            } else {
-                                std::collections::HashMap::new()
-                            };
-                            let new_chunks = store.get_chunks(&new_chunk_ids)?;
-                            let pairs: Vec<(u64, &str)> = new_chunks
-                                .iter()
-                                .map(|c| (c.id, c.content.as_str()))
-                                .collect();
-                            dense_builder =
-                                dense_builder.with_context_annotations(dense_context, annotations);
-                            dense_builder.insert(&pairs)?;
+                            // Incremental adds also stream per batch (no whole-set
+                            // content materialization).
+                            dense_builder.insert_streaming_ids(&new_chunk_ids, |batch_ids| {
+                                let chunks = store.get_chunks(batch_ids)?;
+                                Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                            })?;
                         }
                     }
                     tracing::info!(

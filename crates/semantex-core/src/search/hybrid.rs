@@ -147,9 +147,11 @@ impl HybridSearcher {
                 use crate::index::hnsw_index::{CoderankHnswBackend, HnswParams};
                 let backend_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
                 if backend_dir.join("vectors.bin").exists() {
-                    let mut params = HnswParams::preset(&config.hnsw_preset);
-                    params.ef_search = config.hnsw_ef_search;
-                    params.rescore_k = config.dense_rescore_k;
+                    let params = HnswParams::resolve(
+                        &config.hnsw_preset,
+                        config.hnsw_ef_search,
+                        config.dense_rescore_k,
+                    );
                     let model_dir = crate::embedding::single_vector_model::ensure_coderank_model(
                         &config.models_dir(),
                     );
