@@ -61,6 +61,30 @@
   stub). Not needed — instant-distance passes every hard criterion except native delete, which the
   rebuild-on-mutate design (already in the plan) covers.
 
+## S2 — encoder I/O CORRECTION (verified against the downloaded graph, 2026-06-01)
+
+> The Spike-1 recorded I/O said output `last_hidden_state [batch, seq, hidden]`. The ACTUAL
+> hosted `MisterTK/CodeRankEmbed-onnx-int8` graph (probed live after download + run) differs —
+> recorded here so the encoder constants are non-hallucinated. The S2 e2e gate PASSES with these.
+
+- **Inputs (confirmed):** `input_ids`, `attention_mask` only (int64). **NO `token_type_ids`**
+  (the graph does not declare it) — the encoder feeds exactly these two tensors.
+- **Outputs (CORRECTION):** the export emits TWO outputs:
+  - **`sentence_embedding` `[batch, hidden=768]`** — already mask-mean-pooled (the
+    sentence-transformers head). **The encoder PREFERS this** (matches RECORDED pooling=mean) and
+    only L2-normalizes it. There is **NO `last_hidden_state` output** (the draft name was wrong).
+  - **`token_embeddings` `[batch, seq, hidden]`** — the raw per-token states; the encoder falls
+    back to mask-mean-pooling THESE if a future export drops `sentence_embedding`.
+  `single_vector.rs` probes `["sentence_embedding"]` then `["token_embeddings","last_hidden_state"]`
+  and uses the first present, so it is robust to either export shape.
+- **E2E VERIFIED 2026-06-01** (real model, ORT_DYLIB_PATH=homebrew libonnxruntime 1.26):
+  `coderank_hnsw_dense_search_is_relevant` (fibonacci query → fib.rs ranks #1),
+  `coderank_hnsw_dense_is_deterministic`, `coderank_hnsw_alias_selection_builds_and_searches`,
+  `coderank_hnsw_build_writes_subdir_and_meta` (meta: model=CodeRankEmbed, dim=768, backend
+  coderank-hnsw, schema 11), and `vector_accessor_methods_return_some_on_built_index` ALL PASS.
+  The 4-file external-data download (`model_int8.onnx` 1.2MB + `model_int8.onnx.data` 274MB +
+  tokenizer.json + config.json) provisions cleanly on first use.
+
 ## S3 — Qwen3-Reranker-0.6B reranker (DONE: hosted + verified)
 
 - **ModelSpec.source:** `hf:MisterTK/Qwen3-Reranker-0.6B-onnx` (Apache-2.0)

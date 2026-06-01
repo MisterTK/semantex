@@ -34,8 +34,15 @@ pub(crate) const QUERY_PREFIX: &str = "Represent this query for searching releva
 /// ONNX input tensor names (int64).
 const INPUT_IDS: &str = "input_ids";
 const ATTENTION_MASK: &str = "attention_mask";
-/// ONNX output tensor name holding `[batch, seq, dim]` token embeddings.
-const OUTPUT_NAME: &str = "last_hidden_state";
+/// ONNX output tensor names. The hosted CodeRankEmbed export (verified 2026-06-01
+/// against the downloaded graph) exposes a pre-pooled `sentence_embedding`
+/// `[batch, dim]` AND the raw `token_embeddings` `[batch, seq, dim]`. We prefer
+/// the pre-pooled `sentence_embedding` (== mean-pool + L2 from the
+/// sentence-transformers head, RECORDED pooling = mean); if a future export only
+/// emits token embeddings (`token_embeddings` / `last_hidden_state`), we mask-mean
+/// pool them ourselves. We probe these names in order and use the first present.
+const POOLED_OUTPUT_NAMES: &[&str] = &["sentence_embedding"];
+const TOKEN_OUTPUT_NAMES: &[&str] = &["token_embeddings", "last_hidden_state"];
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// L2-normalize in place. A zero vector is left as zeros (no div-by-zero).
@@ -266,33 +273,58 @@ impl SingleVectorEmbedder {
             ATTENTION_MASK => mask_tensor,
         ])?;
 
-        // Output is [1, seq, dim] f32 token embeddings.
-        let (shape, data) = outputs[OUTPUT_NAME].try_extract_tensor::<f32>()?;
-        anyhow::ensure!(
-            shape.len() == 3 && shape[2] as usize == EMBEDDING_DIM,
-            "unexpected encoder output shape {shape:?} (expected [1, seq, {EMBEDDING_DIM}])"
-        );
-        let seq_len = shape[1] as usize;
         let dim = EMBEDDING_DIM;
 
-        // Mean pooling over masked tokens (RECORDED: mean, mask-weighted).
-        let mut pooled = vec![0.0f32; dim];
-        let mut count = 0.0f32;
-        for t in 0..seq_len {
-            if mask.get(t).copied().unwrap_or(0) == 0 {
-                continue;
+        // Prefer the pre-pooled `sentence_embedding` [batch, dim] output (the
+        // sentence-transformers head already mask-mean-pooled). Fall back to
+        // mask-mean pooling the raw token embeddings if only those are present.
+        let mut pooled = if let Some(name) = POOLED_OUTPUT_NAMES
+            .iter()
+            .find(|n| outputs.contains_key(**n))
+        {
+            let (shape, data) = outputs[*name].try_extract_tensor::<f32>()?;
+            let n: usize = shape.iter().map(|&d| d as usize).product();
+            anyhow::ensure!(
+                n == dim,
+                "unexpected pooled output `{name}` shape {shape:?} (expected {dim} values)"
+            );
+            data[..dim].to_vec()
+        } else {
+            let name = TOKEN_OUTPUT_NAMES
+                .iter()
+                .find(|n| outputs.contains_key(**n))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "encoder produced no known output (looked for {POOLED_OUTPUT_NAMES:?} / {TOKEN_OUTPUT_NAMES:?})"
+                    )
+                })?;
+            let (shape, data) = outputs[*name].try_extract_tensor::<f32>()?;
+            anyhow::ensure!(
+                shape.len() == 3 && shape[2] as usize == dim,
+                "unexpected token output `{name}` shape {shape:?} (expected [1, seq, {dim}])"
+            );
+            let seq_len = shape[1] as usize;
+            // Mean pooling over masked tokens (RECORDED: mean, mask-weighted).
+            let mut pooled = vec![0.0f32; dim];
+            let mut count = 0.0f32;
+            for t in 0..seq_len {
+                if mask.get(t).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                count += 1.0;
+                let row = &data[t * dim..(t + 1) * dim];
+                for (p, &x) in pooled.iter_mut().zip(row) {
+                    *p += x;
+                }
             }
-            count += 1.0;
-            let row = &data[t * dim..(t + 1) * dim];
-            for (p, &x) in pooled.iter_mut().zip(row) {
-                *p += x;
+            if count > 0.0 {
+                for p in &mut pooled {
+                    *p /= count;
+                }
             }
-        }
-        if count > 0.0 {
-            for p in &mut pooled {
-                *p /= count;
-            }
-        }
+            pooled
+        };
+
         l2_normalize(&mut pooled);
         // Keep `dot_f32` referenced for the rescore path (imported for callers).
         debug_assert!(dot_f32(&pooled, &pooled) <= 1.0 + 1e-3);
