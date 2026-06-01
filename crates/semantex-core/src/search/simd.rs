@@ -360,17 +360,95 @@ mod avx2 {
             if denom == 0.0 { 0.0 } else { dot_s / denom }
         }
     }
+    /// Horizontal sum of an 8-lane i32 AVX register → scalar i32.
     /// # Safety
-    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    /// Caller must ensure AVX2 is available.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
-        super::scalar::dot_i8(a, b)
+    unsafe fn hsum256_epi32(v: __m256i) -> i32 {
+        unsafe {
+            let low = _mm256_castsi256_si128(v);
+            let high = _mm256_extracti128_si256(v, 1);
+            let sum128 = _mm_add_epi32(low, high);
+            let hi64 = _mm_unpackhi_epi64(sum128, sum128);
+            let sum64 = _mm_add_epi32(sum128, hi64);
+            let hi32 = _mm_shuffle_epi32(sum64, 0b01);
+            let sum32 = _mm_add_epi32(sum64, hi32);
+            _mm_cvtsi128_si32(sum32)
+        }
     }
+
+    /// Sign-extend 16 packed i8 (a 128-bit load) into 16 i16 lanes (`__m256i`).
+    /// # Safety
+    /// Caller must ensure AVX2 is available.
+    #[target_feature(enable = "avx2")]
+    unsafe fn widen_i8_to_i16(v: __m128i) -> __m256i {
+        unsafe { _mm256_cvtepi8_epi16(v) } // sign-extend 16×i8 → 16×i16
+    }
+
     /// # Safety
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: |sum| ≤ dim·16384 ≪ 2^24, exactly representable
+    pub unsafe fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !15; // 16 i8 per iteration
+            let mut acc = _mm256_setzero_si256();
+            let mut i = 0;
+            while i < chunks {
+                let va = widen_i8_to_i16(_mm_loadu_si128(a.as_ptr().add(i).cast::<__m128i>()));
+                let vb = widen_i8_to_i16(_mm_loadu_si128(b.as_ptr().add(i).cast::<__m128i>()));
+                // madd: (va0*vb0 + va1*vb1), ... → 8×i32
+                let prod = _mm256_madd_epi16(va, vb);
+                acc = _mm256_add_epi32(acc, prod);
+                i += 16;
+            }
+            let mut total = hsum256_epi32(acc);
+            while i < len {
+                total += i32::from(a[i]) * i32::from(b[i]);
+                i += 1;
+            }
+            total as f32
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: bounded magnitudes, exactly representable
     pub unsafe fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
-        super::scalar::cosine_i8(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !15;
+            let mut dot = _mm256_setzero_si256();
+            let mut na = _mm256_setzero_si256();
+            let mut nb = _mm256_setzero_si256();
+            let mut i = 0;
+            while i < chunks {
+                let va = widen_i8_to_i16(_mm_loadu_si128(a.as_ptr().add(i).cast::<__m128i>()));
+                let vb = widen_i8_to_i16(_mm_loadu_si128(b.as_ptr().add(i).cast::<__m128i>()));
+                dot = _mm256_add_epi32(dot, _mm256_madd_epi16(va, vb));
+                na = _mm256_add_epi32(na, _mm256_madd_epi16(va, va));
+                nb = _mm256_add_epi32(nb, _mm256_madd_epi16(vb, vb));
+                i += 16;
+            }
+            let mut dot_s = hsum256_epi32(dot);
+            let mut na_s = hsum256_epi32(na);
+            let mut nb_s = hsum256_epi32(nb);
+            while i < len {
+                let (x, y) = (i32::from(a[i]), i32::from(b[i]));
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = (na_s as f32).sqrt() * (nb_s as f32).sqrt();
+            if denom == 0.0 {
+                0.0
+            } else {
+                dot_s as f32 / denom
+            }
+        }
     }
 }
 
@@ -467,14 +545,66 @@ mod neon {
     /// # Safety
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
     #[target_feature(enable = "neon")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: |sum| ≤ dim·16384 ≪ 2^24, exactly representable
     pub unsafe fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
-        super::scalar::dot_i8(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7; // 8 i8 per iteration (vld1_s8 loads 8)
+            let mut acc = vdupq_n_s32(0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1_s8(a.as_ptr().add(i)); // int8x8
+                let vb = vld1_s8(b.as_ptr().add(i));
+                let prod = vmull_s8(va, vb); // int16x8 = va * vb (widened)
+                // widen-add int16x8 into int32x4 accumulator
+                acc = vaddq_s32(acc, vpaddlq_s16(prod)); // pairwise widen i16→i32 then add
+                i += 8;
+            }
+            let mut total = vaddvq_s32(acc); // horizontal add 4×i32
+            while i < len {
+                total += i32::from(a[i]) * i32::from(b[i]);
+                i += 1;
+            }
+            total as f32
+        }
     }
     /// # Safety
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
     #[target_feature(enable = "neon")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: bounded magnitudes, exactly representable
     pub unsafe fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
-        super::scalar::cosine_i8(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7;
+            let mut dot = vdupq_n_s32(0);
+            let mut na = vdupq_n_s32(0);
+            let mut nb = vdupq_n_s32(0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1_s8(a.as_ptr().add(i));
+                let vb = vld1_s8(b.as_ptr().add(i));
+                dot = vaddq_s32(dot, vpaddlq_s16(vmull_s8(va, vb)));
+                na = vaddq_s32(na, vpaddlq_s16(vmull_s8(va, va)));
+                nb = vaddq_s32(nb, vpaddlq_s16(vmull_s8(vb, vb)));
+                i += 8;
+            }
+            let mut dot_s = vaddvq_s32(dot);
+            let mut na_s = vaddvq_s32(na);
+            let mut nb_s = vaddvq_s32(nb);
+            while i < len {
+                let (x, y) = (i32::from(a[i]), i32::from(b[i]));
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = (na_s as f32).sqrt() * (nb_s as f32).sqrt();
+            if denom == 0.0 {
+                0.0
+            } else {
+                dot_s as f32 / denom
+            }
+        }
     }
 }
 
@@ -621,6 +751,46 @@ mod tests {
             assert_close(d, scalar::dot_f32(&a, &b));
             assert_close(l, scalar::l2_f32(&a, &b));
             assert_close(c, scalar::cosine_f32(&a, &b));
+        }
+    }
+
+    /// i8 dot is an exact integer computation regardless of lane ordering, so the
+    /// SIMD result must EQUAL the scalar i32 sum (cast to f32) — no tolerance.
+    /// Cosine involves a sqrt, so compare with tolerance.
+    fn i8_vecs(len: usize, seed: u64) -> (Vec<i8>, Vec<i8>) {
+        let af = make_vec(len, seed);
+        let bf = make_vec(len, seed ^ 0xFFFF);
+        (
+            af.iter().map(|x| (x * 127.0) as i8).collect(),
+            bf.iter().map(|x| (x * 127.0) as i8).collect(),
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_i8_match_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping avx2 i8 parity: AVX2 not present");
+            return;
+        }
+        for &len in &[16usize, 17, 31, 32, 768, 769] {
+            let (a, b) = i8_vecs(len, 0x9 ^ len as u64);
+            // SAFETY: AVX2 detected; equal-length slices.
+            let (d, c) = unsafe { (avx2::dot_i8(&a, &b), avx2::cosine_i8(&a, &b)) };
+            assert_eq!(d, scalar::dot_i8(&a, &b), "i8 dot must be integer-exact");
+            assert_close(c, scalar::cosine_i8(&a, &b));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_i8_match_scalar() {
+        for &len in &[8usize, 9, 15, 16, 768, 769] {
+            let (a, b) = i8_vecs(len, 0x9 ^ len as u64);
+            // SAFETY: NEON mandatory on aarch64; equal-length slices.
+            let (d, c) = unsafe { (neon::dot_i8(&a, &b), neon::cosine_i8(&a, &b)) };
+            assert_eq!(d, scalar::dot_i8(&a, &b), "i8 dot must be integer-exact");
+            assert_close(c, scalar::cosine_i8(&a, &b));
         }
     }
 
