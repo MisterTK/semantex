@@ -257,7 +257,10 @@ mod tests {
             "missing lateon-colbert: {ids:?}"
         );
         assert!(ids.contains(&"bge-reranker-v2-m3"), "missing bge: {ids:?}");
-        assert!(ids.contains(&"qwen3-reranker-0.6b"), "missing qwen3: {ids:?}");
+        assert!(
+            ids.contains(&"qwen3-reranker-0.6b"),
+            "missing qwen3: {ids:?}"
+        );
     }
 
     #[test]

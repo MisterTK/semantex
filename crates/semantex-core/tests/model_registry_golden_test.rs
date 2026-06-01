@@ -147,10 +147,7 @@ fn user_manifest_single_vector_model_capability_routes() {
     let spec = reg.active_embedder().unwrap();
     assert_eq!(spec.id, "gte-modernbert-hnsw");
     // Capability-routes to the coderank-hnsw BackendKind from the manifest alone.
-    assert_eq!(
-        backend_for(&spec.capabilities),
-        BackendKind::CoderankHnsw
-    );
+    assert_eq!(backend_for(&spec.capabilities), BackendKind::CoderankHnsw);
     // The DenseBackendKind conversion is deferred to S2.
     assert!(reg.embedder_backend_kind().is_err());
 }

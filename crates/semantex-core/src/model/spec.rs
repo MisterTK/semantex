@@ -218,7 +218,11 @@ impl ModelSpec {
             }
         }
         if let RoleData::Embedder(e) = &self.role_data {
-            anyhow::ensure!(e.dims > 0, "model `{}`: embedder `dims` must be > 0", self.id);
+            anyhow::ensure!(
+                e.dims > 0,
+                "model `{}`: embedder `dims` must be > 0",
+                self.id
+            );
             anyhow::ensure!(
                 e.max_context > 0,
                 "model `{}`: embedder `max_context` must be > 0",
@@ -353,17 +357,26 @@ mod tests {
         // Changing dims changes the fingerprint (vector space differs).
         let mut diff_dims = base.clone();
         diff_dims.dims = 384;
-        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_dims));
+        assert_ne!(
+            fp1,
+            EmbedderFingerprint::compute("coderank-137m", &diff_dims)
+        );
 
         // Changing pooling changes it.
         let mut diff_pool = base.clone();
         diff_pool.pooling = Pooling::Mean;
-        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_pool));
+        assert_ne!(
+            fp1,
+            EmbedderFingerprint::compute("coderank-137m", &diff_pool)
+        );
 
         // Changing quant changes it.
         let mut diff_quant = base.clone();
         diff_quant.quant = QuantKind::None;
-        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_quant));
+        assert_ne!(
+            fp1,
+            EmbedderFingerprint::compute("coderank-137m", &diff_quant)
+        );
 
         // Changing the id changes it (different model, same shape).
         assert_ne!(fp1, EmbedderFingerprint::compute("other-embedder", &base));

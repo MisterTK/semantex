@@ -333,7 +333,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         // No pointer yet → None.
-        assert_eq!(read_active_pointer(root, DenseBackendKind::ColbertPlaid), None);
+        assert_eq!(
+            read_active_pointer(root, DenseBackendKind::ColbertPlaid),
+            None
+        );
         // Write then read back.
         write_active_pointer(root, DenseBackendKind::ColbertPlaid, "abc123").unwrap();
         assert_eq!(
