@@ -378,6 +378,8 @@ mod tests {
             "embedding_dim": 48,
             // v0.4.1 W-Index #4: use_bm25_stemmer is now part of IndexMeta.
             "use_bm25_stemmer": true,
+            // S1: dense_backend is now part of IndexMeta (schema v10).
+            "dense_backend": "colbert-plaid",
         });
         std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
     }

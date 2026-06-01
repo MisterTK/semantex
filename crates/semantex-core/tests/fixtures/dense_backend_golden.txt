@@ -1,0 +1,4 @@
+recursive fibonacci function|fib.rs:2-4:0.028;fib.rs:1-1:0.019;server.js:1-6:0.019;db.go:3-5:0.018;
+binary search over a sorted array|search.py:1-11:0.028;fib.rs:2-4:0.022;db.go:3-5:0.021;server.js:1-6:0.021;
+http get request handler|server.js:1-6:0.024;db.go:3-5:0.019;fib.rs:2-4:0.019;
+open a database connection|db.go:3-5:0.047;server.js:1-6:0.038;fib.rs:1-1:0.037;
