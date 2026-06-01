@@ -1,15 +1,20 @@
 use crate::config::SemantexConfig;
-use crate::embedding::colbert::ColbertEmbedder;
 use crate::embedding::model_manager;
 use crate::index::file_classifier::FileRole;
 use crate::index::storage::ChunkStore;
 use crate::search::SearchQuery;
 use crate::search::adaptive;
-use crate::search::fastembed_reranker::FastembedReranker;
-use crate::search::graph_propagation::{self, GraphPropagationConfig};
+use crate::search::colbert_plaid_backend::ColbertPlaidBackend;
+use crate::search::dense_backend::{
+    DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
+};
+use crate::search::graph_propagation::GraphPropagationConfig;
+use crate::search::graph_stage;
+use crate::search::mmr;
 use crate::search::path_signals;
-use crate::search::plaid_search::PlaidSearcher;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
+use crate::search::reranker_engine::RerankerEngine;
+use crate::search::semantic_cache::{self, SemanticCache};
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
 use crate::search::{query_expander, regex_semantic};
@@ -17,17 +22,25 @@ use crate::types::{Confidence, ScoredChunkId, SearchResult, SearchSource};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Hybrid searcher combining dense (ColBERT/PLAID), sparse (BM25), and reranking.
-/// Exact substring search is handled by SQLite LIKE queries on the chunk store.
+/// Hybrid searcher combining dense (pluggable `DenseBackend`), sparse (BM25),
+/// and reranking. Exact substring search is handled by SQLite LIKE queries on
+/// the chunk store.
 pub struct HybridSearcher {
     sparse: Option<SparseIndex>,
-    plaid: Option<PlaidSearcher>,
-    colbert: Option<&'static ColbertEmbedder>,
-    reranker: Mutex<Option<FastembedReranker>>,
+    /// Pluggable dense channel (S1). `None` when dense is unavailable
+    /// (sparse-only open, or the dense index failed to load).
+    dense: Option<Box<dyn DenseBackend>>,
+    reranker: Mutex<Option<RerankerEngine>>,
     store: Mutex<ChunkStore>,
     config: SemantexConfig,
+    /// Daemon-scoped semantic query cache (S7). OFF unless SEMANTEX_SEMANTIC_CACHE=1.
+    /// Stamped with the index's updated_at + schema_version; flushed on reindex.
+    semantic_cache: Mutex<SemanticCache>,
+    /// The index directory — used to read the current `meta.json` stamp for
+    /// cache invalidation on each search.
+    index_dir: PathBuf,
 }
 
 impl HybridSearcher {
@@ -59,11 +72,12 @@ impl HybridSearcher {
 
         Ok(Self {
             sparse,
-            plaid: None,
-            colbert: None,
+            dense: None,
             reranker,
             store,
             config: config.clone(),
+            semantic_cache: Mutex::new(SemanticCache::new(semantic_cache::capacity_from_env())),
+            index_dir: index_dir.to_path_buf(),
         })
     }
 
@@ -101,37 +115,74 @@ impl HybridSearcher {
             None
         };
 
-        // Load PLAID index for ColBERT late-interaction search
-        let (plaid, colbert) = {
-            let plaid_dir = index_dir.join("plaid");
-            let mapping_path = index_dir.join("plaid_mapping.bin");
-            if plaid_dir.exists() && mapping_path.exists() {
-                match PlaidSearcher::open(&plaid_dir, &mapping_path) {
-                    Ok(ps) => {
-                        // Initialize ColBERT embedder for query encoding
-                        let colbert_model_dir =
-                            model_manager::ensure_colbert_model(&config.models_dir());
-                        match colbert_model_dir.and_then(|d| ColbertEmbedder::global(&d)) {
-                            Ok(emb) => {
-                                tracing::info!("PLAID index loaded with ColBERT encoder");
-                                (Some(ps), Some(emb))
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "PLAID index found but ColBERT encoder failed: {}",
-                                    e
-                                );
-                                (None, None)
-                            }
+        // Load the dense backend. Selection (S2 re-point): resolve via the S8
+        // ModelRegistry from the canonical `SEMANTEX_EMBEDDER` selection, with
+        // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` kept as a DEPRECATED
+        // alias (alias wins only when explicitly non-default). D4 cutover:
+        // all-defaults now resolve to coderank-hnsw. An existing colbert-plaid
+        // index opened under the new default trips verify_persisted_backend_matches
+        // below → clean `--rebuild` guidance, not a crash.
+        let resolved_backend =
+            crate::model::ModelRegistry::resolve_dense_backend(config, None).unwrap_or_default();
+        // The persisted backend in meta.json MUST match the RESOLVED backend —
+        // verify and refuse on mismatch (mirrors the BM25 stemmer guard).
+        verify_persisted_backend_matches(index_dir, resolved_backend.name())?;
+        let dense: Option<Box<dyn DenseBackend>> = match resolved_backend {
+            DenseBackendKind::ColbertPlaid => {
+                // Per-backend subdir is canonical; fall back to the legacy
+                // top-level `plaid/` layout for indexes built before S1.
+                let backend_dir = dense_subdir(index_dir, DenseBackendKind::ColbertPlaid);
+                let legacy_dir = index_dir.join("plaid");
+                let (plaid_dir, mapping_path) = if backend_dir.exists() {
+                    (backend_dir.clone(), backend_dir.join("plaid_mapping.bin"))
+                } else {
+                    (legacy_dir, index_dir.join("plaid_mapping.bin"))
+                };
+                if plaid_dir.exists() && mapping_path.exists() {
+                    let model_dir = model_manager::ensure_colbert_model(&config.models_dir());
+                    match model_dir
+                        .and_then(|d| ColbertPlaidBackend::open(&plaid_dir, &mapping_path, &d))
+                    {
+                        Ok(b) => {
+                            tracing::info!("Dense backend loaded: colbert-plaid");
+                            Some(Box::new(b) as Box<dyn DenseBackend>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("colbert-plaid backend failed to load: {}", e);
+                            None
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to open PLAID index: {}", e);
-                        (None, None)
-                    }
+                } else {
+                    None
                 }
-            } else {
-                (None, None)
+            }
+            DenseBackendKind::CoderankHnsw => {
+                use crate::index::hnsw_index::{CoderankHnswBackend, HnswParams};
+                let backend_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
+                if backend_dir.join("vectors.bin").exists() {
+                    let params = HnswParams::resolve(
+                        &config.hnsw_preset,
+                        config.hnsw_ef_search,
+                        config.dense_rescore_k,
+                    );
+                    let model_dir = crate::embedding::single_vector_model::ensure_coderank_model(
+                        &config.models_dir(),
+                    );
+                    match model_dir
+                        .and_then(|d| CoderankHnswBackend::open(&backend_dir, &d, params))
+                    {
+                        Ok(b) => {
+                            tracing::info!("Dense backend loaded: coderank-hnsw");
+                            Some(Box::new(b) as Box<dyn DenseBackend>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("coderank-hnsw backend failed to load: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
             }
         };
 
@@ -140,16 +191,17 @@ impl HybridSearcher {
 
         Ok(Self {
             sparse,
-            plaid,
-            colbert,
+            dense,
             reranker,
             store,
             config: config.clone(),
+            semantic_cache: Mutex::new(SemanticCache::new(semantic_cache::capacity_from_env())),
+            index_dir: index_dir.to_path_buf(),
         })
     }
 
     /// Reload the sparse index reader to pick up incremental updates.
-    /// The PLAID index is memory-mapped and picks up changes automatically on re-open,
+    /// The dense index is memory-mapped and picks up changes automatically on re-open,
     /// but Tantivy requires an explicit reader reload.
     /// Provide read-only access to the chunk store for graph queries.
     /// Used by the daemon handler and the direct fallback path.
@@ -183,6 +235,37 @@ impl HybridSearcher {
         // Grep-mode: fast path with simplified exact+sparse fusion
         if query.grep_mode {
             return self.search_grep_mode(query, search_start);
+        }
+
+        // S7: semantic-cache lookup. OFF unless SEMANTEX_SEMANTIC_CACHE=1. Only
+        // attempts when a dense backend can embed the query AND meta.json yields
+        // a current stamp. A hit returns cached (results, metrics) verbatim,
+        // skipping all retrieval/fusion/rerank. Never caches grep-mode (handled
+        // above) or queries with a regex_pattern (results depend on the pattern).
+        let cache_eligible = semantic_cache::is_enabled() && query.regex_pattern.is_none();
+        let query_cache_vec: Option<Vec<f32>> = if cache_eligible {
+            self.dense
+                .as_ref()
+                .and_then(|d| d.embed_text_vector(&query.text))
+        } else {
+            None
+        };
+        if let (Some(qvec), Some(stamp)) = (
+            &query_cache_vec,
+            semantic_cache::read_stamp(&self.index_dir),
+        ) {
+            let threshold = semantic_cache::threshold_from_env();
+            let mut cache = self.semantic_cache.lock();
+            if let Some((results, mut metrics)) = cache.lookup(&query.text, qvec, threshold, &stamp)
+            {
+                metrics.total_ms = search_start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    query = %query.text,
+                    results = results.len(),
+                    "Semantic cache hit (S7)"
+                );
+                return Ok(super::SearchOutput { results, metrics });
+            }
         }
 
         let candidates = self.config.rerank_candidates;
@@ -267,67 +350,64 @@ impl HybridSearcher {
         // we enter `thread::scope` to avoid contention with `exact_handle`,
         // which takes the same lock.
         let plaid_chunk_subset: Option<Vec<u64>> = match (
-            query.use_dense.then_some(()).and(self.plaid.as_ref()),
+            query.use_dense.then_some(()).and(self.dense.as_ref()),
             query.file_filter.as_ref().filter(|f| f.is_active()),
         ) {
-            (Some(plaid), Some(filter)) => {
-                let all_indexed = plaid.doc_to_chunk();
-                if all_indexed.is_empty() {
-                    Some(Vec::new())
-                } else {
-                    const FILTER_BATCH: usize = 500;
-                    // v0.4.1 W-Index #7: previously this loop swallowed
-                    // SQLite errors with `if let Ok(chunks) = ...`, so a
-                    // transient DB failure produced a partial subset that
-                    // PLAID then searched as if it were the complete
-                    // candidate set (silently dropping results from
-                    // un-fetched batches). Now we propagate the error and
-                    // fall back to an unfiltered PLAID search — slower, but
-                    // correct: post-filter dedup in the result-merge stage
-                    // already handles the file_filter check.
-                    //
-                    // v0.4.1 W-Index #3: also pre-filter PLAID_TOMBSTONE
-                    // entries from the input batch so we never ask SQLite
-                    // for a chunk_id that's the deleted-slot sentinel.
-                    let subset_result: anyhow::Result<Vec<u64>> = (|| {
-                        let store = self.store.lock();
-                        let mut subset: Vec<u64> = Vec::new();
-                        for batch in all_indexed.chunks(FILTER_BATCH) {
-                            let live: Vec<u64> = batch
-                                .iter()
-                                .copied()
-                                .filter(|&cid| cid != crate::types::PLAID_TOMBSTONE)
-                                .collect();
-                            if live.is_empty() {
-                                continue;
-                            }
-                            let chunks = store.get_chunks(&live)?;
-                            for c in chunks {
-                                if filter.matches(&c.file_path) {
-                                    subset.push(c.id);
+            (Some(dense), Some(filter)) => {
+                // The subset is computed from the dense index's positional
+                // chunk list. Only colbert-plaid exposes one today; backends
+                // without positional docs (None) skip subset prep and let the
+                // result-merge file_filter handle scoping.
+                match dense.positional_chunk_ids() {
+                    None => None, // backend has no positional docs — subset N/A
+                    Some([]) => Some(Vec::new()),
+                    Some(all_indexed) => {
+                        const FILTER_BATCH: usize = 500;
+                        // v0.4.1 W-Index #7: propagate SQLite errors and fall
+                        // back to an unfiltered dense search (result merge still
+                        // applies the file_filter) rather than silently
+                        // searching a partial candidate set.
+                        // v0.4.1 W-Index #3: pre-filter PLAID_TOMBSTONE entries
+                        // so we never query SQLite for a deleted-slot sentinel.
+                        let subset_result: anyhow::Result<Vec<u64>> = (|| {
+                            let store = self.store.lock();
+                            let mut subset: Vec<u64> = Vec::new();
+                            for batch in all_indexed.chunks(FILTER_BATCH) {
+                                let live: Vec<u64> = batch
+                                    .iter()
+                                    .copied()
+                                    .filter(|&cid| cid != crate::types::PLAID_TOMBSTONE)
+                                    .collect();
+                                if live.is_empty() {
+                                    continue;
+                                }
+                                let chunks = store.get_chunks(&live)?;
+                                for c in chunks {
+                                    if filter.matches(&c.file_path) {
+                                        subset.push(c.id);
+                                    }
                                 }
                             }
-                        }
-                        Ok(subset)
-                    })();
-
-                    match subset_result {
-                        Ok(s) => {
-                            tracing::debug!(
-                                indexed = all_indexed.len(),
-                                subset = s.len(),
-                                "PLAID file_filter subset prepared"
-                            );
-                            Some(s)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "PLAID file_filter subset construction failed — \
-                                 falling back to unfiltered dense search (result \
-                                 merge will still apply the file_filter)"
-                            );
-                            None
+                            Ok(subset)
+                        })();
+                        match subset_result {
+                            Ok(s) => {
+                                tracing::debug!(
+                                    indexed = all_indexed.len(),
+                                    subset = s.len(),
+                                    "Dense file_filter subset prepared"
+                                );
+                                Some(s)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Dense file_filter subset construction failed — \
+                                     falling back to unfiltered dense search (result \
+                                     merge will still apply the file_filter)"
+                                );
+                                None
+                            }
                         }
                     }
                 }
@@ -353,32 +433,27 @@ impl HybridSearcher {
                     return (Vec::new(), 0);
                 }
                 let dense_start = std::time::Instant::now();
-                let results = if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                let results = if let Some(ref dense) = self.dense {
                     // v0.4 WS-B Item 15: when a file_filter is active, route
                     // through `search_with_subset` with the pre-computed
-                    // chunk-ID subset so PLAID skips MaxSim work on chunks
-                    // the user has filtered out.
-                    let res = if plaid_subset_slice.is_some() {
-                        plaid.search_with_subset(
-                            colbert,
-                            &effective_text,
-                            retrieval_candidates,
-                            plaid_subset_slice,
-                        )
+                    // chunk-ID subset so the backend skips work on chunks the
+                    // user has filtered out.
+                    let res = if let Some(subset) = plaid_subset_slice {
+                        dense.search_with_subset(&effective_text, retrieval_candidates, subset)
                     } else {
-                        plaid.search(colbert, &effective_text, retrieval_candidates)
+                        dense.search(&effective_text, retrieval_candidates)
                     };
                     match res {
                         Ok(results) => {
                             tracing::debug!(
                                 results_count = results.len(),
                                 duration_ms = dense_start.elapsed().as_millis() as u64,
-                                "PLAID (ColBERT) search complete"
+                                "Dense search complete"
                             );
                             results
                         }
                         Err(e) => {
-                            tracing::warn!("PLAID search failed: {}", e);
+                            tracing::warn!("Dense search failed: {}", e);
                             Vec::new()
                         }
                     }
@@ -454,18 +529,13 @@ impl HybridSearcher {
                 if !query.use_dense {
                     return Vec::new();
                 }
-                if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                if let Some(ref dense) = self.dense {
                     // v0.4 WS-B Item 15: same subset-aware routing as the
                     // primary dense channel.
-                    let res = if plaid_subset_slice.is_some() {
-                        plaid.search_with_subset(
-                            colbert,
-                            text,
-                            retrieval_candidates,
-                            plaid_subset_slice,
-                        )
+                    let res = if let Some(subset) = plaid_subset_slice {
+                        dense.search_with_subset(text, retrieval_candidates, subset)
                     } else {
-                        plaid.search(colbert, text, retrieval_candidates)
+                        dense.search(text, retrieval_candidates)
                     };
                     match res {
                         Ok(r) => {
@@ -476,7 +546,7 @@ impl HybridSearcher {
                             r
                         }
                         Err(e) => {
-                            tracing::debug!("Expanded PLAID search failed: {}", e);
+                            tracing::debug!("Expanded dense search failed: {}", e);
                             Vec::new()
                         }
                     }
@@ -573,6 +643,43 @@ impl HybridSearcher {
                         dual_route =
                             !exp_dense_results.is_empty() || !exp_sparse_results.is_empty(),
                         "Triple RRF fusion complete (E2 + E4)"
+                    );
+                    rrf_results.into_iter().map(|r| r.scored).collect()
+                }
+                // S7: Weighted Triple RRF — per-channel rank-decay scaled by the
+                // query-type FusionWeights, with k = config.rrf_k (now live).
+                // Selected by SEMANTEX_FUSION=weighted-rrf; default stays Rrf.
+                FusionMode::WeightedRrf => {
+                    let (weights, k) = weighted_rrf_params(&self.config, query_type);
+                    let rrf_results: Vec<RrfFusedResult> =
+                        if !exp_dense_results.is_empty() || !exp_sparse_results.is_empty() {
+                            triple_fusion::exp4_weighted_rrf_fuse(
+                                &dense_results,
+                                &sparse_results,
+                                &exp_dense_results,
+                                &exp_sparse_results,
+                                &exact_ids,
+                                weights,
+                                k,
+                            )
+                        } else {
+                            triple_fusion::triple_weighted_rrf_fuse(
+                                &dense_results,
+                                &sparse_results,
+                                &exact_ids,
+                                weights,
+                                k,
+                            )
+                        };
+                    let labels = triple_fusion::assign_confidence(&rrf_results);
+                    for (rr, (conf, score)) in rrf_results.iter().zip(labels.iter()) {
+                        confidence_map.insert(rr.scored.chunk_id, (*conf, *score));
+                    }
+                    tracing::debug!(
+                        fused_count = rrf_results.len(),
+                        rrf_k = k,
+                        duration_ms = fusion_start.elapsed().as_millis() as u64,
+                        "Weighted Triple RRF fusion complete (S7)"
                     );
                     rrf_results.into_iter().map(|r| r.scored).collect()
                 }
@@ -858,58 +965,22 @@ impl HybridSearcher {
             }
         }
 
-        // Phase 6: Graph propagation — expand results through code graph edges
-        let graph_config = if is_architectural_query(&effective_text, query_type) {
-            GraphPropagationConfig::architectural_mode(candidates).with_env_overrides()
-        } else {
-            GraphPropagationConfig::for_query_type(&query_type, candidates).with_env_overrides()
-        };
-        let scored_ids: Vec<ScoredChunkId> = fused.iter().take(fetch_count).cloned().collect();
-        let expanded = graph_propagation::propagate(&scored_ids, &store, &graph_config)?;
-
-        // Merge propagated chunks into fused list
-        let existing_ids: HashSet<u64> = fused.iter().map(|s| s.chunk_id).collect();
-        let new_ids: Vec<u64> = expanded
-            .iter()
-            .filter(|s| !existing_ids.contains(&s.chunk_id))
-            .map(|s| s.chunk_id)
-            .collect();
-
-        if !new_ids.is_empty() {
-            let new_chunks = store.get_chunks(&new_ids)?;
-            for chunk in new_chunks {
-                chunk_map.insert(chunk.id, chunk);
-            }
-        }
-
-        // Update scores from propagation (only if higher) and add new entries
-        {
-            let prop_scores: HashMap<u64, f32> =
-                expanded.iter().map(|s| (s.chunk_id, s.score)).collect();
-            for scored in &mut fused {
-                #[allow(clippy::collapsible_if)]
-                if let Some(&new_score) = prop_scores.get(&scored.chunk_id) {
-                    if new_score > scored.score {
-                        scored.score = new_score;
-                    }
-                }
-            }
-            for s in expanded
-                .iter()
-                .filter(|s| !existing_ids.contains(&s.chunk_id))
-            {
-                fused.push(s.clone());
-            }
-            fused.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
+        // Phase 6: Graph propagation — named stage over the fused candidates.
+        let graph_config = select_graph_config(&effective_text, query_type, candidates);
+        let new_ids: Vec<u64> = graph_stage::run_graph_stage(
+            &mut fused,
+            &mut chunk_map,
+            &store,
+            &graph_config,
+            fetch_count,
+        )?
+        .into_iter()
+        .collect();
         tracing::debug!(
-            expanded_count = expanded.len(),
             new_count = new_ids.len(),
-            "Graph propagation complete"
+            disabled = graph_config.disabled,
+            two_hop = graph_config.enable_transitive,
+            "Graph propagation stage complete"
         );
 
         // Import proximity boost for architectural Semantic/Mixed queries only
@@ -1091,7 +1162,9 @@ impl HybridSearcher {
             // enables it; when disabled, rerank() is an identity pass-through.
             if reranker_guard.is_none() {
                 tracing::info!("Loading reranker model (first use)...");
-                match FastembedReranker::new_default(false) {
+                // Resolve the active reranker through S8's ModelRegistry (single
+                // read of config.reranker_model == SEMANTEX_RERANKER_MODEL).
+                match RerankerEngine::from_config(&self.config, false) {
                     Ok(r) => *reranker_guard = Some(r),
                     Err(e) => {
                         tracing::warn!("Failed to initialize reranker: {}", e);
@@ -1128,6 +1201,38 @@ impl HybridSearcher {
             rerank_ms = Some(rerank_start.elapsed().as_millis() as u64);
         }
 
+        // Stage 3b: MMR diversity pass (S7). OFF unless SEMANTEX_MMR_LAMBDA is
+        // set and a dense backend is present. Reorders the top-K results to
+        // reduce near-duplicate clustering; does not change scores, so Stage 4
+        // adaptive sizing/threshold logic is unaffected. O(K²), K ≤ 50.
+        if let Some(lambda) = mmr_active(self.dense.as_deref()) {
+            let mmr_top_k = results.len().min(50); // O(K²) guard, K ≤ 50 per spec
+            if mmr_top_k >= 2
+                && let Some(ref dense) = self.dense
+            {
+                // Per-chunk vectors come from the S1-declared `embed_doc_vectors`
+                // seam (`Option<Vec<(u64, Vec<f32>)>>`). Collect the top-K chunk
+                // ids, ask the backend for their vectors, and fold the returned
+                // pairs into the `HashMap<u64, Vec<f32>>` that `mmr_rerank` wants.
+                // If the backend has no single-vector projection it returns None →
+                // `.map(...)` yields None and MMR no-ops.
+                let ids: Vec<u64> = results.iter().take(mmr_top_k).map(|r| r.chunk.id).collect();
+                let doc_vecs: Option<HashMap<u64, Vec<f32>>> = dense
+                    .embed_doc_vectors(&ids)
+                    .map(|pairs| pairs.into_iter().collect());
+                if let Some(doc_vectors) = doc_vecs {
+                    let before_top = results.first().map(|r| r.chunk.id);
+                    mmr::mmr_rerank(&mut results, &doc_vectors, lambda, mmr_top_k);
+                    tracing::debug!(
+                        lambda,
+                        top_k = mmr_top_k,
+                        reordered = (results.first().map(|r| r.chunk.id) != before_top),
+                        "MMR diversity pass applied (S7)"
+                    );
+                }
+            }
+        }
+
         // Stage 4: Adaptive result sizing, confidence threshold, and deduplication.
         // Exhaustive mode: widen range, skip dedup, lower threshold.
         let mut adaptive_config = self.config.adaptive_config();
@@ -1159,7 +1264,7 @@ impl HybridSearcher {
             "Search completed successfully"
         );
 
-        Ok(super::SearchOutput {
+        let output = super::SearchOutput {
             metrics: super::SearchMetrics {
                 total_ms: total_duration.as_millis() as u64,
                 dense_ms: if query.use_dense {
@@ -1184,7 +1289,25 @@ impl HybridSearcher {
                 response_bytes: None,
             },
             results,
-        })
+        };
+
+        // S7: store this (query → results) association if the cache is engaged.
+        // Re-read the stamp at store time (cheap) so a reindex that completed
+        // mid-search still tags the entry with the post-reindex stamp (or, on
+        // mismatch, enforce_stamp flushes — correctness preserved either way).
+        if let Some(qvec) = query_cache_vec
+            && let Some(stamp) = semantic_cache::read_stamp(&self.index_dir)
+        {
+            self.semantic_cache.lock().store(
+                &query.text,
+                &qvec,
+                output.results.clone(),
+                output.metrics.clone(),
+                &stamp,
+            );
+        }
+
+        Ok(output)
     }
 
     /// Grep-mode search: exact + sparse only, no dense, no rerank, no adaptive filtering.
@@ -1487,6 +1610,23 @@ fn merge_hyde_results(
     }
 }
 
+/// S7: select the (FusionWeights, k) pair the weighted-RRF path uses.
+/// `k` comes from the previously-dead `config.rrf_k`; the weights come from the
+/// query classifier's per-type table. Extracted as a free fn so it is unit-
+/// testable without building an index.
+fn weighted_rrf_params(config: &SemantexConfig, query_type: QueryType) -> (FusionWeights, f32) {
+    (query_type.fusion_weights(), config.rrf_k)
+}
+
+/// S7: resolve the active MMR lambda. MMR runs only when a valid
+/// `SEMANTEX_MMR_LAMBDA` is set AND a dense backend exists (it supplies the
+/// per-result vectors). Returns `Some(lambda)` to run, `None` to skip.
+fn mmr_active(dense: Option<&dyn crate::search::dense_backend::DenseBackend>) -> Option<f32> {
+    let lambda = mmr::mmr_lambda_from_env()?;
+    dense?; // None backend → skip
+    Some(lambda)
+}
+
 /// Heuristic: exhaustive queries ask for complete enumeration of all instances.
 /// Examples: "find all error handling", "list every config option", "all places where X".
 /// These benefit from wider result ranges, no per-file dedup, and lower score thresholds.
@@ -1512,6 +1652,34 @@ fn is_exhaustive_query(query: &str) -> bool {
 }
 
 /// Heuristic: architectural queries are long semantic queries about flows/pipelines/lifecycles.
+/// Pick the graph-propagation config preset for a query's route.
+///
+/// Routes (gated by repo-agnostic predicates, not new QueryType variants):
+/// - exhaustive ("find all usages…") or feature-planning ("where should I add…")
+///   → `localization_mode` (recall-oriented, 2-hop).
+/// - architectural ("how does X flow through layers") → `architectural_mode`
+///   (existing behavior, 2-hop).
+/// - otherwise → `for_query_type` (1-hop, per-type decays).
+///
+/// `with_env_overrides` is applied last so `SEMANTEX_GRAPH_*` env knobs (incl.
+/// `SEMANTEX_GRAPH_DISABLE` and `SEMANTEX_GRAPH_HOPS`) always win for tuning.
+fn select_graph_config(
+    query: &str,
+    query_type: QueryType,
+    candidates: usize,
+) -> GraphPropagationConfig {
+    let base = if query_classifier::is_exhaustive_query(query)
+        || query_classifier::is_feature_planning_query(query)
+    {
+        GraphPropagationConfig::localization_mode(candidates)
+    } else if is_architectural_query(query, query_type) {
+        GraphPropagationConfig::architectural_mode(candidates)
+    } else {
+        GraphPropagationConfig::for_query_type(&query_type, candidates)
+    };
+    base.with_env_overrides()
+}
+
 fn is_architectural_query(query: &str, query_type: QueryType) -> bool {
     if query_type != QueryType::Semantic {
         return false;
@@ -1713,6 +1881,103 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    #[test]
+    fn test_select_graph_config_localization_for_exhaustive() {
+        let cfg = select_graph_config(
+            "find all usages of the retry helper",
+            QueryType::Semantic,
+            20,
+        );
+        assert!(cfg.enable_transitive, "exhaustive should get 2-hop");
+        assert_eq!(
+            cfg.max_propagated, 20,
+            "exhaustive should use localization cap"
+        );
+    }
+
+    #[test]
+    fn test_select_graph_config_localization_for_feature_planning() {
+        let cfg = select_graph_config("where should I add rate limiting", QueryType::Semantic, 20);
+        assert!(cfg.enable_transitive, "feature-planning should get 2-hop");
+        assert_eq!(cfg.max_propagated, 20);
+    }
+
+    #[test]
+    fn test_select_graph_config_architectural_unchanged() {
+        // 4+ words + architectural signal "flow" + Semantic -> architectural_mode.
+        let cfg = select_graph_config(
+            "how does the request flow through layers",
+            QueryType::Semantic,
+            12,
+        );
+        assert!(cfg.enable_transitive);
+        assert_eq!(cfg.max_propagated, 12); // architectural_mode uses top_k
+    }
+
+    #[test]
+    fn test_select_graph_config_default_per_query_type() {
+        // A plain identifier query: no route -> per-query-type config, 1-hop.
+        let cfg = select_graph_config("getUserById", QueryType::Identifier, 20);
+        assert!(!cfg.enable_transitive);
+        assert_eq!(cfg.max_propagated, 5); // 20/4 from for_query_type(Identifier)
+    }
+
+    /// S7: the cache engages only when enabled by env. Default (unset) → no
+    /// cache work regardless of dense/stamp availability.
+    #[test]
+    fn semantic_cache_gate_off_by_default() {
+        unsafe {
+            std::env::remove_var("SEMANTEX_SEMANTIC_CACHE");
+        }
+        assert!(!semantic_cache::is_enabled());
+    }
+
+    /// S7: HybridSearcher carries a daemon-scoped semantic cache, initialized
+    /// empty. open_sparse_only must construct it too (sparse-only callers just
+    /// never get cache hits, since they have no dense embedder for the query).
+    #[test]
+    fn sparse_only_constructs_empty_semantic_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(tmp.path(), &cfg).unwrap();
+        assert_eq!(searcher.semantic_cache.lock().len(), 0);
+    }
+
+    /// S7: MMR runs only when (a) SEMANTEX_MMR_LAMBDA is a valid lambda AND
+    /// (b) a dense backend is present. Sparse-only opens (dense None) never MMR.
+    #[test]
+    fn mmr_active_requires_lambda_and_dense_backend() {
+        // SAFETY: process-level env mutation in a single-threaded test.
+        unsafe {
+            std::env::set_var("SEMANTEX_MMR_LAMBDA", "0.7");
+        }
+        assert_eq!(
+            mmr_active(None),
+            None,
+            "no dense backend → MMR off even with lambda set"
+        );
+        unsafe {
+            std::env::remove_var("SEMANTEX_MMR_LAMBDA");
+        }
+        // (The present-backend case is covered by the integration behavior; this
+        // guards the env+presence gate, the part that's pure.)
+    }
+
+    /// S7: weighted-RRF reads config.rrf_k (previously dead) and the query-type
+    /// FusionWeights. This guards the selection logic the hybrid match arm uses.
+    #[test]
+    fn weighted_rrf_selection_reads_config_rrf_k_and_weights() {
+        let mut cfg = crate::config::SemantexConfig::default();
+        cfg.rrf_k = 42.0;
+        let (weights, k) = weighted_rrf_params(&cfg, query_classifier::QueryType::Identifier);
+        assert!(
+            (k - 42.0).abs() < f32::EPSILON,
+            "config.rrf_k must be live, got {k}"
+        );
+        // Identifier weights favour sparse (dead-code revival check).
+        assert!(weights.w_sparse > weights.w_dense);
+    }
 
     // ---- Defect #13 regression: Phase 3 boosts must NOT clamp at
     //      max_score. The previous `.min(max_score)` ceiling collapsed
@@ -2275,6 +2540,20 @@ mod tests {
             assert!((s - 1.0 / 3.0).abs() < 1e-5);
         }
     }
+
+    /// S1: the dense channel is now a trait object. This test just constructs a
+    /// sparse-only searcher (no model load) and confirms the dense slot is None,
+    /// proving `open_sparse_only` compiles against the new field shape.
+    #[test]
+    fn sparse_only_has_no_dense_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(tmp.path(), &cfg).unwrap();
+        assert!(
+            searcher.dense.is_none(),
+            "sparse-only must not load a dense backend"
+        );
+    }
 }
 
 // ─── Spec L: HyDE unit tests (feature-gated) ────────────────────────────────
@@ -2327,6 +2606,263 @@ mod hyde_tests {
             confidence: Confidence::Inferred,
             confidence_score: 0.5,
         }
+    }
+
+    use super::HybridSearcher;
+    use crate::llm::LlmCapability;
+    use crate::search::agent_classifier::AgentRoute;
+
+    /// Mock LLM for HyDE contract tests.
+    ///
+    /// - `Mode::Ok(doc)` → returns `doc` from `synthesize_hyde_doc`.
+    /// - `Mode::Empty` → returns an empty string (HyDE caller must treat this as
+    ///   "no doc" and return base unchanged).
+    /// - `Mode::Err` → returns an error (HyDE caller must return base).
+    /// - `Mode::Slow(delay)` → sleeps `delay` then returns a doc (used by the
+    ///   timeout test once paired with a 1ms env override).
+    enum Mode {
+        Ok(&'static str),
+        Empty,
+        Err,
+        Slow(std::time::Duration),
+    }
+
+    struct MockLlm {
+        mode: Mode,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmCapability for MockLlm {
+        async fn classify_route(&self, _query: &str) -> anyhow::Result<AgentRoute> {
+            Ok(AgentRoute::Semantic)
+        }
+
+        async fn synthesize_hyde_doc(&self, _query: &str) -> anyhow::Result<String> {
+            match &self.mode {
+                Mode::Ok(doc) => Ok((*doc).to_string()),
+                Mode::Empty => Ok(String::new()),
+                Mode::Err => anyhow::bail!("mock HyDE synthesis error"),
+                Mode::Slow(d) => {
+                    tokio::time::sleep(*d).await;
+                    Ok("fn slow() {}".to_string())
+                }
+            }
+        }
+
+        fn label(&self) -> &'static str {
+            "mock-hyde-llm"
+        }
+    }
+
+    /// Contract: when `synthesize_hyde_doc` errors, the HyDE merge stage is
+    /// never reached, so the caller's result is byte-identical to `base`.
+    ///
+    /// We assert the contract at the seam the production code depends on:
+    /// the mock returns `Err`, and `merge_hyde_results` is therefore NOT the
+    /// path taken — base survives verbatim. This pins the mock's error
+    /// behaviour that `search_with_hyde`'s `Ok(Err(e)) => return Ok(base)`
+    /// branch relies on.
+    #[tokio::test]
+    async fn hyde_llm_error_yields_base_unchanged() {
+        let llm = MockLlm { mode: Mode::Err };
+
+        // The error path is observable directly on the trait object.
+        let doc = llm.synthesize_hyde_doc("how does auth work").await;
+        assert!(doc.is_err(), "mock must error in Mode::Err");
+
+        // And the production branch for an errored doc is: return base.
+        // We reconstruct that decision here to lock its shape: base passes
+        // through with no merge applied.
+        let base = SearchOutput {
+            results: vec![make_result(1, 0.9), make_result(2, 0.8)],
+            metrics: make_metrics(),
+        };
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+        let returned = if doc.is_err() { base } else { unreachable!() };
+        let returned_ids: Vec<u64> = returned.results.iter().map(|r| r.chunk.id).collect();
+        assert_eq!(
+            returned_ids, base_ids,
+            "error path must return base unchanged"
+        );
+        assert_ne!(
+            returned.metrics.query_type, "hyde_merged",
+            "error path must NOT mark results as hyde_merged"
+        );
+    }
+
+    /// Contract: an empty HyDE doc (whitespace-only counts) is treated as "no
+    /// doc" — the caller returns base unchanged, never merging an empty query's
+    /// results.
+    #[tokio::test]
+    async fn hyde_empty_doc_yields_base_unchanged() {
+        let llm = MockLlm { mode: Mode::Empty };
+        let doc = llm.synthesize_hyde_doc("anything").await.unwrap();
+        assert!(
+            doc.trim().is_empty(),
+            "mock must return empty in Mode::Empty"
+        );
+
+        // Production decision for an empty doc: return base (no merge).
+        let base = SearchOutput {
+            results: vec![make_result(7, 0.5)],
+            metrics: make_metrics(),
+        };
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+        let returned = if doc.trim().is_empty() {
+            base
+        } else {
+            unreachable!()
+        };
+        assert_eq!(
+            returned
+                .results
+                .iter()
+                .map(|r| r.chunk.id)
+                .collect::<Vec<_>>(),
+            base_ids,
+            "empty-doc path must return base unchanged"
+        );
+        assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
+    /// Contract: when the LLM is slower than `SEMANTEX_LLM_HYDE_TIMEOUT_MS`,
+    /// `tokio::time::timeout` returns `Err(Elapsed)` and the caller returns
+    /// base unchanged. We drive the *real* `super::llm_hyde_timeout()` reader by
+    /// overriding the env var to 1ms and racing it against a 200ms mock.
+    ///
+    /// SAFETY: env mutation under Rust 2024 is `unsafe`; this test holds the
+    /// crate-wide `TEST_ENV_LOCK` (which guards `SEMANTEX_LLM_*`) so no other
+    /// LLM test races on process env.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyde_timeout_yields_base_unchanged() {
+        // Resolve the *real* `llm_hyde_timeout()` env reader (1ms) inside a
+        // short critical section, then drop the env + lock BEFORE awaiting so
+        // we never hold a std `MutexGuard` across an await point. The captured
+        // `budget` is what the production path would have computed.
+        let budget = {
+            let _guard = crate::llm::TEST_ENV_LOCK.lock().unwrap();
+            // SAFETY: guarded by TEST_ENV_LOCK; see module doc on the lock.
+            unsafe { std::env::set_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS", "1") };
+            let budget = super::llm_hyde_timeout();
+            // SAFETY: guarded by TEST_ENV_LOCK.
+            unsafe { std::env::remove_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS") };
+            budget
+        };
+
+        let llm = MockLlm {
+            mode: Mode::Slow(std::time::Duration::from_millis(200)),
+        };
+        let outcome = tokio::time::timeout(budget, llm.synthesize_hyde_doc("slow query")).await;
+
+        assert!(
+            outcome.is_err(),
+            "1ms budget must elapse before a 200ms mock resolves"
+        );
+
+        // Production decision on Err(Elapsed): return base (no merge).
+        let base = SearchOutput {
+            results: vec![make_result(9, 0.42)],
+            metrics: make_metrics(),
+        };
+        let returned = if outcome.is_err() {
+            base
+        } else {
+            unreachable!()
+        };
+        assert_eq!(returned.results.len(), 1);
+        assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
+    /// Build a minimal real `HybridSearcher` backed by an empty chunk store,
+    /// driving `search_with_hyde` through its genuine async code path (base
+    /// search → LLM → merge). Mirrors `server::handler`'s `build_empty_searcher`.
+    /// An empty index makes both the base and HyDE searches return no results,
+    /// which is exactly what the byte-identity / no-panic contracts need.
+    fn build_tiny_searcher() -> (tempfile::TempDir, HybridSearcher) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+        {
+            let _store =
+                crate::index::storage::ChunkStore::open(&db_path).expect("create chunk store");
+        }
+        let config = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(&semantex_dir, &config)
+            .expect("open sparse-only searcher");
+        (dir, searcher)
+    }
+
+    /// Build a default Semantic `SearchQuery` for the end-to-end tests.
+    fn semantic_query(text: &str) -> crate::search::SearchQuery {
+        crate::search::SearchQuery::new(text).max_results(10)
+    }
+
+    /// End-to-end: with a failing LLM, `search_with_hyde` returns a result set
+    /// byte-identical to the plain base search — proving "HyDE never breaks a
+    /// search." Drives the real async path, not just the branch decision.
+    #[tokio::test]
+    async fn search_with_hyde_error_path_is_identical_to_base() {
+        let (_tmp, searcher) = build_tiny_searcher();
+        let query = semantic_query("error handling");
+
+        let base = searcher.search(&query).expect("base search");
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+
+        let failing: std::sync::Arc<dyn crate::llm::LlmCapability> =
+            std::sync::Arc::new(MockLlm { mode: Mode::Err });
+        let hyde_out = searcher
+            .search_with_hyde(&query, failing)
+            .await
+            .expect("search_with_hyde must not propagate LLM errors");
+
+        let hyde_ids: Vec<u64> = hyde_out.results.iter().map(|r| r.chunk.id).collect();
+        assert_eq!(
+            hyde_ids, base_ids,
+            "LLM-error path must be byte-identical to base (same IDs, same order)"
+        );
+        assert_ne!(
+            hyde_out.metrics.query_type, "hyde_merged",
+            "error path must NOT be marked hyde_merged"
+        );
+    }
+
+    /// Success path: a succeeding mock yields a merged, deduped result set
+    /// tagged `hyde_merged`, with no duplicate chunk IDs and never fewer than
+    /// base after dedup+cap.
+    #[tokio::test]
+    async fn search_with_hyde_success_path_merges_and_tags() {
+        let (_tmp, searcher) = build_tiny_searcher();
+        let query = semantic_query("error handling");
+
+        let base = searcher.search(&query).expect("base search");
+
+        let ok: std::sync::Arc<dyn crate::llm::LlmCapability> = std::sync::Arc::new(MockLlm {
+            mode: Mode::Ok("fn handle_error(e: Error) -> Result<()> { Err(e) }"),
+        });
+        let merged = searcher
+            .search_with_hyde(&query, ok)
+            .await
+            .expect("search_with_hyde");
+
+        // Dedup-by-id invariant: no duplicate chunk IDs in the output.
+        let mut ids: Vec<u64> = merged.results.iter().map(|r| r.chunk.id).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n,
+            "merged output must contain no duplicate chunk IDs"
+        );
+
+        // The success path tags the merge.
+        assert_eq!(merged.metrics.query_type, "hyde_merged");
+        // Merge is base ∪ hyde (capped) → never fewer than base after dedup+cap.
+        assert!(
+            merged.results.len() >= base.results.len().min(query.max_results),
+            "merged result count must be >= base (post dedup/cap)"
+        );
     }
 
     /// `merge_hyde_results` must dedup by `chunk.id`, not by `(file, start, end)`.

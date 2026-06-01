@@ -1,0 +1,23 @@
+[
+  {
+    "instance_id": "demo__demo-1",
+    "repo": "demo/demo",
+    "base_commit": "0000000000000000000000000000000000000001",
+    "problem_statement": "Login fails when the password contains a unicode character.",
+    "patch": "diff --git a/src/auth.py b/src/auth.py\n--- a/src/auth.py\n+++ b/src/auth.py\n@@ -10,7 +10,7 @@ def login(username, password):\n-    return check(password)\n+    return check(password.encode('utf-8'))\n"
+  },
+  {
+    "instance_id": "demo__demo-2",
+    "repo": "demo/demo",
+    "base_commit": "0000000000000000000000000000000000000002",
+    "problem_statement": "Connection pool leaks connections on error.",
+    "patch": "diff --git a/src/db/pool.py b/src/db/pool.py\n--- a/src/db/pool.py\n+++ b/src/db/pool.py\n@@ -20,6 +20,8 @@ class ConnectionPool:\n     def acquire(self):\n+        if not self._connections:\n+            raise PoolEmpty()\n         return self._connections.pop()\n"
+  },
+  {
+    "instance_id": "demo__demo-3",
+    "repo": "demo/demo",
+    "base_commit": "0000000000000000000000000000000000000003",
+    "problem_statement": "Two files change in this fix.",
+    "patch": "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x = 1\n+x = 2\ndiff --git a/pkg/b.py b/pkg/b.py\n--- a/pkg/b.py\n+++ b/pkg/b.py\n@@ -1,1 +1,1 @@\n-y = 1\n+y = 2\n"
+  }
+]

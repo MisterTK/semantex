@@ -66,6 +66,51 @@ pub struct SemantexConfig {
     /// error at startup, not a silent recall regression. Run
     /// `semantex index --rebuild` after toggling.
     pub use_bm25_stemmer: bool,
+    /// DEPRECATED dense-backend alias / A/B knob. Empty-of-meaning at its
+    /// default `"colbert-plaid"`: that value is the [`DenseBackendKind::default`]
+    /// SENTINEL — when `dense_backend` equals the default the canonical
+    /// `embedder` selection decides the backend (see
+    /// [`ModelRegistry::resolve_dense_backend`]). Set it to an explicit,
+    /// NON-default name (e.g. via `SEMANTEX_DENSE_BACKEND=coderank-hnsw`) to
+    /// force that backend regardless of the embedder — the kept-live S0 A/B knob.
+    /// MUST match the value the index was built with — `HybridSearcher::open`
+    /// re-validates it against the persisted `IndexMeta.dense_backend` and
+    /// refuses to load on mismatch (mirrors `use_bm25_stemmer`).
+    pub dense_backend: String,
+    /// Active embedder model id (registry lookup key). Default `"coderank-137m"`
+    /// (D4 cutover, evidence-based: CodeRankEmbed-137M's nDCG meets/beats
+    /// colbert-plaid everywhere in the measured A/B at ~28× less index RSS, so
+    /// coderank-hnsw is now the shipped default dense path). The embedder spec id
+    /// is model-descriptive and distinct from the dense backend name it routes to
+    /// via capabilities (`coderank-137m` → `coderank-hnsw`;
+    /// `lateon-colbert` → `colbert-plaid`, still fully available via
+    /// `SEMANTEX_EMBEDDER=lateon-colbert`). Override via `SEMANTEX_EMBEDDER`. A
+    /// change here triggers a versioned dense rebuild + atomic switchover (S8) —
+    /// the re-embedding compute is inherent. Existing colbert-plaid indexes are
+    /// detected as a backend mismatch by `verify_persisted_backend_matches` and
+    /// rebuilt cleanly (`semantex index --rebuild`), not crashed.
+    pub embedder: String,
+    /// Active reranker model id (registry lookup key). Default
+    /// `"bge-reranker-v2-m3"`. Override via `SEMANTEX_RERANKER_MODEL`. A change
+    /// here is a query-time live swap — no reindex.
+    pub reranker_model: String,
+    /// Active LLM model id (registry lookup key). Empty = none. Override via
+    /// `SEMANTEX_LLM_MODEL`. Only meaningful with the `llm` feature.
+    pub llm_model: String,
+    /// HNSW `ef_search` OVERRIDE for the coderank-hnsw backend (higher = better
+    /// recall, slower). `0` ⇒ "use the preset's ef_search" (the `default` preset
+    /// is 64). Set explicitly via `SEMANTEX_HNSW_EF_SEARCH` to override the
+    /// preset. Kept `0` by default so `SEMANTEX_HNSW_PRESET=high_recall` actually
+    /// takes effect (ef_search bakes into the graph at build time, so a silent
+    /// clobber would discard the preset's recall intent).
+    pub hnsw_ef_search: usize,
+    /// HNSW tuning preset: `default | high_recall | low_latency | memory_optimized`.
+    /// Override via `SEMANTEX_HNSW_PRESET`. The preset's `ef_search` is used
+    /// unless `SEMANTEX_HNSW_EF_SEARCH` is set non-zero (which then overrides it).
+    pub hnsw_preset: String,
+    /// fp32-rescore the top `dense_rescore_k` ANN candidates. `0` ⇒ derive 4×k
+    /// at query time. Override via `SEMANTEX_DENSE_RESCORE_K`.
+    pub dense_rescore_k: usize,
 }
 
 impl Default for SemantexConfig {
@@ -79,7 +124,7 @@ impl Default for SemantexConfig {
             max_file_count: 50_000,
             chunk_size: 512,
             chunk_overlap: 128,
-            rrf_k: 30.0,
+            rrf_k: 60.0,
             rerank_candidates: 100,
             model_dir: None,
             // Adaptive result sizing
@@ -93,6 +138,18 @@ impl Default for SemantexConfig {
             colbert_model: ColbertModelChoice::default(),
             plaid_nbits: 4,
             use_bm25_stemmer: true,
+            // Sentinel default = DenseBackendKind::default() name. At this value
+            // the canonical `embedder` selection decides the backend; set
+            // non-default (SEMANTEX_DENSE_BACKEND) to force a specific backend.
+            dense_backend: "colbert-plaid".to_string(),
+            // D4 cutover: coderank-137m → coderank-hnsw is now the default dense
+            // path (nDCG meets/beats colbert-plaid, ~28× less index RSS).
+            embedder: "coderank-137m".to_string(),
+            reranker_model: "bge-reranker-v2-m3".to_string(),
+            llm_model: String::new(),
+            hnsw_ef_search: 0, // 0 ⇒ use the preset's ef_search (default preset = 64)
+            hnsw_preset: "default".to_string(),
+            dense_rescore_k: 0,
         }
     }
 }
@@ -139,6 +196,27 @@ impl SemantexConfig {
         if let Ok(v) = std::env::var("SEMANTEX_MODEL_DIR") {
             config.model_dir = Some(PathBuf::from(v));
         }
+        if let Ok(v) = std::env::var("SEMANTEX_DENSE_BACKEND") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                config.dense_backend = trimmed.to_string();
+            }
+        }
+        // S8: registry selection keys. `SEMANTEX_RERANKER_MODEL` is the same
+        // selection key S3 already reads — the registry now reads it via config.
+        config.embedder = env_string("SEMANTEX_EMBEDDER", &config.embedder);
+        config.reranker_model = env_string("SEMANTEX_RERANKER_MODEL", &config.reranker_model);
+        config.llm_model = env_string("SEMANTEX_LLM_MODEL", &config.llm_model);
+
+        // S2: coderank-hnsw tuning knobs.
+        config.hnsw_ef_search = env_usize("SEMANTEX_HNSW_EF_SEARCH", config.hnsw_ef_search);
+        config.hnsw_preset = env_string("SEMANTEX_HNSW_PRESET", &config.hnsw_preset);
+        // `dense_rescore_k` uses a raw parse because `0` is a meaningful value
+        // (= derive 4×k at query time) that `env_usize` would reject.
+        config.dense_rescore_k = std::env::var("SEMANTEX_DENSE_RESCORE_K")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(config.dense_rescore_k);
 
         Ok(config)
     }
@@ -206,9 +284,36 @@ pub(crate) fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Read a non-empty string tuning knob from an environment variable.
+///
+/// Returns the trimmed value when `key` is set to a non-empty string; a
+/// missing or whitespace-only value falls back to `default`.
+// Added in S1 for S8's ModelRegistry selection (per integration §3 item 5);
+// S8's `load()` overlays now consume it (SEMANTEX_EMBEDDER / _RERANKER_MODEL /
+// _LLM_MODEL).
+pub(crate) fn env_string(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rrf_k_default_is_60_per_integration_doc_d_rrf_k() {
+        // Integration doc D-rrf-k: weighted-RRF default k aligns with the
+        // parameter-free RRF_K = 60.0 so A/Bs are apples-to-apples.
+        let cfg = SemantexConfig::default();
+        assert!(
+            (cfg.rrf_k - 60.0).abs() < f32::EPSILON,
+            "rrf_k default = {}",
+            cfg.rrf_k
+        );
+    }
 
     /// v0.4 Item 18: BM25 stemmer ON by default (preserves legacy behavior).
     #[test]
@@ -217,6 +322,52 @@ mod tests {
         assert!(
             cfg.use_bm25_stemmer,
             "Default must preserve legacy stemming behavior (true) per v0.4 spec §9.2.3"
+        );
+    }
+
+    #[test]
+    fn default_dense_backend_alias_is_sentinel() {
+        let cfg = SemantexConfig::default();
+        // The `dense_backend` alias default is the DenseBackendKind::default()
+        // SENTINEL ("colbert-plaid") — meaning "let the embedder decide". The
+        // D4 cutover does NOT change this sentinel; it changes the `embedder`
+        // default so the all-default resolution yields coderank-hnsw. See
+        // resolve_dense_backend_all_default_is_coderank_hnsw in registry.rs.
+        assert_eq!(
+            cfg.dense_backend, "colbert-plaid",
+            "alias default stays the sentinel; the embedder default drives the backend"
+        );
+    }
+
+    #[test]
+    fn default_selection_fields() {
+        let cfg = SemantexConfig::default();
+        // D4 cutover: coderank-137m (→ coderank-hnsw) is the shipped default.
+        assert_eq!(cfg.embedder, "coderank-137m");
+        assert_eq!(cfg.reranker_model, "bge-reranker-v2-m3");
+        assert_eq!(
+            cfg.llm_model, "",
+            "no LLM selected by default (zero-LLM-deps build)"
+        );
+    }
+
+    #[test]
+    fn dense_tuning_defaults() {
+        let cfg = SemantexConfig::default();
+        assert_eq!(
+            cfg.hnsw_ef_search, 0,
+            "0 means 'use the preset's ef_search' so SEMANTEX_HNSW_PRESET is honored"
+        );
+        assert_eq!(cfg.hnsw_preset, "default");
+        assert_eq!(cfg.dense_rescore_k, 0, "0 means derive 4×k at query time");
+    }
+
+    #[test]
+    fn env_string_reads_value_or_default() {
+        // Unset key falls back to the provided default.
+        assert_eq!(
+            env_string("SEMANTEX_DENSE_BACKEND_TEST_UNSET_KEY", "colbert-plaid"),
+            "colbert-plaid"
         );
     }
 }

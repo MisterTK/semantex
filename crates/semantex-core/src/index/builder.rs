@@ -6,8 +6,6 @@ use crate::chunking::semantic_role::synthesize_nl_annotation;
 use crate::chunking::structured_meta::TypeRefContext;
 use crate::chunking::text_chunker::TextChunker;
 use crate::config::SemantexConfig;
-use crate::embedding::colbert::ColbertEmbedder;
-use crate::embedding::model_manager;
 use crate::file::detector::FileType;
 use crate::file::hasher;
 use crate::file::walker::FileWalker;
@@ -17,6 +15,8 @@ use crate::index::page_rank;
 use crate::index::pattern_catalog::{self, PatternCatalog, PatternLang};
 use crate::index::storage::ChunkStore;
 use crate::search::code_tokenizer;
+use crate::search::colbert_plaid_backend::ColbertPlaidIndexBuilder;
+use crate::search::dense_backend::{DenseBackendKind, DenseIndexBuilder, dense_subdir};
 use crate::search::sparse_search::SparseIndex;
 use crate::types::{Chunk, ChunkType, FileEntry, IndexMeta};
 use anyhow::{Context, Result};
@@ -25,30 +25,6 @@ use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-/// PLAID UpdateConfig buffer_size: pending-document threshold below which
-/// next-plaid 1.3+ writes new docs to `buffer.npy` (and serves them from
-/// the buffer during search) WITHOUT running the full k-means centroid
-/// expansion. Auto-refresh triggered by a single file change benefits
-/// strongly: incremental updates of 1-10 chunks no longer pay the 2-3s
-/// k-means cost on every call. Buffer flushes to a proper segment on
-/// the next update that exceeds this threshold. Default chosen per
-/// v0.4_SPEC §6.3 / §4.2 (audit recommendation).
-const PLAID_BUFFER_SIZE: usize = 50;
-
-/// PLAID batch size for incremental + full-rebuild encode loops.
-///
-/// v0.4.1 W-Index #12: must stay strictly below `PLAID_BUFFER_SIZE` so the
-/// incremental fast path (no k-means) fires on typical single-file auto-
-/// refreshes. With PLAID_BATCH ≥ PLAID_BUFFER_SIZE every batch
-/// `update_or_create` call exceeds the buffer threshold and pays the full
-/// k-means cost — defeating the auto-refresh latency win.
-///
-/// We also keep this small (≤ 64) to bound peak RSS during batch encoding:
-/// next-plaid 1.3 retains a working copy of the index per call, so smaller
-/// batches → smaller per-call peak. The pre-W-Index value was 128, which
-/// (a) always exceeded PLAID_BUFFER_SIZE and (b) inflated peak memory.
-const PLAID_BATCH: usize = 32;
 
 /// Statistics from an indexing operation
 #[derive(Debug, Clone)]
@@ -148,6 +124,7 @@ impl IndexBuilder {
                 let _ = std::fs::remove_dir_all(index_dir.join("sparse"));
                 let _ = std::fs::remove_dir_all(index_dir.join("plaid"));
                 let _ = std::fs::remove_file(index_dir.join("plaid_mapping.bin"));
+                let _ = std::fs::remove_dir_all(index_dir.join("dense")); // S1 per-backend subdirs
                 let _ = std::fs::remove_file(index_dir.join("chunks.db"));
                 let _ = std::fs::remove_file(&meta_path);
                 // Clean up legacy HNSW files if present
@@ -543,9 +520,27 @@ impl IndexBuilder {
 
         let total_removals = removed_chunk_ids.len();
 
-        let plaid_missing = !index_dir.join("plaid").exists();
+        // Selection (S2 re-point): resolve the active dense backend via the S8
+        // ModelRegistry (canonical `SEMANTEX_EMBEDDER`), with the deprecated
+        // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` alias honored when set
+        // non-default. D4 cutover: all-defaults now resolve to coderank-hnsw.
+        let backend_kind =
+            crate::model::ModelRegistry::resolve_dense_backend(&self.config, Some(&project_path))
+                .unwrap_or_default();
 
-        if total_chunks == 0 && total_removals == 0 && !plaid_missing {
+        // The dense index sentinel file is backend-specific: colbert-plaid writes
+        // `plaid_mapping.bin`, coderank-hnsw writes `vectors.bin`. The dense index
+        // may live in the per-backend subdir (`dense/<backend>/`) or, for
+        // colbert-plaid only, the legacy top-level `plaid/`. Treat dense as
+        // "missing" (forcing a rebuild) only when no layout has the sentinel.
+        let dense_sentinel = dense_sentinel_file(backend_kind);
+        let dense_dir_for_check = dense_subdir(&index_dir, backend_kind);
+        let legacy_plaid_present =
+            backend_kind == DenseBackendKind::ColbertPlaid && index_dir.join("plaid").exists();
+        let dense_missing_for_early_return =
+            !dense_dir_for_check.join(dense_sentinel).exists() && !legacy_plaid_present;
+
+        if total_chunks == 0 && total_removals == 0 && !dense_missing_for_early_return {
             tracing::info!(
                 files_scanned,
                 files_indexed,
@@ -567,290 +562,161 @@ impl IndexBuilder {
             });
         }
 
-        // Build or incrementally update PLAID index (ColBERT late-interaction).
-        //
-        // Memory strategy: never load all chunks at once.
-        // - Full rebuild (plaid_missing): batch 512 chunks at a time from SQLite.
-        // - Incremental: encode only new_chunk_ids; delete only removed_chunk_ids from PLAID.
-        if plaid_missing {
-            tracing::info!("PLAID index missing — rebuilding dense embeddings");
+        // Build or incrementally update the dense index via the selected
+        // DenseBackend. Each backend persists into its per-backend subdir
+        // `.semantex/dense/<backend>/` (`backend_kind` resolved above).
+        let dense_dir = dense_subdir(&index_dir, backend_kind);
+        std::fs::create_dir_all(&dense_dir)?;
+        let dense_missing = !dense_dir.join(dense_sentinel).exists();
+        if dense_missing {
+            tracing::info!("Dense index missing — rebuilding dense embeddings");
         }
-        let colbert_model_dir = model_manager::ensure_colbert_model(&self.config.models_dir())?;
-        match (|| -> Result<()> {
-            use next_plaid::{IndexConfig, MmapIndex, UpdateConfig};
-            // PLAID_BATCH (32) is defined at module scope (see comment there).
-            // Picked to satisfy two constraints:
-            //   1. Strictly < PLAID_BUFFER_SIZE so the incremental fast path
-            //      (no k-means) fires on typical single-file auto-refreshes.
-            //   2. Small enough to bound per-call RSS during update_or_create,
-            //      which holds a working copy of the index. The pre-W-Index
-            //      value (128) violated (1) and inflated peak memory.
 
-            // Indexing-tuned embedder: more ORT threads than the query path
-            // (throughput-bound, and its concurrency is bounded by the build
-            // gate below). Works even for in-process daemon builds, where the
-            // query embedder would otherwise be pinned to 1 thread.
-            let embedder = ColbertEmbedder::for_indexing(&colbert_model_dir)?;
-            let plaid_dir = index_dir.join("plaid");
-            let mapping_path = index_dir.join("plaid_mapping.bin");
-            let plaid_dir_str = plaid_dir.to_string_lossy().into_owned();
-            // PLAID 1.3+: IndexConfig.batch_size defaults to 50_000, which
-            // allocates buffers sized for 50 k docs even when we only have
-            // 2 k. Override to 1024 to bound peak RAM during clustering
-            // (k-means scratch + centroid expansion working set both scale
-            // linearly with batch_size). force_cpu=true bypasses the GPU
-            // K-means path; we're already CPU-only on macOS and don't have
-            // CUDA configured. Same knobs on UpdateConfig below.
-            //
-            // Peak RSS during the k-means build is also bounded by next-plaid's
-            // `chunk_size_data`, which we patch from 51_200 down to 4_096 in
-            // `vendor/next-plaid` (see workspace `[patch.crates-io]`). next-plaid
-            // runs the k-means distance GEMM as `chunk_ranges.par_iter()`, so peak
-            // ≈ rayon_threads × (chunk_size_data × chunk_size_centroids × 4 B). At
-            // the upstream default that is ~2.1 GB/thread (→ ~26 GB on a 32-core
-            // box for a 4 k-chunk repo); the patch cuts the block to ~167 MB/thread
-            // (→ ~9 GB), with bit-identical centroids (pure compute tiling).
-            let plaid_config = IndexConfig {
-                nbits: self.config.plaid_nbits,
-                batch_size: 1024,
-                force_cpu: true,
-                ..Default::default()
-            };
-            let update_config = UpdateConfig {
-                batch_size: 1024,
-                // next-plaid 1.3 fast path: skip k-means when fewer than
-                // PLAID_BUFFER_SIZE pending docs (see module-level constant).
-                buffer_size: PLAID_BUFFER_SIZE,
-                force_cpu: true,
-                ..Default::default()
-            };
-
-            if plaid_missing {
-                // Bound how many FULL builds run at once across all repos (see
-                // index::gate). A full rebuild holds the token embeddings plus
-                // the k-means working set in RAM (several GB), so an unbounded
-                // thundering herd — many repos auto-indexing after a reboot —
-                // would thrash or OOM the machine. Incremental updates (the
-                // `else` branch) are cheap and skip the gate, keeping restarts
-                // instant. The slot releases when `_slot` drops (block end) or
-                // when the process exits (OS releases the advisory lock).
-                let _slot = crate::index::gate::acquire(|| {
-                    tracing::info!(
-                        "Waiting for a free index-build slot (max {} concurrent full builds; \
-                         override with SEMANTEX_MAX_CONCURRENT_BUILDS)",
-                        crate::index::gate::max_concurrent_builds()
-                    );
-                });
-
-                // Full rebuild — encode in small batches (memory bound), then
-                // make ONE call to update_or_create with all embeddings.
-                //
-                // Why one call: every update_or_create call to next_plaid runs
-                // a full k-means clustering and read-modify-write of the index
-                // files. Each call has been measured to allocate ~10× the
-                // batch's working set due to the library's allocation pattern
-                // (verified: 2229 chunks in 17 batches × 128 → 34 GB peak RSS).
-                // Collecting all encoded embeddings first, then a single call,
-                // bounds peak RSS to:
-                //   (raw embeddings) + (one k-means working set)
-                //   ≈ N_chunks × avg_tokens × dim × 4 bytes + per-call overhead
-                // For gin (2229 chunks, 48-dim ColBERT): ~50 MB of embeddings
-                // + library overhead. Far safer than repeated calls.
-                if plaid_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&plaid_dir);
-                }
-                std::fs::create_dir_all(&plaid_dir)?;
-
-                let all_ids = store.get_all_chunk_ids()?;
-                if all_ids.is_empty() {
-                    tracing::info!("No chunks to encode for PLAID index");
-                    return Ok(());
-                }
-
-                let mut full_mapping: Vec<u64> = Vec::with_capacity(all_ids.len());
-                let mut all_embeddings: Vec<_> = Vec::with_capacity(all_ids.len());
-
-                for batch in all_ids.chunks(PLAID_BATCH) {
-                    // Memory failsafe between batches.
-                    if let Err(e) = crate::memory::check_rss_or_abort("PLAID encode batch") {
-                        anyhow::bail!("Indexing aborted: {e}");
-                    }
-                    let chunks = store.get_chunks(batch)?;
-                    if chunks.is_empty() {
-                        continue;
-                    }
-                    let contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-                    let embeddings = embedder.encode_documents(&contents)?;
-                    all_embeddings.extend(embeddings);
-                    full_mapping.extend(chunks.iter().map(|c| c.id));
-                }
-
-                // Final memory check before the single big PLAID call.
-                if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (single call)") {
-                    anyhow::bail!("Indexing aborted: {e}");
-                }
-                // next-plaid 1.3 returns (MmapIndex, Vec<i64>) where the Vec<i64>
-                // is the authoritative list of PLAID doc IDs assigned to the
-                // just-added embeddings. We keep the positional `full_mapping`
-                // (built above in the same order as `all_embeddings`) for the
-                // on-disk mapping, but assert the invariant that the doc count
-                // matches the chunk count. If next-plaid ever stops assigning
-                // IDs sequentially starting at 0, this assert fires and the
-                // positional logic must be replaced.
-                let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
-                    &all_embeddings,
-                    &plaid_dir_str,
-                    &plaid_config,
-                    &update_config,
-                )?;
-                // v0.4.1 W-Index #3: promoted from debug_assert_eq! so release
-                // builds also catch contract violations.
-                anyhow::ensure!(
-                    plaid_doc_ids.len() == full_mapping.len(),
-                    "PLAID returned {} doc IDs for {} chunks — contract violated",
-                    plaid_doc_ids.len(),
-                    full_mapping.len(),
-                );
-                // Drop the in-memory embeddings ASAP so they don't compete with
-                // the post-PLAID work (graph resolution, PageRank, etc.).
-                drop(all_embeddings);
-                crate::memory::purge_allocator();
-
-                let mapping_bytes = postcard::to_stdvec(&full_mapping)?;
-                std::fs::write(&mapping_path, mapping_bytes)?;
-                tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
-            } else {
-                // Incremental update — only touch new/removed chunks.
-                //
-                // v0.4.1 W-Index #3: the mapping Vec is positional (doc_id =
-                // index, chunk_id = value). Previous behaviour appended new
-                // chunk_ids at the tail without zeroing tombstoned positions,
-                // so if next-plaid recycled the freed doc_id slots the lookup
-                // would return a stale chunk_id. The fix:
-                //   1. Stamp `crate::types::PLAID_TOMBSTONE` (= u64::MAX) into
-                //      every position the delete touched, so search-time
-                //      readers know to skip the slot.
-                //   2. Write each new entry at the doc_id `update_or_create`
-                //      returned for it, growing the mapping with tombstones if
-                //      the returned doc_id is past the end. This handles BOTH
-                //      tail-append (the common case) AND slot recycling
-                //      without making assumptions about next-plaid's internal
-                //      strategy.
-                //   3. Promote the debug_assert_eq! count check to an
-                //      anyhow::ensure! so release builds also catch contract
-                //      violations.
-                let mut mapping: Vec<u64> = if mapping_path.exists() {
-                    let bytes = std::fs::read(&mapping_path)?;
-                    postcard::from_bytes::<Vec<u64>>(&bytes)?
-                } else {
-                    Vec::new()
-                };
-
-                // Soft-delete removed chunks from PLAID and from the mapping.
-                if !removed_chunk_ids.is_empty() {
-                    let removed_set: std::collections::HashSet<u64> =
-                        removed_chunk_ids.iter().copied().collect();
-                    let plaid_delete_ids: Vec<i64> = mapping
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(plaid_id, &chunk_id)| {
-                            if chunk_id != crate::types::PLAID_TOMBSTONE
-                                && removed_set.contains(&chunk_id)
-                            {
-                                Some(plaid_id as i64)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if !plaid_delete_ids.is_empty() {
-                        match MmapIndex::load(&plaid_dir_str) {
-                            Ok(mut index) => {
-                                if let Err(e) = index.delete(&plaid_delete_ids) {
-                                    tracing::warn!("PLAID delete failed: {e}");
-                                }
-                            }
-                            Err(e) => tracing::warn!("PLAID load for delete failed: {e}"),
-                        }
-                        // Stamp tombstones into the mapping. The positions are
-                        // still valid u64 indices into the Vec; we keep the
-                        // length so that doc_id N (still potentially referenced
-                        // by next-plaid internals) maps to a sentinel rather
-                        // than a phantom chunk.
-                        for plaid_id in &plaid_delete_ids {
-                            if let Some(slot) = mapping.get_mut(*plaid_id as usize) {
-                                *slot = crate::types::PLAID_TOMBSTONE;
-                            }
-                        }
-                    }
-                }
-
-                // Encode only new chunks and add them to the existing PLAID index.
-                if !new_chunk_ids.is_empty() {
-                    for batch in new_chunk_ids.chunks(PLAID_BATCH) {
-                        // Memory failsafe — same rationale as the full-rebuild path.
-                        if let Err(e) = crate::memory::check_rss_or_abort("PLAID incremental batch")
-                        {
-                            anyhow::bail!("Indexing aborted: {e}");
-                        }
-                        let chunks = store.get_chunks(batch)?;
-                        if chunks.is_empty() {
-                            continue;
-                        }
-                        let contents: Vec<String> =
-                            chunks.iter().map(|c| c.content.clone()).collect();
-                        let embeddings = embedder.encode_documents(&contents)?;
-                        // next-plaid 1.3 returns `plaid_doc_ids: Vec<i64>`,
-                        // the authoritative positional IDs it assigned to the
-                        // freshly-added embeddings. Write each `(doc_id,
-                        // chunk_id)` pair into mapping[doc_id] = chunk_id.
-                        let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
-                            &embeddings,
-                            &plaid_dir_str,
-                            &plaid_config,
-                            &update_config,
-                        )?;
-                        anyhow::ensure!(
-                            plaid_doc_ids.len() == chunks.len(),
-                            "PLAID returned {} doc IDs for {} chunks — contract violated",
-                            plaid_doc_ids.len(),
-                            chunks.len(),
-                        );
-                        for (&doc_id, chunk) in plaid_doc_ids.iter().zip(chunks.iter()) {
-                            anyhow::ensure!(
-                                doc_id >= 0,
-                                "PLAID returned negative doc_id {doc_id} for chunk {}",
-                                chunk.id,
+        if let Err(e) = (|| -> Result<()> {
+            match backend_kind {
+                DenseBackendKind::ColbertPlaid => {
+                    let mut dense_builder =
+                        ColbertPlaidIndexBuilder::new(&dense_dir, self.config.plaid_nbits)
+                            .with_models_dir(self.config.models_dir());
+                    if dense_missing {
+                        // Full rebuild — gate concurrency (same `index::gate`
+                        // semaphore as the pre-seam code) and stream the corpus
+                        // through the dense builder one PLAID_BATCH at a time.
+                        //
+                        // Memory strategy: never load all chunks at once. The
+                        // builder pulls each ≤32-id batch's content via the
+                        // closure below (well under SQLite's variable limit),
+                        // encodes it, and drops it before the next batch — only
+                        // one batch's content is ever live. This preserves the
+                        // PLAID index-build memory bound (the 26GB→9GB fix) that
+                        // a single `get_chunks(&all_ids)` materialization broke,
+                        // while still issuing one `update_or_create` internally
+                        // (byte-identical to the pre-seam index).
+                        let _slot = crate::index::gate::acquire(|| {
+                            tracing::info!(
+                                "Waiting for a free index-build slot (max {} concurrent full builds; \
+                                 override with SEMANTEX_MAX_CONCURRENT_BUILDS)",
+                                crate::index::gate::max_concurrent_builds()
                             );
-                            let idx = doc_id as usize;
-                            // Grow the mapping with tombstones so doc_id is
-                            // an in-bounds index. Slots between the current
-                            // tail and `idx` represent positions next-plaid
-                            // hasn't assigned a chunk to (still tombstoned
-                            // from a delete, or just empty). Treating them as
-                            // PLAID_TOMBSTONE is correct: they map to no
-                            // semantex chunk.
-                            while mapping.len() <= idx {
-                                mapping.push(crate::types::PLAID_TOMBSTONE);
-                            }
-                            mapping[idx] = chunk.id;
+                        });
+                        let all_ids = store.get_all_chunk_ids()?;
+                        if all_ids.is_empty() {
+                            return Ok(());
+                        }
+                        dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
+                            let mut chunks = store.get_chunks(batch_ids)?;
+                            // `get_chunks` (WHERE id IN (...)) does not ORDER BY;
+                            // sort by id so the per-batch order is deterministic
+                            // and matches the ascending `all_ids` ordering, keeping
+                            // the resulting PLAID index byte-stable.
+                            chunks.sort_by_key(|c| c.id);
+                            Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                        })?;
+                    } else {
+                        // Incremental — delete removed, insert new. New chunks
+                        // stream in PLAID_BATCH-sized store reads too, so a large
+                        // incremental add never materializes all content at once
+                        // and never passes >32 ids to a single `get_chunks`.
+                        if !removed_chunk_ids.is_empty() {
+                            dense_builder.delete(&removed_chunk_ids)?;
+                        }
+                        if !new_chunk_ids.is_empty() {
+                            dense_builder.insert_streaming_ids(&new_chunk_ids, |batch_ids| {
+                                let chunks = store.get_chunks(batch_ids)?;
+                                Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                            })?;
                         }
                     }
+                    dense_builder.persist(&dense_dir)?;
+                    tracing::info!(
+                        added = new_chunk_ids.len(),
+                        removed = removed_chunk_ids.len(),
+                        "Dense index ({}) build complete",
+                        backend_kind.name()
+                    );
                 }
+                DenseBackendKind::CoderankHnsw => {
+                    use crate::index::hnsw_index::{CoderankHnswIndexBuilder, HnswParams};
+                    let params = HnswParams::resolve(
+                        &self.config.hnsw_preset,
+                        self.config.hnsw_ef_search,
+                        self.config.dense_rescore_k,
+                    );
+                    // SEMANTEX_DENSE_CONTEXT (default OFF): when on, embed
+                    // `format!("{annotation}\n{code}")` using the graph-derived NL
+                    // annotation already persisted for BM25 (E3). The harness
+                    // ablates this on/off; raw code is the default. Changing the
+                    // embedded text changes the embedder_fingerprint, so on/off
+                    // are separate indexes (the harness builds each independently).
+                    let dense_context = std::env::var("SEMANTEX_DENSE_CONTEXT")
+                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
-                let mapping_bytes = postcard::to_stdvec(&mapping)?;
-                std::fs::write(&mapping_path, mapping_bytes)?;
-                tracing::info!(
-                    added = new_chunk_ids.len(),
-                    removed = removed_chunk_ids.len(),
-                    "PLAID index updated incrementally"
-                );
+                    if dense_missing {
+                        let _slot = crate::index::gate::acquire(|| {
+                            tracing::info!(
+                                "Waiting for a free index-build slot (max {} concurrent full builds)",
+                                crate::index::gate::max_concurrent_builds()
+                            );
+                        });
+                        let all_ids = store.get_all_chunk_ids()?;
+                        if all_ids.is_empty() {
+                            return Ok(());
+                        }
+                        // Annotations (E3 NL strings) are small — fetch the id→text
+                        // map up front; the heavy CHUNK CONTENT is streamed per
+                        // batch below, never materialized whole.
+                        let annotations = if dense_context {
+                            store.get_annotations(&all_ids)?
+                        } else {
+                            std::collections::HashMap::new()
+                        };
+                        let mut dense_builder = CoderankHnswIndexBuilder::new(&dense_dir, params)
+                            .with_models_dir(self.config.models_dir())
+                            .with_context_annotations(dense_context, annotations);
+                        // Stream the full corpus one ENCODE_BATCH at a time
+                        // (RSS-bounded; never materialize all chunk content at
+                        // once) — same memory discipline as the PLAID arm. The
+                        // closure pulls each ≤32-id batch's content and drops it
+                        // before the next, so only one batch's text is ever live.
+                        dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
+                            let mut chunks = store.get_chunks(batch_ids)?;
+                            // `get_chunks` (WHERE id IN (...)) is unordered; sort
+                            // by id so per-batch order is deterministic and matches
+                            // the ascending all_ids order (stable vector store).
+                            chunks.sort_by_key(|c| c.id);
+                            Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                        })?;
+                    } else {
+                        let annotations = if dense_context && !new_chunk_ids.is_empty() {
+                            store.get_annotations(&new_chunk_ids)?
+                        } else {
+                            std::collections::HashMap::new()
+                        };
+                        let mut dense_builder = CoderankHnswIndexBuilder::new(&dense_dir, params)
+                            .with_models_dir(self.config.models_dir())
+                            .with_context_annotations(dense_context, annotations);
+                        if !removed_chunk_ids.is_empty() {
+                            dense_builder.delete(&removed_chunk_ids)?;
+                        }
+                        if !new_chunk_ids.is_empty() {
+                            // Incremental adds also stream per batch (no whole-set
+                            // content materialization).
+                            dense_builder.insert_streaming_ids(&new_chunk_ids, |batch_ids| {
+                                let chunks = store.get_chunks(batch_ids)?;
+                                Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                            })?;
+                        }
+                    }
+                    tracing::info!(
+                        added = new_chunk_ids.len(),
+                        removed = removed_chunk_ids.len(),
+                        "Dense index (coderank-hnsw) build complete"
+                    );
+                }
             }
-
             Ok(())
         })() {
-            Ok(()) => {}
-            Err(e) => tracing::warn!("PLAID index build failed (continuing without): {e}"),
+            tracing::warn!("Dense index build failed (continuing without): {e}");
         }
 
         // Save metadata. v0.4.1 W-Index #4: persist the BM25 stemmer flag so
@@ -859,6 +725,36 @@ impl IndexBuilder {
         // build-time stemmer disagrees with the runtime config.
         let actual_chunk_count = store.chunk_count().unwrap_or(total_chunks as u64);
         let actual_file_count = store.file_count().unwrap_or(files_indexed + files_skipped);
+        // S8: stamp the active embedder's fingerprint so open-time code can
+        // detect a vector-space change. The fingerprint is backend-agnostic
+        // (id+dims+pooling+quant+norm+prefix), resolved from the merged manifest
+        // (built-ins + an optional user `models.toml`) — so it does NOT depend on
+        // S2's dense backend arm. (The versioned-dir build + atomic switchover
+        // wiring is the post-S2 reconciliation pass, gated on S2's builder arm.)
+        let embedder_fingerprint = {
+            let registry =
+                crate::model::ModelRegistry::from_config(&self.config, Some(&project_path))?;
+            let embedder_spec = registry.active_embedder()?;
+            let crate::model::RoleData::Embedder(embedder_data) = &embedder_spec.role_data else {
+                anyhow::bail!(
+                    "active embedder `{}` is not an embedder spec",
+                    embedder_spec.id
+                );
+            };
+            crate::model::EmbedderFingerprint::compute(&embedder_spec.id, embedder_data)
+        };
+        // S2: record the embedding model/dim for the ACTIVE dense backend, and
+        // stamp the RESOLVED backend name (not the raw config string) so the
+        // open-time `verify_persisted_backend_matches` agrees with the resolved
+        // selection (canonical SEMANTEX_EMBEDDER may differ from the deprecated
+        // dense_backend alias default).
+        let (embedding_model, embedding_dim) = match backend_kind {
+            DenseBackendKind::ColbertPlaid => ("LateOn-Code-edge".to_string(), 48u32),
+            DenseBackendKind::CoderankHnsw => (
+                "CodeRankEmbed".to_string(),
+                crate::embedding::single_vector::SingleVectorEmbedder::embedding_dim() as u32,
+            ),
+        };
         let meta = IndexMeta {
             schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
             project_path: project_path.clone(),
@@ -866,9 +762,11 @@ impl IndexBuilder {
             updated_at: chrono_now(),
             file_count: actual_file_count,
             chunk_count: actual_chunk_count,
-            embedding_model: "LateOn-Code-edge".to_string(),
-            embedding_dim: 48,
+            embedding_model,
+            embedding_dim,
             use_bm25_stemmer: self.config.use_bm25_stemmer,
+            dense_backend: backend_kind.name().to_string(),
+            embedder_fingerprint,
         };
         let meta_json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(index_dir.join("meta.json"), meta_json)?;
@@ -894,6 +792,16 @@ impl IndexBuilder {
             chunks_removed: total_removals as u64,
             duration,
         })
+    }
+}
+
+/// The per-backend "dense index present" sentinel file. colbert-plaid writes
+/// `plaid_mapping.bin`; coderank-hnsw writes `vectors.bin`. Its presence in the
+/// per-backend subdir marks the dense index as built (else: rebuild).
+fn dense_sentinel_file(backend: DenseBackendKind) -> &'static str {
+    match backend {
+        DenseBackendKind::ColbertPlaid => "plaid_mapping.bin",
+        DenseBackendKind::CoderankHnsw => "vectors.bin",
     }
 }
 
@@ -1123,21 +1031,67 @@ mod tests {
         }
     }
 
-    /// v0.4.1 W-Index #12: the PLAID encode batch size must stay strictly below
-    /// the next-plaid `UpdateConfig.buffer_size` so a single per-file
-    /// auto-refresh produces a sub-buffer batch and skips k-means clustering.
-    /// Violating this invariant silently regresses incremental-update latency
-    /// (each batch pays the 2-3 s k-means cost).
+    /// S1: a fresh build must write the dense index under the per-backend
+    /// subdir `.semantex/dense/colbert-plaid/` and record the backend in
+    /// meta.json. POST-D4 the shipped DEFAULT embedder is `coderank-137m`, so
+    /// this test EXPLICITLY pins `lateon-colbert` to validate the colbert-plaid
+    /// layout + meta. (Uses a tiny text repo; the PLAID build runs but we only
+    /// assert the layout + meta, which hold regardless of model availability —
+    /// if the dense build is skipped the dirs simply won't exist, so we gate
+    /// the dense-dir assertion on chunk creation.)
     #[test]
-    fn plaid_batch_strictly_below_buffer_size() {
+    #[ignore] // builds an index; run with --ignored
+    fn fresh_build_uses_per_backend_dense_subdir_and_records_meta() {
+        use crate::config::SemantexConfig;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.rs"), "pub fn hello() -> u32 { 41 + 1 }\n").unwrap();
+
+        let cfg = SemantexConfig {
+            embedder: "lateon-colbert".to_string(),
+            ..SemantexConfig::default()
+        };
+        IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
+
+        // meta.json records the active backend.
+        let meta_str = std::fs::read_to_string(project.join(".semantex/meta.json")).unwrap();
+        let meta: crate::types::IndexMeta = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta.dense_backend, "colbert-plaid");
+        assert_eq!(meta.schema_version, 11);
+    }
+
+    /// S2: building with the coderank-137m embedder (→ coderank-hnsw backend)
+    /// writes the per-backend subdir `.semantex/dense/coderank-hnsw/vectors.bin`
+    /// and records the model + dim + resolved backend in meta.json. `#[ignore]`
+    /// — needs the CodeRankEmbed model download.
+    #[test]
+    #[ignore]
+    fn coderank_hnsw_build_writes_subdir_and_meta() {
+        use crate::config::SemantexConfig;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.rs"), "pub fn hello() -> u32 { 41 + 1 }\n").unwrap();
+
+        let cfg = SemantexConfig {
+            embedder: "coderank-137m".to_string(),
+            ..SemantexConfig::default()
+        };
+        IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
+
         assert!(
-            PLAID_BATCH < PLAID_BUFFER_SIZE,
-            "PLAID_BATCH ({}) must be strictly less than PLAID_BUFFER_SIZE ({}) \
-             — see v0.4.1 W-Index #12. Single-file incremental updates rely on \
-             the buffer-only fast path firing instead of k-means clustering.",
-            PLAID_BATCH,
-            PLAID_BUFFER_SIZE,
+            project
+                .join(".semantex/dense/coderank-hnsw/vectors.bin")
+                .exists()
         );
+        let meta: crate::types::IndexMeta = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".semantex/meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta.dense_backend, "coderank-hnsw");
+        assert_eq!(meta.schema_version, 11);
+        assert_eq!(meta.embedding_model, "CodeRankEmbed");
     }
 
     /// v0.4.1 W-Index #3 — synthetic mapping contract:

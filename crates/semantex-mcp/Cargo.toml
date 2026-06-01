@@ -29,7 +29,7 @@ tempfile = "3"
 [features]
 default = ["http"]
 http = ["dep:tokio", "dep:axum", "dep:tower"]
-llm = ["semantex-core/llm"]
+llm = ["semantex-core/llm", "dep:tokio"]
 
 [lints]
 workspace = true

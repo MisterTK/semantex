@@ -149,6 +149,12 @@ pub struct McpServer {
     /// classifier override and HyDE retrieval inside `tool_agent`.
     #[cfg(feature = "llm")]
     llm: Option<Arc<dyn semantex_core::llm::LlmCapability>>,
+    /// Shared current-thread Tokio runtime, built once at construction and
+    /// reused by every `tool_agent` call so HyDE / LLM-classify do NOT build a
+    /// per-request runtime (closing the v0.7.1 MCP wiring gap). Mirrors
+    /// `Listener::bind`'s `llm_runtime` on the daemon path.
+    #[cfg(feature = "llm")]
+    llm_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl McpServer {
@@ -203,6 +209,30 @@ impl McpServer {
                 }
             };
 
+        // Build the shared runtime once (mirrors Listener::bind). A
+        // current_thread build failure is treated like "no runtime": leave it
+        // None and let AgentPipeline fall back to its per-call path rather than
+        // refuse to start the MCP server.
+        #[cfg(feature = "llm")]
+        let llm_runtime: Option<Arc<tokio::runtime::Runtime>> = if llm.is_some() {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => Some(Arc::new(rt)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to build shared Tokio runtime for the MCP server; \
+                         HyDE/classify will use a per-call runtime fallback."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             cache: Mutex::new(HashMap::new()),
@@ -213,6 +243,8 @@ impl McpServer {
             toolset,
             #[cfg(feature = "llm")]
             llm,
+            #[cfg(feature = "llm")]
+            llm_runtime,
         }
     }
 
@@ -1146,10 +1178,14 @@ impl McpServer {
         let index_dir = SemantexConfig::project_index_dir(&path);
         let cached = self.get_searcher(&index_dir)?;
         let pipeline = AgentPipeline::new(&cached.searcher, path.clone());
-        // Spec L §4 Item 1.4: inject the LLM backend so the classifier override
-        // and HyDE retrieval paths are reachable from the MCP entry point.
+        // Spec L §4 Item 1.4 + S5: inject BOTH the LLM backend and the shared
+        // runtime so the classifier override and HyDE retrieval reuse one
+        // runtime instead of building a per-call one (no more per-request
+        // "no shared runtime" warning on the MCP path).
         #[cfg(feature = "llm")]
-        let pipeline = pipeline.with_llm(self.llm.clone());
+        let pipeline = pipeline
+            .with_llm(self.llm.clone())
+            .with_runtime(self.llm_runtime.clone());
 
         let budget = args
             .get("budget")
@@ -2975,6 +3011,8 @@ mod tests {
             // open-time mismatch detection can refuse to load a mis-tuned
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
@@ -3292,6 +3330,8 @@ mod tests {
             // open-time mismatch detection can refuse to load a mis-tuned
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
@@ -3569,6 +3609,8 @@ mod tests {
             // open-time mismatch detection can refuse to load a mis-tuned
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
@@ -3632,6 +3674,67 @@ mod tests {
         assert!(
             !names.contains(&"log"),
             "outgoing macro/call target `log` leaked into methods list: {names:?}"
+        );
+    }
+}
+
+#[cfg(all(feature = "llm", test))]
+mod llm_runtime_wiring_tests {
+    use super::*;
+    use semantex_core::config::SemantexConfig;
+
+    /// Serializes the `SEMANTEX_LLM_*` env mutation in this test binary so two
+    /// LLM-env tests never race on process env. (`semantex-core`'s own
+    /// `TEST_ENV_LOCK` is `pub(crate)` and not reachable across crates; this is
+    /// the mcp-crate-local equivalent.)
+    static MCP_LLM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression for the v0.7.1 MCP wiring gap: `McpServer` must construct a
+    /// shared Tokio runtime once, so `tool_agent` can chain `.with_runtime(...)`
+    /// instead of falling back to AgentPipeline's per-call runtime branch.
+    ///
+    /// Building a `current_thread` runtime in a test environment always
+    /// succeeds, so the field must be `Some` after construction (when an LLM
+    /// backend is configured). With no LLM env configured, the backend is
+    /// `None` and the runtime is intentionally left `None`, so we configure a
+    /// minimal env-driven backend to exercise the runtime-build path.
+    #[test]
+    fn mcp_server_builds_shared_runtime() {
+        let _guard = MCP_LLM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: guarded by MCP_LLM_ENV_LOCK; restored before the lock drops.
+        // A model name is enough for GenaiBackend::from_env() to yield Some,
+        // which makes McpServer build the shared runtime. No network is used.
+        let prev_model = std::env::var("SEMANTEX_LLM_MODEL").ok();
+        let prev_provider = std::env::var("SEMANTEX_LLM_PROVIDER").ok();
+        unsafe {
+            std::env::set_var("SEMANTEX_LLM_MODEL", "gpt-4o-mini");
+            std::env::set_var("SEMANTEX_LLM_PROVIDER", "openai");
+        }
+
+        let server = McpServer::new(SemantexConfig::default());
+        let has_runtime = server.llm_runtime.is_some();
+
+        // SAFETY: guarded by TEST_ENV_LOCK.
+        unsafe {
+            match prev_model {
+                Some(v) => std::env::set_var("SEMANTEX_LLM_MODEL", v),
+                None => std::env::remove_var("SEMANTEX_LLM_MODEL"),
+            }
+            match prev_provider {
+                Some(v) => std::env::set_var("SEMANTEX_LLM_PROVIDER", v),
+                None => std::env::remove_var("SEMANTEX_LLM_PROVIDER"),
+            }
+        }
+
+        assert!(
+            server.llm.is_some(),
+            "test precondition: an LLM backend must be configured from env"
+        );
+        assert!(
+            has_runtime,
+            "McpServer must hold a shared Tokio runtime for the MCP HyDE/classify path"
         );
     }
 }

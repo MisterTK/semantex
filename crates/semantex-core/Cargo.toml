@@ -23,6 +23,25 @@ tracing.workspace = true
 # FastEmbed for cross-encoder reranking (TextRerank)
 fastembed = "5.9"
 
+# Tokenizer for the generic ONNX cross-encoder reranker (search/onnx_reranker.rs).
+# `from_file` + `encode` + `with_truncation` are all we use. We request the
+# PURE-RUST regex backend (`fancy-regex`) with `default-features = false` so OUR
+# dependency edge adds NO net-new C/C++ vendor surface (no `progressbar`/
+# `esaxx_fast` C++ defaults of our own). NOTE: `onig`/`onig_sys` are NOT removed
+# from the build — `cargo tree -i onig` still shows them, because `fastembed 5.9`
+# (and `next-plaid-onnx`) pull the same `tokenizers` crate WITH the `onig`
+# feature, and Cargo unifies features across the graph onto the shared crate.
+# So onig is unavoidable via fastembed's feature unification; it is airgap-safe
+# because it is already vendored transitively (S3 introduces no new requirement).
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+# fp16 logits extraction for the Qwen3-Reranker ONNX export (its `logits` output
+# node is FLOAT16; verified via onnx introspection — see research-notes ## S3).
+# `try_extract_tensor::<half::f16>()` requires ort's `half` feature (enabled
+# below), and we reference `half::f16` directly to convert fp16 -> f32. `half`
+# is already in the tree transitively; this only promotes it to a direct dep.
+half = "2"
+
 # ONNX Runtime — direct dependency for execution provider configuration (CoreML/CUDA/CPU);
 # fastembed depends on ort transitively, but we need the `ort::ep` types directly.
 #
@@ -33,7 +52,14 @@ fastembed = "5.9"
 # statically linked or downloaded at build time. The ONNX Runtime shared library is
 # instead provisioned at runtime (see embedding/runtime_manager.rs) and located via
 # ORT_DYLIB_PATH. Declaring `download-binaries` here was a misleading no-op.
-ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray", "std", "load-dynamic"] }
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray", "std", "load-dynamic", "half"] }
+
+# Pure-Rust HNSW ANN index for the coderank-hnsw dense backend (S2 Spike 2).
+# MIT OR Apache-2.0, NO C/C++ deps (cargo tree verified). Build-once index; we
+# rebuild the in-RAM graph on open from our own int8 vector store (delete =
+# compact + re-persist), so the crate's lack of native insert/delete is by
+# design — see docs/superpowers/plans/2026-05-31-research-notes.md (S2 Spike 2).
+instant-distance = "0.6"
 
 # Full-text search (BM25)
 tantivy = { version = "0.26", features = ["stemmer"] }
@@ -100,6 +126,11 @@ pdf-extract = "0.10"
 # Config
 serde_yml = "0.0.12"
 
+# TOML parser for the user model manifest (model/manifest.rs `models.toml`).
+# Pure Rust, no C/sys deps (verified via `cargo tree`) — keeps the airgap/offline
+# build clean. We only use `toml::from_str` / serde-derive deserialization.
+toml = "0.8"
+
 # Cross-platform
 dirs = "6"
 ctrlc = { version = "3", features = ["termination"] }
@@ -135,6 +166,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "simd_bench"
+harness = false
 
 [lints]
 workspace = true

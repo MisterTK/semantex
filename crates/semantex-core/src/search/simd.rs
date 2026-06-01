@@ -1,0 +1,802 @@
+//! Portable SIMD distance kernels (dot / cosine / L2) for the single-vector dense
+//! backend's hot path (ANN distance, brute-force fallback, fp32 rescore).
+//!
+//! Public safe functions own the runtime dispatch:
+//!   * below [`simd_min_len`] (a batch-size gate; SIMD setup + horizontal reduction
+//!     dominate on tiny inputs) we use the always-correct [`scalar`] reference;
+//!   * at/above the gate we dispatch to an arch kernel via runtime CPU detection
+//!     (`is_x86_feature_detected!` on x86_64, `is_aarch64_feature_detected!` on
+//!     aarch64), falling back to scalar when the feature is absent.
+//!
+//! Kernels are **reimplemented from** the oxirs-core `simd/{scalar,x86_simd,arm_simd}.rs`
+//! reference pattern (Apache-2.0/MIT); no code is copied. Zero external deps — `std::arch`
+//! only. Each `unsafe fn` wraps every intrinsic in an inner `unsafe {}` block to satisfy
+//! the workspace `unsafe_op_in_unsafe_fn = "deny"` lint.
+//!
+//! All public fns require `a.len() == b.len()`; they panic otherwise (HNSW vectors are
+//! fixed-dim, so this always holds in practice).
+
+use std::sync::OnceLock;
+
+// `is_aarch64_feature_detected!` is not in the prelude on all toolchains; import it
+// under the matching arch cfg. (`is_x86_feature_detected!` is in the std prelude.)
+#[cfg(target_arch = "aarch64")]
+use std::arch::is_aarch64_feature_detected;
+
+/// Default batch-size gate: below this many elements, skip SIMD and use scalar.
+/// 32 matches the oxirs default and covers ColBERT-class dims (≥768) firmly in the
+/// SIMD regime while keeping tiny ad-hoc vectors on the cheaper scalar path.
+const DEFAULT_SIMD_MIN_LEN: usize = 32;
+
+/// Resolve the SIMD batch-size gate, honoring an optional `SEMANTEX_SIMD_MIN_LEN`
+/// override (read once). Generic perf knob — not repo metadata.
+fn simd_min_len() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("SEMANTEX_SIMD_MIN_LEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_SIMD_MIN_LEN)
+    })
+}
+
+#[inline]
+fn assert_same_len(a_len: usize, b_len: usize) {
+    assert!(
+        a_len == b_len,
+        "simd kernel requires equal-length slices (got {a_len} and {b_len})"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Public safe API — runtime dispatch lives here.
+// ----------------------------------------------------------------------------
+
+/// Dot product ⟨a, b⟩. Requires `a.len() == b.len()`.
+#[inline]
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    assert_same_len(a.len(), b.len());
+    if a.len() < simd_min_len() {
+        return scalar::dot_f32(a, b);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present at runtime; slices are equal length.
+            return unsafe { avx2::dot_f32(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon confirmed present at runtime; slices are equal length.
+            return unsafe { neon::dot_f32(a, b) };
+        }
+    }
+    scalar::dot_f32(a, b)
+}
+
+/// Cosine **similarity** in [-1, 1]: ⟨a,b⟩ / (‖a‖·‖b‖). Returns `0.0` if either
+/// norm is zero. Requires `a.len() == b.len()`.
+#[inline]
+pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
+    assert_same_len(a.len(), b.len());
+    if a.len() < simd_min_len() {
+        return scalar::cosine_f32(a, b);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present at runtime; slices are equal length.
+            return unsafe { avx2::cosine_f32(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon confirmed present at runtime; slices are equal length.
+            return unsafe { neon::cosine_f32(a, b) };
+        }
+    }
+    scalar::cosine_f32(a, b)
+}
+
+/// Euclidean (L2) **distance**: `sqrt(Σ (aᵢ-bᵢ)²)`. Requires `a.len() == b.len()`.
+#[inline]
+pub fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
+    assert_same_len(a.len(), b.len());
+    if a.len() < simd_min_len() {
+        return scalar::l2_f32(a, b);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present at runtime; slices are equal length.
+            return unsafe { avx2::l2_f32(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon confirmed present at runtime; slices are equal length.
+            return unsafe { neon::l2_f32(a, b) };
+        }
+    }
+    scalar::l2_f32(a, b)
+}
+
+/// Int8 dot product (i32 accumulator → f32). Requires `a.len() == b.len()`.
+#[inline]
+pub fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
+    assert_same_len(a.len(), b.len());
+    if a.len() < simd_min_len() {
+        return scalar::dot_i8(a, b);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present at runtime; slices are equal length.
+            return unsafe { avx2::dot_i8(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon confirmed present at runtime; slices are equal length.
+            return unsafe { neon::dot_i8(a, b) };
+        }
+    }
+    scalar::dot_i8(a, b)
+}
+
+/// Int8 cosine similarity (i32 accumulators → f32). Returns `0.0` if either norm is
+/// zero. Requires `a.len() == b.len()`.
+#[inline]
+pub fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
+    assert_same_len(a.len(), b.len());
+    if a.len() < simd_min_len() {
+        return scalar::cosine_i8(a, b);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed present at runtime; slices are equal length.
+            return unsafe { avx2::cosine_i8(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("neon") {
+            // SAFETY: neon confirmed present at runtime; slices are equal length.
+            return unsafe { neon::cosine_i8(a, b) };
+        }
+    }
+    scalar::cosine_i8(a, b)
+}
+
+// ----------------------------------------------------------------------------
+// Scalar reference — always correct; the parity ground truth.
+// ----------------------------------------------------------------------------
+
+mod scalar {
+    #[inline]
+    pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    #[inline]
+    pub fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let d = x - y;
+                d * d
+            })
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    #[inline]
+    pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0f32;
+        let mut na = 0.0f32;
+        let mut nb = 0.0f32;
+        for (&x, &y) in a.iter().zip(b) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let denom = na.sqrt() * nb.sqrt();
+        if denom == 0.0 { 0.0 } else { dot / denom }
+    }
+
+    #[inline]
+    pub fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
+        let mut acc: i32 = 0;
+        for (&x, &y) in a.iter().zip(b) {
+            acc += i32::from(x) * i32::from(y);
+        }
+        acc as f32
+    }
+
+    #[inline]
+    pub fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
+        let mut dot: i32 = 0;
+        let mut na: i32 = 0;
+        let mut nb: i32 = 0;
+        for (&x, &y) in a.iter().zip(b) {
+            let (xi, yi) = (i32::from(x), i32::from(y));
+            dot += xi * yi;
+            na += xi * xi;
+            nb += yi * yi;
+        }
+        let denom = (na as f32).sqrt() * (nb as f32).sqrt();
+        if denom == 0.0 {
+            0.0
+        } else {
+            dot as f32 / denom
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Arch kernels — STUBBED to scalar in Task 1; real intrinsics land in Tasks 2-6.
+// The stubs keep the dispatcher compiling and the suite green from Task 1.
+// ----------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    // `na`/`nb`, `na_s`/`nb_s`, `a`/`b`/`i`/`x`/`y` are standard linear-algebra names.
+    #![allow(clippy::similar_names, clippy::many_single_char_names)]
+
+    // Wildcard is idiomatic for the std::arch intrinsic namespace.
+    #[allow(clippy::wildcard_imports)]
+    use std::arch::x86_64::*;
+
+    /// Horizontal sum of an 8-lane f32 AVX register → scalar f32.
+    /// # Safety
+    /// Caller must ensure AVX2 is available (the `__m256` argument already implies it).
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256_ps(v: __m256) -> f32 {
+        unsafe {
+            // Fold the high 128 lanes onto the low 128.
+            let low = _mm256_castps256_ps128(v);
+            let high = _mm256_extractf128_ps(v, 1);
+            let sum128 = _mm_add_ps(low, high);
+            // Fold 4 → 2 → 1.
+            let shuf = _mm_movehdup_ps(sum128); // [a1,a1,a3,a3]
+            let sums = _mm_add_ps(sum128, shuf); // [a0+a1, _, a2+a3, _]
+            let hi64 = _mm_movehl_ps(shuf, sums); // bring a2+a3 to lane 0
+            let final_sum = _mm_add_ss(sums, hi64);
+            _mm_cvtss_f32(final_sum)
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7; // process 8 f32 at a time
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
+            while i < chunks {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                // fused multiply-add: acc += va * vb
+                acc = _mm256_fmadd_ps(va, vb, acc);
+                i += 8;
+            }
+            let mut result = hsum256_ps(acc);
+            // scalar tail
+            while i < len {
+                result += a[i] * b[i];
+                i += 1;
+            }
+            result
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7;
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
+            while i < chunks {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                let diff = _mm256_sub_ps(va, vb);
+                acc = _mm256_fmadd_ps(diff, diff, acc); // acc += diff²
+                i += 8;
+            }
+            let mut sumsq = hsum256_ps(acc);
+            while i < len {
+                let d = a[i] - b[i];
+                sumsq += d * d;
+                i += 1;
+            }
+            sumsq.sqrt()
+        }
+    }
+
+    // --- still stubs until later tasks ---
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7;
+            let mut dot = _mm256_setzero_ps();
+            let mut na = _mm256_setzero_ps();
+            let mut nb = _mm256_setzero_ps();
+            let mut i = 0;
+            while i < chunks {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                dot = _mm256_fmadd_ps(va, vb, dot);
+                na = _mm256_fmadd_ps(va, va, na);
+                nb = _mm256_fmadd_ps(vb, vb, nb);
+                i += 8;
+            }
+            let mut dot_s = hsum256_ps(dot);
+            let mut na_s = hsum256_ps(na);
+            let mut nb_s = hsum256_ps(nb);
+            while i < len {
+                let (x, y) = (a[i], b[i]);
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = na_s.sqrt() * nb_s.sqrt();
+            if denom == 0.0 { 0.0 } else { dot_s / denom }
+        }
+    }
+    /// Horizontal sum of an 8-lane i32 AVX register → scalar i32.
+    /// # Safety
+    /// Caller must ensure AVX2 is available.
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256_epi32(v: __m256i) -> i32 {
+        unsafe {
+            let low = _mm256_castsi256_si128(v);
+            let high = _mm256_extracti128_si256(v, 1);
+            let sum128 = _mm_add_epi32(low, high);
+            let hi64 = _mm_unpackhi_epi64(sum128, sum128);
+            let sum64 = _mm_add_epi32(sum128, hi64);
+            let hi32 = _mm_shuffle_epi32(sum64, 0b01);
+            let sum32 = _mm_add_epi32(sum64, hi32);
+            _mm_cvtsi128_si32(sum32)
+        }
+    }
+
+    /// Sign-extend 16 packed i8 (a 128-bit load) into 16 i16 lanes (`__m256i`).
+    /// # Safety
+    /// Caller must ensure AVX2 is available.
+    #[target_feature(enable = "avx2")]
+    unsafe fn widen_i8_to_i16(v: __m128i) -> __m256i {
+        unsafe { _mm256_cvtepi8_epi16(v) } // sign-extend 16×i8 → 16×i16
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: |sum| ≤ dim·16384 ≪ 2^24, exactly representable
+    pub unsafe fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !15; // 16 i8 per iteration
+            let mut acc = _mm256_setzero_si256();
+            let mut i = 0;
+            while i < chunks {
+                let va = widen_i8_to_i16(_mm_loadu_si128(a.as_ptr().add(i).cast::<__m128i>()));
+                let vb = widen_i8_to_i16(_mm_loadu_si128(b.as_ptr().add(i).cast::<__m128i>()));
+                // madd: (va0*vb0 + va1*vb1), ... → 8×i32
+                let prod = _mm256_madd_epi16(va, vb);
+                acc = _mm256_add_epi32(acc, prod);
+                i += 16;
+            }
+            let mut total = hsum256_epi32(acc);
+            while i < len {
+                total += i32::from(a[i]) * i32::from(b[i]);
+                i += 1;
+            }
+            total as f32
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: bounded magnitudes, exactly representable
+    pub unsafe fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !15;
+            let mut dot = _mm256_setzero_si256();
+            let mut na = _mm256_setzero_si256();
+            let mut nb = _mm256_setzero_si256();
+            let mut i = 0;
+            while i < chunks {
+                let va = widen_i8_to_i16(_mm_loadu_si128(a.as_ptr().add(i).cast::<__m128i>()));
+                let vb = widen_i8_to_i16(_mm_loadu_si128(b.as_ptr().add(i).cast::<__m128i>()));
+                dot = _mm256_add_epi32(dot, _mm256_madd_epi16(va, vb));
+                na = _mm256_add_epi32(na, _mm256_madd_epi16(va, va));
+                nb = _mm256_add_epi32(nb, _mm256_madd_epi16(vb, vb));
+                i += 16;
+            }
+            let mut dot_s = hsum256_epi32(dot);
+            let mut na_s = hsum256_epi32(na);
+            let mut nb_s = hsum256_epi32(nb);
+            while i < len {
+                let (x, y) = (i32::from(a[i]), i32::from(b[i]));
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = (na_s as f32).sqrt() * (nb_s as f32).sqrt();
+            if denom == 0.0 {
+                0.0
+            } else {
+                dot_s as f32 / denom
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    // `na`/`nb`, `na_s`/`nb_s`, `a`/`b`/`i`/`x`/`y` are standard linear-algebra names.
+    #![allow(clippy::similar_names, clippy::many_single_char_names)]
+
+    // Wildcard is idiomatic for the std::arch intrinsic namespace.
+    #[allow(clippy::wildcard_imports)]
+    use std::arch::aarch64::*;
+
+    /// # Safety
+    /// Caller must ensure NEON is available and `a.len() == b.len()`.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !3; // 4 f32 per NEON q-register
+            let mut acc = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                acc = vfmaq_f32(acc, va, vb); // acc += va * vb (fused)
+                i += 4;
+            }
+            let mut result = vaddvq_f32(acc); // horizontal add of 4 lanes
+            while i < len {
+                result += a[i] * b[i];
+                i += 1;
+            }
+            result
+        }
+    }
+    /// # Safety
+    /// Caller must ensure NEON is available and `a.len() == b.len()`.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !3;
+            let mut dot = vdupq_n_f32(0.0);
+            let mut na = vdupq_n_f32(0.0);
+            let mut nb = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                dot = vfmaq_f32(dot, va, vb);
+                na = vfmaq_f32(na, va, va);
+                nb = vfmaq_f32(nb, vb, vb);
+                i += 4;
+            }
+            let mut dot_s = vaddvq_f32(dot);
+            let mut na_s = vaddvq_f32(na);
+            let mut nb_s = vaddvq_f32(nb);
+            while i < len {
+                let (x, y) = (a[i], b[i]);
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = na_s.sqrt() * nb_s.sqrt();
+            if denom == 0.0 { 0.0 } else { dot_s / denom }
+        }
+    }
+    /// # Safety
+    /// Caller must ensure NEON is available and `a.len() == b.len()`.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !3;
+            let mut acc = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                let diff = vsubq_f32(va, vb);
+                acc = vfmaq_f32(acc, diff, diff); // acc += diff²
+                i += 4;
+            }
+            let mut sumsq = vaddvq_f32(acc);
+            while i < len {
+                let d = a[i] - b[i];
+                sumsq += d * d;
+                i += 1;
+            }
+            sumsq.sqrt()
+        }
+    }
+    /// # Safety
+    /// Caller must ensure NEON is available and `a.len() == b.len()`.
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: |sum| ≤ dim·16384 ≪ 2^24, exactly representable
+    pub unsafe fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7; // 8 i8 per iteration (vld1_s8 loads 8)
+            let mut acc = vdupq_n_s32(0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1_s8(a.as_ptr().add(i)); // int8x8
+                let vb = vld1_s8(b.as_ptr().add(i));
+                let prod = vmull_s8(va, vb); // int16x8 = va * vb (widened)
+                // widen-add int16x8 into int32x4 accumulator
+                acc = vaddq_s32(acc, vpaddlq_s16(prod)); // pairwise widen i16→i32 then add
+                i += 8;
+            }
+            let mut total = vaddvq_s32(acc); // horizontal add 4×i32
+            while i < len {
+                total += i32::from(a[i]) * i32::from(b[i]);
+                i += 1;
+            }
+            total as f32
+        }
+    }
+    /// # Safety
+    /// Caller must ensure NEON is available and `a.len() == b.len()`.
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::cast_precision_loss)] // i32→f32: bounded magnitudes, exactly representable
+    pub unsafe fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7;
+            let mut dot = vdupq_n_s32(0);
+            let mut na = vdupq_n_s32(0);
+            let mut nb = vdupq_n_s32(0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1_s8(a.as_ptr().add(i));
+                let vb = vld1_s8(b.as_ptr().add(i));
+                dot = vaddq_s32(dot, vpaddlq_s16(vmull_s8(va, vb)));
+                na = vaddq_s32(na, vpaddlq_s16(vmull_s8(va, va)));
+                nb = vaddq_s32(nb, vpaddlq_s16(vmull_s8(vb, vb)));
+                i += 8;
+            }
+            let mut dot_s = vaddvq_s32(dot);
+            let mut na_s = vaddvq_s32(na);
+            let mut nb_s = vaddvq_s32(nb);
+            while i < len {
+                let (x, y) = (i32::from(a[i]), i32::from(b[i]));
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = (na_s as f32).sqrt() * (nb_s as f32).sqrt();
+            if denom == 0.0 {
+                0.0
+            } else {
+                dot_s as f32 / denom
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    // `a`/`b` test vectors are standard math names; the lints are noise here.
+    #![allow(clippy::similar_names, clippy::many_single_char_names)]
+
+    use super::*;
+
+    /// Absolute-or-relative tolerance: FMA / lane partial-sums reorder additions,
+    /// so the SIMD result differs from the strictly-sequential scalar in the last
+    /// ULPs. `1e-6` absolute for small magnitudes; relative for large (a dim-768
+    /// dot of unit-ish vectors can reach magnitudes in the hundreds).
+    fn assert_close(a: f32, b: f32) {
+        let diff = (a - b).abs();
+        let tol = 1e-6_f32 * a.abs().max(b.abs()).max(1.0);
+        assert!(
+            diff <= tol,
+            "values differ beyond 1e-6 tolerance: a={a}, b={b}, diff={diff}, tol={tol}"
+        );
+    }
+
+    /// Tiny deterministic LCG → reproducible test vectors (no rand dep).
+    fn make_vec(len: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                // map high bits to [-1, 1)
+                ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scalar_dot_matches_hand_computation() {
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 5.0, 6.0];
+        // 1*4 + 2*5 + 3*6 = 32
+        assert_close(scalar::dot_f32(&a, &b), 32.0);
+    }
+
+    #[test]
+    fn scalar_l2_matches_hand_computation() {
+        let a = [0.0f32, 0.0];
+        let b = [3.0f32, 4.0];
+        // sqrt(9 + 16) = 5
+        assert_close(scalar::l2_f32(&a, &b), 5.0);
+    }
+
+    #[test]
+    fn scalar_cosine_orthogonal_is_zero_and_parallel_is_one() {
+        assert_close(scalar::cosine_f32(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+        assert_close(scalar::cosine_f32(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]), 1.0);
+    }
+
+    #[test]
+    fn cosine_zero_norm_returns_zero() {
+        assert_close(cosine_f32(&[0.0; 768], &make_vec(768, 1)), 0.0);
+        assert_close(scalar::cosine_i8(&[0i8; 768], &[1i8; 768]), 0.0);
+    }
+
+    #[test]
+    fn scalar_i8_dot_matches_hand_computation() {
+        let a = [1i8, -2, 3];
+        let b = [4i8, 5, -6];
+        // 1*4 + (-2)*5 + 3*(-6) = 4 - 10 - 18 = -24
+        assert_close(scalar::dot_i8(&a, &b), -24.0);
+    }
+
+    /// Dispatch parity: the PUBLIC fn (whatever kernel is live on this arch) must
+    /// match the scalar reference within tolerance, across sizes that exercise the
+    /// gate (below `DEFAULT_SIMD_MIN_LEN`), an exact multiple of the SIMD width, and
+    /// a non-multiple (forces the scalar-tail path). Runs on every architecture.
+    #[test]
+    fn dispatch_matches_scalar_across_sizes() {
+        for &len in &[1usize, 3, 7, 8, 16, 31, 32, 33, 100, 768, 769] {
+            let a = make_vec(len, 0xABCD ^ len as u64);
+            let b = make_vec(len, 0x1234 ^ len as u64);
+            assert_close(dot_f32(&a, &b), scalar::dot_f32(&a, &b));
+            assert_close(cosine_f32(&a, &b), scalar::cosine_f32(&a, &b));
+            assert_close(l2_f32(&a, &b), scalar::l2_f32(&a, &b));
+
+            let ai: Vec<i8> = a.iter().map(|x| (x * 100.0) as i8).collect();
+            let bi: Vec<i8> = b.iter().map(|x| (x * 100.0) as i8).collect();
+            assert_close(dot_i8(&ai, &bi), scalar::dot_i8(&ai, &bi));
+            assert_close(cosine_i8(&ai, &bi), scalar::cosine_i8(&ai, &bi));
+        }
+    }
+
+    /// x86_64-only: directly exercise the AVX2 dot/L2 kernels and assert parity with
+    /// scalar. `#[cfg]`-gated so it compiles only where the kernel exists; on aarch64
+    /// hosts this test is absent (the dispatch test covers NEON there).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_dot_l2_cosine_match_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping avx2 parity: AVX2 not present on this host");
+            return;
+        }
+        for &len in &[8usize, 15, 16, 17, 64, 768, 769] {
+            let a = make_vec(len, 0x55 ^ len as u64);
+            let b = make_vec(len, 0xAA ^ len as u64);
+            // SAFETY: AVX2 detected above; equal-length slices.
+            let (d, l, c) = unsafe {
+                (
+                    avx2::dot_f32(&a, &b),
+                    avx2::l2_f32(&a, &b),
+                    avx2::cosine_f32(&a, &b),
+                )
+            };
+            assert_close(d, scalar::dot_f32(&a, &b));
+            assert_close(l, scalar::l2_f32(&a, &b));
+            assert_close(c, scalar::cosine_f32(&a, &b));
+        }
+    }
+
+    /// aarch64-only: directly exercise the NEON dot/L2 kernels vs scalar. NEON is
+    /// mandatory on aarch64, so no runtime skip is needed. `#[cfg]`-gated so it
+    /// compiles only on aarch64; on x86_64 hosts this test is absent.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_dot_l2_cosine_match_scalar() {
+        for &len in &[4usize, 7, 8, 9, 64, 768, 769] {
+            let a = make_vec(len, 0x55 ^ len as u64);
+            let b = make_vec(len, 0xAA ^ len as u64);
+            // SAFETY: NEON is mandatory on aarch64; equal-length slices.
+            let (d, l, c) = unsafe {
+                (
+                    neon::dot_f32(&a, &b),
+                    neon::l2_f32(&a, &b),
+                    neon::cosine_f32(&a, &b),
+                )
+            };
+            assert_close(d, scalar::dot_f32(&a, &b));
+            assert_close(l, scalar::l2_f32(&a, &b));
+            assert_close(c, scalar::cosine_f32(&a, &b));
+        }
+    }
+
+    /// i8 dot is an exact integer computation regardless of lane ordering, so the
+    /// SIMD result must EQUAL the scalar i32 sum (cast to f32) — no tolerance.
+    /// Cosine involves a sqrt, so compare with tolerance.
+    fn i8_vecs(len: usize, seed: u64) -> (Vec<i8>, Vec<i8>) {
+        let af = make_vec(len, seed);
+        let bf = make_vec(len, seed ^ 0xFFFF);
+        (
+            af.iter().map(|x| (x * 127.0) as i8).collect(),
+            bf.iter().map(|x| (x * 127.0) as i8).collect(),
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_i8_match_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping avx2 i8 parity: AVX2 not present");
+            return;
+        }
+        for &len in &[16usize, 17, 31, 32, 768, 769] {
+            let (a, b) = i8_vecs(len, 0x9 ^ len as u64);
+            // SAFETY: AVX2 detected; equal-length slices.
+            let (d, c) = unsafe { (avx2::dot_i8(&a, &b), avx2::cosine_i8(&a, &b)) };
+            assert_eq!(d, scalar::dot_i8(&a, &b), "i8 dot must be integer-exact");
+            assert_close(c, scalar::cosine_i8(&a, &b));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_i8_match_scalar() {
+        for &len in &[8usize, 9, 15, 16, 768, 769] {
+            let (a, b) = i8_vecs(len, 0x9 ^ len as u64);
+            // SAFETY: NEON mandatory on aarch64; equal-length slices.
+            let (d, c) = unsafe { (neon::dot_i8(&a, &b), neon::cosine_i8(&a, &b)) };
+            assert_eq!(d, scalar::dot_i8(&a, &b), "i8 dot must be integer-exact");
+            assert_close(c, scalar::cosine_i8(&a, &b));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "equal-length")]
+    fn mismatched_lengths_panic() {
+        let _ = dot_f32(&[1.0, 2.0], &[1.0]);
+    }
+}

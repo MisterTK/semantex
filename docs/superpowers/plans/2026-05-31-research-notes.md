@@ -14,6 +14,77 @@
 - **ONNX I/O:** inputs `input_ids`, `attention_mask` (int64) [+ `token_type_ids`→zeros if the graph declares it]; output `last_hidden_state [batch, seq, hidden]` → mean-pool (if a future export already pools to `[batch, hidden]`, use directly).
 - **Verified (CPU smoke):** sim(query, relevant code) = **0.656** vs sim(query, unrelated) = **0.104**.
 
+## S2 Spike 2 — HNSW crate selection (RECORDED 2026-06-01)
+
+- **CHOSEN: `instant-distance` v0.6.1**
+- **License:** MIT OR Apache-2.0 (permissive ✓).
+- **C/C++ deps:** none. `cargo tree` verified pure-Rust (deps: `num_cpus`, `ordered-float`,
+  `parking_lot`, `rand 0.8`, `rayon`, `serde`; the only FFI is `libc` bindings — no `cc`,
+  no `*-sys`, no `bindgen`/`cmake`). Airgap/offline-buildable. Leaner than `hnsw_rs 0.3.4`
+  (which pulls `anndists`, `env_logger`, `jiff`, `sysctl` — also pure-Rust/clean, but heavier).
+- **Metric used:** custom `Point::distance` returning **`1.0 - dot`** over **L2-normalized**
+  vectors (== `1 - cosine`). Smaller distance = closer. We feed dequantized-then-renormalized
+  f32 rows into the graph, and the encoder L2-normalizes the query, so dot == cosine.
+- **Delete support:** NONE native (build-once index). → **rebuild-on-mutate strategy** (matches
+  the plan's Task 8 design): we persist our OWN `Int8VectorStore` (postcard) + chunk_id map and
+  **rebuild the in-RAM graph from the store on open / after every insert/delete** (delete compacts
+  the store, drops the removed ids, re-persists; graph rebuilds next open). No tombstones.
+- **Serialize support:** native (`#[cfg_attr(feature="serde", derive(Serialize,Deserialize))]` on
+  `Hnsw`/`HnswMap`, needs the `with-serde`/`serde`+`serde-big-array` feature) — **but we DON'T use
+  it**: persistence is our own int8 store, graph is rebuilt on open. Keeps persistence
+  crate-independent + int8-compact (the design's intent), so no `serde` feature on the dep.
+- **`M` (max connections):** **NOT configurable** — `instant-distance` hardcodes `const M: usize
+  = 32` internally. So `HnswParams.m` is INFORMATIONAL/ignored for this crate (M is effectively
+  fixed at 32, a good high-recall default). Documented at the build site. `ef_construction` and
+  `ef_search` ARE configurable via `Builder::ef_construction(n)` / `Builder::ef_search(n)`.
+- **`ef_search` is baked at BUILD time** (stored on `Hnsw`; `Search` inherits it). Since we
+  rebuild the graph on open with `config.hnsw_ef_search`, changing ef_search just rebuilds —
+  fine for our open-time graph construction. (rescore_k is applied by us post-search.)
+- **EXACT API (real signatures, verified by compiling+running a 1000×8-dim smoke):**
+    - construct: `instant_distance::Builder::default().ef_construction(ef_c).ef_search(ef_s).build(points: Vec<P>, values: Vec<V>) -> HnswMap<P, V>`
+      where `P: Point + Clone` (our newtype over `Vec<f32>`/`[f32]`), `V: Clone` (we use `V = usize` = store row index).
+    - search:    `map.search(&query_point, &mut Search::default()) -> impl Iterator<Item = MapItem<P, usize>> + ExactSizeIterator`;
+      `MapItem { distance: f32, pid: PointId, point: &P, value: &usize }`. Take top-N, map `*item.value` → store row idx.
+    - `Search`:  `instant_distance::Search::default()` (reusable scratch; one per query).
+    - `Point` trait: `fn distance(&self, other: &Self) -> f32;` — we implement `1.0 - dot(self,other)`.
+    - insert/delete: **n/a** (build-once) → rebuild-on-mutate via our store (see above).
+    - id type:   the value `V` is arbitrary `Clone`; we store `usize` = `Int8VectorStore` row idx,
+      then map row idx → `chunk_ids[idx]: u64` (the PLAID `doc_to_chunk` pattern). graph point id
+      `PointId(u32)` is internal; we never persist it.
+    - distance orientation: smaller = closer (`1 - cosine`). We DON'T use the ANN distance as the
+      score — ANN only yields candidate row idxs; we **fp32-rescore via `dot_f32`** (cosine, larger
+      = better) and return that as `DenseHit.score`.
+- **Smoke result:** 1000 random 8-dim L2-normalized vectors → `HnswMap<V, usize>` built + searched
+  top-5 cleanly; values returned are store row idxs. Compiled + ran offline on macOS arm64.
+- **Fallback note (unused):** if instant-distance had failed, vendor oxirs-vec HNSW
+  (engine/oxirs-vec/src/hnsw/, Apache/MIT, attribute; parallel_construction.rs is a sequential
+  stub). Not needed — instant-distance passes every hard criterion except native delete, which the
+  rebuild-on-mutate design (already in the plan) covers.
+
+## S2 — encoder I/O CORRECTION (verified against the downloaded graph, 2026-06-01)
+
+> The Spike-1 recorded I/O said output `last_hidden_state [batch, seq, hidden]`. The ACTUAL
+> hosted `MisterTK/CodeRankEmbed-onnx-int8` graph (probed live after download + run) differs —
+> recorded here so the encoder constants are non-hallucinated. The S2 e2e gate PASSES with these.
+
+- **Inputs (confirmed):** `input_ids`, `attention_mask` only (int64). **NO `token_type_ids`**
+  (the graph does not declare it) — the encoder feeds exactly these two tensors.
+- **Outputs (CORRECTION):** the export emits TWO outputs:
+  - **`sentence_embedding` `[batch, hidden=768]`** — already mask-mean-pooled (the
+    sentence-transformers head). **The encoder PREFERS this** (matches RECORDED pooling=mean) and
+    only L2-normalizes it. There is **NO `last_hidden_state` output** (the draft name was wrong).
+  - **`token_embeddings` `[batch, seq, hidden]`** — the raw per-token states; the encoder falls
+    back to mask-mean-pooling THESE if a future export drops `sentence_embedding`.
+  `single_vector.rs` probes `["sentence_embedding"]` then `["token_embeddings","last_hidden_state"]`
+  and uses the first present, so it is robust to either export shape.
+- **E2E VERIFIED 2026-06-01** (real model, ORT_DYLIB_PATH=homebrew libonnxruntime 1.26):
+  `coderank_hnsw_dense_search_is_relevant` (fibonacci query → fib.rs ranks #1),
+  `coderank_hnsw_dense_is_deterministic`, `coderank_hnsw_alias_selection_builds_and_searches`,
+  `coderank_hnsw_build_writes_subdir_and_meta` (meta: model=CodeRankEmbed, dim=768, backend
+  coderank-hnsw, schema 11), and `vector_accessor_methods_return_some_on_built_index` ALL PASS.
+  The 4-file external-data download (`model_int8.onnx` 1.2MB + `model_int8.onnx.data` 274MB +
+  tokenizer.json + config.json) provisions cleanly on first use.
+
 ## S3 — Qwen3-Reranker-0.6B reranker (DONE: hosted + verified)
 
 - **ModelSpec.source:** `hf:MisterTK/Qwen3-Reranker-0.6B-onnx` (Apache-2.0)
@@ -22,6 +93,8 @@
 - **ScoreStrategy = YesNoLogit:** chat-format the prompt, run, take `logits[:, -1, :]`, softmax over the `yes`/`no` token logits → P(yes) is the relevance score.
 - **Token ids (Qwen tokenizer):** `yes` = **9693**, `no` = **2152**.
 - **ONNX I/O:** inputs `input_ids`, `attention_mask`, **`position_ids`** (all int64); output `logits [batch, seq, vocab]`.
+- **Output dtype = FLOAT16** (verified 2026-06-01 via `onnx.load` introspection of `MisterTK/Qwen3-Reranker-0.6B-onnx/model.onnx`: `logits: FLOAT16 shape=[batch, sequence, 151669]`). The fp16 source export keeps fp16 logits. **Code MUST extract fp16, not f32** — a fixed `try_extract_tensor::<f32>()` ERRORS on this node, hybrid.rs swallows the error, and the reranker silently no-ops (identity). `onnx_reranker::extract_logits_f32` dispatches on `value.data_type()`: `Float32` → copy; `Float16` → `try_extract_tensor::<half::f16>()` then `to_f32()`. Requires ort's `half` feature + `half` direct dep.
+- **max_context / truncation (Fix 1):** both shipped tokenizer.json have `"truncation": null`. `OnnxReranker::new` sets `with_truncation(max_length = max_context)`. Caps: **bge-reranker-v2-m3 = 512** (its trained positional range — past it logits are garbage); **Qwen3-Reranker-0.6B = 2048** (its trained context is large, but the model is O(seq²) on CPU; 2048 bounds query+chunk+chat-wrapper latency/memory while staying ample for code-search chunks ≤512-token AST targets). Carried as `RerankerSpec.max_context` (manifest data) → `OnnxModelSpec.max_context` → `OnnxReranker`.
 - **Prompt template (verified):**
   ```
   <|im_start|>system
@@ -38,3 +111,345 @@
   ```
 - **Verified (CPU smoke):** P(yes | relevant) = **0.990** vs P(yes | irrelevant) = **0.000**.
 - Reranker stays **off by default** (D8); this is the opt-in code-capable option, bge-reranker-v2-m3 remains the permissive fallback.
+
+### S3 — how S0 decides the rerank default
+- S0 harness (`benchmarks/relevance/`) runs the `rerank` ablation:
+  `python -m scripts.run --dataset csn --ablation rerank` and the CoIR/in-domain
+  equivalents. The harness sets `SEMANTEX_RERANKER=on` (+ `SEMANTEX_RERANKER_MODEL`)
+  in the subprocess env and passes `--rerank` to the CLI.
+- Compare each reranker (bge-v2-m3 fastembed; qwen3-reranker-0.6b ONNX) vs
+  rerank-off on nDCG@10 / MRR@10 / Recall@10, AND record per-query latency
+  (rerank_ms from SearchMetrics; budget stated by S0, e.g. warm p50 < X ms over
+  rerank_candidates=100).
+- ACCEPTANCE (spec §4 S3): a reranker is shippable iff net-positive nDCG@10/MRR
+  vs rerank-off on CoIR + CSN + in-domain WITHIN the stated latency budget.
+  If yes -> flip `SEMANTEX_RERANKER` on by default with the winning
+  `SEMANTEX_RERANKER_MODEL` (a one-line config/default change, separate PR). If no
+  -> leave OFF; record the numbers here.
+- The default-OFF gate in code STAYS until S0 reports a win. Flipping it is NOT
+  part of S3 (it is gated on harness output).
+- S3 code wiring (DONE): the reranker spec (score_strategy / prompt / yes-no
+  token ids / ONNX session file / download coords) is read from S8's
+  `ModelRegistry` as DATA via `RerankerChoice::from_spec(registry.active_reranker())`
+  — so S0 selects a reranker purely by setting `SEMANTEX_RERANKER_MODEL`
+  (== `config.reranker_model`); no S3 code change is needed to A/B a new
+  permissive reranker that is added to the manifest.
+
+## S0 relevance harness
+
+> Verified live on 2026-05-31 in `benchmarks/relevance/.venv` (datasets 4.8.5,
+> huggingface_hub 1.17.0, pytrec_eval 0.5, python 3.12). HF access on this
+> machine **works** — CoIR (cosqa) + CodeSearchNet both reachable. semantex
+> binary: `/Users/tk/.cargo/bin/semantex` (on PATH).
+
+### Step 1 — `semantex --json` output schema (VERIFIED)
+`SEMANTEX_QUIET_LIMITS=1 semantex "hybrid fusion rank" --json --max-count 2`
+returns a JSON **array of objects** with key set (verbatim):
+`content` (str), `end_line` (int), `file` (str, repo-relative), `score` (float),
+`source` (str — e.g. `"Hybrid"`, `"Sparse"`, `"ripgrep"` during fallback),
+`start_line` (int). With a built index also: `chunk_type`, and optionally
+`name`, `language`. **`file` is the file-level gold key; `start_line`/`end_line`
+give the function-level span.** Note: the query is a positional arg to the
+top-level `semantex` command — **there is NO `search` subcommand** (the help
+lists `index/watch/status/serve/agent/...` but search is the default top-level
+action). The harness client therefore invokes `semantex <query> --json ...`,
+which the plan's `_build_args` already does (`[binary, query, "--json", ...]`).
+
+### Step 2 — ablation flags + embedder env (VERIFIED)
+`semantex --help` confirms these flags exist: `--json`, `--dense-only`,
+`--sparse-only`, `--rerank`, `-m/--max-count`, `--no-content` (also `--snippet`,
+`--refs`, `--peek`, `--grep`). **There is NO `--hybrid` flag** (hybrid = the
+default, neither `--dense-only` nor `--sparse-only`) and **NO
+`--embedder`/`--dense-backend` flag** (confirmed: grep for `embedder|dense.backend`
+in `--help` → none). Embedder selection is via env var only (owned by S1/S2/S8).
+Per integration §4 D-env-knob the harness sets **`SEMANTEX_EMBEDDER`** (canonical;
+values `lateon-colbert` | `coderank-137m` | `qwen3-embed-0.6b`); `SEMANTEX_DENSE_BACKEND`
+(`colbert-plaid` | `coderank-hnsw`) is the kept-live alias. Until S1/S2 ship, the
+env var is inert (today's binary ignores it) so the D4 A/B is a no-op — correctly
+gated (plan Task 8.2).
+
+### Step 3 — CodeSearchNet HF id + schema (VERIFIED; id MOVED)
+The legacy bare id `code_search_net` **FAILS** on huggingface_hub 1.17.0
+(`HfUriError: Repository id must be 'namespace/name'`) — the loading-script path
+is dead. **Use the official parquet mirror id `code-search-net/code_search_net`**
+(org `code-search-net`, 24.2K downloads, format:parquet). It needs **NO
+`trust_remote_code`** (parquet, not a script). Verified load:
+`load_dataset('code-search-net/code_search_net', 'python', split='test')`
+→ 22,176 rows. Configs per language: `python`, `java`, `javascript`, `go`,
+`php`, `ruby`. Columns: `repository_name`, `func_path_in_repository`,
+`func_name`, `whole_func_string`, `language`, `func_code_string`,
+`func_code_tokens`, `func_documentation_string`, `func_documentation_tokens`,
+`split_name`, `func_code_url`. Field mapping for the loader (unchanged from plan):
+query = **`func_documentation_string`**, code = **`whole_func_string`**, stable
+id = **`func_code_url`**, path = `func_path_in_repository`.
+**ACTION → `config/csn_subset.yaml`: set `dataset_id: code-search-net/code_search_net`
+and `trust_remote_code: false`.**
+
+### Step 4 — CoIR HF ids (VERIFIED; layout DIFFERS from plan's guess)
+HF access works; CoIR is reachable. The org layout is **NOT** `<name>-{queries,corpus,qrels}`.
+The real layout (verified for cosqa):
+- **`CoIR-Retrieval/<name>-queries-corpus`** — one repo, TWO splits: `corpus` and
+  `queries`. Both have columns `_id`, `partition`, `text`, `title`, `language`,
+  `meta_information`. cosqa: 20,604 corpus docs + 20,604 queries.
+- **`CoIR-Retrieval/<name>-qrels`** — splits `train`/`test`/`valid`; columns
+  **`query_id`, `corpus_id`, `score`** (UNDERSCORES, not the hyphenated
+  `query-id`/`corpus-id` the plan's injected test data + `_qrels_map` assume!).
+  cosqa test: 500 rows, all positive.
+- There is ALSO a flat `CoIR-Retrieval/cosqa` (MTEB-framework version) — not used.
+- `CoIR-Retrieval/<name>-queries` and `-corpus` (separate) do **NOT** exist
+  (DatasetNotFoundError) → must use the combined `-queries-corpus` repo.
+
+**SCHEMA DIVERGENCE — qrels column names:** the plan's injectable
+`build_corpus_from_splits` + its `_qrels_map` read `r["query-id"]` / `r["corpus-id"]`
+(hyphens) and the unit tests inject hyphen keys. The REAL HF qrels use
+`query_id` / `corpus_id` (underscores). Resolution: keep the injectable function
++ tests exactly as the plan writes them (hyphen-keyed, unit-tested), and have the
+**network adapter `load_coir_subdataset` normalize** the HF rows to the
+hyphen-keyed shape before calling `build_corpus_from_splits` (map `query_id`→`query-id`,
+`corpus_id`→`corpus-id`). Corpus/query rows already use `_id`/`text` as the plan
+expects.
+**Real ids to put in `config/coir_subset.yaml`:**
+- cosqa → queries_corpus_id: `CoIR-Retrieval/cosqa-queries-corpus`, qrels_id:
+  `CoIR-Retrieval/cosqa-qrels`, qrels split `test`.
+- CodeSearchNet (CoIR) → `CoIR-Retrieval/CodeSearchNet-queries-corpus` +
+  `CoIR-Retrieval/CodeSearchNet-qrels` (same pattern; not re-probed but layout is
+  org-uniform).
+CoIR is **NOT deferred** (HF reachable here); the loader + a small live smoke are
+buildable. The acceptance GATE still anchors on the deterministic BM25/CSN
+`--sparse-only` baseline (model-independent) per integration §4 D-s0-gate.
+
+### Step 5 — pytrec_eval (VERIFIED; installs + builds)
+`pip install pytrec_eval` → built a wheel cleanly on macOS arm64 (python 3.12).
+`RelevanceEvaluator(qrel, {'recip_rank','ndcg_cut.10','recall.10','map'}).evaluate(run)`
+returns keys with the requested-measure dots turned to underscores:
+**`recip_rank`, `ndcg_cut_10`, `recall_10`, `map`**. Task 2.2's
+`test_metrics_vs_pytrec_eval.py` uses exactly these. pytrec_eval is a hard dev
+dep here (no skip needed), but the test keeps `importorskip` for portability.
+
+### Step 6 — swe_bench module contract (VERIFIED)
+`benchmarks/swe_bench/src/swe_bench_harness/` importable via
+`sys.path.insert(0,'src')`. Confirmed:
+- `dataset.Instance` dataclass fields = `['instance_id','repo','base_commit','problem_statement']`
+  → **NO `patch` field** (plan correct; `swe_loc.py` reads `patch` from the raw HF
+  row / local JSON, not from `Instance`).
+- `indexer.index_repo(*, repo_path: Path, semantex_binary: str, timeout_secs: int = 600) -> IndexResult`.
+- `indexer.IndexResult` fields = `['ok','path','error','duration_secs']` (matches
+  the plan's `ensure_index` usage: `result.ok` / `result.error`).
+- Repo cache convention: `$SWE_BENCH_REPO_CACHE/<instance_id>/` (default
+  `~/.swe_bench_repos`), completed index ⇔ `.semantex/meta.json` with
+  `chunk_count > 0`. `~/.swe_bench_repos` may be EMPTY on this machine → SWE-loc
+  must index on demand via `ensure_index`/`index_repo`.
+
+### Locked outputs (referenced by later tasks)
+- `semantex --json` keys: `file,start_line,end_line,score,source,content[,chunk_type,name,language]`; query is a positional arg, no `search` subcommand.
+- ablation→flag: sparse-only→`--sparse-only`, dense-only→`--dense-only`, hybrid→(none), rerank→`--rerank`; embedder→`SEMANTEX_EMBEDDER` env.
+- CSN id: `code-search-net/code_search_net`, `trust_remote_code: false`.
+- CoIR: `CoIR-Retrieval/<name>-queries-corpus` (splits corpus/queries) + `CoIR-Retrieval/<name>-qrels` (split test, cols query_id/corpus_id/score — underscores; adapter normalizes to hyphens).
+- pytrec_eval measures: `recip_rank, ndcg_cut_10, recall_10, map`.
+- swe_bench: `Instance` lacks `patch`; `index_repo(*, repo_path, semantex_binary, timeout_secs)`→`IndexResult(ok,path,error,duration_secs)`.
+
+### S0 addendum — CoIR loader verified live + subset-coherence caveat
+`load_coir_subdataset(name='cosqa', queries_corpus_id='CoIR-Retrieval/cosqa-queries-corpus',
+qrels_id='CoIR-Retrieval/cosqa-qrels', corpus_size=None, query_size=10)` verified
+end-to-end against live HF on 2026-05-31: 20,604 corpus docs materialised, 10
+queries selected, **all gold docs present in the materialised corpus**, sample
+gold id `d20145__doc_11275.txt:1-...`. The underscore→hyphen qrels normalization
+in `_normalize_qrel_rows` works.
+**CAVEAT (load-bearing for CoIR runs):** capping `corpus_size` while selecting
+queries by `query_size` can ORPHAN queries whose gold corpus doc falls outside
+the first-N corpus slice (observed: `corpus_size=200` → 0 surviving queries,
+because cosqa qrels are diagonal q_i↔d_i with i in the 20k range). The plan's
+loader correctly DROPS orphaned queries (no silent gold loss), but to get a
+non-empty CoIR eval either set `corpus_size: null` (index the full corpus) or
+make corpus subsetting gold-aware (retain every selected query's gold doc) — a
+follow-up refinement. The injectable `build_corpus_from_splits` + its unit tests
+are unaffected (they use a tiny coherent fixture). `config/coir_subset.yaml`
+ships `corpus_size: 5000`; bump to `null` for a real cosqa headline run, or wire
+gold-aware corpus subsetting first.
+
+### S0 addendum — acceptance gate calibration (Task 7.2)
+The BM25/CSN gate (`scripts/reproduce_baseline.py --baseline csn_bm25`) ran the
+FULL configured python subset (1000 docs / 200 queries, seed 20260531,
+`--sparse-only`). Measured **MRR@10 = 0.9099–0.9124** across trials (~0.0025
+run-to-run jitter from semantex's sparse tie-break ordering). Rank distribution:
+**176/200 gold@rank-1, 8/200 not-in-top-10**, Recall@1=0.88, Recall@10=0.955 —
+genuine strong retrieval, NOT a wiring fluke. The published CodeSearchNet/
+CodeXGLUE BM25 MRR is ~0.49 (1000-candidate, docstring-SEPARATED protocol);
+our subset scores higher because (a) ~1000-doc haystack and (b)
+`whole_func_string` embeds the query docstring inside the document (near-exact
+lexical overlap). So the gate anchors to semantex's OWN deterministic protocol
+(`expected_mrr_at_10: 0.91`, `tolerance: 0.10`), satisfying the spec's "CSN
+baseline within a *stated* tolerance" — provenance documented in
+`config/baselines.yaml`, not hidden. **GATE: PASS (delta 0.0024 ≤ 0.10).** This
+is the model-independent D-s0-gate anchor; CoIR headline numbers are a future
+full-corpus run (loader verified-reachable, see CoIR addendum).
+
+### S0 addendum — acceptance-gate REDESIGN (external CoIR anchor) [2026-06-01]
+Spec review correctly flagged the prior 0.91 CSN anchor as a SELF-PORTRAIT, not
+an external check: the CSN gate indexed `whole_func_string` (which CONTAINS the
+docstring) and queried with that same docstring, so `--sparse-only` BM25 matched
+the docstring to a copy of itself (python 0.91 vs js 0.31 / go 0.56 under the
+IDENTICAL protocol = leakage, not protocol-correctness). Owner DECIDED: replace
+with a CoIR EXTERNAL-reproduction gate. Implemented:
+
+**Published external anchor (cited):** MTEB official BM25 baseline run
+`mteb/baseline-bm25s` (mteb v2.10.8), task **CodeTransOceanDL** (== CoIR
+**CodeTrans-DL**), split=test: **nDCG@10 = 0.34418** (MRR@10 0.1904, Recall@10
+0.80556). Source JSON:
+`github.com/embeddings-benchmark/results/results/mteb__baseline-bm25s/0_1_10/CodeTransOceanDL.json`.
+MTEB: arXiv:2210.07316; CoIR: arXiv:2407.02883. **NB the CoIR paper's own Table 3
+reports ONLY neural retrievers (Contriever, E5, BGE, UniXcoder, BGE-M3,
+E5-Mistral, Ada-002, Voyage-Code) — NO BM25 row** (verified against the ar5iv
+HTML + the archersama.github.io/coir leaderboard, both BM25-free). MTEB's BM25
+baseline is therefore the canonical external lexical number for this task.
+
+**Why CodeTrans-DL:** code-to-code translation (query = TF snippet, gold = the
+equivalent Paddle snippet) — corpus AND queries are BOTH code, NO docstring
+embedded in the document, so BM25 measures genuine lexical ranking, not
+self-match. Tiny: **816 corpus docs / 180 test queries** => FULL corpus, no
+subsetting, directly comparable to the published full-corpus number (manifest
+logs kept=180/180 dropped=0).
+
+**Measured reproduction:** semantex `--sparse-only` (full corpus) =
+**nDCG@10 = 0.1884** (Recall@10 0.41, MRR@10 0.12). Gate PASSES: |0.1884 -
+0.34418| = 0.1558 <= tolerance **0.18** -> PASS (rc=0).
+
+**The 0.155 gap is a STRUCTURAL lexical-engine difference, NOT a harness bug —
+and is itself real external signal about semantex's sparse channel:**
+- Debug trail (systematic): broken doc-id matching first read 0.0000 (semantex
+  CHUNKS multi-line docs, so the whole-file id `file:1-N` never equals a returned
+  chunk's `file:start-end`). Fixed via **file-level matching** (`filewise_corpus`
+  rewrites gold to file paths; each CoIR doc is its own file) **+ chunk-dedup**
+  (`dedup_relevances_by_file` keeps one entry per file = document granularity,
+  matching MTEB) -> 0.1884. A manual single-query check confirms the gold file IS
+  retrieved at rank 2 for queries semantex handles.
+- Root cause of the residual gap: **semantex's BM25 returns a BOUNDED
+  high-precision candidate set (~15 results even at `-m 100`; there is NO flag to
+  make it exhaustive over the full corpus)**, whereas MTEB's bm25s scores ALL 816
+  docs and produces a full-corpus ranking. On a hard code-to-code task (weak
+  cross-framework lexical overlap) semantex under-recalls deep gold docs
+  (Recall@10 0.41 vs 0.81). 89/180 queries return the gold outside top-50.
+- Other CoIR tasks empirically tested for a tighter fit and REJECTED: codetrans-
+  contest (1008 docs) -> 0.072 (worse); StackOverflowQA (19.9k docs) + CodeFeedback
+  (66k-156k docs) -> too large for the CPU gate budget. CodeTrans-DL is the only
+  small, fast, fully-reproducible-corpus task with a published BM25 number.
+- tolerance 0.18 admits 0.1884 yet a genuine protocol/wiring break (gold mismatch
+  -> nDCG ~0.0, delta 0.344 >> 0.18) still FAILS by a wide margin. Justification
+  written verbatim in `config/baselines.yaml`. Do NOT widen further.
+
+**The old 0.91 CSN check is RELABELED `csn_internal_determinism`** (type
+`internal_determinism`) in `baselines.yaml` + `reproduce_baseline.py`: it is now
+explicitly an INTERNAL self-consistency / regression gate (self-baselines =
+python 0.91 / js 0.31 / go 0.56, tol 0.10), run **MULTI-LANGUAGE** (python+js+go)
+so a JS/Go wiring regression is no longer invisible (reviewer minor #1). It is
+documented as self-consistency only, NOT external protocol validation. The leaky
+`whole_func_string` corpus is kept for the ABLATION SWEEPS (realistic, fine).
+Measured this run: python 0.9099 / js 0.3105 / go 0.5656 — all OK.
+
+**Reviewer minor #2 fixed:** loaders now attach their `SubsetManifest` to
+`EvalCorpus.manifest`; `run.py` appends it so every CSN report carries a
+"## Subset manifest" section (verified: "kept 8/40 ... dropped 32 seed 20260531").
+
+**Gate commands of record:**
+  python -m scripts.reproduce_baseline --baseline coir_codetrans_dl        # external (acceptance)
+  python -m scripts.reproduce_baseline --baseline csn_internal_determinism # internal regression
+Unit-tested hermetically (mocked loader/runner) in tests/test_reproduce_baseline.py;
+the live reproduction is the opt-in `RELEVANCE_LIVE_COIR=1` test.
+
+### S0 addendum — split-gate framing + corrected recall-gap cause [2026-06-01]
+Gate re-review verdict: GATE-SOUND. Two tightly-scoped follow-ups applied:
+
+**A. Two-band acceptance gate (so subtle regressions aren't invisible).** The
+external CoIR gate now makes TWO explicit assertions, BOTH required to pass:
+ (1) TIGHT internal-determinism band on semantex's OWN measured CodeTrans-DL
+     nDCG@10: `self_baseline_ndcg_at_10: 0.1884`, `internal_tolerance: 0.025`.
+     This is the band that catches a ranking regression — a drop to 0.12 gives
+     delta 0.068 > 0.025 -> FAIL. Unit-tested:
+     `test_external_coir_gate_fails_tight_band_on_0_19_to_0_12_regression` (0.12
+     FAILS) and `test_tight_band_catches_a_regression_the_old_loose_only_gate_would_miss`
+     (0.22 is inside the old loose 0.18 band around 0.34418 — old gate would PASS
+     silently — but outside the tight band -> new gate FAILS).
+ (2) LOOSE external sanity bound vs published MTEB BM25 0.34418, `tolerance: 0.18`.
+     Proves end-to-end wiring vs an independent source; fails on a gross collapse
+     (nDCG~0 -> delta 0.344 >> 0.18).
+ Live run: measured 0.1847 -> (1) delta 0.0037 OK, (2) delta 0.1595 OK -> PASS.
+ The prior single 0.18 band did two jobs at once and would let a 0.19->0.12
+ ranking regression slip through; the split fixes that.
+
+**B. Corrected the recall-gap CAUSE (it is NOT a tantivy BM25 candidate cap).**
+The re-review verified in `crates/` that there is no ~15-candidate engine cap:
+`SparseIndex::search` honors `TopDocs::with_limit(top_k)` and `hybrid.rs` fetches
+`rerank_candidates (100) x oversample_factor (2-5)`. The real cause of the ~15
+trim under `-m 100` is semantex's PRODUCTION post-retrieval ADAPTIVE PIPELINE —
+**`apply_adaptive_pipeline` in `crates/semantex-core/src/search/adaptive.rs`**,
+which runs EVEN under `--sparse-only`: a confidence threshold (retain score >=
+`top_score x min_score(query_type)`) plus elbow-based `adaptive_max_results`
+sizing. On flat-score code-to-code tasks these prune the 100+ retrieved
+candidates to ~15 before `-m` applies, trimming low-overlap gold. Measuring the
+shipped channel (with its adaptive trimming) is INTENTIONAL — that is what real
+semantex returns. `config/baselines.yaml` wording corrected accordingly (now
+points at adaptive.rs, "NOT a tantivy BM25 cap"); no `crates/` code changed.
+
+## S5 — HyDE call-site wiring (spike 2026-05-31)
+
+**Scope statement:** S5 production change = add a shared Tokio runtime to
+`McpServer` and chain `.with_runtime()` in `tool_agent`; everything else is
+test-hardening of an already-correct core.
+
+### Current state (verified against the tree)
+- **HyDE core = implemented & correct.** `crates/semantex-core/src/search/hybrid.rs`:
+  - `const LLM_HYDE_TIMEOUT_DEFAULT_MS: u64 = 15_000;` (`#[cfg(feature="llm")]`).
+  - `fn llm_hyde_timeout() -> std::time::Duration` reads `SEMANTEX_LLM_HYDE_TIMEOUT_MS`.
+  - `impl HybridSearcher { pub async fn search_with_hyde(&self, query: &super::SearchQuery, llm: std::sync::Arc<dyn crate::llm::LlmCapability>) -> anyhow::Result<super::SearchOutput> }`.
+    Empty-doc / `Ok(Err)` / timeout / hyde-search-`Err` branches each `return Ok(base)`.
+  - `fn merge_hyde_results(base, hyde, max_results) -> SearchOutput` dedups by `chunk.id`,
+    sorts by score desc, truncates to `max_results`, sets `metrics.query_type = "hyde_merged"`.
+  - Existing tests (`mod hyde_tests`): `merge_deduplicates_by_chunk_id`,
+    `merge_sorts_by_score_descending`, `merge_caps_at_max_results`,
+    `merge_with_empty_base_does_not_panic`. Helpers `make_metrics()` / `make_result(id, score)`.
+    NO test exercises `search_with_hyde` end-to-end against a failing/timing-out LLM.
+- **Semantic integration = wired.** `crates/semantex-core/src/search/agent.rs::search_semantic`
+  calls `rt.block_on(self.searcher.search_with_hyde(query, llm))` when both `llm` and
+  `runtime` are `Some`; falls back to a per-call `new_current_thread` runtime with a
+  one-time `tracing::warn!` when `runtime` is `None`. `handle_semantic` calls `search_semantic`.
+- **Daemon path = fully wired (llm + runtime).** `server/listener.rs` builds the shared
+  runtime once in `bind` (`tokio::runtime::Builder::new_current_thread().enable_all().build()`
+  → `Arc`, field `llm_runtime` line 47); `build_handler` chains `.with_llm(self.llm.clone())`
+  + `.with_runtime(self.llm_runtime.clone())` (lines 275-276). `handler.rs::handle_agent`
+  chains both (lines 93-94).
+- **MCP path = MISSING shared runtime → per-call fallback.** `crates/semantex-mcp/src/server.rs`:
+  - `struct McpServer` (line 130) has `#[cfg(feature="llm")] llm: Option<Arc<dyn …>>` (line 150)
+    but NO runtime field.
+  - `with_toolset` (line 162) builds `llm` via `LlmBackend::from_env()` + `.into_arc()` but
+    NO runtime.
+  - `tool_agent` (line 1148): `AgentPipeline::new(&cached.searcher, path.clone())` then
+    `#[cfg(feature="llm")] let pipeline = pipeline.with_llm(self.llm.clone());` — NO `.with_runtime`.
+  - `rg "Runtime"` in this file → no match. This is the v0.7.1 residual debt for the surface
+    Claude Code / Cursor actually use.
+
+### Feature-forwarding strings (verbatim, verified)
+- `crates/semantex-mcp/Cargo.toml`:
+  - `tokio = { workspace = true, optional = true }` — gated ONLY by `http`, NOT `llm`.
+  - `[features] default = ["http"]`, `http = ["dep:tokio", "dep:axum", "dep:tower"]`,
+    `llm = ["semantex-core/llm"]`.
+  - **DECISION (verified YES):** Task 3 edits this to `llm = ["semantex-core/llm", "dep:tokio"]`
+    because the new `tokio::runtime::Runtime` field is `llm`-gated and `--no-default-features
+    --features llm` would otherwise fail (no tokio).
+- `crates/semantex-cli/Cargo.toml`:
+  `llm = ["mcp", "semantex-core/llm", "semantex-mcp/llm", "dep:tokio"]` — masks the bug today
+  because it also pulls `mcp → http → tokio`.
+- `crates/semantex-core/Cargo.toml`:
+  `default = []`; `llm = ["dep:genai", "dep:tokio", "dep:async-trait", "dep:which"]`.
+
+### Task-4 helper located
+`crates/semantex-core/src/server/handler.rs::build_empty_searcher()` is the canonical
+cheap real-index helper: makes a `TempDir`, creates an empty `ChunkStore`, opens
+`HybridSearcher::open_sparse_only(&semantex_dir, &config)` → `(TempDir, HybridSearcher)`.
+S5 mirrors this in `hyde_tests` to drive `search_with_hyde` through its real async path.
+Empty index → base search is empty; error path yields empty == base (identical), success
+path yields empty-but-`hyde_merged`-tagged output (dedup invariant trivially holds).
+
+### Test infra
+- `crate::llm::TEST_ENV_LOCK` (`pub(crate) static Mutex<()>`) guards `SEMANTEX_LLM_*` env
+  mutation; the timeout test holds it.
+- `SemantexConfig::default()` is available and used by existing tests (server.rs:2759).
