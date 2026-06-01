@@ -247,6 +247,9 @@ mod scalar {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
+    // `na`/`nb`, `na_s`/`nb_s`, `a`/`b`/`i`/`x`/`y` are standard linear-algebra names.
+    #![allow(clippy::similar_names, clippy::many_single_char_names)]
+
     // Wildcard is idiomatic for the std::arch intrinsic namespace.
     #[allow(clippy::wildcard_imports)]
     use std::arch::x86_64::*;
@@ -373,6 +376,9 @@ mod avx2 {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
+    // `na`/`nb`, `na_s`/`nb_s`, `a`/`b`/`i`/`x`/`y` are standard linear-algebra names.
+    #![allow(clippy::similar_names, clippy::many_single_char_names)]
+
     // Wildcard is idiomatic for the std::arch intrinsic namespace.
     #[allow(clippy::wildcard_imports)]
     use std::arch::aarch64::*;
@@ -404,7 +410,34 @@ mod neon {
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
     #[target_feature(enable = "neon")]
     pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
-        super::scalar::cosine_f32(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !3;
+            let mut dot = vdupq_n_f32(0.0);
+            let mut na = vdupq_n_f32(0.0);
+            let mut nb = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < chunks {
+                let va = vld1q_f32(a.as_ptr().add(i));
+                let vb = vld1q_f32(b.as_ptr().add(i));
+                dot = vfmaq_f32(dot, va, vb);
+                na = vfmaq_f32(na, va, va);
+                nb = vfmaq_f32(nb, vb, vb);
+                i += 4;
+            }
+            let mut dot_s = vaddvq_f32(dot);
+            let mut na_s = vaddvq_f32(na);
+            let mut nb_s = vaddvq_f32(nb);
+            while i < len {
+                let (x, y) = (a[i], b[i]);
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = na_s.sqrt() * nb_s.sqrt();
+            if denom == 0.0 { 0.0 } else { dot_s / denom }
+        }
     }
     /// # Safety
     /// Caller must ensure NEON is available and `a.len() == b.len()`.
@@ -451,6 +484,9 @@ mod neon {
 
 #[cfg(test)]
 mod tests {
+    // `a`/`b` test vectors are standard math names; the lints are noise here.
+    #![allow(clippy::similar_names, clippy::many_single_char_names)]
+
     use super::*;
 
     /// Absolute-or-relative tolerance: FMA / lane partial-sums reorder additions,
@@ -570,14 +606,21 @@ mod tests {
     /// compiles only on aarch64; on x86_64 hosts this test is absent.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn neon_dot_l2_match_scalar() {
+    fn neon_dot_l2_cosine_match_scalar() {
         for &len in &[4usize, 7, 8, 9, 64, 768, 769] {
             let a = make_vec(len, 0x55 ^ len as u64);
             let b = make_vec(len, 0xAA ^ len as u64);
             // SAFETY: NEON is mandatory on aarch64; equal-length slices.
-            let (d, l) = unsafe { (neon::dot_f32(&a, &b), neon::l2_f32(&a, &b)) };
+            let (d, l, c) = unsafe {
+                (
+                    neon::dot_f32(&a, &b),
+                    neon::l2_f32(&a, &b),
+                    neon::cosine_f32(&a, &b),
+                )
+            };
             assert_close(d, scalar::dot_f32(&a, &b));
             assert_close(l, scalar::l2_f32(&a, &b));
+            assert_close(c, scalar::cosine_f32(&a, &b));
         }
     }
 
