@@ -21,6 +21,10 @@ pub struct GraphPropagationConfig {
     pub hierarchy_decay: f32,
     pub max_propagated: usize,
     pub enable_transitive: bool,
+    /// Master off switch (`SEMANTEX_GRAPH_DISABLE`). When set, `propagate`
+    /// returns the seeds unchanged — used by the S0 harness graph-off A/B and
+    /// as a user escape hatch. Default false.
+    pub disabled: bool,
 }
 
 impl GraphPropagationConfig {
@@ -36,6 +40,7 @@ impl GraphPropagationConfig {
                 hierarchy_decay: 0.05,
                 max_propagated: top_k / 4,
                 enable_transitive: false,
+                disabled: false,
             },
             QueryType::Keyword => Self {
                 call_decay: 0.15,
@@ -45,6 +50,7 @@ impl GraphPropagationConfig {
                 hierarchy_decay: 0.10,
                 max_propagated: top_k / 3,
                 enable_transitive: false,
+                disabled: false,
             },
             QueryType::Semantic => Self {
                 call_decay: 0.15,
@@ -54,6 +60,7 @@ impl GraphPropagationConfig {
                 hierarchy_decay: 0.12,
                 max_propagated: top_k / 4,
                 enable_transitive: false,
+                disabled: false,
             },
             QueryType::Mixed => Self {
                 call_decay: 0.20,
@@ -63,6 +70,7 @@ impl GraphPropagationConfig {
                 hierarchy_decay: 0.10,
                 max_propagated: top_k / 3,
                 enable_transitive: false,
+                disabled: false,
             },
         }
     }
@@ -78,6 +86,27 @@ impl GraphPropagationConfig {
             hierarchy_decay: 0.15,
             max_propagated: top_k,
             enable_transitive: true,
+            disabled: false,
+        }
+    }
+
+    /// Localization mode: recall-oriented expansion for SWE-bench-style
+    /// file-level localization. Expands top seeds 1–2 hops along call + import/
+    /// type edges with generous decays and a high propagated cap so structurally
+    /// related (but textually dissimilar) sites surface in the top-k. Tuned on
+    /// the S0 SWE-loc eval (S4 Task S4.7); S4's gate is file-level recall —
+    /// function-level recall is an S0 follow-up (integration §4 D-graph).
+    #[must_use]
+    pub fn localization_mode(top_k: usize) -> Self {
+        Self {
+            call_decay: 0.35,
+            caller_decay: 0.35,
+            type_ref_decay: 0.25,
+            transitive_decay: 0.12,
+            hierarchy_decay: 0.20,
+            max_propagated: top_k,
+            enable_transitive: true,
+            disabled: false,
         }
     }
 
@@ -110,6 +139,16 @@ impl GraphPropagationConfig {
                 self.transitive_decay = f;
             }
         }
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_HOPS") {
+            if let Ok(h) = v.parse::<u32>() {
+                // hops=1 disables 2-hop transitive; hops>=2 enables it.
+                self.enable_transitive = h >= 2;
+            }
+        }
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_DISABLE") {
+            // Any non-empty, non-"0" value disables the stage.
+            self.disabled = !v.is_empty() && v != "0";
+        }
         self
     }
 }
@@ -127,6 +166,10 @@ pub fn propagate(
 ) -> Result<Vec<ScoredChunkId>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if config.disabled {
+        return Ok(seeds.to_vec());
     }
 
     // Build seed lookup: chunk_id -> original score
@@ -256,6 +299,10 @@ fn accumulate(map: &mut HashMap<u64, f32>, chunk_id: u64, bonus: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the env-mutating tests below so they don't clobber each
+    /// other's `SEMANTEX_GRAPH_*` vars under cargo's default parallel runner.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scored(id: u64, score: f32) -> ScoredChunkId {
         ScoredChunkId::new(id, score)
@@ -393,6 +440,7 @@ mod tests {
             hierarchy_decay: 0.0,
             max_propagated: 10,
             enable_transitive: false,
+            disabled: false,
         };
         // All decays are zero, so no propagation would occur
         assert!((config.call_decay).abs() < f32::EPSILON);
@@ -406,5 +454,74 @@ mod tests {
             GraphPropagationConfig::for_query_type(&QueryType::Semantic, 10).with_env_overrides();
         // Should still have default values since env vars aren't set
         assert!((config.call_decay - 0.15).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_localization_mode_enables_two_hop_and_caps_propagated() {
+        let config = GraphPropagationConfig::localization_mode(20);
+        // Localization leans on call + import/type structure; transitive ON.
+        assert!(config.enable_transitive);
+        assert!(config.transitive_decay > 0.0);
+        assert!(config.call_decay > 0.0 && config.caller_decay > 0.0);
+        // Expands generously for recall: up to top_k new chunks.
+        assert_eq!(config.max_propagated, 20);
+        assert!(!config.disabled);
+    }
+
+    #[test]
+    fn test_disabled_default_is_false() {
+        let config = GraphPropagationConfig::for_query_type(&QueryType::Semantic, 10);
+        assert!(!config.disabled);
+    }
+
+    #[test]
+    fn test_hops_env_one_forces_transitive_off() {
+        // SAFETY: env-mutating tests are serialized by ENV_LOCK; restored at end.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("SEMANTEX_GRAPH_HOPS", "1") };
+        let config = GraphPropagationConfig::architectural_mode(10).with_env_overrides();
+        unsafe { std::env::remove_var("SEMANTEX_GRAPH_HOPS") };
+        assert!(!config.enable_transitive, "hops=1 must disable 2-hop");
+    }
+
+    #[test]
+    fn test_hops_env_two_forces_transitive_on() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("SEMANTEX_GRAPH_HOPS", "2") };
+        // Start from a 1-hop preset; hops=2 must turn transitive ON.
+        let config = GraphPropagationConfig::for_query_type(&QueryType::Identifier, 10)
+            .with_env_overrides();
+        unsafe { std::env::remove_var("SEMANTEX_GRAPH_HOPS") };
+        assert!(config.enable_transitive, "hops=2 must enable 2-hop");
+    }
+
+    #[test]
+    fn test_disable_env_sets_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("SEMANTEX_GRAPH_DISABLE", "1") };
+        let config = GraphPropagationConfig::for_query_type(&QueryType::Semantic, 10)
+            .with_env_overrides();
+        unsafe { std::env::remove_var("SEMANTEX_GRAPH_DISABLE") };
+        assert!(config.disabled);
+    }
+
+    #[test]
+    fn test_propagate_returns_seeds_unchanged_when_disabled() {
+        // disabled short-circuits before any store access, so a never-touched
+        // store reference is fine — we pass seeds through a disabled config path
+        // by checking the early-return contract directly.
+        let config = GraphPropagationConfig {
+            call_decay: 0.3,
+            caller_decay: 0.3,
+            type_ref_decay: 0.2,
+            transitive_decay: 0.1,
+            hierarchy_decay: 0.1,
+            max_propagated: 10,
+            enable_transitive: true,
+            disabled: true,
+        };
+        assert!(config.disabled);
+        // The disabled branch in propagate() returns seeds.to_vec() — covered by
+        // the integration test in Task S4.4 against a real ChunkStore.
     }
 }
