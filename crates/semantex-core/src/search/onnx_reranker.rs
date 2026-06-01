@@ -457,6 +457,46 @@ mod tests {
       "model": {"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"}
     }"#;
 
+    /// Manual smoke: downloads the bge-v2-m3 ONNX classifier and verifies an
+    /// on-topic doc outranks an off-topic one. Requires network on first run.
+    /// Exercises the real ONNX classifier (ClassifierLogit) path end-to-end.
+    ///
+    ///   SEMANTEX_RERANKER=on cargo test -p semantex-core \
+    ///     -- --ignored onnx_reranker::tests::onnx_classifier_ranks_on_topic
+    #[test]
+    #[ignore]
+    fn onnx_classifier_ranks_on_topic() {
+        use crate::config::SemantexConfig;
+        use crate::search::fastembed_reranker::ENV_ENABLE;
+        use crate::search::reranker_download::ensure_reranker_model;
+        use crate::search::reranker_model::{select_reranker_choice_from_env, RerankerChoice};
+
+        with_env(&[(ENV_ENABLE, Some("on"))], || {
+            // Force the ONNX classifier alias.
+            // SAFETY: guarded by the with_env mutex above.
+            unsafe { std::env::set_var("SEMANTEX_RERANKER_MODEL", "bge-onnx") };
+            let spec = match select_reranker_choice_from_env() {
+                RerankerChoice::Onnx(s) => s,
+                other => panic!("expected ONNX choice for bge-onnx, got {other:?}"),
+            };
+            let config = SemantexConfig::default();
+            let dir = ensure_reranker_model(&config.models_dir(), &spec.files)
+                .expect("download (offline?)");
+            // The bge ONNX export ships `model.onnx` (carried in spec.session_file).
+            let r = OnnxReranker::new(&dir, &spec.session_file, ScoreStrategy::ClassifierLogit, 4, false)
+                .expect("construct");
+            let docs = [
+                "Pizza is a popular Italian dish.",
+                "fn binary_search(a: &[i32], t: i32) -> Option<usize> { /* ... */ }",
+            ];
+            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let out = r
+                .rerank("how does binary search work", &docs_ref, 2)
+                .expect("rerank");
+            assert_eq!(out[0].0, 1, "on-topic code doc should rank first");
+        });
+    }
+
     /// Env scrub/restore helper (copied verbatim from `fastembed_reranker.rs`
     /// test module — tests can't share a private fn across files).
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {

@@ -39,6 +39,29 @@
 - **Verified (CPU smoke):** P(yes | relevant) = **0.990** vs P(yes | irrelevant) = **0.000**.
 - Reranker stays **off by default** (D8); this is the opt-in code-capable option, bge-reranker-v2-m3 remains the permissive fallback.
 
+### S3 — how S0 decides the rerank default
+- S0 harness (`benchmarks/relevance/`) runs the `rerank` ablation:
+  `python -m scripts.run --dataset csn --ablation rerank` and the CoIR/in-domain
+  equivalents. The harness sets `SEMANTEX_RERANKER=on` (+ `SEMANTEX_RERANKER_MODEL`)
+  in the subprocess env and passes `--rerank` to the CLI.
+- Compare each reranker (bge-v2-m3 fastembed; qwen3-reranker-0.6b ONNX) vs
+  rerank-off on nDCG@10 / MRR@10 / Recall@10, AND record per-query latency
+  (rerank_ms from SearchMetrics; budget stated by S0, e.g. warm p50 < X ms over
+  rerank_candidates=100).
+- ACCEPTANCE (spec §4 S3): a reranker is shippable iff net-positive nDCG@10/MRR
+  vs rerank-off on CoIR + CSN + in-domain WITHIN the stated latency budget.
+  If yes -> flip `SEMANTEX_RERANKER` on by default with the winning
+  `SEMANTEX_RERANKER_MODEL` (a one-line config/default change, separate PR). If no
+  -> leave OFF; record the numbers here.
+- The default-OFF gate in code STAYS until S0 reports a win. Flipping it is NOT
+  part of S3 (it is gated on harness output).
+- S3 code wiring (DONE): the reranker spec (score_strategy / prompt / yes-no
+  token ids / ONNX session file / download coords) is read from S8's
+  `ModelRegistry` as DATA via `RerankerChoice::from_spec(registry.active_reranker())`
+  — so S0 selects a reranker purely by setting `SEMANTEX_RERANKER_MODEL`
+  (== `config.reranker_model`); no S3 code change is needed to A/B a new
+  permissive reranker that is added to the manifest.
+
 ## S0 relevance harness
 
 > Verified live on 2026-05-31 in `benchmarks/relevance/.venv` (datasets 4.8.5,
