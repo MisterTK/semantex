@@ -326,7 +326,34 @@ mod avx2 {
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
-        super::scalar::cosine_f32(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7;
+            let mut dot = _mm256_setzero_ps();
+            let mut na = _mm256_setzero_ps();
+            let mut nb = _mm256_setzero_ps();
+            let mut i = 0;
+            while i < chunks {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                dot = _mm256_fmadd_ps(va, vb, dot);
+                na = _mm256_fmadd_ps(va, va, na);
+                nb = _mm256_fmadd_ps(vb, vb, nb);
+                i += 8;
+            }
+            let mut dot_s = hsum256_ps(dot);
+            let mut na_s = hsum256_ps(na);
+            let mut nb_s = hsum256_ps(nb);
+            while i < len {
+                let (x, y) = (a[i], b[i]);
+                dot_s += x * y;
+                na_s += x * x;
+                nb_s += y * y;
+                i += 1;
+            }
+            let denom = na_s.sqrt() * nb_s.sqrt();
+            if denom == 0.0 { 0.0 } else { dot_s / denom }
+        }
     }
     /// # Safety
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
@@ -474,7 +501,7 @@ mod tests {
     /// hosts this test is absent (the dispatch test covers NEON there).
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn avx2_dot_l2_match_scalar() {
+    fn avx2_dot_l2_cosine_match_scalar() {
         if !is_x86_feature_detected!("avx2") {
             eprintln!("skipping avx2 parity: AVX2 not present on this host");
             return;
@@ -483,9 +510,16 @@ mod tests {
             let a = make_vec(len, 0x55 ^ len as u64);
             let b = make_vec(len, 0xAA ^ len as u64);
             // SAFETY: AVX2 detected above; equal-length slices.
-            let (d, l) = unsafe { (avx2::dot_f32(&a, &b), avx2::l2_f32(&a, &b)) };
+            let (d, l, c) = unsafe {
+                (
+                    avx2::dot_f32(&a, &b),
+                    avx2::l2_f32(&a, &b),
+                    avx2::cosine_f32(&a, &b),
+                )
+            };
             assert_close(d, scalar::dot_f32(&a, &b));
             assert_close(l, scalar::l2_f32(&a, &b));
+            assert_close(c, scalar::cosine_f32(&a, &b));
         }
     }
 
