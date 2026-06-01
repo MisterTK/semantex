@@ -2421,6 +2421,71 @@ mod hyde_tests {
         );
     }
 
+    /// Contract: an empty HyDE doc (whitespace-only counts) is treated as "no
+    /// doc" — the caller returns base unchanged, never merging an empty query's
+    /// results.
+    #[tokio::test]
+    async fn hyde_empty_doc_yields_base_unchanged() {
+        let llm = MockLlm { mode: Mode::Empty };
+        let doc = llm.synthesize_hyde_doc("anything").await.unwrap();
+        assert!(doc.trim().is_empty(), "mock must return empty in Mode::Empty");
+
+        // Production decision for an empty doc: return base (no merge).
+        let base = SearchOutput {
+            results: vec![make_result(7, 0.5)],
+            metrics: make_metrics(),
+        };
+        let base_ids: Vec<u64> = base.results.iter().map(|r| r.chunk.id).collect();
+        let returned = if doc.trim().is_empty() { base } else { unreachable!() };
+        assert_eq!(
+            returned.results.iter().map(|r| r.chunk.id).collect::<Vec<_>>(),
+            base_ids,
+            "empty-doc path must return base unchanged"
+        );
+        assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
+    /// Contract: when the LLM is slower than `SEMANTEX_LLM_HYDE_TIMEOUT_MS`,
+    /// `tokio::time::timeout` returns `Err(Elapsed)` and the caller returns
+    /// base unchanged. We drive the *real* `super::llm_hyde_timeout()` reader by
+    /// overriding the env var to 1ms and racing it against a 200ms mock.
+    ///
+    /// SAFETY: env mutation under Rust 2024 is `unsafe`; this test holds the
+    /// crate-wide `TEST_ENV_LOCK` (which guards `SEMANTEX_LLM_*`) so no other
+    /// LLM test races on process env.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyde_timeout_yields_base_unchanged() {
+        let _guard = crate::llm::TEST_ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by TEST_ENV_LOCK; see module doc on the lock.
+        unsafe { std::env::set_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS", "1") };
+
+        let llm = MockLlm {
+            mode: Mode::Slow(std::time::Duration::from_millis(200)),
+        };
+        let outcome = tokio::time::timeout(
+            super::llm_hyde_timeout(),
+            llm.synthesize_hyde_doc("slow query"),
+        )
+        .await;
+
+        // SAFETY: guarded by TEST_ENV_LOCK.
+        unsafe { std::env::remove_var("SEMANTEX_LLM_HYDE_TIMEOUT_MS") };
+
+        assert!(
+            outcome.is_err(),
+            "1ms budget must elapse before a 200ms mock resolves"
+        );
+
+        // Production decision on Err(Elapsed): return base (no merge).
+        let base = SearchOutput {
+            results: vec![make_result(9, 0.42)],
+            metrics: make_metrics(),
+        };
+        let returned = if outcome.is_err() { base } else { unreachable!() };
+        assert_eq!(returned.results.len(), 1);
+        assert_ne!(returned.metrics.query_type, "hyde_merged");
+    }
+
     /// `merge_hyde_results` must dedup by `chunk.id`, not by `(file, start, end)`.
     /// Chunk ID is the stable DB key and is the only correct dedup key.
     #[test]
