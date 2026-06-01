@@ -380,6 +380,8 @@ mod tests {
             "use_bm25_stemmer": true,
             // S1: dense_backend is now part of IndexMeta (schema v10).
             "dense_backend": "colbert-plaid",
+            // S8: embedder_fingerprint is now part of IndexMeta.
+            "embedder_fingerprint": "test",
         });
         std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
     }

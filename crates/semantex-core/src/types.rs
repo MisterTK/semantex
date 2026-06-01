@@ -196,6 +196,14 @@ pub struct IndexMeta {
     /// `SemantexConfig.dense_backend` and refuses to load on mismatch — the
     /// dense graph/index layout is backend-specific. S1.
     pub dense_backend: String,
+    /// Fingerprint of the embedder spec this dense index was built with
+    /// (id+dims+pooling+quant+norm+prefix, xxh64). Open-time code compares it to
+    /// the active embedder's fingerprint; a mismatch means the vector space
+    /// changed, so the index is rebuilt under a new versioned dir and the active
+    /// pointer is flipped atomically (S8 — zero-downtime). An older meta.json
+    /// lacking this field fails to deserialize → `state::detect` returns `Stale`
+    /// (same mechanism as the v9→v10 `dense_backend` add — no extra schema bump).
+    pub embedder_fingerprint: String,
 }
 
 impl IndexMeta {
@@ -214,6 +222,10 @@ impl IndexMeta {
     /// that an index was built with a different dense backend than the running
     /// config. Older v9 meta.json files lack the field and fail to deserialize
     /// — `state::detect` then returns `Stale`, forcing a clean rebuild.
+    ///
+    /// S8: adds `embedder_fingerprint`. No version bump beyond S1's 10 — an older
+    /// meta.json lacking the field fails the strict deserialize and is treated as
+    /// `Stale` (same mechanism as the v9→v10 `dense_backend` add).
     pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 }
 
@@ -319,11 +331,32 @@ mod tests {
             embedding_dim: 48,
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "fp".to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: IndexMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dense_backend, "colbert-plaid");
         assert_eq!(back.schema_version, 10);
+    }
+
+    #[test]
+    fn index_meta_round_trips_embedder_fingerprint() {
+        let meta = IndexMeta {
+            schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: std::path::PathBuf::from("/x"),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 1,
+            chunk_count: 2,
+            embedding_model: "CodeRankEmbed".to_string(),
+            embedding_dim: 768,
+            use_bm25_stemmer: true,
+            dense_backend: "coderank-hnsw".to_string(),
+            embedder_fingerprint: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.embedder_fingerprint, "abc123");
     }
 
     /// Synthetic v8 meta.json must be detected as `Stale` by `state::detect`
@@ -347,6 +380,7 @@ mod tests {
             embedding_dim: 48,
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "fp".to_string(),
         };
         let meta_json = serde_json::to_string(&meta).expect("serialize meta");
         std::fs::write(semantex_dir.join("meta.json"), meta_json).expect("write meta");

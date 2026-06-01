@@ -238,6 +238,45 @@ impl ModelSpec {
     }
 }
 
+/// A stable content fingerprint of an embedder spec, used to stamp a dense index
+/// and detect an embedder change at open time. Generalizes the schema /
+/// stemmer-flag / dense-backend guards into one uniform "is this index's vector
+/// space the one this embedder produces?" check.
+///
+/// The fingerprint covers exactly the fields that change the produced vectors:
+/// the model id, dims, pooling, quantization, normalization, and the query
+/// prefix. (A reranker/LLM swap does NOT touch the dense vector space → not
+/// fingerprinted → no reindex; that is the design's query-time-live-swap
+/// guarantee.)
+pub struct EmbedderFingerprint;
+
+impl EmbedderFingerprint {
+    /// Compute the fingerprint string for `(id, spec)`. Deterministic across
+    /// runs/platforms (xxh64 of a canonical byte encoding).
+    #[must_use]
+    pub fn compute(id: &str, spec: &EmbedderSpec) -> String {
+        // Canonical, stable encoding of the vector-space-defining fields. Avoid
+        // serde here so a future non-fingerprinted field (e.g. max_context, which
+        // does NOT change the vector space) can be added to EmbedderSpec without
+        // silently invalidating every index.
+        let pooling = match spec.pooling {
+            Pooling::Mean => "mean",
+            Pooling::Cls => "cls",
+            Pooling::LateInteraction => "late_interaction",
+        };
+        let quant = match spec.quant {
+            QuantKind::None => "none",
+            QuantKind::Int8Symmetric => "int8_symmetric",
+        };
+        let canonical = format!(
+            "id={id};dims={};pooling={pooling};quant={quant};norm={};qpre={}",
+            spec.dims, spec.normalize, spec.query_prefix
+        );
+        let hash = xxhash_rust::xxh64::xxh64(canonical.as_bytes(), 0);
+        format!("{hash:016x}")
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -293,6 +332,41 @@ mod tests {
         assert_eq!(e.pooling, Pooling::Cls);
         assert_eq!(e.quant, QuantKind::Int8Symmetric);
         assert!(e.query_prefix.ends_with(' '));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_sensitive() {
+        let base = EmbedderSpec {
+            dims: 768,
+            max_context: 8192,
+            query_prefix: "Q: ".to_string(),
+            doc_prefix: String::new(),
+            pooling: Pooling::Cls,
+            normalize: true,
+            quant: QuantKind::Int8Symmetric,
+        };
+        let fp1 = EmbedderFingerprint::compute("coderank-137m", &base);
+        let fp2 = EmbedderFingerprint::compute("coderank-137m", &base);
+        assert_eq!(fp1, fp2, "same id+spec → same fingerprint (deterministic)");
+        assert!(!fp1.is_empty());
+
+        // Changing dims changes the fingerprint (vector space differs).
+        let mut diff_dims = base.clone();
+        diff_dims.dims = 384;
+        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_dims));
+
+        // Changing pooling changes it.
+        let mut diff_pool = base.clone();
+        diff_pool.pooling = Pooling::Mean;
+        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_pool));
+
+        // Changing quant changes it.
+        let mut diff_quant = base.clone();
+        diff_quant.quant = QuantKind::None;
+        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_quant));
+
+        // Changing the id changes it (different model, same shape).
+        assert_ne!(fp1, EmbedderFingerprint::compute("other-embedder", &base));
     }
 
     /// Helper struct so the role test can deserialize a bare `role = "…"`.

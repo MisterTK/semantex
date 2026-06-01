@@ -639,6 +639,12 @@ impl IndexBuilder {
         // build-time stemmer disagrees with the runtime config.
         let actual_chunk_count = store.chunk_count().unwrap_or(total_chunks as u64);
         let actual_file_count = store.file_count().unwrap_or(files_indexed + files_skipped);
+        // S8: the embedder fingerprint is stamped here so open-time code can
+        // detect a vector-space change. The real value is wired from the
+        // resolved registry spec in S8 Task 9 (after the ModelRegistry + config
+        // selection fields land); kept empty until then so this commit stays
+        // additive and the suite green.
+        let embedder_fingerprint = String::new();
         let meta = IndexMeta {
             schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
             project_path: project_path.clone(),
@@ -650,6 +656,7 @@ impl IndexBuilder {
             embedding_dim: 48,
             use_bm25_stemmer: self.config.use_bm25_stemmer,
             dense_backend: self.config.dense_backend.clone(),
+            embedder_fingerprint,
         };
         let meta_json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(index_dir.join("meta.json"), meta_json)?;

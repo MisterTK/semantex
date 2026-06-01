@@ -12,6 +12,6 @@ pub mod spec;
 
 pub use capabilities::{BackendKind, ModelCapabilities, backend_for};
 pub use spec::{
-    EmbedderSpec, LlmSpec, ModelRole, ModelSource, ModelSpec, Pooling, QuantKind, RerankerSpec,
-    RoleData, ScoreStrategyKind,
+    EmbedderFingerprint, EmbedderSpec, LlmSpec, ModelRole, ModelSource, ModelSpec, Pooling,
+    QuantKind, RerankerSpec, RoleData, ScoreStrategyKind,
 };

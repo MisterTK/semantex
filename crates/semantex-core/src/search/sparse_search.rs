@@ -371,6 +371,7 @@ mod tests {
             embedding_dim: 48,
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             index_dir.join("meta.json"),
@@ -423,6 +424,7 @@ mod tests {
             embedding_dim: 48,
             use_bm25_stemmer: false,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             index_dir.join("meta.json"),
