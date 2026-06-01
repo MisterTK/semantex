@@ -293,3 +293,67 @@ candidates to ~15 before `-m` applies, trimming low-overlap gold. Measuring the
 shipped channel (with its adaptive trimming) is INTENTIONAL — that is what real
 semantex returns. `config/baselines.yaml` wording corrected accordingly (now
 points at adaptive.rs, "NOT a tantivy BM25 cap"); no `crates/` code changed.
+
+## S5 — HyDE call-site wiring (spike 2026-05-31)
+
+**Scope statement:** S5 production change = add a shared Tokio runtime to
+`McpServer` and chain `.with_runtime()` in `tool_agent`; everything else is
+test-hardening of an already-correct core.
+
+### Current state (verified against the tree)
+- **HyDE core = implemented & correct.** `crates/semantex-core/src/search/hybrid.rs`:
+  - `const LLM_HYDE_TIMEOUT_DEFAULT_MS: u64 = 15_000;` (`#[cfg(feature="llm")]`).
+  - `fn llm_hyde_timeout() -> std::time::Duration` reads `SEMANTEX_LLM_HYDE_TIMEOUT_MS`.
+  - `impl HybridSearcher { pub async fn search_with_hyde(&self, query: &super::SearchQuery, llm: std::sync::Arc<dyn crate::llm::LlmCapability>) -> anyhow::Result<super::SearchOutput> }`.
+    Empty-doc / `Ok(Err)` / timeout / hyde-search-`Err` branches each `return Ok(base)`.
+  - `fn merge_hyde_results(base, hyde, max_results) -> SearchOutput` dedups by `chunk.id`,
+    sorts by score desc, truncates to `max_results`, sets `metrics.query_type = "hyde_merged"`.
+  - Existing tests (`mod hyde_tests`): `merge_deduplicates_by_chunk_id`,
+    `merge_sorts_by_score_descending`, `merge_caps_at_max_results`,
+    `merge_with_empty_base_does_not_panic`. Helpers `make_metrics()` / `make_result(id, score)`.
+    NO test exercises `search_with_hyde` end-to-end against a failing/timing-out LLM.
+- **Semantic integration = wired.** `crates/semantex-core/src/search/agent.rs::search_semantic`
+  calls `rt.block_on(self.searcher.search_with_hyde(query, llm))` when both `llm` and
+  `runtime` are `Some`; falls back to a per-call `new_current_thread` runtime with a
+  one-time `tracing::warn!` when `runtime` is `None`. `handle_semantic` calls `search_semantic`.
+- **Daemon path = fully wired (llm + runtime).** `server/listener.rs` builds the shared
+  runtime once in `bind` (`tokio::runtime::Builder::new_current_thread().enable_all().build()`
+  → `Arc`, field `llm_runtime` line 47); `build_handler` chains `.with_llm(self.llm.clone())`
+  + `.with_runtime(self.llm_runtime.clone())` (lines 275-276). `handler.rs::handle_agent`
+  chains both (lines 93-94).
+- **MCP path = MISSING shared runtime → per-call fallback.** `crates/semantex-mcp/src/server.rs`:
+  - `struct McpServer` (line 130) has `#[cfg(feature="llm")] llm: Option<Arc<dyn …>>` (line 150)
+    but NO runtime field.
+  - `with_toolset` (line 162) builds `llm` via `LlmBackend::from_env()` + `.into_arc()` but
+    NO runtime.
+  - `tool_agent` (line 1148): `AgentPipeline::new(&cached.searcher, path.clone())` then
+    `#[cfg(feature="llm")] let pipeline = pipeline.with_llm(self.llm.clone());` — NO `.with_runtime`.
+  - `rg "Runtime"` in this file → no match. This is the v0.7.1 residual debt for the surface
+    Claude Code / Cursor actually use.
+
+### Feature-forwarding strings (verbatim, verified)
+- `crates/semantex-mcp/Cargo.toml`:
+  - `tokio = { workspace = true, optional = true }` — gated ONLY by `http`, NOT `llm`.
+  - `[features] default = ["http"]`, `http = ["dep:tokio", "dep:axum", "dep:tower"]`,
+    `llm = ["semantex-core/llm"]`.
+  - **DECISION (verified YES):** Task 3 edits this to `llm = ["semantex-core/llm", "dep:tokio"]`
+    because the new `tokio::runtime::Runtime` field is `llm`-gated and `--no-default-features
+    --features llm` would otherwise fail (no tokio).
+- `crates/semantex-cli/Cargo.toml`:
+  `llm = ["mcp", "semantex-core/llm", "semantex-mcp/llm", "dep:tokio"]` — masks the bug today
+  because it also pulls `mcp → http → tokio`.
+- `crates/semantex-core/Cargo.toml`:
+  `default = []`; `llm = ["dep:genai", "dep:tokio", "dep:async-trait", "dep:which"]`.
+
+### Task-4 helper located
+`crates/semantex-core/src/server/handler.rs::build_empty_searcher()` is the canonical
+cheap real-index helper: makes a `TempDir`, creates an empty `ChunkStore`, opens
+`HybridSearcher::open_sparse_only(&semantex_dir, &config)` → `(TempDir, HybridSearcher)`.
+S5 mirrors this in `hyde_tests` to drive `search_with_hyde` through its real async path.
+Empty index → base search is empty; error path yields empty == base (identical), success
+path yields empty-but-`hyde_merged`-tagged output (dedup invariant trivially holds).
+
+### Test infra
+- `crate::llm::TEST_ENV_LOCK` (`pub(crate) static Mutex<()>`) guards `SEMANTEX_LLM_*` env
+  mutation; the timeout test holds it.
+- `SemantexConfig::default()` is available and used by existing tests (server.rs:2759).
