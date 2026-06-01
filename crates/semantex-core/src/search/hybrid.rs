@@ -600,6 +600,28 @@ impl HybridSearcher {
                     );
                     rrf_results.into_iter().map(|r| r.scored).collect()
                 }
+                // S7: WeightedRrf arm is wired in Task 1.4. Until then it shares
+                // the parameter-free RRF behavior so the crate compiles.
+                FusionMode::WeightedRrf => {
+                    let rrf_results: Vec<RrfFusedResult> = if !exp_dense_results.is_empty()
+                        || !exp_sparse_results.is_empty()
+                    {
+                        triple_fusion::exp4_rrf_fuse(
+                            &dense_results,
+                            &sparse_results,
+                            &exp_dense_results,
+                            &exp_sparse_results,
+                            &exact_ids,
+                        )
+                    } else {
+                        triple_fusion::triple_rrf_fuse(&dense_results, &sparse_results, &exact_ids)
+                    };
+                    let labels = triple_fusion::assign_confidence(&rrf_results);
+                    for (rr, (conf, score)) in rrf_results.iter().zip(labels.iter()) {
+                        confidence_map.insert(rr.scored.chunk_id, (*conf, *score));
+                    }
+                    rrf_results.into_iter().map(|r| r.scored).collect()
+                }
                 FusionMode::Cc => {
                     let triple_weights = query_type.triple_fusion_weights();
                     tracing::debug!(

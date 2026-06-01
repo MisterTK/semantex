@@ -22,6 +22,10 @@ pub enum FusionMode {
     /// Reciprocal Rank Fusion (default, parameter-free).
     #[default]
     Rrf,
+    /// Weighted RRF: per-channel rank-decay scaled by query-type FusionWeights
+    /// and a configurable `k` (`config.rrf_k`). Spec S7 — revives the dead
+    /// adaptive weights on the RRF path.
+    WeightedRrf,
     /// Triple Convex Combination (legacy, weighted normalized scores).
     Cc,
 }
@@ -31,6 +35,9 @@ impl FusionMode {
     /// Anything unrecognised (or empty) falls back to the default (RRF).
     pub fn from_env_value(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            // Weighted-RRF uses explicit spellings so the legacy "weighted"
+            // (= CC) alias below stays distinct.
+            "weighted-rrf" | "wrrf" => Self::WeightedRrf,
             "cc" | "convex" | "weighted" => Self::Cc,
             // Accept "rrf" or anything unrecognised → default RRF.
             _ => Self::Rrf,
@@ -1321,6 +1328,27 @@ mod tests {
         // Spec: anything unrecognised → default RRF
         assert_eq!(FusionMode::from_env_value(""), FusionMode::Rrf);
         assert_eq!(FusionMode::from_env_value("zzz"), FusionMode::Rrf);
+    }
+
+    #[test]
+    fn test_fusion_mode_parse_weighted_rrf() {
+        assert_eq!(
+            FusionMode::from_env_value("weighted-rrf"),
+            FusionMode::WeightedRrf
+        );
+        assert_eq!(FusionMode::from_env_value("wrrf"), FusionMode::WeightedRrf);
+        assert_eq!(
+            FusionMode::from_env_value("  Weighted-RRF  "),
+            FusionMode::WeightedRrf
+        );
+    }
+
+    #[test]
+    fn test_fusion_mode_weighted_does_not_collide_with_cc() {
+        // "weighted" historically aliased CC (convex). Keep that alias for CC;
+        // weighted-RRF uses the explicit "weighted-rrf"/"wrrf" spellings so the
+        // legacy SEMANTEX_FUSION=weighted users still get CC, unchanged.
+        assert_eq!(FusionMode::from_env_value("weighted"), FusionMode::Cc);
     }
 
     // =================================================================
