@@ -8,6 +8,7 @@
 //! a lowest common denominator. See the SOTA overhaul design spec §4 S8 / §2 D9.
 
 use crate::model::capabilities::ModelCapabilities;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Which pipeline stage a model serves.
@@ -155,6 +156,80 @@ pub struct ModelSpec {
     /// Role-specific nuance (flattened so a manifest entry is one table).
     #[serde(flatten)]
     pub role_data: RoleData,
+}
+
+impl ModelSpec {
+    /// Validate internal consistency: `role` agrees with `role_data`, ids are
+    /// non-empty, sources name at least one file, and role-specific invariants
+    /// hold (e.g. a `YesNoLogit` reranker carries both token ids). Errors NAME
+    /// the offending field so a bad `models.toml` is actionable (risk row
+    /// "model-manifest misconfiguration").
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.id.trim().is_empty(), "model spec has an empty `id`");
+        let role_ok = matches!(
+            (self.role, &self.role_data),
+            (ModelRole::Embedder, RoleData::Embedder(_))
+                | (ModelRole::Reranker, RoleData::Reranker(_))
+                | (ModelRole::Llm, RoleData::Llm(_))
+        );
+        anyhow::ensure!(
+            role_ok,
+            "model `{}`: `role` {:?} disagrees with its role data",
+            self.id,
+            self.role
+        );
+        match &self.source {
+            ModelSource::Hf { repo, files } => {
+                anyhow::ensure!(
+                    !repo.trim().is_empty(),
+                    "model `{}`: empty hf `repo`",
+                    self.id
+                );
+                anyhow::ensure!(
+                    !files.is_empty(),
+                    "model `{}`: hf source lists no `files`",
+                    self.id
+                );
+            }
+            ModelSource::Local { dir } => {
+                anyhow::ensure!(
+                    !dir.trim().is_empty(),
+                    "model `{}`: empty local `dir`",
+                    self.id
+                );
+            }
+            ModelSource::Url { base, files } => {
+                anyhow::ensure!(
+                    !base.trim().is_empty(),
+                    "model `{}`: empty url `base`",
+                    self.id
+                );
+                anyhow::ensure!(
+                    !files.is_empty(),
+                    "model `{}`: url source lists no `files`",
+                    self.id
+                );
+            }
+        }
+        if let RoleData::Embedder(e) = &self.role_data {
+            anyhow::ensure!(e.dims > 0, "model `{}`: embedder `dims` must be > 0", self.id);
+            anyhow::ensure!(
+                e.max_context > 0,
+                "model `{}`: embedder `max_context` must be > 0",
+                self.id
+            );
+        }
+        if let RoleData::Reranker(r) = &self.role_data
+            && matches!(r.score_strategy, ScoreStrategyKind::YesNoLogit)
+        {
+            anyhow::ensure!(
+                r.yes_token_id.is_some() && r.no_token_id.is_some(),
+                "model `{}`: yes_no_logit reranker needs both `yes_token_id` and `no_token_id`",
+                self.id
+            );
+        }
+        Ok(())
+    }
 }
 
 fn default_true() -> bool {
