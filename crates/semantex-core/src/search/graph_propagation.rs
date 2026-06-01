@@ -25,6 +25,11 @@ pub struct GraphPropagationConfig {
     /// returns the seeds unchanged — used by the S0 harness graph-off A/B and
     /// as a user escape hatch. Default false.
     pub disabled: bool,
+    /// Import-cohesion ("community") expansion decay (`SEMANTEX_GRAPH_MODULE_DECAY`).
+    /// When `> 0.0`, the stage expands seeds to chunks in import-neighbor files
+    /// (shared-import cohesion ≈ same subsystem) for the exhaustive route.
+    /// Default `0.0` (off) in every preset per the S4 acceptance gate.
+    pub module_decay: f32,
 }
 
 impl GraphPropagationConfig {
@@ -41,6 +46,7 @@ impl GraphPropagationConfig {
                 max_propagated: top_k / 4,
                 enable_transitive: false,
                 disabled: false,
+                module_decay: 0.0,
             },
             QueryType::Keyword => Self {
                 call_decay: 0.15,
@@ -51,6 +57,7 @@ impl GraphPropagationConfig {
                 max_propagated: top_k / 3,
                 enable_transitive: false,
                 disabled: false,
+                module_decay: 0.0,
             },
             QueryType::Semantic => Self {
                 call_decay: 0.15,
@@ -61,6 +68,7 @@ impl GraphPropagationConfig {
                 max_propagated: top_k / 4,
                 enable_transitive: false,
                 disabled: false,
+                module_decay: 0.0,
             },
             QueryType::Mixed => Self {
                 call_decay: 0.20,
@@ -71,6 +79,7 @@ impl GraphPropagationConfig {
                 max_propagated: top_k / 3,
                 enable_transitive: false,
                 disabled: false,
+                module_decay: 0.0,
             },
         }
     }
@@ -87,6 +96,7 @@ impl GraphPropagationConfig {
             max_propagated: top_k,
             enable_transitive: true,
             disabled: false,
+            module_decay: 0.0,
         }
     }
 
@@ -107,6 +117,7 @@ impl GraphPropagationConfig {
             max_propagated: top_k,
             enable_transitive: true,
             disabled: false,
+            module_decay: 0.0,
         }
     }
 
@@ -148,6 +159,11 @@ impl GraphPropagationConfig {
         if let Ok(v) = std::env::var("SEMANTEX_GRAPH_DISABLE") {
             // Any non-empty, non-"0" value disables the stage.
             self.disabled = !v.is_empty() && v != "0";
+        }
+        if let Ok(v) = std::env::var("SEMANTEX_GRAPH_MODULE_DECAY") {
+            if let Ok(f) = v.parse() {
+                self.module_decay = f;
+            }
         }
         self
     }
@@ -441,6 +457,7 @@ mod tests {
             max_propagated: 10,
             enable_transitive: false,
             disabled: false,
+            module_decay: 0.0,
         };
         // All decays are zero, so no propagation would occur
         assert!((config.call_decay).abs() < f32::EPSILON);
@@ -466,6 +483,40 @@ mod tests {
         // Expands generously for recall: up to top_k new chunks.
         assert_eq!(config.max_propagated, 20);
         assert!(!config.disabled);
+    }
+
+    #[test]
+    fn test_module_decay_off_by_default_in_all_presets() {
+        // Cohesion expansion ships OFF by default in EVERY preset (incl.
+        // localization_mode) per the S4 acceptance gate: default behavior must
+        // equal pre-S4. It is opt-in only via SEMANTEX_GRAPH_MODULE_DECAY.
+        for qt in [
+            QueryType::Identifier,
+            QueryType::Keyword,
+            QueryType::Semantic,
+            QueryType::Mixed,
+        ] {
+            assert!(
+                (GraphPropagationConfig::for_query_type(&qt, 10).module_decay).abs()
+                    < f32::EPSILON,
+            );
+        }
+        assert!(
+            (GraphPropagationConfig::architectural_mode(10).module_decay).abs() < f32::EPSILON,
+        );
+        assert!(
+            (GraphPropagationConfig::localization_mode(10).module_decay).abs() < f32::EPSILON,
+            "localization_mode must also default module_decay to 0 (off by default)"
+        );
+    }
+
+    #[test]
+    fn test_module_decay_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("SEMANTEX_GRAPH_MODULE_DECAY", "0.10") };
+        let config = GraphPropagationConfig::localization_mode(10).with_env_overrides();
+        unsafe { std::env::remove_var("SEMANTEX_GRAPH_MODULE_DECAY") };
+        assert!((config.module_decay - 0.10).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -519,6 +570,7 @@ mod tests {
             max_propagated: 10,
             enable_transitive: true,
             disabled: true,
+            module_decay: 0.0,
         };
         assert!(config.disabled);
         // The disabled branch in propagate() returns seeds.to_vec() — covered by

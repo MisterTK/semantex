@@ -73,13 +73,104 @@ pub fn run_graph_stage(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let mut introduced: HashSet<u64> = new_ids.into_iter().collect();
+
+    // Optional import-cohesion ("community") expansion for the exhaustive route
+    // (off by default; gated on config.module_decay > 0.0 via SEMANTEX_GRAPH_MODULE_DECAY).
+    if config.module_decay > 0.0 {
+        let cohesion_new = apply_module_cohesion(
+            fused,
+            chunk_map,
+            store,
+            config.module_decay,
+            config.max_propagated,
+        )?;
+        introduced.extend(cohesion_new);
+    }
+
     // Optional centrality prior (off by default; SEMANTEX_GRAPH_CENTRALITY_WEIGHT).
     let centrality_weight = centrality_weight_from_env();
     if centrality_weight > 0.0 {
         apply_centrality_prior(fused, store, centrality_weight)?;
     }
 
-    Ok(new_ids.into_iter().collect())
+    Ok(introduced)
+}
+
+/// Import-cohesion ("community") expansion: surface chunks that live in the
+/// import-neighbor files of the seed chunks (shared-import cohesion ≈ same
+/// subsystem). A lightweight, search-time proxy for community detection —
+/// full index-time Louvain clustering is a deferred follow-up.
+///
+/// Adds `module_decay * max_seed_score` to each newly-surfaced neighbor chunk
+/// (the top seed normalizes to 1.0), keeping the bonus on the same scale as the
+/// propagation bonuses. Bounded to `max_propagated` new chunks. Returns the set
+/// of newly-introduced chunk ids (for `GraphExpanded` tagging). No-op when
+/// `module_decay <= 0.0` or no import neighbors exist.
+fn apply_module_cohesion(
+    fused: &mut Vec<ScoredChunkId>,
+    chunk_map: &mut HashMap<u64, Chunk>,
+    store: &ChunkStore,
+    module_decay: f32,
+    max_propagated: usize,
+) -> Result<HashSet<u64>> {
+    if module_decay <= 0.0 || fused.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let max_seed_score = fused
+        .iter()
+        .map(|s| s.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_seed_score <= 0.0 {
+        return Ok(HashSet::new());
+    }
+
+    // Seed chunk ids → their file paths (from the chunk map the caller populated).
+    let existing_ids: HashSet<u64> = fused.iter().map(|s| s.chunk_id).collect();
+    let mut seed_files: Vec<String> = fused
+        .iter()
+        .filter_map(|s| chunk_map.get(&s.chunk_id))
+        .map(|c| c.file_path.to_string_lossy().into_owned())
+        .collect();
+    seed_files.sort_unstable();
+    seed_files.dedup();
+    if seed_files.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let neighbor_files = store.get_import_neighbors(&seed_files)?;
+    if neighbor_files.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let neighbor_ids = store.get_chunk_ids_for_files(&neighbor_files)?;
+    // New, capped, deterministic ordering.
+    let mut candidates: Vec<u64> = neighbor_ids
+        .into_iter()
+        .filter(|id| !existing_ids.contains(id))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.truncate(max_propagated);
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let bonus = module_decay * max_seed_score;
+    let fetched = store.get_chunks(&candidates)?;
+    for chunk in fetched {
+        chunk_map.insert(chunk.id, chunk);
+    }
+    for id in &candidates {
+        fused.push(ScoredChunkId::new(*id, bonus));
+    }
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(candidates.into_iter().collect())
 }
 
 /// Read the centrality-prior weight from `SEMANTEX_GRAPH_CENTRALITY_WEIGHT`.
@@ -188,6 +279,11 @@ pub(crate) mod test_support {
     pub fn add_centrality(store: &ChunkStore, chunk_id: u64, value: f64) {
         store.insert_centrality_score(chunk_id, value).unwrap();
     }
+
+    /// Record a module-level import edge (importer imports imported).
+    pub fn add_module_edge(store: &ChunkStore, importer: &str, imported: &str) {
+        store.insert_module_edge(importer, imported, "import").unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +383,54 @@ mod tests {
         // chunk1 has normalized centrality 0 → unchanged.
         assert!((s1 - 10.0).abs() < f32::EPSILON, "got {s1}");
         // re-sorted desc: chunk1 (10.0) still first.
+        assert_eq!(fused[0].chunk_id, 1);
+    }
+
+    #[test]
+    fn test_module_cohesion_off_when_decay_zero_is_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_call_edge(tmp.path());
+        // caller.rs imports unrelated.rs (chunk 3 lives there).
+        test_support::add_module_edge(&store, "src/caller.rs", "src/unrelated.rs");
+
+        let mut fused = vec![ScoredChunkId::new(1, 10.0)];
+        let mut chunk_map: HashMap<u64, Chunk> = HashMap::new();
+        for c in store.get_chunks(&[1]).unwrap() {
+            chunk_map.insert(c.id, c);
+        }
+        let before = fused.clone();
+        // module_decay = 0.0 → cohesion expansion must not run.
+        let new_ids = apply_module_cohesion(&mut fused, &mut chunk_map, &store, 0.0, 10).unwrap();
+        assert!(new_ids.is_empty());
+        assert_eq!(fused.len(), before.len());
+        for (a, b) in fused.iter().zip(before.iter()) {
+            assert_eq!(a.chunk_id, b.chunk_id);
+            assert!((a.score - b.score).abs() < f32::EPSILON);
+        }
+        assert!(!fused.iter().any(|s| s.chunk_id == 3));
+    }
+
+    #[test]
+    fn test_module_cohesion_surfaces_import_neighbor_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_call_edge(tmp.path());
+        test_support::add_module_edge(&store, "src/caller.rs", "src/unrelated.rs");
+
+        // Seed chunk 1 (in caller.rs). chunk 3 lives in the imported file.
+        let mut fused = vec![ScoredChunkId::new(1, 10.0)];
+        let mut chunk_map: HashMap<u64, Chunk> = HashMap::new();
+        for c in store.get_chunks(&[1]).unwrap() {
+            chunk_map.insert(c.id, c);
+        }
+        let new_ids = apply_module_cohesion(&mut fused, &mut chunk_map, &store, 0.10, 10).unwrap();
+
+        assert!(new_ids.contains(&3), "import-neighbor chunk not surfaced");
+        assert!(fused.iter().any(|s| s.chunk_id == 3));
+        assert!(chunk_map.contains_key(&3), "neighbor chunk not fetched");
+        // chunk 3 score = module_decay * norm(=1.0) * max_seed_score = 0.10 * 10 = 1.0
+        let s3 = fused.iter().find(|s| s.chunk_id == 3).unwrap().score;
+        assert!((s3 - 1.0).abs() < 1e-4, "got {s3}");
+        // seed unchanged and still first.
         assert_eq!(fused[0].chunk_id, 1);
     }
 }

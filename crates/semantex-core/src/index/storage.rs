@@ -1075,6 +1075,30 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Map file paths to their chunk ids. Generic accessor used by the
+    /// search-time import-cohesion expansion. Unknown paths contribute nothing;
+    /// empty input returns an empty vec.
+    pub fn get_chunk_ids_for_files(&self, file_paths: &[String]) -> Result<Vec<u64>> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for batch in file_paths.chunks(500) {
+            let placeholders: String = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id FROM chunks WHERE file_path IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = batch
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), |r| Ok(r.get::<_, i64>(0)? as u64))?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read stored PageRank / structural centrality for the given chunk ids.
     /// Returns an empty map when the aux table is absent (older index) so the
     /// centrality prior is a clean no-op on un-enriched indexes.
@@ -1659,5 +1683,34 @@ mod delete_graph_data_tests {
 
         // Empty input → empty map.
         assert!(store.get_centrality_scores(&[]).unwrap().is_empty());
+    }
+
+    /// `get_chunk_ids_for_files` maps file paths to their chunk ids and ignores
+    /// unknown paths and empty input.
+    #[test]
+    fn get_chunk_ids_for_files_maps_paths_to_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+
+        let a = insert_test_chunk(&store, "src/a.rs");
+        let b = insert_test_chunk(&store, "src/b.rs");
+
+        let mut got = store
+            .get_chunk_ids_for_files(&["src/a.rs".to_string(), "src/b.rs".to_string()])
+            .unwrap();
+        got.sort_unstable();
+        let mut want = vec![a, b];
+        want.sort_unstable();
+        assert_eq!(got, want);
+
+        // Unknown path → no ids; empty input → empty.
+        assert!(
+            store
+                .get_chunk_ids_for_files(&["nope.rs".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.get_chunk_ids_for_files(&[]).unwrap().is_empty());
     }
 }
