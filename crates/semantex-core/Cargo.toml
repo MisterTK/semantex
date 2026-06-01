@@ -100,6 +100,11 @@ pdf-extract = "0.10"
 # Config
 serde_yml = "0.0.12"
 
+# TOML parser for the user model manifest (model/manifest.rs `models.toml`).
+# Pure Rust, no C/sys deps (verified via `cargo tree`) — keeps the airgap/offline
+# build clean. We only use `toml::from_str` / serde-derive deserialization.
+toml = "0.8"
+
 # Cross-platform
 dirs = "6"
 ctrlc = { version = "3", features = ["termination"] }

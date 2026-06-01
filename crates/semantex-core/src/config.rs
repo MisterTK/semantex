@@ -72,6 +72,21 @@ pub struct SemantexConfig {
     /// refuses to load on mismatch (mirrors `use_bm25_stemmer`). Override via
     /// `SEMANTEX_DENSE_BACKEND`. Default `"colbert-plaid"`.
     pub dense_backend: String,
+    /// Active embedder model id (registry lookup key). Default `"lateon-colbert"`
+    /// (D4: PLAID is the shipped dense default until the Phase-3 cutover flips
+    /// this to `"coderank-137m"`). The embedder spec id is model-descriptive and
+    /// distinct from the dense backend name it routes to via capabilities
+    /// (`lateon-colbert` → `colbert-plaid`; `coderank-137m` → `coderank-hnsw`).
+    /// Override via `SEMANTEX_EMBEDDER`. A change here triggers a versioned dense
+    /// rebuild + atomic switchover (S8) — the re-embedding compute is inherent.
+    pub embedder: String,
+    /// Active reranker model id (registry lookup key). Default
+    /// `"bge-reranker-v2-m3"`. Override via `SEMANTEX_RERANKER_MODEL`. A change
+    /// here is a query-time live swap — no reindex.
+    pub reranker_model: String,
+    /// Active LLM model id (registry lookup key). Empty = none. Override via
+    /// `SEMANTEX_LLM_MODEL`. Only meaningful with the `llm` feature.
+    pub llm_model: String,
 }
 
 impl Default for SemantexConfig {
@@ -100,6 +115,9 @@ impl Default for SemantexConfig {
             plaid_nbits: 4,
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder: "lateon-colbert".to_string(),
+            reranker_model: "bge-reranker-v2-m3".to_string(),
+            llm_model: String::new(),
         }
     }
 }
@@ -152,6 +170,11 @@ impl SemantexConfig {
                 config.dense_backend = trimmed.to_string();
             }
         }
+        // S8: registry selection keys. `SEMANTEX_RERANKER_MODEL` is the same
+        // selection key S3 already reads — the registry now reads it via config.
+        config.embedder = env_string("SEMANTEX_EMBEDDER", &config.embedder);
+        config.reranker_model = env_string("SEMANTEX_RERANKER_MODEL", &config.reranker_model);
+        config.llm_model = env_string("SEMANTEX_LLM_MODEL", &config.llm_model);
 
         Ok(config)
     }
@@ -224,8 +247,8 @@ pub(crate) fn env_usize(key: &str, default: usize) -> usize {
 /// Returns the trimmed value when `key` is set to a non-empty string; a
 /// missing or whitespace-only value falls back to `default`.
 // Added in S1 for S8's ModelRegistry selection (per integration §3 item 5);
-// no production caller in this stream yet — only the unit test exercises it.
-#[allow(dead_code)]
+// S8's `load()` overlays now consume it (SEMANTEX_EMBEDDER / _RERANKER_MODEL /
+// _LLM_MODEL).
 pub(crate) fn env_string(key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
@@ -254,6 +277,18 @@ mod tests {
         assert_eq!(
             cfg.dense_backend, "colbert-plaid",
             "default dense backend must stay colbert-plaid until S2 + harness flip it (D4)"
+        );
+    }
+
+    #[test]
+    fn default_selection_fields() {
+        let cfg = SemantexConfig::default();
+        // D4: PLAID stays the shipped dense default until the Phase-3 cutover.
+        assert_eq!(cfg.embedder, "lateon-colbert");
+        assert_eq!(cfg.reranker_model, "bge-reranker-v2-m3");
+        assert_eq!(
+            cfg.llm_model, "",
+            "no LLM selected by default (zero-LLM-deps build)"
         );
     }
 

@@ -2976,6 +2976,7 @@ mod tests {
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
@@ -3294,6 +3295,7 @@ mod tests {
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
@@ -3572,6 +3574,7 @@ mod tests {
             // index. Default-true matches the v0.4 legacy build behaviour.
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "test".to_string(),
         };
         std::fs::write(
             semantex_dir.join("meta.json"),
