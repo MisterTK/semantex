@@ -22,6 +22,7 @@ pub mod reranker_engine;
 pub mod reranker_model;
 pub mod ripgrep_fallback;
 pub mod simd;
+pub mod semantic_cache;
 pub mod sparse_search;
 pub mod summarize;
 pub mod triple_fusion;
