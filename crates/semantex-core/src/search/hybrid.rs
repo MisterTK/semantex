@@ -234,6 +234,37 @@ impl HybridSearcher {
             return self.search_grep_mode(query, search_start);
         }
 
+        // S7: semantic-cache lookup. OFF unless SEMANTEX_SEMANTIC_CACHE=1. Only
+        // attempts when a dense backend can embed the query AND meta.json yields
+        // a current stamp. A hit returns cached (results, metrics) verbatim,
+        // skipping all retrieval/fusion/rerank. Never caches grep-mode (handled
+        // above) or queries with a regex_pattern (results depend on the pattern).
+        let cache_eligible = semantic_cache::is_enabled() && query.regex_pattern.is_none();
+        let query_cache_vec: Option<Vec<f32>> = if cache_eligible {
+            self.dense
+                .as_ref()
+                .and_then(|d| d.embed_text_vector(&query.text))
+        } else {
+            None
+        };
+        if let (Some(qvec), Some(stamp)) =
+            (&query_cache_vec, semantic_cache::read_stamp(&self.index_dir))
+        {
+            let threshold = semantic_cache::threshold_from_env();
+            let mut cache = self.semantic_cache.lock();
+            if let Some((results, mut metrics)) =
+                cache.lookup(&query.text, qvec, threshold, &stamp)
+            {
+                metrics.total_ms = search_start.elapsed().as_millis() as u64;
+                tracing::debug!(
+                    query = %query.text,
+                    results = results.len(),
+                    "Semantic cache hit (S7)"
+                );
+                return Ok(super::SearchOutput { results, metrics });
+            }
+        }
+
         let candidates = self.config.rerank_candidates;
 
         // Phase 5: If a regex pattern is present, augment the query text with
@@ -1267,7 +1298,7 @@ impl HybridSearcher {
             "Search completed successfully"
         );
 
-        Ok(super::SearchOutput {
+        let output = super::SearchOutput {
             metrics: super::SearchMetrics {
                 total_ms: total_duration.as_millis() as u64,
                 dense_ms: if query.use_dense {
@@ -1292,7 +1323,25 @@ impl HybridSearcher {
                 response_bytes: None,
             },
             results,
-        })
+        };
+
+        // S7: store this (query → results) association if the cache is engaged.
+        // Re-read the stamp at store time (cheap) so a reindex that completed
+        // mid-search still tags the entry with the post-reindex stamp (or, on
+        // mismatch, enforce_stamp flushes — correctness preserved either way).
+        if let Some(qvec) = query_cache_vec
+            && let Some(stamp) = semantic_cache::read_stamp(&self.index_dir)
+        {
+            self.semantic_cache.lock().store(
+                &query.text,
+                &qvec,
+                output.results.clone(),
+                output.metrics.clone(),
+                &stamp,
+            );
+        }
+
+        Ok(output)
     }
 
     /// Grep-mode search: exact + sparse only, no dense, no rerank, no adaptive filtering.
@@ -1838,6 +1887,16 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    /// S7: the cache engages only when enabled by env. Default (unset) → no
+    /// cache work regardless of dense/stamp availability.
+    #[test]
+    fn semantic_cache_gate_off_by_default() {
+        unsafe {
+            std::env::remove_var("SEMANTEX_SEMANTIC_CACHE");
+        }
+        assert!(!semantic_cache::is_enabled());
+    }
 
     /// S7: HybridSearcher carries a daemon-scoped semantic cache, initialized
     /// empty. open_sparse_only must construct it too (sparse-only callers just
