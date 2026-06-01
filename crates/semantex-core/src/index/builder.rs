@@ -15,7 +15,10 @@ use crate::index::page_rank;
 use crate::index::pattern_catalog::{self, PatternCatalog, PatternLang};
 use crate::index::storage::ChunkStore;
 use crate::search::code_tokenizer;
-use crate::search::dense_backend::{DenseBackendKind, DenseIndexBuilder, dense_subdir};
+use crate::search::dense_backend::{
+    DenseBackendKind, DenseIndexBuilder, active_dense_dir, dense_sentinel_file,
+    read_active_pointer, resolve_active_dense_dir, write_active_pointer,
+};
 use crate::search::sparse_search::SparseIndex;
 use crate::types::{Chunk, ChunkType, FileEntry, IndexMeta};
 use anyhow::{Context, Result};
@@ -529,14 +532,52 @@ impl IndexBuilder {
             crate::model::ModelRegistry::resolve_dense_backend(&self.config, Some(&project_path))
                 .unwrap_or_default();
 
-        // The dense index sentinel file is backend-specific: coderank-hnsw writes
-        // `vectors.bin` into the per-backend subdir (`dense/<backend>/`). Treat
-        // dense as "missing" (forcing a rebuild) when the sentinel is absent.
         let dense_sentinel = dense_sentinel_file(backend_kind);
-        let dense_dir_for_check = dense_subdir(&index_dir, backend_kind);
-        let dense_missing_for_early_return = !dense_dir_for_check.join(dense_sentinel).exists();
 
-        if total_chunks == 0 && total_removals == 0 && !dense_missing_for_early_return {
+        // S8: compute the active embedder's fingerprint EARLY — the versioned
+        // dense dir now depends on it. Backend-agnostic
+        // (id+dims+pooling+quant+norm+prefix), resolved from the merged manifest
+        // (built-ins + an optional user `models.toml`). Reused for the meta.json
+        // stamp below.
+        let embedder_fingerprint = crate::model::ModelRegistry::resolve_embedder_fingerprint(
+            &self.config,
+            Some(&project_path),
+        )?;
+
+        // The dense store the new build writes into is the VERSIONED dir for
+        // THIS fingerprint (`dense/<backend>/<fingerprint>/`). A fingerprint
+        // change therefore targets a fresh dir, leaving the old one untouched
+        // for any in-flight reader until we flip ACTIVE.
+        let dense_dir = active_dense_dir(&index_dir, backend_kind, &embedder_fingerprint);
+
+        // Decide full-vs-incremental against the ACTIVE pointer + versioned
+        // layout. The dense store is "present and reusable" only when the ACTIVE
+        // pointer already names THIS fingerprint AND the versioned dir holds the
+        // sentinel — i.e. the same embedder produced the live store. Anything
+        // else (no pointer / a DIFFERENT fingerprint / missing-or-empty versioned
+        // dir / a legacy plain index with no pointer) means a NEW vector space or
+        // a first versioned build → FULL rebuild into `dense_dir`, then flip
+        // ACTIVE. This is what makes a fingerprint change auto-rebuild instead of
+        // silently mixing vector spaces.
+        let active_fp = read_active_pointer(&index_dir, backend_kind);
+        let versioned_sentinel_present = dense_dir.join(dense_sentinel).exists();
+        // Presence for the no-op early return: resolve the dir readers WOULD open
+        // (versioned-if-active, else legacy plain) and probe its sentinel. This
+        // recognizes BOTH a built versioned index AND a legacy plain index as
+        // "present", so an unchanged corpus is not needlessly rebuilt — UNLESS the
+        // embedder fingerprint changed (then a migrating full rebuild is owed).
+        let resolved_present = resolve_active_dense_dir(&index_dir, backend_kind)
+            .join(dense_sentinel)
+            .exists();
+        let decision = decide_dense_build(
+            active_fp.as_deref(),
+            &embedder_fingerprint,
+            versioned_sentinel_present,
+            resolved_present,
+        );
+        let dense_missing = decision.full_rebuild;
+
+        if total_chunks == 0 && total_removals == 0 && decision.present_no_migration {
             tracing::info!(
                 files_scanned,
                 files_indexed,
@@ -559,16 +600,22 @@ impl IndexBuilder {
         }
 
         // Build or incrementally update the dense index via the selected
-        // DenseBackend. Each backend persists into its per-backend subdir
-        // `.semantex/dense/<backend>/` (`backend_kind` resolved above).
-        let dense_dir = dense_subdir(&index_dir, backend_kind);
+        // DenseBackend into the VERSIONED per-fingerprint dir
+        // (`.semantex/dense/<backend>/<fingerprint>/`).
         std::fs::create_dir_all(&dense_dir)?;
-        let dense_missing = !dense_dir.join(dense_sentinel).exists();
         if dense_missing {
-            tracing::info!("Dense index missing — rebuilding dense embeddings");
+            tracing::info!(
+                fingerprint = %embedder_fingerprint,
+                prior_active = ?active_fp,
+                "Dense index missing or embedder changed — full (re)build into versioned dir"
+            );
         }
 
-        if let Err(e) = (|| -> Result<()> {
+        // Track whether a full build wrote a complete store, so we only flip
+        // ACTIVE after the new versioned store is fully persisted (atomic
+        // switchover; readers see the old fingerprint until then). The closure
+        // returns `true` only on the full-build path that actually wrote vectors.
+        let dense_result = (|| -> Result<bool> {
             match backend_kind {
                 DenseBackendKind::CoderankHnsw => {
                     use crate::index::hnsw_index::{CoderankHnswIndexBuilder, HnswParams};
@@ -579,14 +626,17 @@ impl IndexBuilder {
                     );
                     // SEMANTEX_DENSE_CONTEXT (default OFF): when on, embed
                     // `format!("{annotation}\n{code}")` using the graph-derived NL
-                    // annotation already persisted for BM25 (E3). The harness
-                    // ablates this on/off; raw code is the default. Changing the
-                    // embedded text changes the embedder_fingerprint, so on/off
-                    // are separate indexes (the harness builds each independently).
-                    let dense_context = std::env::var("SEMANTEX_DENSE_CONTEXT")
-                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                    // annotation already persisted for BM25 (E3); raw code is the
+                    // default. Changing the embedded text changes the vector
+                    // space, so the flag IS part of `embedder_fingerprint` —
+                    // on/off ARE separate versioned indexes, and toggling it
+                    // triggers a migrating full rebuild + ACTIVE flip (enforced,
+                    // not just convention). We read it through the SAME
+                    // `dense_context_enabled()` the fingerprint uses, so the
+                    // embedded text and the stamped fingerprint can never disagree.
+                    let dense_context = crate::model::dense_context_enabled();
 
-                    if dense_missing {
+                    let did_full_build = if dense_missing {
                         let _slot = crate::index::gate::acquire(|| {
                             tracing::info!(
                                 "Waiting for a free index-build slot (max {} concurrent full builds)",
@@ -595,7 +645,8 @@ impl IndexBuilder {
                         });
                         let all_ids = store.get_all_chunk_ids()?;
                         if all_ids.is_empty() {
-                            return Ok(());
+                            // Empty corpus — no store written, so do NOT flip ACTIVE.
+                            return Ok(false);
                         }
                         // Annotations (E3 NL strings) are small — fetch the id→text
                         // map up front; the heavy CHUNK CONTENT is streamed per
@@ -621,6 +672,9 @@ impl IndexBuilder {
                             chunks.sort_by_key(|c| c.id);
                             Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
                         })?;
+                        // A complete versioned store was written → eligible to
+                        // flip ACTIVE once the closure returns Ok.
+                        true
                     } else {
                         let annotations = if dense_context && !new_chunk_ids.is_empty() {
                             store.get_annotations(&new_chunk_ids)?
@@ -641,17 +695,41 @@ impl IndexBuilder {
                                 Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
                             })?;
                         }
-                    }
+                        // Incremental path reuses the already-ACTIVE versioned
+                        // dir in place — no pointer flip owed.
+                        false
+                    };
                     tracing::info!(
                         added = new_chunk_ids.len(),
                         removed = removed_chunk_ids.len(),
+                        full_build = did_full_build,
                         "Dense index (coderank-hnsw) build complete"
                     );
+                    Ok(did_full_build)
                 }
             }
-            Ok(())
-        })() {
-            tracing::warn!("Dense index build failed (continuing without): {e}");
+        })();
+        let full_build_ok = match dense_result {
+            Ok(did_full) => did_full,
+            Err(e) => {
+                tracing::warn!("Dense index build failed (continuing without): {e}");
+                false
+            }
+        };
+
+        // S8 atomic switchover: only AFTER a full build wrote a complete
+        // versioned store do we flip the ACTIVE pointer to this fingerprint.
+        // Readers (`resolve_active_dense_dir`) see the OLD fingerprint until this
+        // rename lands, so there is never a window where they open a partial
+        // store. The previous versioned dir is intentionally left in place —
+        // any in-flight reader that already resolved it keeps a valid store;
+        // GC of stale versioned dirs is deferred (NOT this PR).
+        if full_build_ok
+            && let Err(e) = write_active_pointer(&index_dir, backend_kind, &embedder_fingerprint)
+        {
+            tracing::warn!(
+                "Failed to flip ACTIVE dense pointer (readers stay on prior store): {e}"
+            );
         }
 
         // Save metadata. v0.4.1 W-Index #4: persist the BM25 stemmer flag so
@@ -660,24 +738,10 @@ impl IndexBuilder {
         // build-time stemmer disagrees with the runtime config.
         let actual_chunk_count = store.chunk_count().unwrap_or(total_chunks as u64);
         let actual_file_count = store.file_count().unwrap_or(files_indexed + files_skipped);
-        // S8: stamp the active embedder's fingerprint so open-time code can
-        // detect a vector-space change. The fingerprint is backend-agnostic
-        // (id+dims+pooling+quant+norm+prefix), resolved from the merged manifest
-        // (built-ins + an optional user `models.toml`) — so it does NOT depend on
-        // S2's dense backend arm. (The versioned-dir build + atomic switchover
-        // wiring is the post-S2 reconciliation pass, gated on S2's builder arm.)
-        let embedder_fingerprint = {
-            let registry =
-                crate::model::ModelRegistry::from_config(&self.config, Some(&project_path))?;
-            let embedder_spec = registry.active_embedder()?;
-            let crate::model::RoleData::Embedder(embedder_data) = &embedder_spec.role_data else {
-                anyhow::bail!(
-                    "active embedder `{}` is not an embedder spec",
-                    embedder_spec.id
-                );
-            };
-            crate::model::EmbedderFingerprint::compute(&embedder_spec.id, embedder_data)
-        };
+        // S8: the active embedder's fingerprint was computed EARLY (it drives the
+        // versioned dense dir + ACTIVE switchover above) — reuse it here to stamp
+        // meta.json so open-time staleness (`state::is_stale_for_embedder`) can
+        // detect a vector-space change and auto-rebuild.
         // S2: record the embedding model/dim for the ACTIVE dense backend, and
         // stamp the RESOLVED backend name (not the raw config string) so the
         // open-time `verify_persisted_backend_matches` agrees with the resolved
@@ -729,12 +793,36 @@ impl IndexBuilder {
     }
 }
 
-/// The per-backend "dense index present" sentinel file. coderank-hnsw writes
-/// `vectors.bin`. Its presence in the per-backend subdir marks the dense index
-/// as built (else: rebuild).
-fn dense_sentinel_file(backend: DenseBackendKind) -> &'static str {
-    match backend {
-        DenseBackendKind::CoderankHnsw => "vectors.bin",
+/// The S8 dense-build decision: given the ACTIVE pointer's fingerprint, the
+/// current embedder fingerprint, whether the versioned dir for the current
+/// fingerprint already holds the store sentinel, and whether the resolved live
+/// dir (versioned-if-active, else legacy plain) holds the sentinel, decide:
+///
+/// * `full_rebuild` — `true` unless the SAME embedder already produced the live
+///   versioned store (no pointer / a different fingerprint / a missing-or-empty
+///   versioned dir / a legacy plain index all force a full migrating rebuild).
+/// * `present_no_migration` — `true` only when the resolved live store is
+///   present AND it was produced by the current embedder, so an unchanged corpus
+///   can take the no-op early return without owing a migration.
+///
+/// Pure (no I/O) so the riskiest branch of the builder is unit-testable without
+/// the ONNX model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DenseBuildDecision {
+    full_rebuild: bool,
+    present_no_migration: bool,
+}
+
+fn decide_dense_build(
+    active_fp: Option<&str>,
+    current_fp: &str,
+    versioned_sentinel_present: bool,
+    resolved_sentinel_present: bool,
+) -> DenseBuildDecision {
+    let same_embedder_live = active_fp == Some(current_fp) && versioned_sentinel_present;
+    DenseBuildDecision {
+        full_rebuild: !same_embedder_live,
+        present_no_migration: resolved_sentinel_present && same_embedder_live,
     }
 }
 
@@ -964,14 +1052,19 @@ mod tests {
         }
     }
 
-    /// Building with the coderank-137m embedder (→ coderank-hnsw backend)
-    /// writes the per-backend subdir `.semantex/dense/coderank-hnsw/vectors.bin`
-    /// and records the model + dim + resolved backend in meta.json. `#[ignore]`
-    /// — needs the CodeRankEmbed model download.
+    /// Building with the coderank-137m embedder (→ coderank-hnsw backend) writes
+    /// the S8 VERSIONED dense dir (`.semantex/dense/coderank-hnsw/<fingerprint>/
+    /// vectors.bin`) plus the ACTIVE pointer naming that fingerprint, and records
+    /// the model + dim + resolved backend in meta.json. The reader-side resolver
+    /// `resolve_active_dense_dir` must land on that versioned dir. `#[ignore]` —
+    /// needs the CodeRankEmbed model download.
     #[test]
     #[ignore]
-    fn coderank_hnsw_build_writes_subdir_and_meta() {
+    fn coderank_hnsw_build_writes_versioned_dir_and_active_pointer() {
         use crate::config::SemantexConfig;
+        use crate::search::dense_backend::{
+            active_dense_dir, read_active_pointer, resolve_active_dense_dir,
+        };
         let tmp = tempfile::TempDir::new().unwrap();
         let project = tmp.path().join("repo");
         std::fs::create_dir_all(&project).unwrap();
@@ -983,18 +1076,73 @@ mod tests {
         };
         IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
 
+        let index_dir = project.join(".semantex");
+        // ACTIVE pointer written, naming the live fingerprint.
+        let fp = read_active_pointer(&index_dir, DenseBackendKind::CoderankHnsw)
+            .expect("ACTIVE pointer must be written after a full build");
+        // The versioned dir for that fingerprint holds the store.
+        let versioned = active_dense_dir(&index_dir, DenseBackendKind::CoderankHnsw, &fp);
         assert!(
-            project
-                .join(".semantex/dense/coderank-hnsw/vectors.bin")
-                .exists()
+            versioned.join("vectors.bin").exists(),
+            "versioned vectors.bin must exist at {}",
+            versioned.display()
         );
-        let meta: crate::types::IndexMeta = serde_json::from_str(
-            &std::fs::read_to_string(project.join(".semantex/meta.json")).unwrap(),
-        )
-        .unwrap();
+        // The reader-side resolver lands on the versioned dir.
+        assert_eq!(
+            resolve_active_dense_dir(&index_dir, DenseBackendKind::CoderankHnsw),
+            versioned
+        );
+
+        let meta: crate::types::IndexMeta =
+            serde_json::from_str(&std::fs::read_to_string(index_dir.join("meta.json")).unwrap())
+                .unwrap();
         assert_eq!(meta.dense_backend, "coderank-hnsw");
-        assert_eq!(meta.schema_version, 11);
+        assert_eq!(
+            meta.schema_version,
+            crate::types::IndexMeta::CURRENT_SCHEMA_VERSION
+        );
         assert_eq!(meta.embedding_model, "CodeRankEmbed");
+        // meta's fingerprint matches the ACTIVE pointer.
+        assert_eq!(meta.embedder_fingerprint, fp);
+    }
+
+    /// S8 dense-build decision logic (pure, no model needed): exercises the
+    /// full-vs-incremental + early-return matrix the builder runs.
+    #[test]
+    fn decide_dense_build_matrix() {
+        // (a) No ACTIVE pointer, nothing present (fresh index) → full rebuild,
+        // no early return.
+        let d = decide_dense_build(None, "FP1", false, false);
+        assert!(d.full_rebuild);
+        assert!(!d.present_no_migration);
+
+        // (b) Legacy PLAIN index (no pointer) but the resolved/plain store IS
+        // present → still a full migrating rebuild (no versioned store for the
+        // current fp), and NOT a no-migration early return.
+        let d = decide_dense_build(None, "FP1", false, true);
+        assert!(d.full_rebuild, "legacy plain must migrate via full rebuild");
+        assert!(
+            !d.present_no_migration,
+            "a migration is owed → must not take the no-op early return"
+        );
+
+        // (c) Versioned index, SAME embedder, store present → incremental
+        // (no full rebuild) AND eligible for the no-op early return.
+        let d = decide_dense_build(Some("FP1"), "FP1", true, true);
+        assert!(!d.full_rebuild, "same embedder → incremental");
+        assert!(d.present_no_migration);
+
+        // (d) Versioned index, DIFFERENT embedder (fingerprint changed) → full
+        // rebuild into the new versioned dir, no early return.
+        let d = decide_dense_build(Some("OLD"), "NEW", false, true);
+        assert!(d.full_rebuild, "fingerprint change MUST rebuild");
+        assert!(!d.present_no_migration);
+
+        // (e) Pointer names current fp but the versioned sentinel is missing
+        // (partial/crashed build) → full rebuild, no early return.
+        let d = decide_dense_build(Some("FP1"), "FP1", false, false);
+        assert!(d.full_rebuild);
+        assert!(!d.present_no_migration);
     }
 
     /// v0.4.1 W-Index #3 — positional doc→chunk map reader contract:

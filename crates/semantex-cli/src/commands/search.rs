@@ -51,7 +51,10 @@ pub fn run(opts: &SearchOpts, config: &SemantexConfig) -> Result<()> {
 
     let index_dir = SemantexConfig::project_index_dir(&project_path);
 
-    match state::detect(&project_path) {
+    // S8: fold the embedder fingerprint into staleness so a model/embedding-text
+    // change auto-rebuilds (the `config` is already loaded here, so this is the
+    // natural rebuild-decision site — not a hot loop).
+    match state::detect_for_config(&project_path, config) {
         IndexState::NotIndexed | IndexState::Stale => {
             eprintln!(
                 "No index found for {}. Building in background...",

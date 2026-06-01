@@ -9,6 +9,7 @@
 //!   { "hookSpecificOutput": { "hookEventName": "...", "additionalContext": "..." } }
 
 use anyhow::Result;
+use semantex_core::config::SemantexConfig;
 use semantex_core::index::registry;
 use semantex_core::index::state::{self, IndexState};
 use std::path::PathBuf;
@@ -56,8 +57,15 @@ pub fn cmd_session_hook() -> Result<()> {
 
     let project_dir = index_dir.parent().unwrap_or(&index_dir);
 
-    // Use state::detect() to catch stale indexes (schema mismatch)
-    let idx_state = state::detect(project_dir);
+    // Use state::detect_for_config() to catch stale indexes — schema mismatch AND
+    // (S8) an embedder-fingerprint change, so a model/embedding swap auto-rebuilds.
+    // The session hook runs once per session, so loading the config here is cheap.
+    let idx_state = match SemantexConfig::load(Some(project_dir)) {
+        Ok(cfg) => state::detect_for_config(project_dir, &cfg),
+        // Config load failed → fall back to schema-only detect (never block on a
+        // transient config problem).
+        Err(_) => state::detect(project_dir),
+    };
     if idx_state == IndexState::Stale {
         super::spawn_background_index(project_dir);
 
@@ -258,7 +266,13 @@ fn refresh_stale_registry_repos(current_dir: &std::path::Path) {
         if canonical == current_dir {
             continue; // already handled
         }
-        let idx_state = state::detect(&canonical);
+        // S8: detect_for_config so an embedder change in any registered repo also
+        // triggers a refresh. One config load per registered repo on the session
+        // hook (not a hot loop); fall back to schema-only on a config error.
+        let idx_state = match SemantexConfig::load(Some(&canonical)) {
+            Ok(cfg) => state::detect_for_config(&canonical, &cfg),
+            Err(_) => state::detect(&canonical),
+        };
         if idx_state == IndexState::Building {
             continue; // already in progress
         }

@@ -258,24 +258,36 @@ impl ModelSpec {
 /// space the one this embedder produces?" check.
 ///
 /// The fingerprint covers exactly the fields that change the produced vectors:
-/// the model id, dims, pooling, quantization, normalization, and BOTH the query
-/// and document prefixes. (`doc_prefix` is prepended to document text at index
-/// time, so it changes the stored vector space — overriding it on the same id
-/// MUST invalidate the on-disk index.) A reranker/LLM swap does NOT touch the
-/// dense vector space → not fingerprinted → no reindex; that is the design's
-/// query-time-live-swap guarantee.
+/// the model id, dims, pooling, quantization, normalization, BOTH the query and
+/// document prefixes, AND the runtime `dense_context` flag. (`doc_prefix` is
+/// prepended to document text at index time, so it changes the stored vector
+/// space — overriding it on the same id MUST invalidate the on-disk index.
+/// `dense_context` likewise changes the EMBEDDED TEXT — annotation+code vs raw
+/// code — so the two settings produce distinct vector spaces and MUST be distinct
+/// indexes.) A reranker/LLM swap does NOT touch the dense vector space → not
+/// fingerprinted → no reindex; that is the design's query-time-live-swap
+/// guarantee.
 pub struct EmbedderFingerprint;
 
 impl EmbedderFingerprint {
-    /// Compute the fingerprint string for `(id, spec)`. Deterministic across
-    /// runs/platforms (xxh64 of a canonical byte encoding).
+    /// Compute the fingerprint string for `(id, spec, dense_context)`.
+    /// Deterministic across runs/platforms (xxh64 of a canonical byte encoding).
+    ///
+    /// `dense_context` is the runtime `SEMANTEX_DENSE_CONTEXT` A/B flag: when on,
+    /// documents are embedded as `annotation\ncode` instead of raw code, which
+    /// changes the stored vectors. It is therefore part of the vector-space
+    /// identity — toggling it MUST yield a different fingerprint so the index is
+    /// re-embedded (not silently reused under the wrong embedded text). Pure: the
+    /// caller resolves the flag (no env read here) so both the build-time write
+    /// and the open-time expected-fingerprint computation pass the same value.
     #[must_use]
-    pub fn compute(id: &str, spec: &EmbedderSpec) -> String {
+    pub fn compute(id: &str, spec: &EmbedderSpec, dense_context: bool) -> String {
         // Canonical, stable encoding of the vector-space-defining fields
-        // (including BOTH prefixes — doc_prefix changes the stored doc vectors).
-        // Avoid serde here so a future non-fingerprinted field (e.g. max_context,
-        // which does NOT change the vector space) can be added to EmbedderSpec
-        // without silently invalidating every index.
+        // (including BOTH prefixes — doc_prefix changes the stored doc vectors —
+        // and the dense_context flag, which changes the embedded text). Avoid
+        // serde here so a future non-fingerprinted field (e.g. max_context, which
+        // does NOT change the vector space) can be added to EmbedderSpec without
+        // silently invalidating every index.
         let pooling = match spec.pooling {
             Pooling::Mean => "mean",
             Pooling::Cls => "cls",
@@ -285,8 +297,9 @@ impl EmbedderFingerprint {
             QuantKind::None => "none",
             QuantKind::Int8Symmetric => "int8_symmetric",
         };
+        let ctx = u8::from(dense_context);
         let canonical = format!(
-            "id={id};dims={};pooling={pooling};quant={quant};norm={};qpre={};dpre={}",
+            "id={id};dims={};pooling={pooling};quant={quant};norm={};qpre={};dpre={};ctx={ctx}",
             spec.dims, spec.normalize, spec.query_prefix, spec.doc_prefix
         );
         let hash = xxhash_rust::xxh64::xxh64(canonical.as_bytes(), 0);
@@ -367,8 +380,8 @@ mod tests {
             normalize: true,
             quant: QuantKind::Int8Symmetric,
         };
-        let fp1 = EmbedderFingerprint::compute("coderank-137m", &base);
-        let fp2 = EmbedderFingerprint::compute("coderank-137m", &base);
+        let fp1 = EmbedderFingerprint::compute("coderank-137m", &base, false);
+        let fp2 = EmbedderFingerprint::compute("coderank-137m", &base, false);
         assert_eq!(fp1, fp2, "same id+spec → same fingerprint (deterministic)");
         assert!(!fp1.is_empty());
 
@@ -377,7 +390,7 @@ mod tests {
         diff_dims.dims = 384;
         assert_ne!(
             fp1,
-            EmbedderFingerprint::compute("coderank-137m", &diff_dims)
+            EmbedderFingerprint::compute("coderank-137m", &diff_dims, false)
         );
 
         // Changing pooling changes it.
@@ -385,7 +398,7 @@ mod tests {
         diff_pool.pooling = Pooling::Mean;
         assert_ne!(
             fp1,
-            EmbedderFingerprint::compute("coderank-137m", &diff_pool)
+            EmbedderFingerprint::compute("coderank-137m", &diff_pool, false)
         );
 
         // Changing quant changes it.
@@ -393,11 +406,43 @@ mod tests {
         diff_quant.quant = QuantKind::None;
         assert_ne!(
             fp1,
-            EmbedderFingerprint::compute("coderank-137m", &diff_quant)
+            EmbedderFingerprint::compute("coderank-137m", &diff_quant, false)
         );
 
         // Changing the id changes it (different model, same shape).
-        assert_ne!(fp1, EmbedderFingerprint::compute("other-embedder", &base));
+        assert_ne!(
+            fp1,
+            EmbedderFingerprint::compute("other-embedder", &base, false)
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_sensitive_to_dense_context() {
+        // The `dense_context` flag changes the EMBEDDED TEXT (annotation+code vs
+        // raw code) → it changes the stored vector space. ctx=on and ctx=off on
+        // the SAME spec MUST get different fingerprints, so the engine never
+        // silently reuses an index embedded under the other setting (the literal
+        // bug F5 fixes). All other fields held equal.
+        let base = EmbedderSpec {
+            dims: 768,
+            max_context: 8192,
+            query_prefix: "Q: ".to_string(),
+            doc_prefix: String::new(),
+            pooling: Pooling::Cls,
+            normalize: true,
+            quant: QuantKind::Int8Symmetric,
+        };
+        let off = EmbedderFingerprint::compute("coderank-137m", &base, false);
+        let on = EmbedderFingerprint::compute("coderank-137m", &base, true);
+        assert_ne!(
+            off, on,
+            "dense_context must be part of the fingerprint (it changes embedded text)"
+        );
+        // Still deterministic per setting.
+        assert_eq!(
+            on,
+            EmbedderFingerprint::compute("coderank-137m", &base, true)
+        );
     }
 
     #[test]
@@ -418,8 +463,8 @@ mod tests {
         let mut diff_doc = base.clone();
         diff_doc.doc_prefix = "passage: ".to_string();
         assert_ne!(
-            EmbedderFingerprint::compute("coderank-137m", &base),
-            EmbedderFingerprint::compute("coderank-137m", &diff_doc),
+            EmbedderFingerprint::compute("coderank-137m", &base, false),
+            EmbedderFingerprint::compute("coderank-137m", &diff_doc, false),
             "doc_prefix must be part of the fingerprint"
         );
     }

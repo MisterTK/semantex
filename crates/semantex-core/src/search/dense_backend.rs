@@ -57,6 +57,37 @@ pub fn active_dense_dir(index_dir: &Path, backend: DenseBackendKind, fingerprint
     dense_subdir(index_dir, backend).join(fingerprint)
 }
 
+/// The per-backend "dense index present" sentinel file. coderank-hnsw writes
+/// `vectors.bin`. Its presence in a dense dir marks the store as built (else:
+/// rebuild). Owned by the seam so both the builder and the reader-side
+/// [`resolve_active_dense_dir`] agree on what "present" means per backend.
+pub fn dense_sentinel_file(backend: DenseBackendKind) -> &'static str {
+    match backend {
+        DenseBackendKind::CoderankHnsw => "vectors.bin",
+    }
+}
+
+/// Resolve the directory the dense store actually lives in: the ACTIVE
+/// versioned dir (`dense/<backend>/<fingerprint>/`) when an ACTIVE pointer
+/// exists and its versioned dir holds the store sentinel, else the legacy
+/// plain `dense_subdir` (pre-versioned indexes built before S8 hot-swap).
+///
+/// This is the single resolver both readers (`hybrid.rs`, `validate.rs`,
+/// cache-warming in `storage.rs`) and the builder's presence check go through,
+/// so a live versioned store is found while legacy plain-layout indexes still
+/// open via the fallback (backward-compat, no schema bump).
+pub fn resolve_active_dense_dir(index_dir: &Path, backend: DenseBackendKind) -> PathBuf {
+    if let Some(fp) = read_active_pointer(index_dir, backend) {
+        let versioned = active_dense_dir(index_dir, backend, &fp);
+        if versioned.join(dense_sentinel_file(backend)).exists() {
+            return versioned;
+        }
+    }
+    // No pointer, or the pointed-at versioned dir is missing/empty → fall back
+    // to the legacy plain layout (still valid for pre-S8 indexes).
+    dense_subdir(index_dir, backend)
+}
+
 /// Path of the active-pointer file for a backend: `<index_dir>/dense/<backend>/ACTIVE`.
 /// Its contents are the fingerprint of the currently-live versioned dir.
 fn active_pointer_path(index_dir: &Path, backend: DenseBackendKind) -> PathBuf {
@@ -383,6 +414,48 @@ mod tests {
             read_active_pointer(root, DenseBackendKind::CoderankHnsw),
             Some("def456".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_active_dense_dir_no_pointer_returns_plain() {
+        // (a) No ACTIVE pointer → the legacy plain layout.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let got = resolve_active_dense_dir(root, DenseBackendKind::CoderankHnsw);
+        assert_eq!(got, dense_subdir(root, DenseBackendKind::CoderankHnsw));
+    }
+
+    #[test]
+    fn resolve_active_dense_dir_pointer_plus_populated_returns_versioned() {
+        // (b) Pointer present AND the versioned dir holds the store sentinel.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let fp = "deadbeef";
+        let versioned = active_dense_dir(root, DenseBackendKind::CoderankHnsw, fp);
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::write(
+            versioned.join(dense_sentinel_file(DenseBackendKind::CoderankHnsw)),
+            b"x",
+        )
+        .unwrap();
+        write_active_pointer(root, DenseBackendKind::CoderankHnsw, fp).unwrap();
+        let got = resolve_active_dense_dir(root, DenseBackendKind::CoderankHnsw);
+        assert_eq!(got, versioned);
+    }
+
+    #[test]
+    fn resolve_active_dense_dir_pointer_but_missing_sentinel_falls_back() {
+        // (c) Pointer present but the versioned dir lacks the sentinel (e.g. a
+        // crashed/partial build never flipped a complete store) → plain fallback.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let fp = "deadbeef";
+        // Create the versioned dir but DO NOT write the sentinel.
+        std::fs::create_dir_all(active_dense_dir(root, DenseBackendKind::CoderankHnsw, fp))
+            .unwrap();
+        write_active_pointer(root, DenseBackendKind::CoderankHnsw, fp).unwrap();
+        let got = resolve_active_dense_dir(root, DenseBackendKind::CoderankHnsw);
+        assert_eq!(got, dense_subdir(root, DenseBackendKind::CoderankHnsw));
     }
 
     /// Helper: write a current-shape meta.json carrying `backend`.
