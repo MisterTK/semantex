@@ -6,11 +6,15 @@
 //! id. A user `models.toml` (project `.semantex/` over `~/.semantex/`) adds or
 //! overrides specs by id with no code change.
 
+use crate::config::SemantexConfig;
 use crate::model::capabilities::ModelCapabilities;
 use crate::model::spec::{
     EmbedderSpec, ModelRole, ModelSource, ModelSpec, Pooling, QuantKind, RerankerSpec, RoleData,
     ScoreStrategyKind,
 };
+use anyhow::Result;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 /// The compiled-in permissive default specs. MIT/Apache only.
 ///
@@ -142,6 +146,66 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
 #[cfg(not(feature = "llm"))]
 fn append_builtin_llm_specs(_specs: &mut Vec<ModelSpec>) {}
 
+/// Wire shape of a `models.toml` document: a `[[model]]` array of specs.
+#[derive(Debug, Deserialize)]
+struct UserManifest {
+    #[serde(default)]
+    model: Vec<ModelSpec>,
+}
+
+/// Parse + validate a user `models.toml`. Each spec is validated; the first
+/// invalid one aborts with an error naming the file and the offending field, so
+/// a misconfiguration never silently mis-loads (risk row "model-manifest
+/// misconfiguration").
+pub fn load_user_manifest(path: &Path) -> Result<Vec<ModelSpec>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read model manifest {}: {e}", path.display()))?;
+    let manifest: UserManifest = toml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("failed to parse model manifest {}: {e}", path.display()))?;
+    for spec in &manifest.model {
+        spec.validate()
+            .map_err(|e| anyhow::anyhow!("invalid model in {}: {e}", path.display()))?;
+    }
+    Ok(manifest.model)
+}
+
+/// Locate the active user manifest: a project-local `<project>/.semantex/models.toml`
+/// takes precedence over the global `~/.semantex/models.toml`. Returns `None`
+/// when neither exists (the registry then runs on built-ins only).
+pub fn user_manifest_path(
+    _config: &SemantexConfig,
+    project_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(project) = project_path {
+        let local = SemantexConfig::project_index_dir(project).join("models.toml");
+        if local.exists() {
+            return Some(local);
+        }
+    }
+    let global = SemantexConfig::semantex_home().join("models.toml");
+    if global.exists() {
+        return Some(global);
+    }
+    None
+}
+
+/// Merge built-in and user specs, with user specs overriding built-ins **by id**
+/// (the modularity guarantee: replace a built-in's data, or add a brand-new
+/// model, without touching code). Order: built-ins first (in declaration
+/// order), then any user ids not already present.
+#[must_use]
+pub fn merge(builtin: Vec<ModelSpec>, user: Vec<ModelSpec>) -> Vec<ModelSpec> {
+    let mut out = builtin;
+    for u in user {
+        if let Some(existing) = out.iter_mut().find(|s| s.id == u.id) {
+            *existing = u; // override by id
+        } else {
+            out.push(u); // new id → append
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +296,101 @@ mod tests {
             s.validate()
                 .unwrap_or_else(|e| panic!("builtin {} invalid: {e}", s.id));
         }
+    }
+
+    #[test]
+    fn load_user_manifest_parses_a_second_embedder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("models.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[model]]
+            id = "gte-modernbert-hnsw"
+            role = "embedder"
+            [model.source]
+            kind = "hf"
+            repo = "Alibaba-NLP/gte-modernbert-base"
+            files = ["model_int8.onnx", "tokenizer.json"]
+            [model.capabilities]
+            multi_vector = false
+            [model.embedder]
+            dims = 768
+            max_context = 8192
+            query_prefix = ""
+            pooling = "cls"
+            quant = "int8_symmetric"
+            "#,
+        )
+        .unwrap();
+        let specs = load_user_manifest(&path).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "gte-modernbert-hnsw");
+        assert_eq!(specs[0].role, ModelRole::Embedder);
+        specs[0].validate().unwrap();
+    }
+
+    #[test]
+    fn load_user_manifest_errors_clearly_on_bad_spec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("models.toml");
+        // Embedder with dims=0 → validate() must reject, naming the field.
+        std::fs::write(
+            &path,
+            r#"
+            [[model]]
+            id = "broken"
+            role = "embedder"
+            [model.source]
+            kind = "hf"
+            repo = "x/y"
+            files = ["model_int8.onnx"]
+            [model.embedder]
+            dims = 0
+            max_context = 8192
+            pooling = "mean"
+            quant = "none"
+            "#,
+        )
+        .unwrap();
+        let err = load_user_manifest(&path).expect_err("dims=0 must error");
+        let msg = err.to_string();
+        assert!(msg.contains("broken") && msg.contains("dims"), "got: {msg}");
+    }
+
+    #[test]
+    fn merge_lets_user_override_a_builtin_by_id() {
+        let builtin = builtin_specs();
+        // A user spec re-using the `coderank-137m` id overrides the built-in.
+        let mut overridden = builtin
+            .iter()
+            .find(|s| s.id == "coderank-137m")
+            .cloned()
+            .unwrap();
+        if let RoleData::Embedder(e) = &mut overridden.role_data {
+            e.max_context = 4096; // user shrinks the context window
+        }
+        let merged = merge(builtin.clone(), vec![overridden]);
+        // Same count (override, not append).
+        assert_eq!(merged.len(), builtin.len());
+        let s = merged.iter().find(|s| s.id == "coderank-137m").unwrap();
+        let RoleData::Embedder(e) = &s.role_data else {
+            panic!()
+        };
+        assert_eq!(e.max_context, 4096, "user override must win");
+    }
+
+    #[test]
+    fn merge_appends_a_new_user_id() {
+        let builtin = builtin_specs();
+        let mut newspec = builtin
+            .iter()
+            .find(|s| s.id == "coderank-137m")
+            .cloned()
+            .unwrap();
+        newspec.id = "my-custom-embedder".to_string();
+        let merged = merge(builtin.clone(), vec![newspec]);
+        assert_eq!(merged.len(), builtin.len() + 1);
+        assert!(merged.iter().any(|s| s.id == "my-custom-embedder"));
     }
 }

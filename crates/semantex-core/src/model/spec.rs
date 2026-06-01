@@ -131,8 +131,14 @@ pub struct LlmSpec {
 
 /// The role-specific payload of a [`ModelSpec`]. Exactly one variant matches
 /// `ModelSpec::role`.
+///
+/// Externally tagged: in a `models.toml` entry the payload lives in a subtable
+/// named for the role (`[model.embedder]` / `[model.reranker]` / `[model.llm]`),
+/// alongside the independent `role = "…"` discriminator field on `ModelSpec`.
+/// `ModelSpec` flattens this enum, so the subtable key sits at the same level as
+/// `id`/`source`/`capabilities`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum RoleData {
     Embedder(EmbedderSpec),
     Reranker(RerankerSpec),
