@@ -13,11 +13,18 @@
 //!
 //! - `SEMANTEX_RERANKER` — master switch. Accepts `on|1|true` (case-insensitive)
 //!   to enable; any other value (including unset) disables. **Default: off.**
-//! - `SEMANTEX_RERANKER_MODEL` — override the cross-encoder model. Accepts:
-//!     - `bge-reranker-v2-m3` (default when enabled) — multilingual, code-friendly
-//!     - `bge-reranker-base` — smaller, EN/ZH only
-//!     - `jina-reranker-v1-turbo-en` — legacy, kept for A/B comparison
-//!     - `jina-reranker-v2-base-multilingual`
+//! - `SEMANTEX_RERANKER_MODEL` — override the cross-encoder model. Resolved by
+//!   `search::reranker_model` (authoritatively `RerankerChoice::from_spec` via
+//!   S8's `ModelRegistry`; `select_reranker_choice_from_env` for the standalone
+//!   env path), which routes to one of two engines:
+//!     - **fastembed-native** (this module): `bge-reranker-v2-m3` (default when
+//!       enabled, multilingual/code-friendly), `bge-reranker-base` (smaller,
+//!       EN/ZH only), `jina-reranker-v1-turbo-en` (legacy, kept for A/B),
+//!       `jina-reranker-v2-base-multilingual`.
+//!     - **generic ONNX loader** (`search::onnx_reranker`): `qwen3-reranker-0.6b`
+//!       (Apache-2.0, code-capable, yes/no-logit), `bge-reranker-v2-m3-onnx`
+//!       (classifier-logit smoke target).
+//!   Unknown values warn and fall back to `bge-reranker-v2-m3` (fastembed).
 //!
 //! When the master switch is off, `FastembedReranker::rerank` returns an
 //! identity ordering (original index, score 0.0) so the caller's pipeline keeps
