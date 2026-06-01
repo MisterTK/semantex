@@ -96,40 +96,53 @@ _BASELINE = {
     "corpus_size": None,
     "query_size": None,
     "seed": 20260531,
-    "expected_ndcg_at_10": 0.34418,
-    "tolerance": 0.12,
+    "expected_ndcg_at_10": 0.34418,    # published MTEB BM25 (loose external bound)
+    "self_baseline_ndcg_at_10": 0.1884,  # semantex's own measured (tight internal band)
+    "internal_tolerance": 0.025,         # TIGHT: catches a ranking regression
+    "tolerance": 0.18,                   # LOOSE external sanity bound
     "retrieve_k": 50,
     "source": "MTEB BM25 baseline CodeTransOceanDL nDCG@10=0.34418",
 }
 
 
-def test_external_coir_gate_passes_when_measured_matches(tmp_path):
-    # gold file at rank 4 (after dedup) -> nDCG@10 = 1/log2(5) = 0.4307;
-    # |0.4307 - 0.34418| = 0.0865 <= 0.12 -> PASS.
-    rr = RankedResult(
-        query_id="637",
-        ranked_doc_ids=("a:1-1", "b:1-1", "c:1-1", "doc_597.txt:1-40"),
-        ranked_files=("a", "b", "c", "doc_597.txt"),
-    )
-    out = _run_output([], [], per_query=[rr])
+def _run_gate_with_measured(measured: float, tmp_path):
+    """Drive _run_external_coir with the measured nDCG@10 pinned to `measured`,
+    so the two-band decision logic is exercised in isolation."""
+    out = _run_output([], [], per_query=[])
     with patch.object(gate, "load_coir_subdataset", return_value=_coir_corpus(tmp_path)), \
-         patch.object(gate, "run_corpus", return_value=out):
-        rc = gate._run_external_coir(_BASELINE, "semantex")
-    assert rc == 0
+         patch.object(gate, "run_corpus", return_value=out), \
+         patch.object(gate, "dedup_relevances_by_file", return_value=out), \
+         patch.object(gate, "evaluate_metric", return_value=measured):
+        return gate._run_external_coir(_BASELINE, "semantex")
 
 
-def test_external_coir_gate_fails_when_protocol_collapses(tmp_path):
-    # broken wiring: gold file never retrieved -> nDCG 0 -> outside tol -> rc=1
-    rr = RankedResult(
-        query_id="637",
-        ranked_doc_ids=("a:1-1", "b:1-1"),
-        ranked_files=("a", "b"),
-    )
-    out = _run_output([], [], per_query=[rr])
-    with patch.object(gate, "load_coir_subdataset", return_value=_coir_corpus(tmp_path)), \
-         patch.object(gate, "run_corpus", return_value=out):
-        rc = gate._run_external_coir(_BASELINE, "semantex")
-    assert rc == 1
+def test_external_coir_gate_passes_both_bands_on_correct_run(tmp_path):
+    # measured == semantex's own baseline 0.1884: internal delta 0 <= 0.025 AND
+    # external delta |0.1884 - 0.34418| = 0.1558 <= 0.18 -> PASS both bands.
+    assert _run_gate_with_measured(0.1884, tmp_path) == 0
+
+
+def test_external_coir_gate_fails_tight_band_on_0_19_to_0_12_regression(tmp_path):
+    # The owner's required case: a ranking regression from ~0.19 to 0.12.
+    #   tight internal: |0.12 - 0.1884| = 0.0684 > 0.025  -> FAILS the tight band.
+    # The new gate FAILS it (whereas a single loose 0.18 band would not reliably
+    # catch sub-band drift — see the next test for the cleanly-isolated case).
+    assert _run_gate_with_measured(0.12, tmp_path) == 1
+
+
+def test_tight_band_catches_a_regression_the_old_loose_only_gate_would_miss(tmp_path):
+    # measured 0.22 is INSIDE the old loose-only band around the published number
+    # (|0.22 - 0.34418| = 0.124 <= 0.18 -> OLD single-band gate would PASS, silent)
+    # but OUTSIDE the tight internal band around semantex's own 0.1884
+    # (|0.22 - 0.1884| = 0.0316 > 0.025 -> NEW gate FAILS). This is the subtle
+    # regression the split exists to catch.
+    assert _run_gate_with_measured(0.22, tmp_path) == 1
+
+
+def test_external_coir_gate_fails_external_bound_on_gross_collapse(tmp_path):
+    # gross protocol break: measured collapses toward 0 -> external bound breached
+    # (|0.0 - 0.34418| = 0.344 >> 0.18) -> FAIL. (Internal also fails; either trips.)
+    assert _run_gate_with_measured(0.0, tmp_path) == 1
 
 
 @pytest.mark.skipif(
@@ -137,8 +150,9 @@ def test_external_coir_gate_fails_when_protocol_collapses(tmp_path):
     reason="opt-in live gate: set RELEVANCE_LIVE_COIR=1 and have semantex on PATH",
 )
 def test_external_coir_gate_live_reproduces_published_number():
-    # Full live reproduction against real HF + a real semantex index. Tolerance
-    # from baselines.yaml (0.12 around MTEB's 0.34418).
+    # Full live reproduction against real HF + a real semantex index. Two-band
+    # check from baselines.yaml: tight internal (0.025 around semantex's own 0.1884)
+    # AND loose external (0.18 around MTEB's published 0.34418).
     import yaml
     from pathlib import Path
     cfg_path = Path(__file__).parent.parent / "config" / "baselines.yaml"

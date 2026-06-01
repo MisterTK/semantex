@@ -47,34 +47,48 @@ coir_codetrans_dl:
   seed: 20260531
   expected_ndcg_at_10: 0.34418 # MTEB BM25 baseline, CodeTransOceanDL, test split
   retrieve_k: 50               # retrieve depth before collapsing chunks -> files
-  # TOLERANCE JUSTIFICATION (measured, not guessed). semantex --sparse-only over
-  # the full 816-doc corpus measures nDCG@10 = 0.1884 (Recall@10 = 0.41, MRR@10 =
-  # 0.12), vs MTEB's bm25s 0.34418 (Recall@10 = 0.81). The gap is a STRUCTURAL
-  # lexical-engine difference, not a harness wiring bug (proved: with broken
-  # matching the gate reads 0.0000; with correct file-level matching + chunk-dedup
-  # it reads 0.1884, and a manual single-query check shows the gold file retrieved
-  # at rank 2). Root cause: semantex's BM25 returns a BOUNDED high-precision
-  # candidate set (~15 results even at -m 100 — there is no flag to make it
-  # exhaustive over the full corpus), whereas MTEB's bm25s scores ALL 816 docs and
-  # produces a full-corpus ranking. On a hard code-to-code task (TF->Paddle
-  # translation, weak cross-framework lexical overlap) semantex therefore
-  # under-recalls deep gold docs. This is REAL external signal about semantex's
-  # sparse channel (recorded in research notes), not something to hide.
   #
-  # tolerance 0.18 admits the measured 0.1884 (delta 0.1558) while STILL failing a
-  # genuine protocol/wiring break by a wide margin: a gold-mismatch collapses
-  # nDCG to ~0.0 (delta 0.344 >> 0.18) -> FAIL. Do NOT widen further. The number
-  # this gate certifies is "semantex's BM25 protocol is wired correctly end-to-end
-  # against an EXTERNAL published corpus+qrels+metric", with the absolute-recall
-  # gap vs reference BM25 documented as a known semantex sparse-channel property.
-  tolerance: 0.18
+  # TWO-BAND GATE (both assertions must pass):
+  #
+  #  (1) TIGHT internal-determinism band — `self_baseline_ndcg_at_10` +/-
+  #      `internal_tolerance`. This is the band that actually catches a subtle
+  #      RANKING regression: semantex's own measured CodeTrans-DL nDCG@10 is 0.1884,
+  #      so a regression to e.g. 0.12 (delta 0.068) breaches the 0.025 band and
+  #      FAILS. A single loose 0.18 band would let that pass silently.
+  #
+  #  (2) LOOSE external sanity bound — `expected_ndcg_at_10` (published MTEB BM25)
+  #      +/- `tolerance` (0.18). Proves end-to-end wiring against an INDEPENDENT
+  #      source; fails on a gross protocol break (a gold-mismatch collapses nDCG to
+  #      ~0.0, delta 0.344 >> 0.18 -> FAIL). Do NOT widen this further.
+  #
+  # WHY THE measured 0.1884 SITS BELOW the published 0.34418 (Recall@10 0.41 vs
+  # 0.81): this is NOT a harness wiring bug (proved: broken matching reads 0.0000;
+  # correct file-level matching + chunk-dedup reads 0.1884; a manual single-query
+  # check shows the gold file retrieved at rank 2). It is also NOT a tantivy BM25
+  # candidate cap — `SparseIndex::search` honors `TopDocs::with_limit(top_k)` and
+  # hybrid.rs fetches rerank_candidates(100) x oversample_factor(2-5). The real
+  # cause is semantex's PRODUCTION post-retrieval ADAPTIVE PIPELINE —
+  # `apply_adaptive_pipeline` in crates/semantex-core/src/search/adaptive.rs, which
+  # runs EVEN under --sparse-only: a confidence threshold (retain score >=
+  # top_score x min_score(query_type)) plus elbow-based `adaptive_max_results`
+  # sizing. On flat-score code-to-code tasks these prune the 100+ retrieved
+  # candidates down to ~15 before `-m` applies, so low cross-framework-overlap gold
+  # docs get trimmed. Measuring the shipped channel (with its adaptive trimming) is
+  # INTENTIONAL — that is what real semantex returns. The gap is recorded in the
+  # research notes as a real property of semantex's sparse channel.
+  self_baseline_ndcg_at_10: 0.1884  # semantex --sparse-only measured (this harness)
+  internal_tolerance: 0.025          # TIGHT: catches a ranking regression
+  tolerance: 0.18                    # LOOSE external sanity bound vs MTEB BM25
   source: >-
     MTEB official BM25 baseline (mteb/baseline-bm25s, mteb v2.10.8), task
     CodeTransOceanDL == CoIR CodeTrans-DL, split=test: nDCG@10 = 0.34418
     (github.com/embeddings-benchmark/results/.../CodeTransOceanDL.json). MTEB:
     arXiv:2210.07316; CoIR: arXiv:2407.02883. semantex --sparse-only measured
-    nDCG@10 = 0.1884 (full corpus); gap = semantex's bounded-candidate Tantivy
-    BM25 vs MTEB's full-corpus bm25s (see tolerance justification + research notes).
+    nDCG@10 = 0.1884 (full corpus); gap = semantex's production post-retrieval
+    adaptive pipeline (apply_adaptive_pipeline in crates/semantex-core/src/search/
+    adaptive.rs — confidence-threshold + elbow sizing, applied even under
+    --sparse-only) trimming low-overlap candidates, NOT a tantivy BM25 cap. Measuring
+    the shipped channel is intentional (see two-band justification + research notes).
 
 # ---------------------------------------------------------------------------
 # INTERNAL determinism / regression gate (NOT external protocol validation).

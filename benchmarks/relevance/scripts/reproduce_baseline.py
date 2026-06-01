@@ -143,18 +143,46 @@ def _run_external_coir(b: dict, semantex_bin: str) -> int:
     out = dedup_relevances_by_file(raw, fcorpus)
     metric = b["metric"]
     measured = evaluate_metric(out, metric=metric, k=10)
-    expected = float(b["expected_ndcg_at_10"])
-    tol = float(b["tolerance"])
-    delta = abs(measured - expected)
+
+    # The gate makes TWO explicit assertions; BOTH must pass.
+    #
+    #  (1) TIGHT internal-determinism band on semantex's OWN measured CodeTrans-DL
+    #      nDCG@10 (self_baseline_ndcg_at_10). This is the band that actually catches
+    #      a subtle RANKING regression (e.g. 0.19 -> 0.12 would blow past it).
+    #
+    #  (2) LOOSE external sanity bound vs the published MTEB BM25 number
+    #      (expected_ndcg_at_10). This proves end-to-end wiring against an
+    #      independent source and fails on a GROSS protocol break (collapse to ~0).
+    self_baseline = float(b["self_baseline_ndcg_at_10"])
+    internal_tol = float(b["internal_tolerance"])
+    published = float(b["expected_ndcg_at_10"])
+    external_tol = float(b["tolerance"])
+
+    internal_delta = abs(measured - self_baseline)
+    external_delta = abs(measured - published)
+    internal_ok = within_tolerance(measured, self_baseline, internal_tol)
+    external_ok = within_tolerance(measured, published, external_tol)
+
     click.echo(f"[external_coir/{b['subdataset']}] measured_{metric}={measured:.4f} "
-               f"published={expected:.4f} tol={tol:.4f} delta={delta:.4f} "
                f"(n_queries={len(out.relevances)})")
+    click.echo(f"  (1) internal determinism: self_baseline={self_baseline:.4f} "
+               f"tol={internal_tol:.4f} delta={internal_delta:.4f} "
+               f"-> {'OK' if internal_ok else 'REGRESSED'}")
+    click.echo(f"  (2) external sanity:      published={published:.4f} "
+               f"tol={external_tol:.4f} delta={external_delta:.4f} "
+               f"-> {'OK' if external_ok else 'OUT-OF-BOUND'}")
     click.echo(f"source: {b['source']}")
-    if delta > tol:
-        click.echo("FAIL: outside tolerance — protocol does NOT reproduce the "
-                   "published number; debug wiring (do not widen tolerance).", err=True)
+    if not internal_ok:
+        click.echo("FAIL: internal-determinism band breached — a RANKING regression "
+                   "in semantex's measured nDCG@10 (not a tolerance to widen; debug "
+                   "the change that moved the number).", err=True)
         return 1
-    click.echo("PASS: within tolerance — reproduces the published external BM25 number.")
+    if not external_ok:
+        click.echo("FAIL: external sanity bound breached — gross protocol/wiring break "
+                   "vs the published MTEB BM25 number; debug wiring.", err=True)
+        return 1
+    click.echo("PASS: (1) stable vs semantex's own measured baseline AND (2) within "
+               "the external sanity bound of the published MTEB BM25 number.")
     return 0
 
 

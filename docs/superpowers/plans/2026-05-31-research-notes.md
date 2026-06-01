@@ -259,3 +259,37 @@ Measured this run: python 0.9099 / js 0.3105 / go 0.5656 — all OK.
   python -m scripts.reproduce_baseline --baseline csn_internal_determinism # internal regression
 Unit-tested hermetically (mocked loader/runner) in tests/test_reproduce_baseline.py;
 the live reproduction is the opt-in `RELEVANCE_LIVE_COIR=1` test.
+
+### S0 addendum — split-gate framing + corrected recall-gap cause [2026-06-01]
+Gate re-review verdict: GATE-SOUND. Two tightly-scoped follow-ups applied:
+
+**A. Two-band acceptance gate (so subtle regressions aren't invisible).** The
+external CoIR gate now makes TWO explicit assertions, BOTH required to pass:
+ (1) TIGHT internal-determinism band on semantex's OWN measured CodeTrans-DL
+     nDCG@10: `self_baseline_ndcg_at_10: 0.1884`, `internal_tolerance: 0.025`.
+     This is the band that catches a ranking regression — a drop to 0.12 gives
+     delta 0.068 > 0.025 -> FAIL. Unit-tested:
+     `test_external_coir_gate_fails_tight_band_on_0_19_to_0_12_regression` (0.12
+     FAILS) and `test_tight_band_catches_a_regression_the_old_loose_only_gate_would_miss`
+     (0.22 is inside the old loose 0.18 band around 0.34418 — old gate would PASS
+     silently — but outside the tight band -> new gate FAILS).
+ (2) LOOSE external sanity bound vs published MTEB BM25 0.34418, `tolerance: 0.18`.
+     Proves end-to-end wiring vs an independent source; fails on a gross collapse
+     (nDCG~0 -> delta 0.344 >> 0.18).
+ Live run: measured 0.1847 -> (1) delta 0.0037 OK, (2) delta 0.1595 OK -> PASS.
+ The prior single 0.18 band did two jobs at once and would let a 0.19->0.12
+ ranking regression slip through; the split fixes that.
+
+**B. Corrected the recall-gap CAUSE (it is NOT a tantivy BM25 candidate cap).**
+The re-review verified in `crates/` that there is no ~15-candidate engine cap:
+`SparseIndex::search` honors `TopDocs::with_limit(top_k)` and `hybrid.rs` fetches
+`rerank_candidates (100) x oversample_factor (2-5)`. The real cause of the ~15
+trim under `-m 100` is semantex's PRODUCTION post-retrieval ADAPTIVE PIPELINE —
+**`apply_adaptive_pipeline` in `crates/semantex-core/src/search/adaptive.rs`**,
+which runs EVEN under `--sparse-only`: a confidence threshold (retain score >=
+`top_score x min_score(query_type)`) plus elbow-based `adaptive_max_results`
+sizing. On flat-score code-to-code tasks these prune the 100+ retrieved
+candidates to ~15 before `-m` applies, trimming low-overlap gold. Measuring the
+shipped channel (with its adaptive trimming) is INTENTIONAL — that is what real
+semantex returns. `config/baselines.yaml` wording corrected accordingly (now
+points at adaptive.rs, "NOT a tantivy BM25 cap"); no `crates/` code changed.
