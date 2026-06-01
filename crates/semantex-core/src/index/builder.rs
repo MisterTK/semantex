@@ -639,12 +639,24 @@ impl IndexBuilder {
         // build-time stemmer disagrees with the runtime config.
         let actual_chunk_count = store.chunk_count().unwrap_or(total_chunks as u64);
         let actual_file_count = store.file_count().unwrap_or(files_indexed + files_skipped);
-        // S8: the embedder fingerprint is stamped here so open-time code can
-        // detect a vector-space change. The real value is wired from the
-        // resolved registry spec in S8 Task 9 (after the ModelRegistry + config
-        // selection fields land); kept empty until then so this commit stays
-        // additive and the suite green.
-        let embedder_fingerprint = String::new();
+        // S8: stamp the active embedder's fingerprint so open-time code can
+        // detect a vector-space change. The fingerprint is backend-agnostic
+        // (id+dims+pooling+quant+norm+prefix), resolved from the merged manifest
+        // (built-ins + an optional user `models.toml`) — so it does NOT depend on
+        // S2's dense backend arm. (The versioned-dir build + atomic switchover
+        // wiring is the post-S2 reconciliation pass, gated on S2's builder arm.)
+        let embedder_fingerprint = {
+            let registry =
+                crate::model::ModelRegistry::from_config(&self.config, Some(&project_path))?;
+            let embedder_spec = registry.active_embedder()?;
+            let crate::model::RoleData::Embedder(embedder_data) = &embedder_spec.role_data else {
+                anyhow::bail!(
+                    "active embedder `{}` is not an embedder spec",
+                    embedder_spec.id
+                );
+            };
+            crate::model::EmbedderFingerprint::compute(&embedder_spec.id, embedder_data)
+        };
         let meta = IndexMeta {
             schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
             project_path: project_path.clone(),
