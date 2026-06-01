@@ -572,8 +572,18 @@ impl IndexBuilder {
                             .with_models_dir(self.config.models_dir());
                     if dense_missing {
                         // Full rebuild — gate concurrency (same `index::gate`
-                        // semaphore as the pre-seam code) and feed the whole
-                        // corpus as (chunk_id, content) pairs.
+                        // semaphore as the pre-seam code) and stream the corpus
+                        // through the dense builder one PLAID_BATCH at a time.
+                        //
+                        // Memory strategy: never load all chunks at once. The
+                        // builder pulls each ≤32-id batch's content via the
+                        // closure below (well under SQLite's variable limit),
+                        // encodes it, and drops it before the next batch — only
+                        // one batch's content is ever live. This preserves the
+                        // PLAID index-build memory bound (the 26GB→9GB fix) that
+                        // a single `get_chunks(&all_ids)` materialization broke,
+                        // while still issuing one `update_or_create` internally
+                        // (byte-identical to the pre-seam index).
                         let _slot = crate::index::gate::acquire(|| {
                             tracing::info!(
                                 "Waiting for a free index-build slot (max {} concurrent full builds; \
@@ -585,24 +595,28 @@ impl IndexBuilder {
                         if all_ids.is_empty() {
                             return Ok(());
                         }
-                        let all_chunks = store.get_chunks(&all_ids)?;
-                        let pairs: Vec<(u64, &str)> = all_chunks
-                            .iter()
-                            .map(|c| (c.id, c.content.as_str()))
-                            .collect();
-                        dense_builder.build(&pairs)?;
+                        dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
+                            let mut chunks = store.get_chunks(batch_ids)?;
+                            // `get_chunks` (WHERE id IN (...)) does not ORDER BY;
+                            // sort by id so the per-batch order is deterministic
+                            // and matches the ascending `all_ids` ordering, keeping
+                            // the resulting PLAID index byte-stable.
+                            chunks.sort_by_key(|c| c.id);
+                            Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                        })?;
                     } else {
-                        // Incremental — delete removed, insert new.
+                        // Incremental — delete removed, insert new. New chunks
+                        // stream in PLAID_BATCH-sized store reads too, so a large
+                        // incremental add never materializes all content at once
+                        // and never passes >32 ids to a single `get_chunks`.
                         if !removed_chunk_ids.is_empty() {
                             dense_builder.delete(&removed_chunk_ids)?;
                         }
                         if !new_chunk_ids.is_empty() {
-                            let new_chunks = store.get_chunks(&new_chunk_ids)?;
-                            let pairs: Vec<(u64, &str)> = new_chunks
-                                .iter()
-                                .map(|c| (c.id, c.content.as_str()))
-                                .collect();
-                            dense_builder.insert(&pairs)?;
+                            dense_builder.insert_streaming_ids(&new_chunk_ids, |batch_ids| {
+                                let chunks = store.get_chunks(batch_ids)?;
+                                Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                            })?;
                         }
                     }
                     dense_builder.persist(&dense_dir)?;

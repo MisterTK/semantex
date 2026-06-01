@@ -162,17 +162,33 @@ impl ColbertPlaidIndexBuilder {
         };
         (index_config, update_config)
     }
-}
 
-impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
-    fn name(&self) -> &'static str {
-        ColbertPlaidBackend::NAME
-    }
-
-    fn build(&mut self, chunks: &[(u64, &str)]) -> Result<()> {
+    /// Memory-bounded full rebuild that streams chunk content from the store
+    /// instead of materializing the entire corpus at once.
+    ///
+    /// This preserves the hard-won PLAID index-build memory bound (the
+    /// 26GB→9GB fix): for each `PLAID_BATCH` (32) slice of `chunk_ids`, the
+    /// caller-supplied `fetch` pulls only that batch's content (≤32 ids — well
+    /// under SQLite's `SQLITE_MAX_VARIABLE_NUMBER` default of 999), we encode
+    /// it, accumulate the compact token embeddings, then DROP the batch content
+    /// before the next iteration. Only one batch's content is ever live; the
+    /// accumulated embeddings are far smaller than the source text.
+    ///
+    /// Crucially we still issue exactly ONE `update_or_create` over all
+    /// embeddings — identical to the pre-seam single-call strategy — so the
+    /// resulting PLAID index is byte-identical (repeated `update_or_create`
+    /// calls would re-run k-means per batch, both perturbing centroids and
+    /// reintroducing the ~10×-per-call RSS blowup the single call avoids).
+    ///
+    /// `fetch(batch_ids)` must return `(chunk_id, content)` pairs for the given
+    /// ids; order need not match (we read the id back from each pair).
+    pub fn build_streaming_ids<F>(&mut self, chunk_ids: &[u64], mut fetch: F) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
+    {
         use next_plaid::MmapIndex;
 
-        if chunks.is_empty() {
+        if chunk_ids.is_empty() {
             tracing::info!("No chunks to encode for PLAID index");
             return Ok(());
         }
@@ -187,19 +203,30 @@ impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
         }
         std::fs::create_dir_all(&self.plaid_dir)?;
 
-        // Full rebuild: encode in small batches (memory bound), accumulate all
-        // embeddings, then ONE update_or_create call (identical to the pre-seam
-        // single-call strategy in builder.rs:646-720).
-        let mut full_mapping: Vec<u64> = Vec::with_capacity(chunks.len());
-        let mut all_embeddings: Vec<_> = Vec::with_capacity(chunks.len());
-        for batch in chunks.chunks(PLAID_BATCH) {
+        // Stream content batch-by-batch (memory bound) and accumulate only the
+        // compact embeddings; then ONE update_or_create over everything.
+        let mut full_mapping: Vec<u64> = Vec::with_capacity(chunk_ids.len());
+        let mut all_embeddings: Vec<_> = Vec::with_capacity(chunk_ids.len());
+        for batch_ids in chunk_ids.chunks(PLAID_BATCH) {
             if let Err(e) = crate::memory::check_rss_or_abort("PLAID encode batch") {
                 anyhow::bail!("Indexing aborted: {e}");
             }
-            let contents: Vec<String> = batch.iter().map(|(_, c)| (*c).to_string()).collect();
+            // Fetch only this batch's content from the store (≤32 ids).
+            let batch = fetch(batch_ids)?;
+            if batch.is_empty() {
+                continue;
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
             let embeddings = embedder.encode_documents(&contents)?;
             all_embeddings.extend(embeddings);
             full_mapping.extend(batch.iter().map(|(id, _)| *id));
+            // `batch` (and `contents`) drop here → only one batch's content is
+            // ever live at a time.
+        }
+
+        if all_embeddings.is_empty() {
+            tracing::info!("No chunks to encode for PLAID index");
+            return Ok(());
         }
 
         if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (single call)") {
@@ -226,10 +253,19 @@ impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
         Ok(())
     }
 
-    fn insert(&mut self, chunks: &[(u64, &str)]) -> Result<()> {
+    /// Memory-bounded incremental insert that streams content from the store.
+    ///
+    /// Mirrors the per-batch encode + `update_or_create` loop of the trait
+    /// `insert`, but pulls each `PLAID_BATCH` (32) slice's content via `fetch`
+    /// so a large incremental add never materializes all new content at once
+    /// and never passes >32 ids to a single `get_chunks` call.
+    pub fn insert_streaming_ids<F>(&mut self, chunk_ids: &[u64], mut fetch: F) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
+    {
         use next_plaid::MmapIndex;
 
-        if chunks.is_empty() {
+        if chunk_ids.is_empty() {
             return Ok(());
         }
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
@@ -243,11 +279,15 @@ impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
             Vec::new()
         };
 
-        for batch in chunks.chunks(PLAID_BATCH) {
+        for batch_ids in chunk_ids.chunks(PLAID_BATCH) {
             if let Err(e) = crate::memory::check_rss_or_abort("PLAID incremental batch") {
                 anyhow::bail!("Indexing aborted: {e}");
             }
-            let contents: Vec<String> = batch.iter().map(|(_, c)| (*c).to_string()).collect();
+            let batch = fetch(batch_ids)?;
+            if batch.is_empty() {
+                continue;
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
             let embeddings = embedder.encode_documents(&contents)?;
             let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
                 &embeddings,
@@ -273,6 +313,42 @@ impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
 
         std::fs::write(&self.mapping_path, postcard::to_stdvec(&mapping)?)?;
         Ok(())
+    }
+}
+
+impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
+    fn name(&self) -> &'static str {
+        ColbertPlaidBackend::NAME
+    }
+
+    fn build(&mut self, chunks: &[(u64, &str)]) -> Result<()> {
+        // Full rebuild over an already-materialized corpus. Delegate to the
+        // streaming core (single `update_or_create`, byte-identical to the
+        // pre-seam path) by serving each batch straight from the in-memory
+        // slice. Memory-sensitive callers (the indexer) use
+        // `build_streaming_ids` so the corpus content is never all live at
+        // once; this slice-based path exists for direct/tests callers.
+        let ids: Vec<u64> = chunks.iter().map(|(id, _)| *id).collect();
+        let by_id: std::collections::HashMap<u64, &str> =
+            chunks.iter().map(|(id, c)| (*id, *c)).collect();
+        self.build_streaming_ids(&ids, |batch_ids| {
+            Ok(batch_ids
+                .iter()
+                .filter_map(|id| by_id.get(id).map(|c| (*id, (*c).to_string())))
+                .collect())
+        })
+    }
+
+    fn insert(&mut self, chunks: &[(u64, &str)]) -> Result<()> {
+        let ids: Vec<u64> = chunks.iter().map(|(id, _)| *id).collect();
+        let by_id: std::collections::HashMap<u64, &str> =
+            chunks.iter().map(|(id, c)| (*id, *c)).collect();
+        self.insert_streaming_ids(&ids, |batch_ids| {
+            Ok(batch_ids
+                .iter()
+                .filter_map(|id| by_id.get(id).map(|c| (*id, (*c).to_string())))
+                .collect())
+        })
     }
 
     fn delete(&mut self, chunk_ids: &[u64]) -> Result<()> {
