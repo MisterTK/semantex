@@ -1,12 +1,11 @@
 //! S8 acceptance: capability routing, user-manifest 2nd-model end-to-end,
 //! fingerprint stamping, and the clean-mismatch error arm.
 //!
-//! PHASE-1 NOTE: S1's `DenseBackendKind` has only the `ColbertPlaid` variant
-//! today (S2 owns `CoderankHnsw`), so `embedder_backend_kind()` is interim-
-//! fallible: a multi-vector embedder resolves to `Ok(ColbertPlaid)`; a single-
-//! vector embedder resolves its SPEC fine but its backend conversion errors
-//! "until S2". These golden tests assert that honest interim contract; the
-//! post-S2 reconciliation pass tightens the single-vector arm to `Ok(HNSW)`.
+//! POST-S2 NOTE: S2 added the `CoderankHnsw` variant to `DenseBackendKind` and
+//! totalized the capability→backend conversion, so `embedder_backend_kind()` now
+//! resolves a multi-vector embedder to `Ok(ColbertPlaid)` and a single-vector
+//! embedder to `Ok(CoderankHnsw)`. These golden tests assert that totalized
+//! contract.
 
 use semantex_core::config::SemantexConfig;
 use semantex_core::model::ModelRegistry;
@@ -38,12 +37,12 @@ fn registry_resolved_backend_equals_direct_for_default() {
     );
 }
 
-/// Gate 4 (interim arm): a single-vector built-in (coderank-137m) RESOLVES from
-/// its spec and capability-routes to the coderank-hnsw `BackendKind`, but the
-/// conversion to S1's `DenseBackendKind` errors honestly until S2 lands the
-/// variant. Proves the negotiation is capability-driven (not id-branching).
+/// Gate 4 (post-S2): a single-vector built-in (coderank-137m) RESOLVES from its
+/// spec and capability-routes to the coderank-hnsw backend, now totally mapped
+/// to S1's `DenseBackendKind`. Proves the negotiation is capability-driven (not
+/// id-branching).
 #[test]
-fn single_vector_routes_to_hnsw_backendkind_errors_until_s2() {
+fn single_vector_routes_to_hnsw_backendkind() {
     let mut cfg = SemantexConfig::default();
     cfg.embedder = "coderank-137m".to_string();
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
@@ -52,11 +51,11 @@ fn single_vector_routes_to_hnsw_backendkind_errors_until_s2() {
         backend_for(&reg.active_embedder().unwrap().capabilities),
         BackendKind::CoderankHnsw
     );
-    // …but the S1 DenseBackendKind conversion is fallible pre-S2.
-    let err = reg
-        .embedder_backend_kind()
-        .expect_err("coderank-hnsw must error until S2");
-    assert!(err.to_string().contains("S2"), "got: {err}");
+    // …and the S1 DenseBackendKind conversion is now total (post-S2).
+    assert_eq!(
+        reg.embedder_backend_kind().unwrap(),
+        DenseBackendKind::CoderankHnsw
+    );
 }
 
 /// Gate 3: a user `models.toml` adding a SECOND permissive embedder loads and
@@ -109,8 +108,8 @@ fn user_manifest_second_model_loads_and_routes() {
 }
 
 /// Gate 3 (single-vector arm): a user `models.toml` single-vector embedder also
-/// LOADS and capability-routes (to coderank-hnsw) from the manifest alone — only
-/// the S1 backend-kind conversion is deferred to S2.
+/// LOADS and capability-routes (to coderank-hnsw) from the manifest alone, and
+/// (post-S2) the S1 backend-kind conversion is total.
 #[test]
 fn user_manifest_single_vector_model_capability_routes() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -148,8 +147,11 @@ fn user_manifest_single_vector_model_capability_routes() {
     assert_eq!(spec.id, "gte-modernbert-hnsw");
     // Capability-routes to the coderank-hnsw BackendKind from the manifest alone.
     assert_eq!(backend_for(&spec.capabilities), BackendKind::CoderankHnsw);
-    // The DenseBackendKind conversion is deferred to S2.
-    assert!(reg.embedder_backend_kind().is_err());
+    // Post-S2: the DenseBackendKind conversion is total.
+    assert_eq!(
+        reg.embedder_backend_kind().unwrap(),
+        DenseBackendKind::CoderankHnsw
+    );
 }
 
 /// Gate 1 (config-only reranker/llm swap): swapping the reranker by config alone
