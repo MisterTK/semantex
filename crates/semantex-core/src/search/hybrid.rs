@@ -1,14 +1,16 @@
 use crate::config::SemantexConfig;
-use crate::embedding::colbert::ColbertEmbedder;
 use crate::embedding::model_manager;
 use crate::index::file_classifier::FileRole;
 use crate::index::storage::ChunkStore;
 use crate::search::SearchQuery;
 use crate::search::adaptive;
+use crate::search::colbert_plaid_backend::ColbertPlaidBackend;
+use crate::search::dense_backend::{
+    DenseBackend, DenseBackendKind, dense_subdir, verify_persisted_backend_matches,
+};
 use crate::search::fastembed_reranker::FastembedReranker;
 use crate::search::graph_propagation::{self, GraphPropagationConfig};
 use crate::search::path_signals;
-use crate::search::plaid_search::PlaidSearcher;
 use crate::search::query_classifier::{self, FusionWeights, QueryType};
 use crate::search::sparse_search::SparseIndex;
 use crate::search::triple_fusion::{self, FusionMode, RrfFusedResult};
@@ -19,12 +21,14 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Hybrid searcher combining dense (ColBERT/PLAID), sparse (BM25), and reranking.
-/// Exact substring search is handled by SQLite LIKE queries on the chunk store.
+/// Hybrid searcher combining dense (pluggable `DenseBackend`), sparse (BM25),
+/// and reranking. Exact substring search is handled by SQLite LIKE queries on
+/// the chunk store.
 pub struct HybridSearcher {
     sparse: Option<SparseIndex>,
-    plaid: Option<PlaidSearcher>,
-    colbert: Option<&'static ColbertEmbedder>,
+    /// Pluggable dense channel (S1). `None` when dense is unavailable
+    /// (sparse-only open, or the dense index failed to load).
+    dense: Option<Box<dyn DenseBackend>>,
     reranker: Mutex<Option<FastembedReranker>>,
     store: Mutex<ChunkStore>,
     config: SemantexConfig,
@@ -59,8 +63,7 @@ impl HybridSearcher {
 
         Ok(Self {
             sparse,
-            plaid: None,
-            colbert: None,
+            dense: None,
             reranker,
             store,
             config: config.clone(),
@@ -101,37 +104,48 @@ impl HybridSearcher {
             None
         };
 
-        // Load PLAID index for ColBERT late-interaction search
-        let (plaid, colbert) = {
-            let plaid_dir = index_dir.join("plaid");
-            let mapping_path = index_dir.join("plaid_mapping.bin");
-            if plaid_dir.exists() && mapping_path.exists() {
-                match PlaidSearcher::open(&plaid_dir, &mapping_path) {
-                    Ok(ps) => {
-                        // Initialize ColBERT embedder for query encoding
-                        let colbert_model_dir =
-                            model_manager::ensure_colbert_model(&config.models_dir());
-                        match colbert_model_dir.and_then(|d| ColbertEmbedder::global(&d)) {
-                            Ok(emb) => {
-                                tracing::info!("PLAID index loaded with ColBERT encoder");
-                                (Some(ps), Some(emb))
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "PLAID index found but ColBERT encoder failed: {}",
-                                    e
-                                );
-                                (None, None)
-                            }
+        // Load the dense backend (S1). Selection: config.dense_backend (which
+        // SEMANTEX_DENSE_BACKEND already overlaid in SemantexConfig::load).
+        // The persisted backend in meta.json MUST match — verify and refuse on
+        // mismatch (mirrors the BM25 stemmer guard).
+        verify_persisted_backend_matches(index_dir, &config.dense_backend)?;
+        let dense: Option<Box<dyn DenseBackend>> = match DenseBackendKind::parse(
+            &config.dense_backend,
+        ) {
+            Some(DenseBackendKind::ColbertPlaid) => {
+                // Per-backend subdir is canonical; fall back to the legacy
+                // top-level `plaid/` layout for indexes built before S1.
+                let backend_dir = dense_subdir(index_dir, DenseBackendKind::ColbertPlaid);
+                let legacy_dir = index_dir.join("plaid");
+                let (plaid_dir, mapping_path) = if backend_dir.exists() {
+                    (backend_dir.clone(), backend_dir.join("plaid_mapping.bin"))
+                } else {
+                    (legacy_dir, index_dir.join("plaid_mapping.bin"))
+                };
+                if plaid_dir.exists() && mapping_path.exists() {
+                    let model_dir = model_manager::ensure_colbert_model(&config.models_dir());
+                    match model_dir
+                        .and_then(|d| ColbertPlaidBackend::open(&plaid_dir, &mapping_path, &d))
+                    {
+                        Ok(b) => {
+                            tracing::info!("Dense backend loaded: colbert-plaid");
+                            Some(Box::new(b) as Box<dyn DenseBackend>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("colbert-plaid backend failed to load: {}", e);
+                            None
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to open PLAID index: {}", e);
-                        (None, None)
-                    }
+                } else {
+                    None
                 }
-            } else {
-                (None, None)
+            }
+            None => {
+                tracing::warn!(
+                    "Unknown dense_backend '{}' — dense channel disabled (falling back to sparse+exact)",
+                    config.dense_backend
+                );
+                None
             }
         };
 
@@ -140,8 +154,7 @@ impl HybridSearcher {
 
         Ok(Self {
             sparse,
-            plaid,
-            colbert,
+            dense,
             reranker,
             store,
             config: config.clone(),
@@ -149,7 +162,7 @@ impl HybridSearcher {
     }
 
     /// Reload the sparse index reader to pick up incremental updates.
-    /// The PLAID index is memory-mapped and picks up changes automatically on re-open,
+    /// The dense index is memory-mapped and picks up changes automatically on re-open,
     /// but Tantivy requires an explicit reader reload.
     /// Provide read-only access to the chunk store for graph queries.
     /// Used by the daemon handler and the direct fallback path.
@@ -267,67 +280,64 @@ impl HybridSearcher {
         // we enter `thread::scope` to avoid contention with `exact_handle`,
         // which takes the same lock.
         let plaid_chunk_subset: Option<Vec<u64>> = match (
-            query.use_dense.then_some(()).and(self.plaid.as_ref()),
+            query.use_dense.then_some(()).and(self.dense.as_ref()),
             query.file_filter.as_ref().filter(|f| f.is_active()),
         ) {
-            (Some(plaid), Some(filter)) => {
-                let all_indexed = plaid.doc_to_chunk();
-                if all_indexed.is_empty() {
-                    Some(Vec::new())
-                } else {
-                    const FILTER_BATCH: usize = 500;
-                    // v0.4.1 W-Index #7: previously this loop swallowed
-                    // SQLite errors with `if let Ok(chunks) = ...`, so a
-                    // transient DB failure produced a partial subset that
-                    // PLAID then searched as if it were the complete
-                    // candidate set (silently dropping results from
-                    // un-fetched batches). Now we propagate the error and
-                    // fall back to an unfiltered PLAID search — slower, but
-                    // correct: post-filter dedup in the result-merge stage
-                    // already handles the file_filter check.
-                    //
-                    // v0.4.1 W-Index #3: also pre-filter PLAID_TOMBSTONE
-                    // entries from the input batch so we never ask SQLite
-                    // for a chunk_id that's the deleted-slot sentinel.
-                    let subset_result: anyhow::Result<Vec<u64>> = (|| {
-                        let store = self.store.lock();
-                        let mut subset: Vec<u64> = Vec::new();
-                        for batch in all_indexed.chunks(FILTER_BATCH) {
-                            let live: Vec<u64> = batch
-                                .iter()
-                                .copied()
-                                .filter(|&cid| cid != crate::types::PLAID_TOMBSTONE)
-                                .collect();
-                            if live.is_empty() {
-                                continue;
-                            }
-                            let chunks = store.get_chunks(&live)?;
-                            for c in chunks {
-                                if filter.matches(&c.file_path) {
-                                    subset.push(c.id);
+            (Some(dense), Some(filter)) => {
+                // The subset is computed from the dense index's positional
+                // chunk list. Only colbert-plaid exposes one today; backends
+                // without positional docs (None) skip subset prep and let the
+                // result-merge file_filter handle scoping.
+                match dense.positional_chunk_ids() {
+                    None => None, // backend has no positional docs — subset N/A
+                    Some(all_indexed) if all_indexed.is_empty() => Some(Vec::new()),
+                    Some(all_indexed) => {
+                        const FILTER_BATCH: usize = 500;
+                        // v0.4.1 W-Index #7: propagate SQLite errors and fall
+                        // back to an unfiltered dense search (result merge still
+                        // applies the file_filter) rather than silently
+                        // searching a partial candidate set.
+                        // v0.4.1 W-Index #3: pre-filter PLAID_TOMBSTONE entries
+                        // so we never query SQLite for a deleted-slot sentinel.
+                        let subset_result: anyhow::Result<Vec<u64>> = (|| {
+                            let store = self.store.lock();
+                            let mut subset: Vec<u64> = Vec::new();
+                            for batch in all_indexed.chunks(FILTER_BATCH) {
+                                let live: Vec<u64> = batch
+                                    .iter()
+                                    .copied()
+                                    .filter(|&cid| cid != crate::types::PLAID_TOMBSTONE)
+                                    .collect();
+                                if live.is_empty() {
+                                    continue;
+                                }
+                                let chunks = store.get_chunks(&live)?;
+                                for c in chunks {
+                                    if filter.matches(&c.file_path) {
+                                        subset.push(c.id);
+                                    }
                                 }
                             }
-                        }
-                        Ok(subset)
-                    })();
-
-                    match subset_result {
-                        Ok(s) => {
-                            tracing::debug!(
-                                indexed = all_indexed.len(),
-                                subset = s.len(),
-                                "PLAID file_filter subset prepared"
-                            );
-                            Some(s)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "PLAID file_filter subset construction failed — \
-                                 falling back to unfiltered dense search (result \
-                                 merge will still apply the file_filter)"
-                            );
-                            None
+                            Ok(subset)
+                        })();
+                        match subset_result {
+                            Ok(s) => {
+                                tracing::debug!(
+                                    indexed = all_indexed.len(),
+                                    subset = s.len(),
+                                    "Dense file_filter subset prepared"
+                                );
+                                Some(s)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Dense file_filter subset construction failed — \
+                                     falling back to unfiltered dense search (result \
+                                     merge will still apply the file_filter)"
+                                );
+                                None
+                            }
                         }
                     }
                 }
@@ -353,32 +363,27 @@ impl HybridSearcher {
                     return (Vec::new(), 0);
                 }
                 let dense_start = std::time::Instant::now();
-                let results = if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                let results = if let Some(ref dense) = self.dense {
                     // v0.4 WS-B Item 15: when a file_filter is active, route
                     // through `search_with_subset` with the pre-computed
-                    // chunk-ID subset so PLAID skips MaxSim work on chunks
-                    // the user has filtered out.
-                    let res = if plaid_subset_slice.is_some() {
-                        plaid.search_with_subset(
-                            colbert,
-                            &effective_text,
-                            retrieval_candidates,
-                            plaid_subset_slice,
-                        )
+                    // chunk-ID subset so the backend skips work on chunks the
+                    // user has filtered out.
+                    let res = if let Some(subset) = plaid_subset_slice {
+                        dense.search_with_subset(&effective_text, retrieval_candidates, subset)
                     } else {
-                        plaid.search(colbert, &effective_text, retrieval_candidates)
+                        dense.search(&effective_text, retrieval_candidates)
                     };
                     match res {
                         Ok(results) => {
                             tracing::debug!(
                                 results_count = results.len(),
                                 duration_ms = dense_start.elapsed().as_millis() as u64,
-                                "PLAID (ColBERT) search complete"
+                                "Dense search complete"
                             );
                             results
                         }
                         Err(e) => {
-                            tracing::warn!("PLAID search failed: {}", e);
+                            tracing::warn!("Dense search failed: {}", e);
                             Vec::new()
                         }
                     }
@@ -454,18 +459,13 @@ impl HybridSearcher {
                 if !query.use_dense {
                     return Vec::new();
                 }
-                if let (Some(plaid), Some(colbert)) = (&self.plaid, self.colbert) {
+                if let Some(ref dense) = self.dense {
                     // v0.4 WS-B Item 15: same subset-aware routing as the
                     // primary dense channel.
-                    let res = if plaid_subset_slice.is_some() {
-                        plaid.search_with_subset(
-                            colbert,
-                            text,
-                            retrieval_candidates,
-                            plaid_subset_slice,
-                        )
+                    let res = if let Some(subset) = plaid_subset_slice {
+                        dense.search_with_subset(text, retrieval_candidates, subset)
                     } else {
-                        plaid.search(colbert, text, retrieval_candidates)
+                        dense.search(text, retrieval_candidates)
                     };
                     match res {
                         Ok(r) => {
@@ -476,7 +476,7 @@ impl HybridSearcher {
                             r
                         }
                         Err(e) => {
-                            tracing::debug!("Expanded PLAID search failed: {}", e);
+                            tracing::debug!("Expanded dense search failed: {}", e);
                             Vec::new()
                         }
                     }
@@ -2274,6 +2274,20 @@ mod tests {
             assert_eq!(c, Confidence::Inferred);
             assert!((s - 1.0 / 3.0).abs() < 1e-5);
         }
+    }
+
+    /// S1: the dense channel is now a trait object. This test just constructs a
+    /// sparse-only searcher (no model load) and confirms the dense slot is None,
+    /// proving `open_sparse_only` compiles against the new field shape.
+    #[test]
+    fn sparse_only_has_no_dense_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(tmp.path(), &cfg).unwrap();
+        assert!(
+            searcher.dense.is_none(),
+            "sparse-only must not load a dense backend"
+        );
     }
 }
 
