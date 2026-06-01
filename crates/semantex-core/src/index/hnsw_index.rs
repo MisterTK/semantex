@@ -653,6 +653,48 @@ mod tests {
         }
     }
 
+    /// End-to-end on a tiny built index: BOTH accessor methods return `Some`
+    /// with `EMBEDDING_DIM`-length vectors, and `embed_doc_vectors` round-trips
+    /// the stored ids. `#[ignore]` — needs the CodeRankEmbed model download.
+    #[test]
+    #[ignore]
+    fn vector_accessor_methods_return_some_on_built_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("dense");
+        let models = tmp.path().join("models");
+        let model_dir = crate::embedding::single_vector_model::ensure_coderank_model(&models)
+            .expect("model provisions");
+
+        let mut b = CoderankHnswIndexBuilder::new(&dir, HnswParams::default())
+            .with_models_dir(models.clone());
+        b.build(&[
+            (7, "fn parse_int(s:&str)->i64 { s.parse().unwrap() }"),
+            (9, "def add(a,b): return a+b"),
+        ])
+        .unwrap();
+
+        let backend = CoderankHnswBackend::open(&dir, &model_dir, HnswParams::default()).unwrap();
+
+        let qv = backend
+            .embed_text_vector("parse an integer")
+            .expect("Some on coderank-hnsw");
+        assert_eq!(qv.len(), SingleVectorEmbedder::embedding_dim());
+        let norm: f32 = qv.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "query vector must be L2-normalized, got {norm}"
+        );
+
+        let dv = backend
+            .embed_doc_vectors(&[9, 7, 404])
+            .expect("Some on coderank-hnsw");
+        assert_eq!(dv.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![9, 7]);
+        assert!(
+            dv.iter()
+                .all(|(_, v)| v.len() == SingleVectorEmbedder::embedding_dim())
+        );
+    }
+
     #[test]
     fn hnsw_graph_and_brute_force_agree_on_tiny_corpus() {
         // Force the HNSW graph path on a tiny corpus by lowering the threshold,

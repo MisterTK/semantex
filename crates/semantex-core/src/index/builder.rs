@@ -1051,6 +1051,39 @@ mod tests {
         assert_eq!(meta.schema_version, 11);
     }
 
+    /// S2: building with the coderank-137m embedder (→ coderank-hnsw backend)
+    /// writes the per-backend subdir `.semantex/dense/coderank-hnsw/vectors.bin`
+    /// and records the model + dim + resolved backend in meta.json. `#[ignore]`
+    /// — needs the CodeRankEmbed model download.
+    #[test]
+    #[ignore]
+    fn coderank_hnsw_build_writes_subdir_and_meta() {
+        use crate::config::SemantexConfig;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.rs"), "pub fn hello() -> u32 { 41 + 1 }\n").unwrap();
+
+        let cfg = SemantexConfig {
+            embedder: "coderank-137m".to_string(),
+            ..SemantexConfig::default()
+        };
+        IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
+
+        assert!(
+            project
+                .join(".semantex/dense/coderank-hnsw/vectors.bin")
+                .exists()
+        );
+        let meta: crate::types::IndexMeta = serde_json::from_str(
+            &std::fs::read_to_string(project.join(".semantex/meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta.dense_backend, "coderank-hnsw");
+        assert_eq!(meta.schema_version, 11);
+        assert_eq!(meta.embedding_model, "CodeRankEmbed");
+    }
+
     /// v0.4.1 W-Index #3 — synthetic mapping contract:
     ///
     /// A mapping vector with `PLAID_TOMBSTONE` at index 1 and real chunk IDs
