@@ -129,6 +129,7 @@ mod tests {
             "embedding_model": "test",
             "embedding_dim": 48,
             "use_bm25_stemmer": true,
+            "dense_backend": "colbert-plaid",
         });
         std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
         assert_eq!(detect(tmp.path()), IndexState::Ready);
@@ -206,6 +207,7 @@ mod tests {
             embedding_model: "test".to_string(),
             embedding_dim: 48,
             use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
         };
         let meta_json = serde_json::to_string(&meta).unwrap();
         std::fs::write(semantex_dir.join("meta.json"), meta_json).unwrap();

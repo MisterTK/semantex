@@ -191,6 +191,11 @@ pub struct IndexMeta {
     /// (since tantivy stores the analyzer state implicitly via the index
     /// schema). v0.4.1 W-Index #4.
     pub use_bm25_stemmer: bool,
+    /// Dense backend identity this index was built with (e.g.
+    /// `"colbert-plaid"`). Open-time code re-validates against the runtime
+    /// `SemantexConfig.dense_backend` and refuses to load on mismatch — the
+    /// dense graph/index layout is backend-specific. S1.
+    pub dense_backend: String,
 }
 
 impl IndexMeta {
@@ -204,7 +209,12 @@ impl IndexMeta {
     /// before the postcard switch fail to decode the mapping file and the
     /// missing-field deserialize blocks v8 meta.json from parsing as v9 —
     /// both surface as `Stale` via `state::detect`, triggering a rebuild.
-    pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+    ///
+    /// v10 (S1): persists `dense_backend` so the daemon can detect at open time
+    /// that an index was built with a different dense backend than the running
+    /// config. Older v9 meta.json files lack the field and fail to deserialize
+    /// — `state::detect` then returns `Stale`, forcing a clean rebuild.
+    pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 }
 
 /// File metadata for incremental indexing
@@ -289,9 +299,31 @@ mod tests {
     /// 8 records both the postcard wire format for `plaid_mapping.bin` and the
     /// addition of the persisted `use_bm25_stemmer` field. Older v8 indexes
     /// stay incompatible (rebuild via the stale-detection path).
+    /// S1: schema bumped 9 → 10 to add the persisted `dense_backend` field.
+    /// Older v9 indexes (which lack the field) become `Stale` and rebuild.
     #[test]
-    fn current_schema_version_is_9() {
-        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 9);
+    fn current_schema_version_is_10() {
+        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 10);
+    }
+
+    #[test]
+    fn index_meta_round_trips_dense_backend() {
+        let meta = IndexMeta {
+            schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: std::path::PathBuf::from("/x"),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 1,
+            chunk_count: 2,
+            embedding_model: "LateOn-Code-edge".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dense_backend, "colbert-plaid");
+        assert_eq!(back.schema_version, 10);
     }
 
     /// Synthetic v8 meta.json must be detected as `Stale` by `state::detect`
@@ -314,6 +346,7 @@ mod tests {
             embedding_model: "test".to_string(),
             embedding_dim: 48,
             use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
         };
         let meta_json = serde_json::to_string(&meta).expect("serialize meta");
         std::fs::write(semantex_dir.join("meta.json"), meta_json).expect("write meta");

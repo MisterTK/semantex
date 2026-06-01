@@ -869,6 +869,7 @@ impl IndexBuilder {
             embedding_model: "LateOn-Code-edge".to_string(),
             embedding_dim: 48,
             use_bm25_stemmer: self.config.use_bm25_stemmer,
+            dense_backend: self.config.dense_backend.clone(),
         };
         let meta_json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(index_dir.join("meta.json"), meta_json)?;
