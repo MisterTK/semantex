@@ -600,26 +600,42 @@ impl HybridSearcher {
                     );
                     rrf_results.into_iter().map(|r| r.scored).collect()
                 }
-                // S7: WeightedRrf arm is wired in Task 1.4. Until then it shares
-                // the parameter-free RRF behavior so the crate compiles.
+                // S7: Weighted Triple RRF — per-channel rank-decay scaled by the
+                // query-type FusionWeights, with k = config.rrf_k (now live).
+                // Selected by SEMANTEX_FUSION=weighted-rrf; default stays Rrf.
                 FusionMode::WeightedRrf => {
+                    let (weights, k) = weighted_rrf_params(&self.config, query_type);
                     let rrf_results: Vec<RrfFusedResult> = if !exp_dense_results.is_empty()
                         || !exp_sparse_results.is_empty()
                     {
-                        triple_fusion::exp4_rrf_fuse(
+                        triple_fusion::exp4_weighted_rrf_fuse(
                             &dense_results,
                             &sparse_results,
                             &exp_dense_results,
                             &exp_sparse_results,
                             &exact_ids,
+                            weights,
+                            k,
                         )
                     } else {
-                        triple_fusion::triple_rrf_fuse(&dense_results, &sparse_results, &exact_ids)
+                        triple_fusion::triple_weighted_rrf_fuse(
+                            &dense_results,
+                            &sparse_results,
+                            &exact_ids,
+                            weights,
+                            k,
+                        )
                     };
                     let labels = triple_fusion::assign_confidence(&rrf_results);
                     for (rr, (conf, score)) in rrf_results.iter().zip(labels.iter()) {
                         confidence_map.insert(rr.scored.chunk_id, (*conf, *score));
                     }
+                    tracing::debug!(
+                        fused_count = rrf_results.len(),
+                        rrf_k = k,
+                        duration_ms = fusion_start.elapsed().as_millis() as u64,
+                        "Weighted Triple RRF fusion complete (S7)"
+                    );
                     rrf_results.into_iter().map(|r| r.scored).collect()
                 }
                 FusionMode::Cc => {
@@ -1535,6 +1551,14 @@ fn merge_hyde_results(
     }
 }
 
+/// S7: select the (FusionWeights, k) pair the weighted-RRF path uses.
+/// `k` comes from the previously-dead `config.rrf_k`; the weights come from the
+/// query classifier's per-type table. Extracted as a free fn so it is unit-
+/// testable without building an index.
+fn weighted_rrf_params(config: &SemantexConfig, query_type: QueryType) -> (FusionWeights, f32) {
+    (query_type.fusion_weights(), config.rrf_k)
+}
+
 /// Heuristic: exhaustive queries ask for complete enumeration of all instances.
 /// Examples: "find all error handling", "list every config option", "all places where X".
 /// These benefit from wider result ranges, no per-file dedup, and lower score thresholds.
@@ -1761,6 +1785,18 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    /// S7: weighted-RRF reads config.rrf_k (previously dead) and the query-type
+    /// FusionWeights. This guards the selection logic the hybrid match arm uses.
+    #[test]
+    fn weighted_rrf_selection_reads_config_rrf_k_and_weights() {
+        let mut cfg = crate::config::SemantexConfig::default();
+        cfg.rrf_k = 42.0;
+        let (weights, k) = weighted_rrf_params(&cfg, query_classifier::QueryType::Identifier);
+        assert!((k - 42.0).abs() < f32::EPSILON, "config.rrf_k must be live, got {k}");
+        // Identifier weights favour sparse (dead-code revival check).
+        assert!(weights.w_sparse > weights.w_dense);
+    }
 
     // ---- Defect #13 regression: Phase 3 boosts must NOT clamp at
     //      max_score. The previous `.min(max_score)` ceiling collapsed
