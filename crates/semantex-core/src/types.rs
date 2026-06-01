@@ -192,9 +192,11 @@ pub struct IndexMeta {
     /// schema). v0.4.1 W-Index #4.
     pub use_bm25_stemmer: bool,
     /// Dense backend identity this index was built with (e.g.
-    /// `"colbert-plaid"`). Open-time code re-validates against the runtime
-    /// `SemantexConfig.dense_backend` and refuses to load on mismatch — the
-    /// dense graph/index layout is backend-specific. S1.
+    /// `"coderank-hnsw"`). Open-time code re-validates against the runtime
+    /// resolved backend and refuses to load on mismatch — the dense graph/index
+    /// layout is backend-specific. An index stamped with a removed backend (e.g.
+    /// a straggler `"colbert-plaid"`) trips the mismatch guard → clean rebuild
+    /// guidance, never a panic. S1.
     pub dense_backend: String,
     /// Fingerprint of the embedder spec this dense index was built with
     /// (id+dims+pooling+quant+norm+prefix, xxh64). Open-time code compares it to
@@ -230,7 +232,14 @@ impl IndexMeta {
     /// v11 (S2): the single-vector dense backend (`coderank-hnsw`) introduces a
     /// new on-disk layout (`dense/coderank-hnsw/vectors.bin`). Bumping forces a
     /// clean reindex so an old PLAID-only index isn't half-read by the new path.
-    pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+    ///
+    /// v12 (D4): the ColBERT/PLAID dense backend was removed — coderank-hnsw is
+    /// now the sole built-in dense backend. Bumping forces any straggler index
+    /// still stamped `dense_backend:"colbert-plaid"` to be detected `Stale` and
+    /// rebuilt cleanly (belt-and-braces alongside the open-time backend-mismatch
+    /// guard in `hybrid.rs`, which already refuses such an index with rebuild
+    /// guidance rather than panicking).
+    pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 }
 
 /// File metadata for incremental indexing
@@ -319,9 +328,11 @@ mod tests {
     /// Older v9 indexes (which lack the field) become `Stale` and rebuild.
     /// S2: schema bumped 10 → 11 for the single-vector dense on-disk layout
     /// (`dense/coderank-hnsw/vectors.bin`). Older indexes become `Stale`.
+    /// D4: bumped 11 → 12 when the ColBERT/PLAID backend was removed; any
+    /// straggler colbert-plaid index becomes `Stale` and rebuilds.
     #[test]
-    fn current_schema_version_is_11() {
-        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 11);
+    fn current_schema_version_is_12() {
+        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 12);
     }
 
     #[test]
@@ -333,16 +344,16 @@ mod tests {
             updated_at: "0".to_string(),
             file_count: 1,
             chunk_count: 2,
-            embedding_model: "LateOn-Code-edge".to_string(),
-            embedding_dim: 48,
+            embedding_model: "CodeRankEmbed".to_string(),
+            embedding_dim: 768,
             use_bm25_stemmer: true,
-            dense_backend: "colbert-plaid".to_string(),
+            dense_backend: "coderank-hnsw".to_string(),
             embedder_fingerprint: "fp".to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: IndexMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.dense_backend, "colbert-plaid");
-        assert_eq!(back.schema_version, 11);
+        assert_eq!(back.dense_backend, "coderank-hnsw");
+        assert_eq!(back.schema_version, 12);
     }
 
     #[test]
@@ -383,6 +394,36 @@ mod tests {
             file_count: 0,
             chunk_count: 0,
             embedding_model: "test".to_string(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".to_string(),
+            embedder_fingerprint: "fp".to_string(),
+        };
+        let meta_json = serde_json::to_string(&meta).expect("serialize meta");
+        std::fs::write(semantex_dir.join("meta.json"), meta_json).expect("write meta");
+        assert_eq!(state::detect(tmp.path()), state::IndexState::Stale);
+    }
+
+    /// D4: an old index stamped with the removed `colbert-plaid` backend (at the
+    /// PRE-D4 schema 11) must be detected `Stale` after the v12 bump and rebuilt
+    /// cleanly — never opened/panicked. This is the graceful-degradation path for
+    /// stragglers that predate the backend removal.
+    #[test]
+    fn old_colbert_plaid_meta_is_stale_after_v12_bump() {
+        use crate::index::state;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let semantex_dir = tmp.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).expect("create .semantex dir");
+        let meta = IndexMeta {
+            schema_version: 11, // pre-D4 schema
+            project_path: tmp.path().to_path_buf(),
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+            file_count: 0,
+            chunk_count: 0,
+            embedding_model: "LateOn-Code-edge".to_string(),
             embedding_dim: 48,
             use_bm25_stemmer: true,
             dense_backend: "colbert-plaid".to_string(),

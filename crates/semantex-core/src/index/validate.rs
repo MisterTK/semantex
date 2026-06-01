@@ -212,53 +212,39 @@ fn check_stale_files(index_dir: &Path, project_path: &Path) -> CheckResult {
     }
 }
 
-/// Check 3: Dense index integrity — PLAID directory and mapping file.
+/// Check 3: Dense index integrity — the coderank-hnsw vector store sentinel
+/// (`dense/coderank-hnsw/vectors.bin`).
 fn check_dense_index(index_dir: &Path) -> CheckResult {
+    use crate::search::dense_backend::{DenseBackendKind, dense_subdir};
     let name = "dense_index".to_string();
 
-    let plaid_dir = index_dir.join("plaid");
-    let mapping_file = index_dir.join("plaid_mapping.bin");
+    let dense_dir = dense_subdir(index_dir, DenseBackendKind::CoderankHnsw);
+    let vectors_file = dense_dir.join("vectors.bin");
 
-    let plaid_exists = plaid_dir.exists() && plaid_dir.is_dir();
-    let mapping_exists = mapping_file.exists();
-
-    if !plaid_exists && !mapping_exists {
+    if !vectors_file.exists() {
         return CheckResult {
             name,
             passed: false,
-            message: "Dense index missing: no plaid/ directory or plaid_mapping.bin".to_string(),
+            message: format!(
+                "Dense index missing: no {} (vector store sentinel)",
+                vectors_file.display()
+            ),
         };
     }
 
-    let mut issues = Vec::new();
-
-    if !plaid_exists {
-        issues.push("plaid/ directory missing");
-    }
-    if !mapping_exists {
-        issues.push("plaid_mapping.bin missing");
-    }
-
-    if mapping_exists
-        && let Ok(meta) = std::fs::metadata(&mapping_file)
-        && meta.len() == 0
-    {
-        issues.push("plaid_mapping.bin is empty (0 bytes)");
-    }
-
-    if issues.is_empty() {
-        let mapping_size = std::fs::metadata(&mapping_file).map_or(0, |m| m.len());
-        CheckResult {
-            name,
-            passed: true,
-            message: format!("OK: plaid/ directory present, mapping={mapping_size} bytes"),
-        }
-    } else {
-        CheckResult {
+    let vectors_size = std::fs::metadata(&vectors_file).map_or(0, |m| m.len());
+    if vectors_size == 0 {
+        return CheckResult {
             name,
             passed: false,
-            message: issues.join("; "),
-        }
+            message: "vectors.bin is empty (0 bytes)".to_string(),
+        };
+    }
+
+    CheckResult {
+        name,
+        passed: true,
+        message: format!("OK: dense vector store present, vectors={vectors_size} bytes"),
     }
 }
 
@@ -379,7 +365,7 @@ mod tests {
             // v0.4.1 W-Index #4: use_bm25_stemmer is now part of IndexMeta.
             "use_bm25_stemmer": true,
             // S1: dense_backend is now part of IndexMeta (schema v10).
-            "dense_backend": "colbert-plaid",
+            "dense_backend": "coderank-hnsw",
             // S8: embedder_fingerprint is now part of IndexMeta.
             "embedder_fingerprint": "test",
         });

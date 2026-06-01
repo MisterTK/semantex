@@ -1,7 +1,7 @@
 use anyhow::Result;
 use colored::Colorize;
 use semantex_core::config::SemantexConfig;
-use semantex_core::embedding::{model_manager, runtime_manager};
+use semantex_core::embedding::{runtime_manager, single_vector_model};
 
 pub fn run(config: &SemantexConfig) -> Result<()> {
     let models_dir = config.models_dir();
@@ -11,7 +11,7 @@ pub fn run(config: &SemantexConfig) -> Result<()> {
         models_dir.display()
     );
 
-    model_manager::ensure_colbert_model(&models_dir)?;
+    single_vector_model::ensure_coderank_model(&models_dir)?;
 
     // Provision the ONNX Runtime shared library too: `ort` runs in load-dynamic
     // mode, so the runtime is fetched at first use rather than linked at build

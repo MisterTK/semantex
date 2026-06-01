@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use semantex_core::config::SemantexConfig;
-use semantex_core::embedding::model_manager;
+use semantex_core::embedding::single_vector_model;
 use semantex_core::index::storage::ChunkStore;
 use semantex_core::types::IndexMeta;
 use std::path::Path;
@@ -18,12 +18,12 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
     println!("{}", "Models:".bold());
     let models_dir = config.models_dir();
 
-    let colbert_status = if model_manager::is_colbert_downloaded(&models_dir) {
+    let embedder_status = if single_vector_model::is_coderank_downloaded(&models_dir) {
         "downloaded".green().to_string()
     } else {
         "not downloaded".red().to_string()
     };
-    println!("  LateOn-Code-edge (ColBERT): {colbert_status}");
+    println!("  CodeRankEmbed (dense): {embedder_status}");
     println!();
 
     // Index status
@@ -74,14 +74,14 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
         println!("  Index path: {}", index_dir.display().to_string().dimmed());
 
         // Check component files
-        let has_plaid = index_dir.join("plaid").exists();
+        let has_dense = index_dir.join("dense").exists();
         let has_sparse = index_dir.join("sparse").exists();
         let has_chunks = index_dir.join("chunks.db").exists();
         println!();
         println!("  Components:");
         println!(
-            "    Dense (PLAID): {}",
-            if has_plaid {
+            "    Dense (HNSW): {}",
+            if has_dense {
                 "present".green()
             } else {
                 "missing".red()

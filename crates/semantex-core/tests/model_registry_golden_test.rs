@@ -1,11 +1,10 @@
 //! S8 acceptance: capability routing, user-manifest 2nd-model end-to-end,
 //! fingerprint stamping, and the clean-mismatch error arm.
 //!
-//! POST-S2 NOTE: S2 added the `CoderankHnsw` variant to `DenseBackendKind` and
-//! totalized the capability→backend conversion, so `embedder_backend_kind()` now
-//! resolves a multi-vector embedder to `Ok(ColbertPlaid)` and a single-vector
-//! embedder to `Ok(CoderankHnsw)`. These golden tests assert that totalized
-//! contract.
+//! POST-D4 NOTE: D4 removed the ColBERT/PLAID dense backend, leaving
+//! `coderank-hnsw` as the sole built-in. `DenseBackendKind` is now a
+//! single-variant enum and `backend_for` errors on a multi-vector model (no
+//! built-in backend serves it). These golden tests assert that contract.
 
 use semantex_core::config::SemantexConfig;
 use semantex_core::model::ModelRegistry;
@@ -15,32 +14,32 @@ use semantex_core::search::dense_backend::DenseBackendKind;
 use std::fs;
 
 /// Gate 4 + spec §6: the dense backend the registry resolves for the default
-/// multi-vector built-in embedder is IDENTICAL to constructing the
+/// single-vector built-in embedder is IDENTICAL to constructing the
 /// `DenseBackendKind` directly from the model's known capability (no quality
 /// regression from the indirection).
 #[test]
 fn registry_resolved_backend_equals_direct_for_default() {
-    // lateon-colbert (multi-vector) → PLAID, both ways.
+    // coderank-137m (single-vector) → coderank-hnsw, both ways.
     let mut cfg = SemantexConfig::default();
-    cfg.embedder = "lateon-colbert".to_string();
+    cfg.embedder = "coderank-137m".to_string();
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
     let resolved = reg.embedder_backend_kind().unwrap();
-    // Direct construction: a multi-vector capability maps to PLAID.
+    // Direct construction: a single-vector capability maps to coderank-hnsw.
     let direct = backend_for(&reg.active_embedder().unwrap().capabilities)
+        .unwrap()
         .dense_kind()
         .unwrap();
     assert_eq!(resolved, direct);
-    assert_eq!(resolved, DenseBackendKind::ColbertPlaid);
+    assert_eq!(resolved, DenseBackendKind::CoderankHnsw);
     assert_eq!(
-        BackendKind::ColbertPlaid.dense_kind().unwrap(),
-        DenseBackendKind::ColbertPlaid
+        BackendKind::CoderankHnsw.dense_kind().unwrap(),
+        DenseBackendKind::CoderankHnsw
     );
 }
 
-/// Gate 4 (post-S2): a single-vector built-in (coderank-137m) RESOLVES from its
-/// spec and capability-routes to the coderank-hnsw backend, now totally mapped
-/// to S1's `DenseBackendKind`. Proves the negotiation is capability-driven (not
-/// id-branching).
+/// Gate 4: a single-vector built-in (coderank-137m) RESOLVES from its spec and
+/// capability-routes to the coderank-hnsw backend. Proves the negotiation is
+/// capability-driven (not id-branching).
 #[test]
 fn single_vector_routes_to_hnsw_backendkind() {
     let mut cfg = SemantexConfig::default();
@@ -48,10 +47,9 @@ fn single_vector_routes_to_hnsw_backendkind() {
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
     // Capability negotiation picks the coderank-hnsw BackendKind from the spec.
     assert_eq!(
-        backend_for(&reg.active_embedder().unwrap().capabilities),
+        backend_for(&reg.active_embedder().unwrap().capabilities).unwrap(),
         BackendKind::CoderankHnsw
     );
-    // …and the S1 DenseBackendKind conversion is now total (post-S2).
     assert_eq!(
         reg.embedder_backend_kind().unwrap(),
         DenseBackendKind::CoderankHnsw
@@ -59,24 +57,73 @@ fn single_vector_routes_to_hnsw_backendkind() {
 }
 
 /// Gate 3: a user `models.toml` adding a SECOND permissive embedder loads and
-/// capability-routes end-to-end with NO code change. The 2nd model is multi-
-/// vector so it routes to a representable `DenseBackendKind` pre-S2.
+/// capability-routes end-to-end with NO code change. (Single-vector → routes to
+/// coderank-hnsw.)
 #[test]
 fn user_manifest_second_model_loads_and_routes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let project = tmp.path().join("proj");
     let semantex_dir = project.join(".semantex");
     fs::create_dir_all(&semantex_dir).unwrap();
-    // A 2nd permissive multi-vector (late-interaction) embedder.
+    // A 2nd permissive single-vector embedder.
     fs::write(
         semantex_dir.join("models.toml"),
         r#"
         [[model]]
-        id = "my-colbert-variant"
+        id = "my-sv-variant"
         role = "embedder"
         [model.source]
         kind = "hf"
-        repo = "example/my-colbert-variant"
+        repo = "example/my-sv-variant"
+        files = ["model_int8.onnx", "tokenizer.json"]
+        [model.capabilities]
+        multi_vector = false
+        [model.embedder]
+        dims = 768
+        max_context = 8192
+        query_prefix = ""
+        pooling = "mean"
+        quant = "int8_symmetric"
+        "#,
+    )
+    .unwrap();
+
+    let mut cfg = SemantexConfig::default();
+    cfg.embedder = "my-sv-variant".to_string();
+    let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
+
+    // It resolves…
+    let spec = reg.active_embedder().unwrap();
+    assert_eq!(spec.id, "my-sv-variant");
+    let RoleData::Embedder(_) = &spec.role_data else {
+        panic!()
+    };
+    // …and capability-routes to coderank-hnsw from the spec alone.
+    assert_eq!(
+        reg.embedder_backend_kind().unwrap(),
+        DenseBackendKind::CoderankHnsw
+    );
+}
+
+/// D4: a user `models.toml` multi-vector embedder LOADS but has no built-in
+/// backend — `embedder_backend_kind` errors cleanly rather than mis-routing it
+/// to the single-vector path. The capability field is retained for a future
+/// multi-vector backend behind the DenseBackend seam.
+#[test]
+fn user_manifest_multi_vector_model_has_no_backend() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("proj");
+    let semantex_dir = project.join(".semantex");
+    fs::create_dir_all(&semantex_dir).unwrap();
+    fs::write(
+        semantex_dir.join("models.toml"),
+        r#"
+        [[model]]
+        id = "my-multivec-variant"
+        role = "embedder"
+        [model.source]
+        kind = "hf"
+        repo = "example/my-multivec-variant"
         files = ["model_int8.onnx", "tokenizer.json"]
         [model.capabilities]
         multi_vector = true
@@ -91,19 +138,14 @@ fn user_manifest_second_model_loads_and_routes() {
     .unwrap();
 
     let mut cfg = SemantexConfig::default();
-    cfg.embedder = "my-colbert-variant".to_string();
+    cfg.embedder = "my-multivec-variant".to_string();
     let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
-
-    // It resolves…
-    let spec = reg.active_embedder().unwrap();
-    assert_eq!(spec.id, "my-colbert-variant");
-    let RoleData::Embedder(_) = &spec.role_data else {
-        panic!()
-    };
-    // …and capability-routes to PLAID from the spec alone (multi_vector=true).
-    assert_eq!(
-        reg.embedder_backend_kind().unwrap(),
-        DenseBackendKind::ColbertPlaid
+    // Loads as a spec…
+    assert_eq!(reg.active_embedder().unwrap().id, "my-multivec-variant");
+    // …but routes to no built-in backend.
+    assert!(
+        reg.embedder_backend_kind().is_err(),
+        "multi-vector embedder must have no built-in backend after D4"
     );
 }
 
@@ -146,8 +188,10 @@ fn user_manifest_single_vector_model_capability_routes() {
     let spec = reg.active_embedder().unwrap();
     assert_eq!(spec.id, "gte-modernbert-hnsw");
     // Capability-routes to the coderank-hnsw BackendKind from the manifest alone.
-    assert_eq!(backend_for(&spec.capabilities), BackendKind::CoderankHnsw);
-    // Post-S2: the DenseBackendKind conversion is total.
+    assert_eq!(
+        backend_for(&spec.capabilities).unwrap(),
+        BackendKind::CoderankHnsw
+    );
     assert_eq!(
         reg.embedder_backend_kind().unwrap(),
         DenseBackendKind::CoderankHnsw
@@ -194,10 +238,10 @@ fn mismatched_index_errors_cleanly() {
         updated_at: "0".to_string(),
         file_count: 0,
         chunk_count: 0,
-        embedding_model: "lateon-colbert".to_string(),
-        embedding_dim: 48,
+        embedding_model: "CodeRankEmbed".to_string(),
+        embedding_dim: 768,
         use_bm25_stemmer: true,
-        dense_backend: "colbert-plaid".to_string(),
+        dense_backend: "coderank-hnsw".to_string(),
         embedder_fingerprint: "BUILT_WITH_THIS".to_string(),
     };
     fs::write(
@@ -214,8 +258,8 @@ fn mismatched_index_errors_cleanly() {
 }
 
 /// Write a tiny synthetic repo so a real index can be built without network
-/// (the lateon-colbert path needs the ColBERT model; gate the model-dependent
-/// assertion with `#[ignore]`). This test only inspects meta.json shape.
+/// (the default embedder path needs the CodeRankEmbed model; gate the
+/// model-dependent assertion with `#[ignore]`). Inspects meta.json shape only.
 fn write_tiny_repo(dir: &std::path::Path) {
     fs::create_dir_all(dir).unwrap();
     fs::write(
@@ -234,8 +278,7 @@ fn build_stamps_a_nonempty_embedder_fingerprint() {
     let tmp = tempfile::TempDir::new().unwrap();
     let project = tmp.path().join("proj");
     write_tiny_repo(&project);
-    // Build with the shipped DEFAULT embedder (lateon-colbert / colbert-plaid),
-    // the only path representable pre-S2.
+    // Build with the shipped DEFAULT embedder (coderank-137m / coderank-hnsw).
     let cfg = SemantexConfig::default();
     IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
 
