@@ -248,10 +248,12 @@ impl ModelSpec {
 /// space the one this embedder produces?" check.
 ///
 /// The fingerprint covers exactly the fields that change the produced vectors:
-/// the model id, dims, pooling, quantization, normalization, and the query
-/// prefix. (A reranker/LLM swap does NOT touch the dense vector space → not
-/// fingerprinted → no reindex; that is the design's query-time-live-swap
-/// guarantee.)
+/// the model id, dims, pooling, quantization, normalization, and BOTH the query
+/// and document prefixes. (`doc_prefix` is prepended to document text at index
+/// time, so it changes the stored vector space — overriding it on the same id
+/// MUST invalidate the on-disk index.) A reranker/LLM swap does NOT touch the
+/// dense vector space → not fingerprinted → no reindex; that is the design's
+/// query-time-live-swap guarantee.
 pub struct EmbedderFingerprint;
 
 impl EmbedderFingerprint {
@@ -259,10 +261,11 @@ impl EmbedderFingerprint {
     /// runs/platforms (xxh64 of a canonical byte encoding).
     #[must_use]
     pub fn compute(id: &str, spec: &EmbedderSpec) -> String {
-        // Canonical, stable encoding of the vector-space-defining fields. Avoid
-        // serde here so a future non-fingerprinted field (e.g. max_context, which
-        // does NOT change the vector space) can be added to EmbedderSpec without
-        // silently invalidating every index.
+        // Canonical, stable encoding of the vector-space-defining fields
+        // (including BOTH prefixes — doc_prefix changes the stored doc vectors).
+        // Avoid serde here so a future non-fingerprinted field (e.g. max_context,
+        // which does NOT change the vector space) can be added to EmbedderSpec
+        // without silently invalidating every index.
         let pooling = match spec.pooling {
             Pooling::Mean => "mean",
             Pooling::Cls => "cls",
@@ -273,8 +276,8 @@ impl EmbedderFingerprint {
             QuantKind::Int8Symmetric => "int8_symmetric",
         };
         let canonical = format!(
-            "id={id};dims={};pooling={pooling};quant={quant};norm={};qpre={}",
-            spec.dims, spec.normalize, spec.query_prefix
+            "id={id};dims={};pooling={pooling};quant={quant};norm={};qpre={};dpre={}",
+            spec.dims, spec.normalize, spec.query_prefix, spec.doc_prefix
         );
         let hash = xxhash_rust::xxh64::xxh64(canonical.as_bytes(), 0);
         format!("{hash:016x}")
@@ -380,6 +383,30 @@ mod tests {
 
         // Changing the id changes it (different model, same shape).
         assert_ne!(fp1, EmbedderFingerprint::compute("other-embedder", &base));
+    }
+
+    #[test]
+    fn fingerprint_is_sensitive_to_doc_prefix() {
+        // `doc_prefix` is applied to DOCUMENT text at index time → it changes the
+        // stored vector space. Two specs differing ONLY in doc_prefix MUST get
+        // different fingerprints, else the engine would silently reuse an index
+        // embedded under the old prefix.
+        let base = EmbedderSpec {
+            dims: 768,
+            max_context: 8192,
+            query_prefix: "Q: ".to_string(),
+            doc_prefix: String::new(),
+            pooling: Pooling::Cls,
+            normalize: true,
+            quant: QuantKind::Int8Symmetric,
+        };
+        let mut diff_doc = base.clone();
+        diff_doc.doc_prefix = "passage: ".to_string();
+        assert_ne!(
+            EmbedderFingerprint::compute("coderank-137m", &base),
+            EmbedderFingerprint::compute("coderank-137m", &diff_doc),
+            "doc_prefix must be part of the fingerprint"
+        );
     }
 
     /// Helper struct so the role test can deserialize a bare `role = "…"`.

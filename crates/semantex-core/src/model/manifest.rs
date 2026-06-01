@@ -85,6 +85,41 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 quant: QuantKind::Int8Symmetric,
             }),
         },
+        // Qwen3-Embedding-0.6B (Apache-2.0) — the 2026-SOTA single-vector A/B
+        // candidate (semantica review). Single-vector → capabilities route it to
+        // the `coderank-hnsw` BACKEND exactly like coderank-137m (no S2 dep). The
+        // base Qwen repo coordinates are carried as DATA (S8 downloads nothing).
+        ModelSpec {
+            id: "qwen3-embed-0.6b".to_string(),
+            role: ModelRole::Embedder,
+            source: ModelSource::Hf {
+                repo: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+                files: vec![
+                    "model_int8.onnx".to_string(),
+                    "tokenizer.json".to_string(),
+                    "config.json".to_string(),
+                ],
+            },
+            capabilities: ModelCapabilities {
+                multi_vector: false,
+                instruction_aware: true,
+                ..ModelCapabilities::default()
+            },
+            role_data: RoleData::Embedder(EmbedderSpec {
+                dims: 1024,
+                max_context: 32768,
+                // Qwen3-Embedding uses an instruction-style query prefix; the
+                // task instruction is tuned for code retrieval here. Documents
+                // get NO prefix (Qwen3-Embedding convention).
+                query_prefix:
+                    "Instruct: Given a code search query, retrieve relevant code snippets.\nQuery: "
+                        .to_string(),
+                doc_prefix: String::new(),
+                pooling: Pooling::Mean,
+                normalize: true,
+                quant: QuantKind::Int8Symmetric,
+            }),
+        },
         // ── Rerankers ───────────────────────────────────────────────────────
         // bge-reranker-v2-m3 (permissive, already shipped) — classifier head.
         ModelSpec {
@@ -194,6 +229,12 @@ struct UserManifest {
 pub fn load_user_manifest(path: &Path) -> Result<Vec<ModelSpec>> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read model manifest {}: {e}", path.display()))?;
+    // Probe the RAW document first: serde's externally-tagged `RoleData` keeps
+    // exactly one role subtable and silently discards any others, so a stray
+    // second table would be a silent mis-load of user input. Reject != 1 role
+    // table per `[[model]]` (naming the id + the tables found) before the typed
+    // parse collapses the information.
+    check_one_role_table_per_model(&text, path)?;
     let manifest: UserManifest = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("failed to parse model manifest {}: {e}", path.display()))?;
     for spec in &manifest.model {
@@ -203,13 +244,47 @@ pub fn load_user_manifest(path: &Path) -> Result<Vec<ModelSpec>> {
     Ok(manifest.model)
 }
 
+/// The role-subtable keys an externally-tagged [`RoleData`] can present.
+const ROLE_TABLE_KEYS: [&str; 3] = ["embedder", "reranker", "llm"];
+
+/// Reject any `[[model]]` entry that carries more or fewer than one of the role
+/// subtables {`embedder`, `reranker`, `llm`}. serde would keep one and drop the
+/// rest — a silent mis-load — so we count them on the raw `toml::Value` and emit
+/// a clear error naming the model id and the offending tables.
+fn check_one_role_table_per_model(text: &str, path: &Path) -> Result<()> {
+    let raw: toml::Value = toml::from_str(text)
+        .map_err(|e| anyhow::anyhow!("failed to parse model manifest {}: {e}", path.display()))?;
+    let Some(models) = raw.get("model").and_then(toml::Value::as_array) else {
+        return Ok(()); // no `[[model]]` array → nothing to check
+    };
+    for (idx, model) in models.iter().enumerate() {
+        let present: Vec<&str> = ROLE_TABLE_KEYS
+            .iter()
+            .copied()
+            .filter(|k| model.get(*k).is_some())
+            .collect();
+        if present.len() != 1 {
+            let id = model
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .map_or_else(|| format!("#{idx}"), |s| format!("`{s}`"));
+            anyhow::bail!(
+                "model {id} in {}: expected exactly one role table \
+                 ({}), found {} ({:?})",
+                path.display(),
+                ROLE_TABLE_KEYS.join(", "),
+                present.len(),
+                present,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Locate the active user manifest: a project-local `<project>/.semantex/models.toml`
 /// takes precedence over the global `~/.semantex/models.toml`. Returns `None`
 /// when neither exists (the registry then runs on built-ins only).
-pub fn user_manifest_path(
-    _config: &SemantexConfig,
-    project_path: Option<&Path>,
-) -> Option<PathBuf> {
+pub fn user_manifest_path(project_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(project) = project_path {
         let local = SemantexConfig::project_index_dir(project).join("models.toml");
         if local.exists() {
@@ -284,6 +359,28 @@ mod tests {
         assert!(e.doc_prefix.is_empty(), "documents get no prefix");
         // Single-vector → not multi_vector.
         assert!(!s.capabilities.multi_vector);
+    }
+
+    #[test]
+    fn qwen3_embed_resolves_validates_and_routes_to_hnsw() {
+        use crate::model::capabilities::{BackendKind, backend_for};
+        let s = builtin_specs()
+            .into_iter()
+            .find(|s| s.id == "qwen3-embed-0.6b")
+            .expect("qwen3-embed-0.6b must be a built-in");
+        assert_eq!(s.role, ModelRole::Embedder);
+        s.validate().expect("qwen3-embed-0.6b must validate");
+        let RoleData::Embedder(e) = &s.role_data else {
+            panic!("qwen3-embed-0.6b must be an embedder");
+        };
+        assert_eq!(e.dims, 1024);
+        assert_eq!(e.pooling, Pooling::Mean);
+        assert!(e.normalize);
+        assert_eq!(e.quant, QuantKind::Int8Symmetric);
+        // Single-vector → routes to the coderank-hnsw backend (no S2 dep).
+        assert!(!s.capabilities.multi_vector);
+        assert!(s.capabilities.instruction_aware);
+        assert_eq!(backend_for(&s.capabilities), BackendKind::CoderankHnsw);
     }
 
     #[test]
@@ -393,6 +490,43 @@ mod tests {
         let err = load_user_manifest(&path).expect_err("dims=0 must error");
         let msg = err.to_string();
         assert!(msg.contains("broken") && msg.contains("dims"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_user_manifest_errors_on_multiple_role_tables() {
+        // A `[[model]]` with role="embedder" but BOTH an [model.embedder] and a
+        // stray [model.reranker] table: serde would silently keep one and drop
+        // the other. The loader must reject it (naming the id + the tables), so
+        // user input is never silently mis-loaded.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("models.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[model]]
+            id = "two-tables"
+            role = "embedder"
+            [model.source]
+            kind = "hf"
+            repo = "x/y"
+            files = ["model_int8.onnx"]
+            [model.embedder]
+            dims = 768
+            max_context = 8192
+            pooling = "cls"
+            quant = "int8_symmetric"
+            [model.reranker]
+            score_strategy = "classifier_head"
+            "#,
+        )
+        .unwrap();
+        let err = load_user_manifest(&path).expect_err("two role tables must error");
+        let msg = err.to_string();
+        assert!(msg.contains("two-tables"), "must name the model id: {msg}");
+        assert!(
+            msg.contains("embedder") && msg.contains("reranker"),
+            "must name the conflicting tables: {msg}"
+        );
     }
 
     #[test]

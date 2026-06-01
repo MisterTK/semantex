@@ -80,7 +80,9 @@ pub fn write_active_pointer(
     let dir = dense_subdir(index_dir, backend);
     std::fs::create_dir_all(&dir)?;
     let final_path = dir.join("ACTIVE");
-    let tmp_path = dir.join(".ACTIVE.tmp");
+    // PID-suffixed temp name so two concurrent rebuilds don't clobber each
+    // other's staging file before the atomic rename.
+    let tmp_path = dir.join(format!(".ACTIVE.{}.tmp", std::process::id()));
     std::fs::write(&tmp_path, fingerprint.as_bytes())?;
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(())

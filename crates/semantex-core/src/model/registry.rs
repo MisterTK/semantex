@@ -27,7 +27,7 @@ impl ModelRegistry {
     /// `models.toml`). Merges built-ins with the user manifest (user overrides by
     /// id), validates every spec, and records the active id per role from config.
     pub fn from_config(config: &SemantexConfig, project_path: Option<&Path>) -> Result<Self> {
-        let user = match user_manifest_path(config, project_path) {
+        let user = match user_manifest_path(project_path) {
             Some(path) => load_user_manifest(&path)?,
             None => Vec::new(),
         };
