@@ -249,10 +249,10 @@ mod tests {
     /// each helper-using test must hold the env mutex while it manipulates
     /// vars.
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        let _guard = ENV_LOCK
+        // One crate-wide lock (search::RERANKER_TEST_ENV_LOCK) serializes env
+        // mutation across ALL reranker test modules; per-module statics did not
+        // serialize each other within one test binary, causing flakes.
+        let _guard = crate::search::RERANKER_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 

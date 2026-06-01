@@ -33,6 +33,10 @@ pub struct OnnxModelSpec {
     /// ONNX session filename within the model dir (`model_int8.onnx` /
     /// `model.onnx`). Always one of `files`.
     pub session_file: String,
+    /// Max sequence length (tokens) the model is truncated to. From the reranker
+    /// spec; bounds the ONNX sequence so it never exceeds the model's trained
+    /// range or CPU O(seq²) budget.
+    pub max_context: usize,
     /// Concrete score-extraction strategy (with token ids + prompt for yes/no).
     pub strategy: ScoreStrategy,
 }
@@ -107,6 +111,7 @@ impl RerankerChoice {
                 files,
             },
             session_file,
+            max_context: rspec.max_context,
             strategy,
         }))
     }
@@ -164,7 +169,11 @@ pub fn select_reranker_choice_from_env() -> RerankerChoice {
     let raw = std::env::var(ENV_MODEL).unwrap_or_default();
     match raw.to_ascii_lowercase().as_str() {
         "qwen3-reranker-0.6b" | "qwen3-reranker" | "qwen3" => {
-            RerankerChoice::Onnx(qwen3_reranker_0_6b())
+            // Resolve through the SAME built-in manifest spec the registry uses,
+            // so the env alias can never drift from the authoritative Qwen3
+            // coordinates / verified chat template / token ids (the Fix-2 hazard).
+            choice_from_builtin_id("qwen3-reranker-0.6b")
+                .unwrap_or_else(|| RerankerChoice::Fastembed(select_model_from_env()))
         }
         "bge-reranker-v2-m3-onnx" | "bge-v2-m3-onnx" | "bge-onnx" => {
             RerankerChoice::Onnx(bge_v2_m3_onnx())
@@ -174,39 +183,20 @@ pub fn select_reranker_choice_from_env() -> RerankerChoice {
     }
 }
 
-/// Qwen3-Reranker-0.6B (Apache-2.0) coordinates for the env-alias path. Mirrors
-/// the S8 manifest built-in (`MisterTK/Qwen3-Reranker-0.6B-onnx`, fp16
-/// `model.onnx`, yes/no ids 9693/2152). The registry path (`from_spec`) is
-/// authoritative; this keeps the env alias self-contained.
-fn qwen3_reranker_0_6b() -> OnnxModelSpec {
-    OnnxModelSpec {
-        files: ModelFiles {
-            subdir: "Qwen3-Reranker-0.6B-onnx".to_string(),
-            base_url: "https://huggingface.co/MisterTK/Qwen3-Reranker-0.6B-onnx/resolve/main"
-                .to_string(),
-            files: vec![
-                "model.onnx".to_string(),
-                "tokenizer.json".to_string(),
-                "config.json".to_string(),
-            ],
-        },
-        session_file: "model.onnx".to_string(),
-        strategy: ScoreStrategy::YesNoLogit {
-            yes_id: 9693,
-            no_id: 2152,
-            prompt: PromptTemplate {
-                prefix:
-                    "<Instruct>: Given a code search query, judge whether the document is relevant.\n<Query>: "
-                        .to_string(),
-                middle: "\n<Document>: ".to_string(),
-                suffix: "\n<Relevant>:".to_string(),
-            },
-        },
-    }
+/// Look up a built-in manifest spec by id and resolve it via `from_spec`, so the
+/// env-alias path shares the manifest's authoritative coordinates/template/ids.
+fn choice_from_builtin_id(id: &str) -> Option<RerankerChoice> {
+    crate::model::manifest::builtin_specs()
+        .into_iter()
+        .find(|s| s.id == id)
+        .and_then(|spec| RerankerChoice::from_spec(&spec).ok())
 }
 
 /// bge-reranker-v2-m3 driven through the GENERIC loader (classifier head). The
-/// permissive smoke target proving `ScoreStrategy::ClassifierLogit`.
+/// permissive smoke target proving `ScoreStrategy::ClassifierLogit`. Has no
+/// manifest equivalent (the built-in `bge-reranker-v2-m3` routes to fastembed by
+/// id), so it stays a dedicated alias spec. `max_context` = 512 (bge's trained
+/// context).
 fn bge_v2_m3_onnx() -> OnnxModelSpec {
     OnnxModelSpec {
         files: ModelFiles {
@@ -216,6 +206,7 @@ fn bge_v2_m3_onnx() -> OnnxModelSpec {
             files: vec!["model.onnx".to_string(), "tokenizer.json".to_string()],
         },
         session_file: "model.onnx".to_string(),
+        max_context: 512,
         strategy: ScoreStrategy::ClassifierLogit,
     }
 }
@@ -227,9 +218,7 @@ mod tests {
     use crate::model::ModelRegistry;
 
     fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK
+        let _g = crate::search::RERANKER_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = std::env::var(key).ok();
@@ -335,19 +324,42 @@ mod tests {
         match RerankerChoice::from_spec(spec).unwrap() {
             RerankerChoice::Onnx(o) => {
                 // Strategy + coordinates come from the registry spec as DATA.
-                match o.strategy {
+                match &o.strategy {
                     ScoreStrategy::YesNoLogit {
                         yes_id,
                         no_id,
                         prompt,
                     } => {
-                        assert_eq!(yes_id, 9693);
-                        assert_eq!(no_id, 2152);
-                        assert!(prompt.suffix.contains("Relevant") || !prompt.suffix.is_empty());
+                        assert_eq!(*yes_id, 9693);
+                        assert_eq!(*no_id, 2152);
+                        // FIX 2: the wired template MUST be the verified FULL chat
+                        // form (im_start/im_end control tokens + assistant/<think>
+                        // terminator), not the simplified <Relevant> stub.
+                        let rendered = prompt.render("binary search", "fn bsearch() {}");
+                        assert!(
+                            rendered.contains("<|im_start|>system"),
+                            "missing system im_start; got:\n{rendered}"
+                        );
+                        assert!(
+                            rendered.contains("<|im_start|>user"),
+                            "missing user im_start"
+                        );
+                        assert!(
+                            rendered.contains("<|im_start|>assistant"),
+                            "missing assistant im_start"
+                        );
+                        assert!(rendered.contains("<|im_end|>"), "missing im_end");
+                        assert!(rendered.contains("<think>"), "missing <think> terminator");
+                        assert!(
+                            rendered.contains("binary search") && rendered.contains("fn bsearch"),
+                            "query/doc not injected"
+                        );
                     }
                     other => panic!("expected YesNoLogit, got {other:?}"),
                 }
                 assert_eq!(o.session_file, "model.onnx");
+                // FIX 1: max_context plumbed from the spec (Qwen3 CPU-sane cap).
+                assert_eq!(o.max_context, 2048);
                 assert_eq!(o.files.subdir, "Qwen3-Reranker-0.6B-onnx");
                 assert!(
                     o.files
@@ -357,5 +369,28 @@ mod tests {
             }
             other => panic!("expected Onnx for qwen3 registry spec, got {other:?}"),
         }
+    }
+
+    /// FIX 2 (env-alias path): the `qwen3` env alias resolves THROUGH the same
+    /// built-in manifest spec, so its rendered prompt also carries the verified
+    /// chat-control markers (env and registry paths cannot drift).
+    #[test]
+    fn qwen3_env_alias_renders_full_chat_template() {
+        with_env(
+            ENV_MODEL,
+            Some("qwen3"),
+            || match select_reranker_choice_from_env() {
+                RerankerChoice::Onnx(o) => match &o.strategy {
+                    ScoreStrategy::YesNoLogit { prompt, .. } => {
+                        let rendered = prompt.render("q", "d");
+                        assert!(rendered.contains("<|im_start|>"), "missing im_start");
+                        assert!(rendered.contains("<think>"), "missing <think>");
+                        assert_eq!(o.max_context, 2048);
+                    }
+                    other => panic!("expected YesNoLogit, got {other:?}"),
+                },
+                other => panic!("expected Onnx for qwen3 alias, got {other:?}"),
+            },
+        );
     }
 }

@@ -95,6 +95,7 @@ impl RerankerEngine {
             &model_dir,
             &spec.session_file,
             spec.strategy.clone(),
+            spec.max_context,
             threads,
             use_coreml,
         )
@@ -120,9 +121,7 @@ mod tests {
     use super::*;
 
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK
+        let _g = crate::search::RERANKER_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior: Vec<(String, Option<String>)> = vars

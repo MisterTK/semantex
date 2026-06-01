@@ -98,6 +98,14 @@ pub struct EmbedderSpec {
 pub struct RerankerSpec {
     /// Score-extraction strategy.
     pub score_strategy: ScoreStrategyKind,
+    /// Max sequence length (in tokens) fed to the cross-encoder. The tokenizer
+    /// truncates each (query, document) pair / rendered prompt to this many
+    /// tokens so a large chunk never blows past the model's trained positional
+    /// range (bge @512 — past it the logits are garbage) or its CPU O(seq²)
+    /// latency/memory cliff (Qwen3-0.6B). Mirrors `EmbedderSpec.max_context`.
+    /// Defaults to 512 (bge's trained context) when absent from a manifest entry.
+    #[serde(default = "default_reranker_max_context")]
+    pub max_context: usize,
     /// Prompt template for `YesNoLogit` rerankers (prefix/middle/suffix around
     /// the query+doc). Ignored for `ClassifierHead`.
     #[serde(default)]
@@ -286,6 +294,11 @@ impl EmbedderFingerprint {
 
 fn default_true() -> bool {
     true
+}
+
+/// Default reranker `max_context` (bge-reranker-v2-m3's trained context length).
+fn default_reranker_max_context() -> usize {
+    512
 }
 
 #[cfg(test)]

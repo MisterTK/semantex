@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
+use tokenizers::tokenizer::TruncationParams;
 
 /// Prompt wrapper for a generative (yes/no) reranker. Strings come from the
 /// model's reranker spec (S8 registry / recorded spike), never hardcoded per
@@ -119,6 +120,10 @@ pub struct OnnxReranker {
     tokenizer: Tokenizer,
     /// How to turn model output into a relevance score.
     strategy: ScoreStrategy,
+    /// Max sequence length (tokens) — the tokenizer is configured to truncate
+    /// each pair/prompt to this, so a large chunk never exceeds the model's
+    /// trained positional range or its CPU O(seq²) budget.
+    max_context: usize,
     /// ORT intra-op threads (from `SEMANTEX_ORT_THREADS`, default 4 — set by caller).
     threads: usize,
     /// Opt into CoreML on macOS (gated by `SEMANTEX_COREML`).
@@ -138,23 +143,42 @@ impl OnnxReranker {
     /// as data because exports differ (bge ships `model_int8.onnx`; the hosted
     /// Qwen3-Reranker export is fp16 `model.onnx`).
     ///
+    /// `max_context` is the max sequence length (in tokens): the tokenizer is
+    /// configured to truncate every (query, document) pair / rendered prompt to
+    /// this length, so a large chunk never blows past the model's trained range
+    /// (bge @512) or its CPU O(seq²) budget (Qwen3). Both shipped tokenizers
+    /// have `"truncation": null`, so this is the ONLY truncation guard.
+    ///
     /// # Errors
     /// Errors if the directory or `tokenizer.json` is missing/unreadable.
     pub fn new(
         model_dir: &Path,
         session_file: &str,
         strategy: ScoreStrategy,
+        max_context: usize,
         threads: usize,
         use_coreml: bool,
     ) -> Result<Self> {
         let tok_path = model_dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tok_path)
+        let mut tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer {}: {e}", tok_path.display()))?;
+        // Enforce truncation at the tokenizer level (both shipped tokenizer.json
+        // declare `"truncation": null`). For a sentence-pair classifier this
+        // truncates the longer member; for the single-sequence yes/no prompt it
+        // truncates the whole rendered string. max_length >= 1.
+        let max_length = max_context.max(1);
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("failed to set tokenizer truncation: {e}"))?;
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
             session_file: session_file.to_string(),
             tokenizer,
             strategy,
+            max_context: max_length,
             threads: threads.max(1),
             use_coreml,
             session: OnceLock::new(),
@@ -221,7 +245,7 @@ impl OnnxReranker {
     /// and document as a sentence pair joined by the tokenizer's separator; for
     /// the yes/no strategy it sees the rendered prompt as a single sequence.
     fn encode_pair(&self, query: &str, document: &str) -> Result<(Vec<i64>, Vec<i64>)> {
-        match &self.strategy {
+        let (mut ids, mut mask) = match &self.strategy {
             ScoreStrategy::ClassifierLogit => {
                 // Cross-encoders score "query [SEP] document". The tokenizer's
                 // post-processor inserts the separator when given a pair via
@@ -230,7 +254,7 @@ impl OnnxReranker {
                     .tokenizer
                     .encode((query, document), true)
                     .map_err(|e| anyhow::anyhow!("tokenizer.encode(pair) failed: {e}"))?;
-                Ok(to_i64_pair(&enc))
+                to_i64_pair(&enc)
             }
             ScoreStrategy::YesNoLogit { prompt, .. } => {
                 let text = prompt.render(query, document);
@@ -238,9 +262,17 @@ impl OnnxReranker {
                     .tokenizer
                     .encode(text, true)
                     .map_err(|e| anyhow::anyhow!("tokenizer.encode failed: {e}"))?;
-                Ok(to_i64_pair(&enc))
+                to_i64_pair(&enc)
             }
+        };
+        // Defensive hard cap: the tokenizer is configured to truncate at
+        // `max_context`, but clamp again so a misconfigured tokenizer.json can
+        // never feed an unbounded sequence to the ONNX session.
+        if ids.len() > self.max_context {
+            ids.truncate(self.max_context);
+            mask.truncate(self.max_context);
         }
+        Ok((ids, mask))
     }
 
     /// Score a single (query, document) pair. Runs one ONNX forward pass.
@@ -278,13 +310,14 @@ impl OnnxReranker {
             .context("ONNX reranker forward pass failed")?;
 
         // First (only) output is the logits tensor; index by position 0 to be
-        // robust to the model's output name.
-        let (out_shape, logits) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .context("failed to extract f32 logits from reranker output")?;
+        // robust to the model's output name. The Qwen3-Reranker export emits
+        // FLOAT16 logits (verified — research-notes ## S3), so a fixed
+        // `try_extract_tensor::<f32>()` would ERROR and the reranker would
+        // silently no-op. Extract dtype-agnostically into owned f32.
+        let (out_shape, logits) = extract_logits_f32(&outputs[0])?;
 
         match &self.strategy {
-            ScoreStrategy::ClassifierLogit => classifier_score_from_logits(logits),
+            ScoreStrategy::ClassifierLogit => classifier_score_from_logits(&logits),
             ScoreStrategy::YesNoLogit { yes_id, no_id, .. } => {
                 // Generative output shape is [batch=1, seq, vocab]; the
                 // judgment is the final position's vocab logits.
@@ -350,6 +383,33 @@ fn to_i64_pair(enc: &tokenizers::Encoding) -> (Vec<i64>, Vec<i64>) {
     (ids, mask)
 }
 
+/// Extract a reranker's logits output as owned `f32`, regardless of whether the
+/// ONNX node emits `f32` or `f16`. The hosted Qwen3-Reranker export emits
+/// FLOAT16 logits, so a fixed `try_extract_tensor::<f32>()` would error and the
+/// YesNoLogit path would silently no-op. Returns the dimensions (as a `Vec<i64>`)
+/// alongside the flattened f32 values.
+fn extract_logits_f32(value: &ort::value::DynValue) -> Result<(Vec<i64>, Vec<f32>)> {
+    use ort::tensor::TensorElementType;
+    match value.data_type() {
+        TensorElementType::Float32 => {
+            let (shape, data) = value
+                .try_extract_tensor::<f32>()
+                .context("failed to extract f32 logits from reranker output")?;
+            Ok((shape.iter().copied().collect(), data.to_vec()))
+        }
+        TensorElementType::Float16 => {
+            let (shape, data) = value
+                .try_extract_tensor::<half::f16>()
+                .context("failed to extract f16 logits from reranker output")?;
+            let floats: Vec<f32> = data.iter().map(|h| h.to_f32()).collect();
+            Ok((shape.iter().copied().collect(), floats))
+        }
+        other => anyhow::bail!(
+            "reranker logits output has unsupported dtype {other:?} (expected f32 or f16)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +466,7 @@ mod tests {
             tmp.path(),
             "model_int8.onnx",
             ScoreStrategy::ClassifierLogit,
+            512,
             2,
             false,
         );
@@ -420,6 +481,7 @@ mod tests {
                 missing,
                 "model_int8.onnx",
                 ScoreStrategy::ClassifierLogit,
+                512,
                 2,
                 false,
             )
@@ -442,6 +504,7 @@ mod tests {
                 tmp.path(),
                 "model_int8.onnx",
                 ScoreStrategy::ClassifierLogit,
+                512,
                 2,
                 false,
             )
@@ -451,6 +514,36 @@ mod tests {
             let out = r.rerank("q", &docs_ref, 2).expect("identity rerank");
             assert_eq!(out, vec![(0, 0.0_f32), (1, 0.0_f32)]);
         });
+    }
+
+    /// FIX 1: an over-long input must be truncated to <= max_context tokens.
+    /// Both shipped tokenizer.json declare `"truncation": null`, so without the
+    /// `with_truncation` config a 600-word chunk would tokenize unbounded and
+    /// blow past bge's 512 positional range / Qwen3's CPU O(seq^2) budget.
+    #[test]
+    fn encode_pair_truncates_to_max_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("tokenizer.json"), MINIMAL_TOKENIZER_JSON).unwrap();
+        const MAX: usize = 8;
+        let r = OnnxReranker::new(
+            tmp.path(),
+            "model.onnx",
+            ScoreStrategy::ClassifierLogit,
+            MAX,
+            2,
+            false,
+        )
+        .expect("construct");
+        // 600 whitespace-separated words -> the WordLevel tokenizer emits one
+        // token per word (all [UNK]); far exceeds MAX before truncation.
+        let long_doc = vec!["word"; 600].join(" ");
+        let (ids, mask) = r.encode_pair("a query", &long_doc).expect("encode");
+        assert!(
+            ids.len() <= MAX,
+            "input_ids must be truncated to <= max_context ({MAX}); got {}",
+            ids.len()
+        );
+        assert_eq!(ids.len(), mask.len(), "ids/mask lengths must match");
     }
 
     /// Smallest tokenizer.json the `tokenizers` crate will load: a WordLevel
@@ -498,7 +591,8 @@ mod tests {
             let r = OnnxReranker::new(
                 &dir,
                 &spec.session_file,
-                ScoreStrategy::ClassifierLogit,
+                spec.strategy.clone(),
+                spec.max_context,
                 4,
                 false,
             )
@@ -515,12 +609,63 @@ mod tests {
         });
     }
 
-    /// Env scrub/restore helper (copied verbatim from `fastembed_reranker.rs`
-    /// test module — tests can't share a private fn across files).
+    /// FIX 3: real-model smoke for the Qwen3 YesNoLogit path. Exercises prompt
+    /// render + position_ids + the FP16 logits extraction end-to-end (the hosted
+    /// `model.onnx` emits FLOAT16 logits, so this validates `extract_logits_f32`
+    /// taking the f16 branch). `#[ignore]` — needs the ~1.1 GB download.
+    ///
+    ///   SEMANTEX_RERANKER=on cargo test -p semantex-core \
+    ///     -- --ignored onnx_reranker::tests::onnx_qwen3_yesno_ranks_on_topic
+    #[test]
+    #[ignore]
+    fn onnx_qwen3_yesno_ranks_on_topic() {
+        use crate::config::SemantexConfig;
+        use crate::search::fastembed_reranker::ENV_ENABLE;
+        use crate::search::reranker_download::ensure_reranker_model;
+        use crate::search::reranker_model::{RerankerChoice, select_reranker_choice_from_env};
+
+        with_env(&[(ENV_ENABLE, Some("on"))], || {
+            // SAFETY: guarded by the with_env mutex above.
+            unsafe { std::env::set_var("SEMANTEX_RERANKER_MODEL", "qwen3") };
+            let spec = match select_reranker_choice_from_env() {
+                RerankerChoice::Onnx(s) => s,
+                other => panic!("expected ONNX choice for qwen3, got {other:?}"),
+            };
+            // The resolved strategy must be the verified yes/no template.
+            assert!(
+                matches!(spec.strategy, ScoreStrategy::YesNoLogit { .. }),
+                "qwen3 must resolve to YesNoLogit"
+            );
+            let config = SemantexConfig::default();
+            let dir = ensure_reranker_model(&config.models_dir(), &spec.files)
+                .expect("download (offline?)");
+            let r = OnnxReranker::new(
+                &dir,
+                &spec.session_file,
+                spec.strategy.clone(),
+                spec.max_context,
+                4,
+                false,
+            )
+            .expect("construct");
+            let docs = [
+                "Pizza is a popular Italian dish.",
+                "fn binary_search(a: &[i32], t: i32) -> Option<usize> { /* ... */ }",
+            ];
+            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let out = r
+                .rerank("how does binary search work", &docs_ref, 2)
+                .expect("rerank (fp16 extraction must succeed)");
+            assert_eq!(out[0].0, 1, "on-topic code doc should rank first");
+            // Real relevance separation, not the 0.0 identity no-op.
+            assert!(out[0].1 > out[1].1, "scores must separate on-topic vs off");
+        });
+    }
+
+    /// Env scrub/restore helper. Locks the ONE crate-wide reranker test env
+    /// mutex so env mutations serialize across all reranker test modules.
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK
+        let _guard = crate::search::RERANKER_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior: Vec<(String, Option<String>)> = vars

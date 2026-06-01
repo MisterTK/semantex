@@ -22,6 +22,8 @@
 - **ScoreStrategy = YesNoLogit:** chat-format the prompt, run, take `logits[:, -1, :]`, softmax over the `yes`/`no` token logits → P(yes) is the relevance score.
 - **Token ids (Qwen tokenizer):** `yes` = **9693**, `no` = **2152**.
 - **ONNX I/O:** inputs `input_ids`, `attention_mask`, **`position_ids`** (all int64); output `logits [batch, seq, vocab]`.
+- **Output dtype = FLOAT16** (verified 2026-06-01 via `onnx.load` introspection of `MisterTK/Qwen3-Reranker-0.6B-onnx/model.onnx`: `logits: FLOAT16 shape=[batch, sequence, 151669]`). The fp16 source export keeps fp16 logits. **Code MUST extract fp16, not f32** — a fixed `try_extract_tensor::<f32>()` ERRORS on this node, hybrid.rs swallows the error, and the reranker silently no-ops (identity). `onnx_reranker::extract_logits_f32` dispatches on `value.data_type()`: `Float32` → copy; `Float16` → `try_extract_tensor::<half::f16>()` then `to_f32()`. Requires ort's `half` feature + `half` direct dep.
+- **max_context / truncation (Fix 1):** both shipped tokenizer.json have `"truncation": null`. `OnnxReranker::new` sets `with_truncation(max_length = max_context)`. Caps: **bge-reranker-v2-m3 = 512** (its trained positional range — past it logits are garbage); **Qwen3-Reranker-0.6B = 2048** (its trained context is large, but the model is O(seq²) on CPU; 2048 bounds query+chunk+chat-wrapper latency/memory while staying ample for code-search chunks ≤512-token AST targets). Carried as `RerankerSpec.max_context` (manifest data) → `OnnxModelSpec.max_context` → `OnnxReranker`.
 - **Prompt template (verified):**
   ```
   <|im_start|>system

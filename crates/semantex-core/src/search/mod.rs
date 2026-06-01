@@ -26,6 +26,16 @@ pub mod triple_fusion;
 
 use crate::types::{FileFilter, SearchResult};
 use anyhow::Result;
+
+/// One process-wide test mutex serializing every `with_env` helper that mutates
+/// the shared `SEMANTEX_RERANKER` / `SEMANTEX_RERANKER_MODEL` env vars across the
+/// reranker test modules (`fastembed_reranker`, `onnx_reranker`, `reranker_model`,
+/// `reranker_engine`). Per-module `static`s do NOT serialize each other within
+/// one test binary, which made env-mutating reranker tests flaky; all four helpers
+/// lock THIS one. (Mirrors the `crate::llm::TEST_ENV_LOCK` pattern, but lives here
+/// so it is available on the default, no-`llm` build.)
+#[cfg(test)]
+pub(crate) static RERANKER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use serde::{Deserialize, Serialize};
 
 /// Measured performance metrics from a single search invocation.
