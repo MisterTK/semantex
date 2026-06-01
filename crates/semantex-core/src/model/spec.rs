@@ -45,7 +45,8 @@ pub enum Pooling {
     Mean,
     /// CLS token (position 0).
     Cls,
-    /// No pooling — per-token vectors (ColBERT / PLAID MaxSim).
+    /// No pooling — per-token vectors (for a future multi-vector /
+    /// late-interaction MaxSim backend; no built-in backend serves it today).
     LateInteraction,
 }
 
@@ -74,7 +75,8 @@ pub enum ScoreStrategyKind {
 /// constant in `embedding/*.rs` lives here as data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedderSpec {
-    /// Output embedding dimension (e.g. 768 for CodeRankEmbed, 48/token ColBERT).
+    /// Output embedding dimension (e.g. 768 for CodeRankEmbed; for a
+    /// multi-vector model this is the per-token dimension).
     pub dims: usize,
     /// Max context tokens the encoder accepts (inputs truncate to this).
     pub max_context: usize,
@@ -158,7 +160,7 @@ pub enum RoleData {
 pub struct ModelSpec {
     /// Stable logical id used by config selection (e.g. `"coderank-137m"`,
     /// `"bge-reranker-v2-m3"`). Distinct from the dense BACKEND name
-    /// (`coderank-hnsw`/`colbert-plaid`) the embedder routes to via capabilities.
+    /// (e.g. `coderank-hnsw`) the embedder routes to via capabilities.
     pub id: String,
     /// Pipeline stage. MUST agree with `role_data`'s variant.
     pub role: ModelRole,

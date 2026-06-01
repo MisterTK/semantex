@@ -3,7 +3,7 @@
 //! reranker, NOT download weights, and return results in the same order the
 //! fusion produced (rerank stage is a no-op). Repo-agnostic: synthetic tempdir.
 //!
-//! `#[ignore]` because it builds a full index (downloads the ColBERT embedder),
+//! `#[ignore]` because it builds a full index (downloads the dense embedder),
 //! matching the other index-building integration tests in this crate. The
 //! engine-level off-by-default contract is covered by the always-run unit tests
 //! `search::onnx_reranker::tests::rerank_is_identity_when_disabled` and

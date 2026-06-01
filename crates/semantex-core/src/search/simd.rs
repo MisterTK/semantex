@@ -24,8 +24,8 @@ use std::sync::OnceLock;
 use std::arch::is_aarch64_feature_detected;
 
 /// Default batch-size gate: below this many elements, skip SIMD and use scalar.
-/// 32 matches the oxirs default and covers ColBERT-class dims (≥768) firmly in the
-/// SIMD regime while keeping tiny ad-hoc vectors on the cheaper scalar path.
+/// 32 matches the oxirs default and covers dense-embedding dims (≥768) firmly in
+/// the SIMD regime while keeping tiny ad-hoc vectors on the cheaper scalar path.
 const DEFAULT_SIMD_MIN_LEN: usize = 32;
 
 /// Resolve the SIMD batch-size gate, honoring an optional `SEMANTEX_SIMD_MIN_LEN`

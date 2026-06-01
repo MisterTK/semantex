@@ -121,6 +121,8 @@ impl IndexBuilder {
                 );
                 // Remove existing index files to force full rebuild.
                 let _ = std::fs::remove_dir_all(index_dir.join("sparse"));
+                // Legacy top-level dense layout from pre-D4 indexes (the removed
+                // colbert-plaid backend); clean up so a rebuild leaves no orphans.
                 let _ = std::fs::remove_dir_all(index_dir.join("plaid"));
                 let _ = std::fs::remove_file(index_dir.join("plaid_mapping.bin"));
                 let _ = std::fs::remove_dir_all(index_dir.join("dense")); // S1 per-backend subdirs
@@ -608,9 +610,9 @@ impl IndexBuilder {
                             .with_context_annotations(dense_context, annotations);
                         // Stream the full corpus one ENCODE_BATCH at a time
                         // (RSS-bounded; never materialize all chunk content at
-                        // once) — same memory discipline as the PLAID arm. The
-                        // closure pulls each ≤32-id batch's content and drops it
-                        // before the next, so only one batch's text is ever live.
+                        // once) — the D6 build-memory discipline. The closure
+                        // pulls each ≤32-id batch's content and drops it before
+                        // the next, so only one batch's text is ever live.
                         dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
                             let mut chunks = store.get_chunks(batch_ids)?;
                             // `get_chunks` (WHERE id IN (...)) is unordered; sort

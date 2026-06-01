@@ -1481,7 +1481,7 @@ fn llm_hyde_timeout() -> std::time::Duration {
 ///
 /// - The daemon uses a current-thread Tokio runtime, so spawning blocking work
 ///   there would deadlock.
-/// - ColBERT ONNX inference is the dominant cost and runs inside rayon threads
+/// - Dense ONNX inference is the dominant cost and runs inside rayon threads
 ///   that are independent of the Tokio event loop.
 /// - Adding `Arc` wrapping to use `spawn_blocking` would change a large call
 ///   surface for marginal benefit.

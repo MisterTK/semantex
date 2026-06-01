@@ -1,8 +1,8 @@
 //! ONNX Runtime shared-library provisioning for the `load-dynamic` linking mode.
 //!
-//! semantex's dependency graph forces `ort` into pure dynamic-loading mode:
-//! `next-plaid-onnx` depends on `ort` with the `load-dynamic` feature, which
-//! enables `ort-sys/disable-linking`. `ort-sys`'s build script early-returns on
+//! semantex-core declares `ort` with the `load-dynamic` feature, putting `ort`
+//! into pure dynamic-loading mode: `load-dynamic` enables
+//! `ort-sys/disable-linking`, and `ort-sys`'s build script early-returns on
 //! `disable-linking`, so the binary never embeds ONNX Runtime — on **every**
 //! platform. At runtime `ort` must `dlopen` a `libonnxruntime` shared library
 //! resolved through `ORT_DYLIB_PATH` (or the OS loader search path).
@@ -10,7 +10,7 @@
 //! To make this work uniformly across operating systems without requiring a
 //! system package (apt/brew/etc.), semantex downloads the official Microsoft
 //! ONNX Runtime release and caches it under `~/.semantex/runtime/<version>/lib`,
-//! mirroring how the ColBERT model is cached under `~/.semantex/models`.
+//! mirroring how the dense embedder model is cached under `~/.semantex/models`.
 //!
 //! ## Version pinning
 //!

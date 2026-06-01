@@ -34,7 +34,7 @@ const STORE_FILE: &str = "vectors.bin";
 
 /// Streaming-build batch size: at most this many chunks' content is fetched +
 /// encoded at once, so only one batch's text is ever resident (the D6 build-RSS
-/// bound — mirrors PLAID's `PLAID_BATCH`). Well under SQLite's variable limit.
+/// bound). Well under SQLite's variable limit.
 const ENCODE_BATCH: usize = 32;
 
 /// HNSW + rescore tuning. Presets mirror the oxirs config-preset idea.
@@ -500,9 +500,8 @@ impl CoderankHnswIndexBuilder {
     /// Stream content batch-by-batch and encode→quantize→push into the store,
     /// checking the RSS failsafe at each batch boundary. `fetch` pulls only one
     /// `ENCODE_BATCH`-sized slice of `(id, content)` from the store at a time, so
-    /// only ONE batch's chunk text is ever resident — the D6 build-memory bound
-    /// (mirrors `ColbertPlaidIndexBuilder::build_streaming_ids`). The whole
-    /// corpus is NEVER materialized.
+    /// only ONE batch's chunk text is ever resident — the D6 build-memory bound.
+    /// The whole corpus is NEVER materialized.
     fn encode_streaming_ids<F>(
         &mut self,
         embedder: &SingleVectorEmbedder,
