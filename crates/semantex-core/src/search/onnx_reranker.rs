@@ -3,8 +3,8 @@
 //! fastembed 5.9's `RerankerModel` enum cannot express newer checkpoints
 //! (e.g. Qwen3-Reranker-0.6B), so this module loads any HuggingFace
 //! cross-encoder's ONNX model + `tokenizer.json` directly through `ort` +
-//! `tokenizers`, mirroring how `embedding/colbert.rs` pins the CPU execution
-//! provider. It supports two ways to turn model output into a relevance score:
+//! `tokenizers`, pinning the CPU execution provider the same way the dense
+//! embedder does. It supports two ways to turn model output into a relevance score:
 //!
 //! - [`ScoreStrategy::ClassifierLogit`] — sequence-classification head
 //!   (bge-style): the model emits a single relevance logit; the score is that
@@ -108,7 +108,7 @@ pub(crate) fn yes_no_score_from_logits(
 
 /// A generic ONNX cross-encoder reranker. Thread-safe: the inner `ort::Session`
 /// is built lazily on first scoring and guarded by a `Mutex` (single-threaded
-/// inference, like `ColbertEmbedder`). Construction is cheap.
+/// inference, like the dense embedder). Construction is cheap.
 pub struct OnnxReranker {
     /// Directory containing the ONNX model file and `tokenizer.json`.
     model_dir: PathBuf,
@@ -188,7 +188,7 @@ impl OnnxReranker {
 
     /// Execution providers: CoreML iff `use_coreml` on macOS, CUDA under the
     /// `cuda` feature, then always CPU. Mirrors `fastembed_reranker.rs` /
-    /// `colbert.rs` so reranking never allocates the ~10 GB CoreML buffers
+    /// the dense embedder so reranking never allocates the ~10 GB CoreML buffers
     /// unless explicitly opted in.
     #[allow(clippy::vec_init_then_push)] // conditional pushes based on platform/feature flags
     fn execution_providers(&self) -> Vec<ort::ep::ExecutionProviderDispatch> {
@@ -223,7 +223,7 @@ impl OnnxReranker {
     }
 
     /// Get the session, building it once on first call (double-checked locking,
-    /// same discipline as `ColbertEmbedder::encoder`).
+    /// same discipline as the dense embedder's session).
     fn session(&self) -> Result<&Mutex<Session>> {
         if let Some(s) = self.session.get() {
             return Ok(s);
@@ -456,8 +456,8 @@ mod tests {
     /// Construction reads `tokenizer.json` eagerly (cheap, validates the dir)
     /// while the heavy ONNX session is deferred to the first scoring call. So an
     /// empty dir fails at construction (no tokenizer), and a missing dir fails
-    /// too — mirroring ColbertEmbedder's "fail late for the model, fail early
-    /// for the tokenizer/dir".
+    /// too — the dense embedder's "fail late for the model, fail early
+    /// for the tokenizer/dir" discipline.
     #[test]
     fn new_rejects_missing_dir_but_is_lazy_for_files() {
         let tmp = tempfile::TempDir::new().unwrap();

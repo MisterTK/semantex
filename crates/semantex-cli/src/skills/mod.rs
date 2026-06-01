@@ -89,8 +89,8 @@ impl Platform {
 
 /// Shared introduction every platform's skill should expose to the agent.
 pub(crate) const SKILL_INTRO: &str = concat!(
-    "semantex is a fully local semantic code search engine. It combines dense ColBERT ",
-    "embeddings, BM25 sparse retrieval and structural code graphs into a daemon ",
+    "semantex is a fully local semantic code search engine. It combines dense ",
+    "CodeRankEmbed embeddings (HNSW), BM25 sparse retrieval and structural code graphs into a daemon ",
     "queried over MCP. Use it instead of running grep + read loops — every additional ",
     "tool call resends the accumulated context (O(N^2) cost), and semantex collapses ",
     "those loops into one call."
