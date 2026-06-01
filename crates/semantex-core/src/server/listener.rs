@@ -570,10 +570,10 @@ pub fn prefetch_index(index_dir: &Path) -> PrefetchOutcome {
     tracing::debug!(
         sqlite_ms = outcome.sqlite_ns / 1_000_000,
         sparse_ms = outcome.sparse_ns / 1_000_000,
-        plaid_ms = outcome.plaid_ns / 1_000_000,
+        dense_ms = outcome.dense_ns / 1_000_000,
         sqlite_ok = outcome.sqlite_ok,
         sparse_ok = outcome.sparse_ok,
-        plaid_ok = outcome.plaid_ok,
+        dense_ok = outcome.dense_ok,
         "E8(b) prefetch_index_files completed",
     );
     outcome

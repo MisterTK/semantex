@@ -6,12 +6,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-// ── E8(a): mmap'd PLAID mapping file (Unix only — Windows uses read fallback) ──
+// ── E8(a): mmap'd index file helper (Unix only — Windows uses read fallback) ──
 //
 // Per spec risk T5, mmap is feature-gated to non-Windows platforms. On Windows
-// we fall back to `std::fs::read`. The PLAID index itself (centroids/codes)
-// is already mmap'd by `next-plaid::MmapIndex`; the file we own here is the
-// `plaid_mapping.bin` doc-to-chunk-ID mapping used by `PlaidSearcher`.
+// we fall back to `std::fs::read`. This is a generic single-file mapper used by
+// the cold-start prefetch path.
 #[cfg(not(target_os = "windows"))]
 use memmap2::Mmap;
 #[cfg(not(target_os = "windows"))]
@@ -421,7 +420,7 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// Return all chunk IDs ordered by ID, for batched PLAID rebuilds.
+    /// Return all chunk IDs ordered by ID, for batched dense index rebuilds.
     pub fn get_all_chunk_ids(&self) -> Result<Vec<u64>> {
         let mut stmt = self.conn.prepare("SELECT id FROM chunks ORDER BY id")?;
         let ids = stmt
@@ -1161,14 +1160,14 @@ impl ChunkStore {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// E8(a) + E8(b): mmap'd PLAID mapping + parallel index prefetch
+// E8(a) + E8(b): mmap'd file helper + parallel index prefetch
 // ════════════════════════════════════════════════════════════════════════
 //
-// These helpers are called by the daemon at startup to (1) memory-map the
-// PLAID doc-to-chunk mapping file (Unix; falls back to read on Windows) and
-// (2) warm the OS page cache for the heaviest index files in parallel, so
-// that `HybridSearcher::open` does cache-warm sequential reads rather than
-// cold disk I/O.
+// These helpers are called by the daemon at startup to (1) memory-map a single
+// index file (Unix; falls back to read on Windows) and (2) warm the OS page
+// cache for the heaviest index files in parallel, so that
+// `HybridSearcher::open` does cache-warm sequential reads rather than cold disk
+// I/O.
 //
 // We deliberately do NOT re-implement `HybridSearcher::open` — that lives in
 // `search/hybrid.rs` (owned by W1). The page-cache prefetch achieves the
@@ -1178,9 +1177,8 @@ impl ChunkStore {
 
 /// Memory-mapped bytes from a file (Unix). On Windows, holds an owned `Vec<u8>`.
 ///
-/// This abstraction lets callers treat the PLAID mapping file as a `&[u8]`
-/// regardless of platform, without forcing every consumer to handle two
-/// distinct types.
+/// This abstraction lets callers treat an index file as a `&[u8]` regardless of
+/// platform, without forcing every consumer to handle two distinct types.
 pub struct MappedBytes {
     #[cfg(not(target_os = "windows"))]
     inner: Mmap,
@@ -1201,8 +1199,8 @@ impl MappedBytes {
                 .with_context(|| format!("Failed to open {} for mmap", path.display()))?;
             // SAFETY: We hold the File open for the lifetime of the Mmap. If
             // another process truncates the file the mapping becomes UB, but
-            // PLAID mapping files are written once at index build and never
-            // mutated in place (rebuild deletes and recreates).
+            // index files are written once at build and never mutated in place
+            // (rebuild deletes and recreates).
             let mmap = unsafe { Mmap::map(&file) }
                 .with_context(|| format!("Failed to mmap {}", path.display()))?;
             Ok(Self { inner: mmap })
@@ -1236,19 +1234,21 @@ impl MappedBytes {
 pub struct PrefetchOutcome {
     pub sqlite_ns: u128,
     pub sparse_ns: u128,
-    pub plaid_ns: u128,
+    pub dense_ns: u128,
     pub sqlite_ok: bool,
     pub sparse_ok: bool,
-    pub plaid_ok: bool,
+    pub dense_ok: bool,
 }
 
 /// Prefetch the three heavy index components in parallel, warming the OS page
 /// cache so that `HybridSearcher::open` runs entirely against cached pages.
 ///
-/// Uses `rayon::join3` to fan out one task per component:
+/// Uses nested `rayon::join` to fan out one task per component:
 /// - SQLite chunk store (`chunks.db`)
 /// - Tantivy sparse index (`sparse/`)
-/// - PLAID dense index (`plaid/` + `plaid_mapping.bin`)
+/// - Dense index — the coderank-hnsw vector store
+///   (`dense/coderank-hnsw/vectors.bin`); the HNSW graph itself is rebuilt in
+///   RAM on open from this file, so warming it warms the whole dense channel.
 ///
 /// Each task touches its files via `std::fs::read` (or a directory walk for
 /// Tantivy); failures are recorded in [`PrefetchOutcome`] but never propagated
@@ -1263,8 +1263,15 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
 
     let sqlite_path = index_dir.join("chunks.db");
     let sparse_dir = index_dir.join("sparse");
-    let plaid_dir = index_dir.join("plaid");
-    let plaid_mapping = index_dir.join("plaid_mapping.bin");
+    // The dense vector store the daemon actually opens. Backend-resolution lives
+    // in `hybrid.rs`; here we warm the sole built-in backend's store file
+    // directly (a best-effort page-cache touch — a missing file just yields
+    // dense_ok=false, exactly as the old plaid path did when absent).
+    let dense_store = crate::search::dense_backend::dense_subdir(
+        index_dir,
+        crate::search::dense_backend::DenseBackendKind::CoderankHnsw,
+    )
+    .join("vectors.bin");
 
     // E8(b): fan out the three reads to the rayon thread pool. Rayon only
     // provides binary `join`, so we nest one call inside the other —
@@ -1273,20 +1280,17 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
     // run concurrently; this function blocks until all complete. Errors are
     // swallowed into the per-task `ok` flag — the goal is warming the OS
     // page cache, not strict correctness.
-    let ((sqlite_ns, sqlite_ok), ((sparse_ns, sparse_ok), (plaid_ns, plaid_ok))) = rayon::join(
+    let ((sqlite_ns, sqlite_ok), ((sparse_ns, sparse_ok), (dense_ns, dense_ok))) = rayon::join(
         || prefetch_file_timed(&sqlite_path),
         || {
             rayon::join(
                 || prefetch_dir_timed(&sparse_dir),
                 || {
-                    let t = std::time::Instant::now();
-                    let dir_ok = prefetch_dir_timed(&plaid_dir).1;
-                    let map_ok = if plaid_mapping.exists() {
-                        prefetch_file_timed(&plaid_mapping).1
+                    if dense_store.exists() {
+                        prefetch_file_timed(&dense_store)
                     } else {
-                        false
-                    };
-                    (t.elapsed().as_nanos(), dir_ok || map_ok)
+                        (0, false)
+                    }
                 },
             )
         },
@@ -1295,10 +1299,10 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
     PrefetchOutcome {
         sqlite_ns,
         sparse_ns,
-        plaid_ns,
+        dense_ns,
         sqlite_ok,
         sparse_ok,
-        plaid_ok,
+        dense_ok,
     }
 }
 
@@ -1377,7 +1381,7 @@ mod e8_storage_tests {
         let outcome = prefetch_index_files(tmp.path());
         assert!(!outcome.sqlite_ok);
         assert!(!outcome.sparse_ok);
-        assert!(!outcome.plaid_ok);
+        assert!(!outcome.dense_ok);
     }
 
     /// `prefetch_index_files` on a missing directory should return all-zero
@@ -1387,21 +1391,22 @@ mod e8_storage_tests {
         let outcome = prefetch_index_files(Path::new("/nonexistent/path/that/does/not/exist"));
         assert!(!outcome.sqlite_ok);
         assert!(!outcome.sparse_ok);
-        assert!(!outcome.plaid_ok);
+        assert!(!outcome.dense_ok);
     }
 
-    /// When the SQLite file and PLAID mapping exist, the prefetch should
-    /// report `sqlite_ok` and `plaid_ok` true.
+    /// When the SQLite file and the coderank-hnsw vector store exist, the
+    /// prefetch should report `sqlite_ok` and `dense_ok` true.
     #[test]
     fn prefetch_reports_ok_for_present_files() {
+        use crate::search::dense_backend::{DenseBackendKind, dense_subdir};
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("chunks.db"), b"fake").unwrap();
-        std::fs::create_dir(tmp.path().join("plaid")).unwrap();
-        std::fs::write(tmp.path().join("plaid").join("dummy"), b"x").unwrap();
-        std::fs::write(tmp.path().join("plaid_mapping.bin"), b"y").unwrap();
+        let dense_dir = dense_subdir(tmp.path(), DenseBackendKind::CoderankHnsw);
+        std::fs::create_dir_all(&dense_dir).unwrap();
+        std::fs::write(dense_dir.join("vectors.bin"), b"y").unwrap();
         let outcome = prefetch_index_files(tmp.path());
         assert!(outcome.sqlite_ok);
-        assert!(outcome.plaid_ok);
+        assert!(outcome.dense_ok);
     }
 }
 
