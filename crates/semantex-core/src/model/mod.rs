@@ -11,6 +11,7 @@ pub mod registry;
 pub mod spec;
 
 pub use capabilities::{BackendKind, ModelCapabilities, backend_for};
+pub use registry::ModelRegistry;
 pub use spec::{
     EmbedderFingerprint, EmbedderSpec, LlmSpec, ModelRole, ModelSource, ModelSpec, Pooling,
     QuantKind, RerankerSpec, RoleData, ScoreStrategyKind,
