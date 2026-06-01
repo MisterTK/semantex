@@ -76,7 +76,7 @@ pub fn cmd_session_hook() -> Result<()> {
     }
 
     // Pre-warm daemon (fire-and-forget, non-blocking)
-    let _ = std::process::Command::new("semantex")
+    let _ = std::process::Command::new(super::self_exe())
         .arg("serve")
         .arg(project_dir)
         .stdin(Stdio::null())
@@ -295,7 +295,9 @@ pub fn cmd_session_end_hook() -> Result<()> {
 
     let project_dir = index_dir.parent().unwrap_or(&index_dir);
 
-    let _ = std::process::Command::new("semantex")
+    // `stop` connects to the per-project daemon via its port file, so binary
+    // identity doesn't affect routing — self_exe() just keeps it consistent.
+    let _ = std::process::Command::new(super::self_exe())
         .arg("stop")
         .arg(project_dir)
         .stdin(Stdio::null())
