@@ -75,3 +75,39 @@ Only if you want the design docs to read post-hoc — generally leave them (hist
 
 ## 5. Hard rules that still apply (CLAUDE.md)
 `crates/` repo-agnostic, no hardcoded paths, permissive-license defaults, **default build zero-LLM** (`cargo tree | grep genai` empty). Verify every change with `cargo build/test/clippy/fmt` + `actually verify_change`. Never flip a default without a measured win on the S0 harness.
+
+---
+
+## 6. Execution outcomes (2026-06-01, follow-ups executed this session)
+
+All four code follow-ups SHIPPED to `origin/main` via subagent-driven-development (per-PR branch, spec→quality two-stage review, full `cargo build/test/clippy/fmt` + `verify_change` gate, rebase-merged). PR #1 (ColBERT/next-plaid removal) was already merged (`d996122`) before this session.
+
+| Follow-up | PR | merged SHA | Result |
+|---|---|---|---|
+| **F3 (#14)** harness daemon-binary | #2 | `a2d7dda` | `spawn_daemon_if_needed` + the 3 sibling `serve`/`stop`/`index` spawns now use `std::env::current_exe()` (shared `commands::self_exe()` helper, graceful fallback to `"semantex"`). A/Bs now hit the branch binary, not `~/.cargo/bin/semantex`. |
+| **F2a (#15)** rerank-candidates knob | #3 | `f32b259` | New `SEMANTEX_RERANK_CANDIDATES` env → config `rerank_top_n` (default **25**), decoupled from the misnamed `rerank_candidates` (the base **retrieval pool**, default 100, drives ALL-query retrieval width — left untouched so the default rerank-OFF path is byte-identical, locked by `rerank_candidates_default_is_still_100`). Stage-3 scores only `rerank_scoring_window(rerank_top_n, max_results) = top_n.max(max_results)`. |
+| **F5 (#10)** S8 versioned-dir hot-swap | #4 | `7a5663f` | Full versioned dense dir `dense/<backend>/<fingerprint>/` + atomic `ACTIVE` pointer; pure unit-tested `decide_dense_build`; `write_active_pointer` flips only after a complete full build; readers (`hybrid`/`storage`/`validate`) resolve via `resolve_active_dense_dir` with **legacy plain-layout fallback → NO schema bump (stays v12)**; `detect_for_config` folds fingerprint into staleness (auto-rebuild, never spuriously Stale on registry error; per-search `detect_state_fast` stays schema-only for latency). **D5:** `SEMANTEX_DENSE_CONTEXT` folded into the fingerprint via the single env-read site `dense_context_enabled()` (shared by builder text-selection + fingerprint) — closes the literal silent-wrong-index bug. |
+| **F4 (#5)** adaptive-pruning probe | #5 | `2976d0e` | Confirmed `apply_adaptive_pipeline` runs post-fusion for ALL searches incl. `--sparse-only` (caps ≤15 non-exhaustive + confidence-threshold + per-file dedup; applied identically across A/B arms → relative comparisons fair, absolute Recall@k bounded). Added `SEMANTEX_ADAPTIVE_SIZING=0` env knob (default unchanged = on) so the harness can measure clean Recall@k. |
+
+### F2b — rerank re-A/B (executed): **KEEP RERANK OFF (confirmed, decisively)**
+Harness: CoIR-CodeTransDL (180q), coderank-137m, branch `target/release/semantex`, daemon env `SEMANTEX_RERANK=1 SEMANTEX_RERANKER=on SEMANTEX_RERANKER_MODEL=bge-reranker-v2-m3 SEMANTEX_RERANK_CANDIDATES=25 SEMANTEX_MAX_RSS_MB=8192`. One daemon served both cells (hybrid omits `--rerank`).
+
+| cell | nDCG@10 | Recall@10 | MRR@10 | warm latency |
+|---|---|---|---|---|
+| hybrid (rerank off) | **0.2149** | **0.5278** | 0.1238 | ~894 ms |
+| rerank @ window 25 (bge-v2-m3) | 0.0586 | 0.1222 | 0.0389 | **~19,974 ms** |
+
+At the smaller window, bge-reranker-v2-m3 **regresses quality −72% nDCG / −77% R@10 AND is ~22× slower** — fails on BOTH axes, not just latency. This is stronger than §1's prior "correct but latency-bound" finding: bge-v2-m3 is quality-NEGATIVE on this anchor (consistent with its low 35.97 CoIR fit). **The §10 "reranking net-positive on code" claim is FALSIFIED for the available model.** The F2a knob still ships (opt-in / tuning). Caveat: absolute latencies were inflated by residual CPU load (the F6 cleanup was decaying) — the quality regression is load-independent and decisive. The regression magnitude is large enough that a FUTURE rerank A/B (the memory's recommended **jina-reranker-v3, 0.6B, 63.28 CoIR**) should also sanity-check the rerank feeding (query/doc orientation, truncation), not just the model.
+
+### F6 — SWE-loc measurement: **INFEASIBLE IN-SESSION (deferred, measured cost finding); graph levers STAY OFF (unchanged default)**
+Stood up `/tmp/f6_preindex.py` (standalone, relevance-venv-only: `datasets` + git + the release binary — no swe_bench venv needed) to checkout+index a 25-instance phase-A subset into `~/.swe_bench_repos/<id>/`, then planned `run.py --dataset swe-loc` (skips non-checked-out instances, so a subset evaluates that subset; graph ablations vary query-time `SEMANTEX_GRAPH_*` env, so the index is built ONCE and reused across graph-off/on/levers).
+
+**Blocker (measured):** SWE-bench-Verified phase-A is **entirely large repos** (django×44, sphinx×15, sympy×11, matplotlib×10, xarray×9, sklearn×5, pytest×3, astropy×3 — **no small repos**). CodeRankEmbed int8 ONNX indexing on CPU is **~30 min–2 h per repo** (astropy-14598 = 20,926 chunks → 1.8 h; the other 3 of the first batch **timed out at the 2 h cap**), and 4 concurrent workers oversubscribe the cores (load avg hit ~140). A statistically meaningful corpus (even the bounded 25-subset) is **not achievable on this CPU in a session**. Only `astropy__astropy-14598` fully indexed (n=1, not a signal).
+
+**Decision:** graph centrality/cohesion/2-hop levers **stay OFF** (their default — no measured SWE-loc lift is available to justify a flip; the conservative correct outcome, **no code change**). The §10 "+Z pp SWE-bench localization Recall@10" claim **remains unmeasured** (documented reason: CPU-infeasible). To run it later: a GPU/CUDA execution-provider machine (or many hours of wall-clock on a dedicated box), `SWE_BENCH_INDEX_TIMEOUT` raised, **≤2 workers** to avoid oversubscription; the standalone `/tmp/f6_preindex.py` driver + `run.py --dataset swe-loc` (ablations: graph-off / graph-on default / `SEMANTEX_GRAPH_CENTRALITY_WEIGHT`+`_MODULE_DECAY`+`_HOPS=2`) is the recipe. The 1 indexed repo remains in `~/.swe_bench_repos/`.
+
+### Open follow-ups discovered during F5 review (filed, NOT fixed — pre-existing, not data-losing)
+1. **meta.json stamps the new fingerprint even when the dense build fails** → a "Ready but dense actually failed" state where the new `detect_for_config` won't re-fire the rebuild (it sees `meta.fp == expected` → Ready). Pre-existing; the S8 atomic-switchover contains the blast radius (the old versioned store + `ACTIVE` stay valid). The correct fix (stamp the **live `ACTIVE` fingerprint**, not the intended one) has an empty-corpus edge case (a chunk-less repo must not loop on Stale) → needs its own careful change + tests.
+2. **`verify_persisted_fingerprint_matches` has no production caller** (only tests). By design: there is no hard fingerprint guard at `HybridSearcher::open` (would contradict "auto-rebuild, not hard error"); session-level `detect_for_config` is the rebuild trigger. A long-lived daemon serves the old vector space until restart. `listener.rs::reload_searcher` is also dead code.
+3. **`index::gate` test isolation** (`slot_is_held_until_dropped_then_reusable`) uses the real `~/.semantex/build-slots/` and HANGS when external/concurrent `semantex index` processes hold the slots (it bit the F5 gate during the F6 pre-index). Workaround used: run the gate with an isolated `SEMANTEX_HOME`. A real fix should give the gate test its own `SEMANTEX_HOME` — but a naive global `set_var` risks cross-test env interference, so it needs care.
+4. **Stale comment** `hybrid.rs` reload doc says the dense index is "memory-mapped"; it is `std::fs::read` into RAM (cosmetic).
