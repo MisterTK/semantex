@@ -1143,12 +1143,22 @@ impl HybridSearcher {
             }
 
             if let Some(ref mut reranker) = *reranker_guard {
-                let docs: Vec<&str> = results.iter().map(|r| r.chunk.content.as_str()).collect();
+                // Bound the cross-encoder scoring window (rerank latency is
+                // ~linear in the doc count). Decoupled from the retrieval pool
+                // (`rerank_candidates`): score only the top-`n` fused candidates,
+                // but never fewer than we will return.
+                let n = rerank_scoring_window(self.config.rerank_top_n, query.max_results);
+                let docs: Vec<&str> = results
+                    .iter()
+                    .take(n)
+                    .map(|r| r.chunk.content.as_str())
+                    .collect();
                 let candidate_count = docs.len();
 
                 if let Ok(reranked) = reranker.rerank(&query.text, &docs, query.max_results) {
                     tracing::debug!(
                         candidates = candidate_count,
+                        window = n,
                         reranked = reranked.len(),
                         duration_ms = rerank_start.elapsed().as_millis() as u64,
                         "Reranking complete (fastembed)"
@@ -1824,6 +1834,13 @@ fn derive_cc_confidence(scored: &ScoredChunkId) -> (Confidence, f32) {
     (confidence, score)
 }
 
+/// The cross-encoder scoring window: how many top fused candidates the
+/// reranker scores. Floored at `max_results` so we never rerank fewer
+/// documents than we will return. Latency is ~linear in the result.
+pub(crate) fn rerank_scoring_window(rerank_top_n: usize, max_results: usize) -> usize {
+    rerank_top_n.max(max_results)
+}
+
 /// Sanitize a query string for tantivy's query parser
 fn sanitize_tantivy_query(query: &str) -> String {
     // Escape special characters that tantivy's query parser interprets
@@ -1851,6 +1868,17 @@ mod tests {
         w_dense: 1.0,
         w_sparse: 1.0,
     };
+
+    #[test]
+    fn rerank_scoring_window_floors_at_max_results() {
+        // Guards the real Stage 3 call site: the window is the larger of the
+        // configured top-N and max_results, so we never rerank fewer documents
+        // than we return. A refactor swapping `.max` for `.min`/`+`/`top_n`
+        // would break this.
+        assert_eq!(rerank_scoring_window(25, 15), 25, "honors the larger top_n");
+        assert_eq!(rerank_scoring_window(5, 15), 15, "floors at max_results");
+        assert_eq!(rerank_scoring_window(15, 15), 15, "equal values are stable");
+    }
 
     #[test]
     fn test_select_graph_config_localization_for_exhaustive() {

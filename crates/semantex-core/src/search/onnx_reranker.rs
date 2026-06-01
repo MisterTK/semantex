@@ -343,8 +343,9 @@ impl OnnxReranker {
     /// always-callable.
     ///
     /// Latency guard: the caller (`hybrid.rs`) already truncates the candidate
-    /// list to `rerank_candidates` before this runs, so the per-document loop is
-    /// bounded; a 0.6B model never runs on an unbounded list.
+    /// list to the rerank scoring window (`rerank_top_n`,
+    /// `SEMANTEX_RERANK_CANDIDATES`) before this runs, so the per-document loop
+    /// is bounded; a 0.6B model never runs on an unbounded list.
     pub fn rerank(
         &self,
         query: &str,

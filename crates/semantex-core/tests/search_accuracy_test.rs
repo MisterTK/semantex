@@ -86,6 +86,10 @@ impl TestFixture {
             chunk_overlap: 128,
             rerank: true,
             rerank_candidates: 50,
+            // Preserve original intent: rerank the full 50-wide retrieval pool
+            // (the new SEMANTEX_RERANK_CANDIDATES window defaults to 25, which
+            // would otherwise shrink the scored set).
+            rerank_top_n: 50,
             ..SemantexConfig::default()
         };
 
