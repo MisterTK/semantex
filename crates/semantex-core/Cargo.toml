@@ -141,5 +141,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 
+[[bench]]
+name = "simd_bench"
+harness = false
+
 [lints]
 workspace = true
