@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a leaderboard-grade, pure-retrieval relevance harness `benchmarks/relevance/` that measures semantex on CoIR + CodeSearchNet + SWE-bench localization with MRR@10 / nDCG@10 / Recall@{1,5,10} / MAP, supports the `--sparse-only / --dense-only / --hybrid / --rerank` ablations and the D4 `--dense-backend colbert-plaid|coderank-hnsw` A/B, and reproduces a published CSN/CoIR baseline within a stated tolerance.
+**Goal:** Build a leaderboard-grade, pure-retrieval relevance harness `benchmarks/relevance/` that measures semantex on CoIR + CodeSearchNet + SWE-bench localization with MRR@10 / nDCG@10 / Recall@{1,5,10} / MAP, supports the `--sparse-only / --dense-only / --hybrid / --rerank` ablations and the D4 `--embedder lateon-colbert|coderank-137m` A/B (env-selected via `SEMANTEX_EMBEDDER`), and reproduces a published CSN/CoIR baseline within a stated tolerance.
+
+> **Per integration §4 D-env-knob, `SEMANTEX_EMBEDDER` (embedder id: `lateon-colbert` / `coderank-137m`) is canonical; `SEMANTEX_DENSE_BACKEND` (backend name: `colbert-plaid` / `coderank-hnsw`) is a kept-live deprecated alias. This harness sets `SEMANTEX_EMBEDDER`.**
 
 **Architecture:** A Python package under `benchmarks/relevance/` (mirroring `benchmarks/swe_bench/`: `pyproject.toml`, `src/`, `tests/`, `fixtures/`, gitignored `results/`) orchestrates three pieces: (1) dataset loaders that emit a uniform `(corpus, queries, qrels)` triple with deterministic *logged* subsetting; (2) a runner that indexes each corpus with `semantex index`, calls `semantex search --json` per query under the requested ablation/backend, and records the rank of each gold target; (3) pure-function metrics + a report module that emits `report.md` + machine-readable JSON with a subset manifest and a git-rev/model stamp. The SWE-loc loader reuses `benchmarks/swe_bench/`'s `dataset.py` / `repo_checkout.py` / `indexer.py` so the Phase-A 100 pre-indexed instances are shared, not re-derived.
 
@@ -43,7 +45,7 @@ benchmarks/relevance/
 │   └── report.py                      # aggregate → report.md + report.json (manifest + git/model stamp)
 ├── scripts/
 │   ├── __init__.py
-│   ├── run.py                         # main entrypoint: --dataset --ablation --dense-backend
+│   ├── run.py                         # main entrypoint: --dataset --ablation --embedder
 │   └── reproduce_baseline.py          # acceptance gate: CSN/CoIR baseline within tolerance
 ├── tests/
 │   ├── __init__.py
@@ -86,7 +88,7 @@ benchmarks/relevance/
 
 ### Task 0.1: Verify external assumptions (research-only, no commit)
 
-**Files:** none (write findings to `docs/superpowers/plans/2026-05-31-research-notes.md`)
+**Files:** none (Append to (create if first): `docs/superpowers/plans/2026-05-31-research-notes.md` under a `## S0 relevance harness` section; never overwrite — sibling streams share this file)
 
 These facts are genuinely external/uncertain. Record the REAL values; later tasks reference them by the recorded names.
 
@@ -100,11 +102,11 @@ Expected: a JSON array of objects. Record the exact key set. As of this plan it 
 `file` (str, repo-relative), `start_line` (int), `end_line` (int), `score` (float), `source` (str e.g. "Hybrid"), `content` (str), `chunk_type` (str/obj), and optionally `name`, `language`.
 **The `file` field is the file-level gold key; `start_line`/`end_line` give function-level overlap.** Record verbatim in research notes.
 
-- [ ] **Step 2: Confirm semantex ablation flags + dense-backend env (VERIFY)**
+- [ ] **Step 2: Confirm semantex ablation flags + embedder-selection env (VERIFY)**
 
 Run: `SEMANTEX_QUIET_LIMITS=1 semantex search --help`
 Record that these flags exist: `--json`, `--dense-only`, `--sparse-only`, `--rerank`, `-m/--max-count`, `--no-content`.
-**Record explicitly: there is NO `--hybrid` flag (hybrid is the default = neither `--dense-only` nor `--sparse-only`) and NO `--dense-backend` flag.** Dense-backend selection is via the `SEMANTEX_DENSE_BACKEND` env var (introduced by streams S1/S2). Record that the harness selects the backend by setting `SEMANTEX_DENSE_BACKEND=colbert-plaid|coderank-hnsw` in the subprocess env.
+**Record explicitly: there is NO `--hybrid` flag (hybrid is the default = neither `--dense-only` nor `--sparse-only`) and NO `--embedder`/`--dense-backend` flag.** Embedder selection is via an env var (introduced by streams S1/S2/S8). **Per integration §4 D-env-knob, `SEMANTEX_EMBEDDER` (embedder id) is canonical; `SEMANTEX_DENSE_BACKEND` is a kept-live alias. Set `SEMANTEX_EMBEDDER`.** Record that the harness selects the backend by setting `SEMANTEX_EMBEDDER=lateon-colbert|coderank-137m` in the subprocess env (optionally also the `SEMANTEX_DENSE_BACKEND=colbert-plaid|coderank-hnsw` alias for belt-and-suspenders).
 
 - [ ] **Step 3: Confirm CodeSearchNet HuggingFace dataset id + schema (VERIFY)**
 
@@ -169,7 +171,7 @@ Expected: prints `OK ...`. Record: (a) `swe_bench_harness.dataset.Instance` has 
 
 - [ ] **Step 7: Write research notes (no commit — controller commits)**
 
-Write all recorded values to `docs/superpowers/plans/2026-05-31-research-notes.md` under a `## S0 relevance harness` section. Leave version control to the controller.
+Append to (create if first) `docs/superpowers/plans/2026-05-31-research-notes.md` all recorded values under a `## S0 relevance harness` section; never overwrite (sibling streams share this file). Leave version control to the controller.
 
 **Outputs locked after this task:** the `semantex --json` key set, the ablation→flag/env mapping, the CSN dataset id + fields, the CoIR ids (or a deferral note), `pytrec_eval` measure names, and the swe_bench module contract. All later tasks reference these recorded values.
 
@@ -263,9 +265,9 @@ python -m scripts.run --dataset csn --ablation sparse-only
 python -m scripts.run --dataset csn --ablation dense-only
 python -m scripts.run --dataset csn --ablation rerank
 
-# D4 dense-backend A/B (env-selected backend)
-python -m scripts.run --dataset csn --ablation hybrid --dense-backend colbert-plaid
-python -m scripts.run --dataset csn --ablation hybrid --dense-backend coderank-hnsw
+# D4 embedder A/B (env-selected via SEMANTEX_EMBEDDER; canonical per integration §4)
+python -m scripts.run --dataset csn --ablation hybrid --embedder lateon-colbert
+python -m scripts.run --dataset csn --ablation hybrid --embedder coderank-137m
 
 # SWE-bench localization (reuses benchmarks/swe_bench Phase-A instances)
 python -m scripts.run --dataset swe-loc --ablation hybrid
@@ -937,7 +939,7 @@ EOF
 - Create: `benchmarks/relevance/src/relevance_harness/semantex_client.py`
 - Create: `benchmarks/relevance/tests/test_semantex_client.py`
 
-Maps ablations to the REAL flags/env from Task 0.1: `sparse-only`→`--sparse-only`; `dense-only`→`--dense-only`; `hybrid`→neither; `rerank`→hybrid + `--rerank`. Dense backend → `SEMANTEX_DENSE_BACKEND` env. All runs add `--json --no-content -m <k>`.
+Maps ablations to the REAL flags/env from Task 0.1: `sparse-only`→`--sparse-only`; `dense-only`→`--dense-only`; `hybrid`→neither; `rerank`→hybrid + `--rerank`. Embedder selection → `SEMANTEX_EMBEDDER` env (canonical per integration §4 D-env-knob; `SEMANTEX_DENSE_BACKEND` is a kept-live alias). All runs add `--json --no-content -m <k>`.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1016,15 +1018,16 @@ def test_search_rerank_adds_flag_on_hybrid():
     assert "--dense-only" not in args and "--sparse-only" not in args
 
 
-def test_dense_backend_sets_env():
+def test_embedder_sets_env():
     client = SemantexClient(
-        semantex_binary="semantex", corpus_dir="/tmp/c", dense_backend="coderank-hnsw"
+        semantex_binary="semantex", corpus_dir="/tmp/c", embedder="coderank-137m"
     )
     with patch("subprocess.run") as mr:
         mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
         client.search("q1", "x", ablation="hybrid", k=5)
     env = mr.call_args.kwargs["env"]
-    assert env["SEMANTEX_DENSE_BACKEND"] == "coderank-hnsw"
+    # SEMANTEX_EMBEDDER is canonical (integration §4 D-env-knob).
+    assert env["SEMANTEX_EMBEDDER"] == "coderank-137m"
 
 
 def test_failed_search_raises_with_stderr():
@@ -1055,8 +1058,9 @@ Ablation -> CLI mapping (verified in Task 0.1):
   dense-only  -> --dense-only
   hybrid      -> (neither flag; hybrid is the default)
   rerank      -> hybrid + --rerank
-Dense backend -> SEMANTEX_DENSE_BACKEND env var (colbert-plaid | coderank-hnsw).
-All runs add: --json --no-content -m <k>.
+Embedder selection -> SEMANTEX_EMBEDDER env var (lateon-colbert | coderank-137m).
+Canonical per integration §4 D-env-knob; SEMANTEX_DENSE_BACKEND is a kept-live
+deprecated alias. All runs add: --json --no-content -m <k>.
 """
 from __future__ import annotations
 
@@ -1090,12 +1094,14 @@ class SemantexClient:
         *,
         semantex_binary: str,
         corpus_dir: str,
-        dense_backend: Optional[str] = None,
+        embedder: Optional[str] = None,
         timeout_secs: int = 120,
     ):
         self.binary = semantex_binary
         self.corpus_dir = corpus_dir
-        self.dense_backend = dense_backend
+        # Embedder id (e.g. "lateon-colbert" | "coderank-137m"), set via the
+        # canonical SEMANTEX_EMBEDDER env var (integration §4 D-env-knob).
+        self.embedder = embedder
         self.timeout_secs = timeout_secs
 
     def _build_args(self, query: str, *, ablation: str, k: int) -> list[str]:
@@ -1114,8 +1120,9 @@ class SemantexClient:
     def _build_env(self) -> dict:
         env = os.environ.copy()
         env["SEMANTEX_QUIET_LIMITS"] = "1"
-        if self.dense_backend:
-            env["SEMANTEX_DENSE_BACKEND"] = self.dense_backend
+        if self.embedder:
+            # Canonical embedder selector (integration §4 D-env-knob).
+            env["SEMANTEX_EMBEDDER"] = self.embedder
         return env
 
     def search(self, query_id: str, query: str, *, ablation: str, k: int) -> RankedResult:
@@ -1147,7 +1154,7 @@ Expected: 8 passed.
 git add benchmarks/relevance/src/relevance_harness/semantex_client.py \
         benchmarks/relevance/tests/test_semantex_client.py
 git commit -m "$(cat <<'EOF'
-feat(relevance): semantex --json client with ablation flags + dense-backend env
+feat(relevance): semantex --json client with ablation flags + SEMANTEX_EMBEDDER env
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -1441,7 +1448,7 @@ def run_corpus(
     ablation: str,
     k: int,
     semantex_binary: str,
-    dense_backend: Optional[str] = None,
+    embedder: Optional[str] = None,
     match_mode: str = "doc_id",
 ) -> RunOutput:
     if corpus.corpus_dir is None:
@@ -1451,7 +1458,7 @@ def run_corpus(
     client = SemantexClient(
         semantex_binary=semantex_binary,
         corpus_dir=str(corpus.corpus_dir),
-        dense_backend=dense_backend,
+        embedder=embedder,  # canonical SEMANTEX_EMBEDDER selector (integration §4)
     )
 
     relevances: list[list[int]] = []
@@ -2464,7 +2471,7 @@ EOF
 **Files:**
 - Create: `benchmarks/relevance/scripts/run.py`
 
-Wires loaders → runner → report. Exposes `--dataset {csn,coir,swe-loc}`, `--ablation {sparse-only,dense-only,hybrid,rerank}`, `--dense-backend {colbert-plaid,coderank-hnsw}`, `--k`, `--run-id`. Writes `results/<run-id>/report.md` + `report.json`. No new test (it's glue over tested modules); smoke-tested in Step 2.
+Wires loaders → runner → report. Exposes `--dataset {csn,coir,swe-loc}`, `--ablation {sparse-only,dense-only,hybrid,rerank}`, `--embedder {lateon-colbert,coderank-137m}` (canonical `SEMANTEX_EMBEDDER` selector per integration §4 D-env-knob), `--k`, `--run-id`. Writes `results/<run-id>/report.md` + `report.json`. No new test (it's glue over tested modules); smoke-tested in Step 2.
 
 - [ ] **Step 1: Write the script**
 
@@ -2474,7 +2481,7 @@ Wires loaders → runner → report. Exposes `--dataset {csn,coir,swe-loc}`, `--
 
 Examples:
   python -m scripts.run --dataset csn --ablation hybrid
-  python -m scripts.run --dataset csn --ablation dense-only --dense-backend coderank-hnsw
+  python -m scripts.run --dataset csn --ablation dense-only --embedder coderank-137m
   python -m scripts.run --dataset swe-loc --ablation hybrid
 """
 from __future__ import annotations
@@ -2516,12 +2523,13 @@ def _phase_a_ids() -> set[str] | None:
 @click.option("--dataset", type=click.Choice(["csn", "coir", "swe-loc"]), required=True)
 @click.option("--ablation", type=click.Choice(["sparse-only", "dense-only", "hybrid", "rerank"]),
               default="hybrid", show_default=True)
-@click.option("--dense-backend", default="", help="colbert-plaid | coderank-hnsw (env override)")
+@click.option("--embedder", default="", help="lateon-colbert | coderank-137m "
+              "(canonical SEMANTEX_EMBEDDER selector, integration §4 D-env-knob)")
 @click.option("--k", default=10, type=int, show_default=True)
 @click.option("--run-id", default="", help="reuse a results/<run-id> dir")
 @click.option("--semantex-bin", default=os.environ.get("SEMANTEX_BINARY", "semantex"))
-def main(dataset, ablation, dense_backend, k, run_id, semantex_bin):
-    backend = dense_backend or None
+def main(dataset, ablation, embedder, k, run_id, semantex_bin):
+    embedder = embedder or None
     if not run_id:
         run_id = time.strftime(f"%Y%m%d-%H%M%S-{dataset}-{ablation}")
     out_dir = RESULTS / run_id
@@ -2542,7 +2550,7 @@ def main(dataset, ablation, dense_backend, k, run_id, semantex_bin):
                 trust_remote_code=cfg.get("trust_remote_code", True),
             )
             out = run_corpus(corpus, ablation=ablation, k=k, semantex_binary=semantex_bin,
-                             dense_backend=backend, match_mode="doc_id")
+                             embedder=embedder, match_mode="doc_id")
             rows.append(compute_metrics_row(out, k=k))
     elif dataset == "swe-loc":
         match_mode = "file"
@@ -2558,7 +2566,7 @@ def main(dataset, ablation, dense_backend, k, run_id, semantex_bin):
                 click.echo(f"skip {q.query_id}: {e}", err=True)
                 continue
             out = run_corpus(corpus, ablation=ablation, k=k, semantex_binary=semantex_bin,
-                             dense_backend=backend, match_mode="file")
+                             embedder=embedder, match_mode="file")
             agg_rel.extend(out.relevances)
             agg_nrel.extend(out.n_relevant)
         from relevance_harness.runner import RunOutput
@@ -2575,7 +2583,11 @@ def main(dataset, ablation, dense_backend, k, run_id, semantex_bin):
 
     stamp = ReproStamp(
         git_rev=current_git_rev(),
-        dense_backend=backend or os.environ.get("SEMANTEX_DENSE_BACKEND", "default"),
+        # ReproStamp.dense_backend records the active embedder selector; the
+        # canonical env var is SEMANTEX_EMBEDDER (integration §4 D-env-knob).
+        dense_backend=embedder
+        or os.environ.get("SEMANTEX_EMBEDDER")
+        or os.environ.get("SEMANTEX_DENSE_BACKEND", "default"),
         model_id=os.environ.get("SEMANTEX_LLM_MODEL", "n/a-dense-path"),
         k=k,
     )
@@ -2813,33 +2825,34 @@ EOF
 
 ---
 
-### Task 8.2: D4 dense-backend A/B (real; gated on S1+S2 shipping `coderank-hnsw`)
+### Task 8.2: D4 embedder A/B (real; gated on S1+S2 shipping `coderank-137m` / `coderank-hnsw`)
 
 **Files:** none modified — execution.
 
-**Dependency gate:** this task can only RUN once S1 (the `DenseBackend` seam) and S2 (`coderank-hnsw`) have shipped, so `SEMANTEX_DENSE_BACKEND=coderank-hnsw` is honoured. Until then, both invocations resolve to the same backend and the A/B is a no-op. Mark this task blocked-on-S2 in the tracker.
+**Dependency gate:** this task can only RUN once S1 (the `DenseBackend` seam) and S2 (`coderank-137m` / `coderank-hnsw`) have shipped, so `SEMANTEX_EMBEDDER=coderank-137m` is honoured. Until then, both invocations resolve to the same embedder and the A/B is a no-op. Mark this task blocked-on-S2 in the tracker.
 
-- [ ] **Step 1: Run hybrid under both backends on CSN + SWE-loc**
+- [ ] **Step 1: Run hybrid under both embedders on CSN + SWE-loc**
 
+`--embedder` sets the canonical `SEMANTEX_EMBEDDER` selector (integration §4 D-env-knob; `SEMANTEX_DENSE_BACKEND` is the kept-live alias).
 ```bash
 cd benchmarks/relevance && source .venv/bin/activate
 export SEMANTEX_BINARY=$(which semantex)
-for BK in colbert-plaid coderank-hnsw; do
-  python -m scripts.run --dataset csn     --ablation hybrid --dense-backend "$BK" --run-id ab-$BK --k 10
-  python -m scripts.run --dataset swe-loc --ablation hybrid --dense-backend "$BK" --run-id ab-$BK --k 10
+for EMB in lateon-colbert coderank-137m; do
+  python -m scripts.run --dataset csn     --ablation hybrid --embedder "$EMB" --run-id ab-$EMB --k 10
+  python -m scripts.run --dataset swe-loc --ablation hybrid --embedder "$EMB" --run-id ab-$EMB --k 10
 done
-echo "=== colbert-plaid ==="; cat results/ab-colbert-plaid/report.md
-echo "=== coderank-hnsw ==="; cat results/ab-coderank-hnsw/report.md
+echo "=== lateon-colbert ==="; cat results/ab-lateon-colbert/report.md
+echo "=== coderank-137m ==="; cat results/ab-coderank-137m/report.md
 ```
-Expected: two reports, each stamped with its `dense_backend`. The D4 decision (spec §2): `coderank-hnsw` must **meet-or-beat** `colbert-plaid` on Recall@10/nDCG@10 (CoIR + CSN) before cutover. Record the side-by-side in the integration notes; the controller owns the cutover decision.
+Expected: two reports, each stamped with its embedder. The D4 decision (spec §2): `coderank-137m` (`coderank-hnsw` backend) must **meet-or-beat** `lateon-colbert` (`colbert-plaid` backend) on Recall@10/nDCG@10 (CoIR + CSN) before cutover. Record the side-by-side in the integration notes; the controller owns the cutover decision.
 
 - [ ] **Step 2: Commit both reports**
 
 ```bash
-git add -f benchmarks/relevance/results/ab-colbert-plaid/report.md \
-           benchmarks/relevance/results/ab-coderank-hnsw/report.md
+git add -f benchmarks/relevance/results/ab-lateon-colbert/report.md \
+           benchmarks/relevance/results/ab-coderank-137m/report.md
 git commit -m "$(cat <<'EOF'
-data(relevance): D4 dense-backend A/B (colbert-plaid vs coderank-hnsw)
+data(relevance): D4 embedder A/B (lateon-colbert vs coderank-137m)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -2850,8 +2863,8 @@ EOF
 
 ## Self-Review Notes
 
-- **Coverage vs spec §4 S0:** CoIR (loader + seeded/logged subset config, Task 5.3), CodeSearchNet (Task 5.1), SWE-loc from Verified gold patches reusing the Phase-A cache (Task 5.2); metrics MRR@10/nDCG@10/Recall@{1,5,10}/MAP (Task 2.1, validated against `pytrec_eval` in Task 2.2); ablations `--sparse-only/--dense-only/--hybrid/--rerank` (Task 3.1) AND `--dense-backend colbert-plaid|coderank-hnsw` via env (Task 3.1, exercised Task 8.2); report with subset manifest + git-rev/model stamp (Task 6.1); acceptance gate reproducing a published baseline within tolerance (Task 7.2). The "runs end-to-end on a tiny fixture in tests" requirement is Task 4.2.
-- **No hallucinated APIs:** the `semantex --json` schema, the ablation→flag mapping, and the absence of `--hybrid`/`--dense-backend` flags are VERIFIED live (Task 0.1 Steps 1–2). The CSN dataset id/fields, CoIR ids, `pytrec_eval` measure names, and the swe_bench module contract are recorded by the spike (Task 0.1 Steps 3–6) and referenced thereafter. Loaders are unit-tested against injected rows so the network path is the only unverified surface, isolated to the `load_*` functions.
+- **Coverage vs spec §4 S0:** CoIR (loader + seeded/logged subset config, Task 5.3), CodeSearchNet (Task 5.1), SWE-loc from Verified gold patches reusing the Phase-A cache (Task 5.2); metrics MRR@10/nDCG@10/Recall@{1,5,10}/MAP (Task 2.1, validated against `pytrec_eval` in Task 2.2); ablations `--sparse-only/--dense-only/--hybrid/--rerank` (Task 3.1) AND `--embedder lateon-colbert|coderank-137m` via the canonical `SEMANTEX_EMBEDDER` env (Task 3.1, exercised Task 8.2); report with subset manifest + git-rev/model stamp (Task 6.1); acceptance gate reproducing a published baseline within tolerance (Task 7.2). The "runs end-to-end on a tiny fixture in tests" requirement is Task 4.2.
+- **No hallucinated APIs:** the `semantex --json` schema, the ablation→flag mapping, and the absence of `--hybrid`/`--embedder`/`--dense-backend` flags are VERIFIED live (Task 0.1 Steps 1–2). The CSN dataset id/fields, CoIR ids, `pytrec_eval` measure names, and the swe_bench module contract are recorded by the spike (Task 0.1 Steps 3–6) and referenced thereafter. Loaders are unit-tested against injected rows so the network path is the only unverified surface, isolated to the `load_*` functions.
 - **CLAUDE.md compliance:** everything lives under `benchmarks/` (exempt from the no-hardcoded-paths rule); the only absolute path is the `$SWE_BENCH_REPO_CACHE` default `~/.swe_bench_repos`, which mirrors the existing swe_bench harness and is env-overridable. No semantex `crates/` code is touched. Deps are permissive (datasets/numpy/pandas/pyyaml/click/tabulate; `pytrec_eval` is dev-only).
 - **CPU-feasibility / no silent truncation:** all subsetting goes through `subset.select_queries`, which records a `SubsetManifest` (kept + dropped ids) that the report emits; `n=None` keeps everything and logs zero drops.
 - **Type consistency:** `Query`, `Document`, `EvalCorpus`, `RankedResult` (types.py), `RunOutput` (runner.py), `SubsetManifest` (subset.py), `ReproStamp` (report.py) defined once and reused. `query_id`/`doc_id`/`file_path` are the universal keys; doc id is `file:start-end` everywhere (client + loaders agree).
@@ -2861,4 +2874,4 @@ EOF
 1. **CoIR exact HF ids + the published CoIR baseline figure are unverified on this machine** (no confirmed HF access at plan-time). Task 0.1 Step 4 records them; Task 5.3 ships the injectable, unit-tested loader, but the CoIR network path and a CoIR-specific acceptance baseline are deferred to a machine with HF access. The acceptance gate (Task 7.2) therefore anchors on **BM25/CSN** (deterministic, model-independent) rather than CoIR — satisfying the spec's "CSN **or** CoIR baseline within tolerance" wording, but CoIR-as-headline still needs a real run to populate `coir_subset.yaml` and wire `load_coir_subdataset` into `run.py` (currently a `SystemExit(2)` stub).
 2. **The published baseline number itself (`expected_mrr_at_10`, `tolerance`) is a placeholder ballpark.** Task 0.1 must cite the exact figure; the gate's correctness depends on that citation. I set a generous default tolerance (0.15) and flagged "do not widen tolerance to pass" — but the precise anchor is external and must be filled from a cited source.
 3. **Function-level (vs file-level) SWE-loc recall** is only partially realized: `swe_loc.py` extracts changed *files* (file-level Recall/MRR, which the spec lists first). The spec also mentions function-level recall ("gold files/functions", "changed files/symbols"). Mapping a patch hunk's `@@ ... def name` to a specific gold *symbol* and matching it against a result's `start_line/end_line` overlap is a natural extension of `RankedResult.rank_of_file` + the hunk parser, but is **not** built here — it would be a follow-up task adding `changed_symbols_from_patch` + a `match_mode="function"` overlap check in `runner.py`. File-level localization is the shipped metric.
-4. **D4 A/B (Task 8.2) cannot run until S1+S2 ship.** The harness is backend-agnostic and ready, but the `coderank-hnsw` backend and the `SEMANTEX_DENSE_BACKEND` env honoring it are owned by S1/S2; this task is correctly gated, not self-contained within S0.
+4. **D4 A/B (Task 8.2) cannot run until S1+S2 ship.** The harness is backend-agnostic and ready, but the `coderank-137m`/`coderank-hnsw` backend and the canonical `SEMANTEX_EMBEDDER` env honoring it (integration §4 D-env-knob; `SEMANTEX_DENSE_BACKEND` is the kept-live alias) are owned by S1/S2/S8; this task is correctly gated, not self-contained within S0.

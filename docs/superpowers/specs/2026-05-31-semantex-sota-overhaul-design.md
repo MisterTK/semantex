@@ -63,7 +63,7 @@ query
 
 Selected by config (`SEMANTEX_DENSE_BACKEND` / `dense_backend` in config), so the benchmark harness A/Bs them on identical corpora and we default to the proven winner.
 
-**All three model seams — dense embedder, reranker, LLM — resolve through a config-driven model registry (S8).** Models are declared as *data* in a manifest (built-in permissive defaults + optional user `models.toml`), so any model can be swapped by config with no recompile and no engine refactor. Query-time models (reranker, LLM) swap live; embedder swaps trigger a versioned, zero-downtime reindex (the re-embedding compute is inherent to changing the vector space — see §S8).
+**All three model seams — dense embedder, reranker, LLM — resolve through a config-driven model registry (S8).** Models are declared as *data* in a manifest (built-in permissive defaults + optional user `models.toml`), so any model can be swapped by config with no recompile and no engine refactor. Query-time models (reranker, LLM) swap live; embedder swaps trigger a versioned **rebuild + atomic switchover** (zero-downtime; the re-embedding compute is inherent to changing the vector space — see §S8).
 
 ---
 

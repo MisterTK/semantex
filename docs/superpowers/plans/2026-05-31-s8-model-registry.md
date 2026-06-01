@@ -58,7 +58,7 @@ Files created or modified, one responsibility each:
 
 - **Create `crates/semantex-core/src/model/capabilities.rs`** — `ModelCapabilities` (`multi_vector`, `matryoshka_dims: Option<Vec<usize>>`, `produces_sparse`, `instruction_aware`, `max_batch`) with serde defaults so a partial `models.toml` entry keeps working. `BackendKind` (`ColbertPlaid|CoderankHnsw`) + `pub fn backend_for(caps: &ModelCapabilities) -> BackendKind` — the capability negotiation (`multi_vector → ColbertPlaid`, else `CoderankHnsw`) and `BackendKind::dense_kind(self) -> crate::search::dense_backend::DenseBackendKind` (the one place S8 touches S1's enum). Pure.
 
-- **Create `crates/semantex-core/src/model/manifest.rs`** — `pub fn builtin_specs() -> Vec<ModelSpec>` (compiled-in permissive defaults: `coderank-hnsw` embedder, `colbert-plaid` embedder, `bge-reranker-v2-m3`, `qwen3-reranker-0.6b`, and — feature-gated — the LLM specs). `pub fn load_user_manifest(path: &Path) -> Result<Vec<ModelSpec>>` (parse `models.toml`; clear error naming the file + offending field). `pub fn user_manifest_path(config: &SemantexConfig, project_path: Option<&Path>) -> Option<PathBuf>` (project `.semantex/models.toml` overrides `~/.semantex/models.toml`). `pub fn merge(builtin, user) -> Vec<ModelSpec>` (override-by-id; user wins). Built-ins only — every default is MIT/Apache (CLAUDE.md).
+- **Create `crates/semantex-core/src/model/manifest.rs`** — `pub fn builtin_specs() -> Vec<ModelSpec>` (compiled-in permissive defaults: `coderank-137m` embedder, `lateon-colbert` embedder, `bge-reranker-v2-m3`, `qwen3-reranker-0.6b`, and — feature-gated — the LLM specs). `pub fn load_user_manifest(path: &Path) -> Result<Vec<ModelSpec>>` (parse `models.toml`; clear error naming the file + offending field). `pub fn user_manifest_path(config: &SemantexConfig, project_path: Option<&Path>) -> Option<PathBuf>` (project `.semantex/models.toml` overrides `~/.semantex/models.toml`). `pub fn merge(builtin, user) -> Vec<ModelSpec>` (override-by-id; user wins). Built-ins only — every default is MIT/Apache (CLAUDE.md).
 
 - **Create `crates/semantex-core/src/model/registry.rs`** — `ModelRegistry`: `from_config(config, project_path) -> Result<Self>` (merge builtin+user, validate all), `resolve(role, id) -> Result<&ModelSpec>`, `active_embedder(&self) -> Result<&ModelSpec>` / `active_reranker` / `active_llm` (read the id from `SemantexConfig`, fall back to the role's default id), `embedder_backend_kind(&self) -> Result<DenseBackendKind>` (resolve active embedder → capabilities → `BackendKind::dense_kind`). Lazy caching is the merged-`Vec` + `OnceLock` discipline (the registry itself is cheap; model *weights* stay lazy in the existing embedder/reranker singletons).
 
@@ -66,7 +66,7 @@ Files created or modified, one responsibility each:
 
 - **Modify `crates/semantex-core/Cargo.toml`** — add `toml = "0.8"` to `[dependencies]` (pure-Rust, no C deps). Default build stays zero-genai.
 
-- **Modify `crates/semantex-core/src/config.rs`** — add `pub embedder: String` (default `"colbert-plaid"` — matches S1's `dense_backend` default; D4 keeps the PLAID dense path as the shipped default until the Phase-3 cutover flips it to `"coderank-hnsw"`), `pub reranker_model: String` (default `"bge-reranker-v2-m3"`), `pub llm_model: String` (default `""`) to `SemantexConfig` + `Default` + the `SEMANTEX_EMBEDDER` / `SEMANTEX_RERANKER_MODEL` / `SEMANTEX_LLM_MODEL` env overlays in `load()`. (These are registry lookup keys — see §"Reconciliation".)
+- **Modify `crates/semantex-core/src/config.rs`** — add `pub embedder: String` (default `"lateon-colbert"` — the embedder id that capability-routes to S1's `colbert-plaid` backend default; D4 keeps the PLAID dense path as the shipped default until the Phase-3 cutover flips it to `"coderank-137m"`), `pub reranker_model: String` (default `"bge-reranker-v2-m3"`), `pub llm_model: String` (default `""`) to `SemantexConfig` + `Default` + the `SEMANTEX_EMBEDDER` / `SEMANTEX_RERANKER_MODEL` / `SEMANTEX_LLM_MODEL` env overlays in `load()`. (These are registry lookup keys — see §"Reconciliation". Embedder spec ids are model-descriptive (`coderank-137m`, `lateon-colbert`) and are distinct from backend names (`coderank-hnsw`, `colbert-plaid`) — the registry maps embedder→backend via capabilities.)
 
 - **Modify `crates/semantex-core/src/types.rs`** — add `pub embedder_fingerprint: String` to `IndexMeta`; extend the doc comment (no schema bump beyond S1/S2's 11). Update the in-file `IndexMeta` test literals.
 
@@ -76,7 +76,7 @@ Files created or modified, one responsibility each:
 
 - **Modify `crates/semantex-core/src/search/dense_backend.rs`** — add `pub fn active_dense_dir(index_dir, backend, fingerprint) -> PathBuf` (the versioned `<index_dir>/dense/<backend>/<fingerprint>` path) + `pub fn read_active_pointer` / `write_active_pointer` (the atomic `dense/<backend>/ACTIVE` file). (S1 owns this file; S8 appends — coordinate per §"Sequencing".)
 
-- **Create `crates/semantex-core/tests/model_registry_golden_test.rs`** — the spec §6 golden gate: a registry-resolved `colbert-plaid` / `coderank-hnsw` embedder spec produces the **same** `DenseBackendKind` (and, where the backend is constructible without a model download, the same on-disk dir + fingerprint) as direct construction; a user `models.toml` adds a 2nd permissive embedder that resolves + capability-routes end-to-end. Repo-agnostic (tempdir).
+- **Create `crates/semantex-core/tests/model_registry_golden_test.rs`** — the spec §6 golden gate: a registry-resolved `lateon-colbert` / `coderank-137m` embedder spec produces the **same** `DenseBackendKind` (and, where the backend is constructible without a model download, the same on-disk dir + fingerprint) as direct construction; a user `models.toml` adds a 2nd permissive embedder that resolves + capability-routes end-to-end. Repo-agnostic (tempdir).
 
 No new workspace crate dependencies beyond `toml`. `serde`, `serde_json`, `xxhash-rust`, `anyhow` are already present.
 
@@ -432,8 +432,9 @@ pub enum RoleData {
 /// A fully-declared model. The umbrella type the registry stores and resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSpec {
-    /// Stable logical id used by config selection + on-disk dirs (e.g.
-    /// `"coderank-hnsw"`, `"bge-reranker-v2-m3"`).
+    /// Stable logical id used by config selection (e.g. `"coderank-137m"`,
+    /// `"bge-reranker-v2-m3"`). Distinct from the dense BACKEND name
+    /// (`coderank-hnsw`/`colbert-plaid`) the embedder routes to via capabilities.
     pub id: String,
     /// Pipeline stage. MUST agree with `role_data`'s variant.
     pub role: ModelRole,
@@ -488,7 +489,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### Task 3: built-in permissive specs (`manifest::builtin_specs`)
 
-The compiled-in defaults: the two embedders (`coderank-hnsw` single-vector, `colbert-plaid` late-interaction), the two rerankers (`bge-reranker-v2-m3`, `qwen3-reranker-0.6b`). LLM specs are added feature-gated in Task 12. **Every default is MIT/Apache** (CLAUDE.md permissive-only). The embedder dims/prefix/pooling quote S2's recorded values; the reranker fields quote S3's recorded values.
+The compiled-in defaults: the two embedders (`coderank-137m` single-vector, `lateon-colbert` late-interaction), the two rerankers (`bge-reranker-v2-m3`, `qwen3-reranker-0.6b`). LLM specs are added feature-gated in Task 12. **Every default is MIT/Apache** (CLAUDE.md permissive-only). The embedder dims/prefix/pooling quote S2's recorded values; the reranker fields quote S3's recorded values. Embedder spec ids are model-descriptive (`coderank-137m`, `lateon-colbert`) and are distinct from backend names (`coderank-hnsw`, `colbert-plaid`) — the registry maps embedder→backend via capabilities.
 
 **Files:**
 - Modify: `crates/semantex-core/src/model/manifest.rs`
@@ -519,8 +520,8 @@ mod tests {
     fn builtins_include_both_embedders_and_both_rerankers() {
         let specs = builtin_specs();
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"coderank-hnsw"), "missing coderank-hnsw: {ids:?}");
-        assert!(ids.contains(&"colbert-plaid"), "missing colbert-plaid: {ids:?}");
+        assert!(ids.contains(&"coderank-137m"), "missing coderank-137m: {ids:?}");
+        assert!(ids.contains(&"lateon-colbert"), "missing lateon-colbert: {ids:?}");
         assert!(ids.contains(&"bge-reranker-v2-m3"), "missing bge: {ids:?}");
         assert!(ids.contains(&"qwen3-reranker-0.6b"), "missing qwen3: {ids:?}");
     }
@@ -529,11 +530,11 @@ mod tests {
     fn coderank_embedder_carries_recorded_nuance() {
         let s = builtin_specs()
             .into_iter()
-            .find(|s| s.id == "coderank-hnsw")
+            .find(|s| s.id == "coderank-137m")
             .unwrap();
         assert_eq!(s.role, ModelRole::Embedder);
         let RoleData::Embedder(e) = &s.role_data else {
-            panic!("coderank-hnsw must be an embedder");
+            panic!("coderank-137m must be an embedder");
         };
         // S2 Spike 1 recorded values (arctic-embed-m-long base).
         assert_eq!(e.dims, 768);
@@ -549,10 +550,10 @@ mod tests {
     fn colbert_embedder_is_multi_vector_late_interaction() {
         let s = builtin_specs()
             .into_iter()
-            .find(|s| s.id == "colbert-plaid")
+            .find(|s| s.id == "lateon-colbert")
             .unwrap();
         let RoleData::Embedder(e) = &s.role_data else {
-            panic!("colbert-plaid must be an embedder");
+            panic!("lateon-colbert must be an embedder");
         };
         assert_eq!(e.pooling, Pooling::LateInteraction);
         assert!(s.capabilities.multi_vector, "ColBERT is multi-vector");
@@ -677,10 +678,11 @@ use crate::model::spec::{
 pub fn builtin_specs() -> Vec<ModelSpec> {
     let mut specs = vec![
         // ── Embedders ───────────────────────────────────────────────────────
-        // CodeRankEmbed (MIT) — the new single-vector default. Capabilities:
-        // single-vector → routes to the HNSW backend (Task 5 negotiation).
+        // CodeRankEmbed 137M (MIT) — the new single-vector default. The spec id
+        // is model-descriptive (`coderank-137m`); its capabilities (single-vector)
+        // route it to the `coderank-hnsw` BACKEND (Task 5 negotiation).
         ModelSpec {
-            id: "coderank-hnsw".to_string(),
+            id: "coderank-137m".to_string(),
             role: ModelRole::Embedder,
             source: ModelSource::Hf {
                 // RECORDED in research-notes (S2 Spike 1 Task 1 Step 4).
@@ -702,10 +704,11 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 quant: QuantKind::Int8Symmetric,
             }),
         },
-        // ColBERT LateOn-Code-edge — today's late-interaction path. Multi-vector
-        // → routes to the PLAID backend.
+        // LateOn-Code-edge ColBERT — today's late-interaction path. The spec id is
+        // model-descriptive (`lateon-colbert`); its capabilities (multi-vector)
+        // route it to the `colbert-plaid` BACKEND.
         ModelSpec {
-            id: "colbert-plaid".to_string(),
+            id: "lateon-colbert".to_string(),
             role: ModelRole::Embedder,
             source: ModelSource::Hf {
                 repo: "lightonai/LateOn-Code-edge".to_string(),
@@ -882,10 +885,10 @@ Add to the `#[cfg(test)] mod tests` block in `manifest.rs`:
     #[test]
     fn merge_lets_user_override_a_builtin_by_id() {
         let builtin = builtin_specs();
-        // A user spec re-using the `coderank-hnsw` id overrides the built-in.
+        // A user spec re-using the `coderank-137m` id overrides the built-in.
         let mut overridden = builtin
             .iter()
-            .find(|s| s.id == "coderank-hnsw")
+            .find(|s| s.id == "coderank-137m")
             .cloned()
             .unwrap();
         if let RoleData::Embedder(e) = &mut overridden.role_data {
@@ -894,7 +897,7 @@ Add to the `#[cfg(test)] mod tests` block in `manifest.rs`:
         let merged = merge(builtin.clone(), vec![overridden]);
         // Same count (override, not append).
         assert_eq!(merged.len(), builtin.len());
-        let s = merged.iter().find(|s| s.id == "coderank-hnsw").unwrap();
+        let s = merged.iter().find(|s| s.id == "coderank-137m").unwrap();
         let RoleData::Embedder(e) = &s.role_data else { panic!() };
         assert_eq!(e.max_context, 4096, "user override must win");
     }
@@ -904,7 +907,7 @@ Add to the `#[cfg(test)] mod tests` block in `manifest.rs`:
         let builtin = builtin_specs();
         let mut newspec = builtin
             .iter()
-            .find(|s| s.id == "coderank-hnsw")
+            .find(|s| s.id == "coderank-137m")
             .cloned()
             .unwrap();
         newspec.id = "my-custom-embedder".to_string();
@@ -1181,25 +1184,25 @@ Add to the `#[cfg(test)] mod tests` block in `spec.rs`:
             normalize: true,
             quant: QuantKind::Int8Symmetric,
         };
-        let fp1 = EmbedderFingerprint::compute("coderank-hnsw", &base);
-        let fp2 = EmbedderFingerprint::compute("coderank-hnsw", &base);
+        let fp1 = EmbedderFingerprint::compute("coderank-137m", &base);
+        let fp2 = EmbedderFingerprint::compute("coderank-137m", &base);
         assert_eq!(fp1, fp2, "same id+spec → same fingerprint (deterministic)");
         assert!(!fp1.is_empty());
 
         // Changing dims changes the fingerprint (vector space differs).
         let mut diff_dims = base.clone();
         diff_dims.dims = 384;
-        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-hnsw", &diff_dims));
+        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_dims));
 
         // Changing pooling changes it.
         let mut diff_pool = base.clone();
         diff_pool.pooling = Pooling::Mean;
-        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-hnsw", &diff_pool));
+        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_pool));
 
         // Changing quant changes it.
         let mut diff_quant = base.clone();
         diff_quant.quant = QuantKind::None;
-        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-hnsw", &diff_quant));
+        assert_ne!(fp1, EmbedderFingerprint::compute("coderank-137m", &diff_quant));
 
         // Changing the id changes it (different model, same shape).
         assert_ne!(fp1, EmbedderFingerprint::compute("other-embedder", &base));
@@ -1335,7 +1338,7 @@ Add the config-field tests to the `#[cfg(test)] mod tests` block in `crates/sema
     fn default_selection_fields() {
         let cfg = SemantexConfig::default();
         // D4: PLAID stays the shipped dense default until the Phase-3 cutover.
-        assert_eq!(cfg.embedder, "colbert-plaid");
+        assert_eq!(cfg.embedder, "lateon-colbert");
         assert_eq!(cfg.reranker_model, "bge-reranker-v2-m3");
         assert_eq!(cfg.llm_model, "", "no LLM selected by default (zero-LLM-deps build)");
     }
@@ -1371,16 +1374,16 @@ mod tests {
 
     #[test]
     fn resolves_active_embedder_default() {
-        // D4: the shipped default embedder is colbert-plaid until cutover.
+        // D4: the shipped default embedder is lateon-colbert until cutover.
         let reg = registry_from_builtins();
         let spec = reg.active_embedder().unwrap();
-        assert_eq!(spec.id, "colbert-plaid");
+        assert_eq!(spec.id, "lateon-colbert");
         assert_eq!(spec.role, ModelRole::Embedder);
     }
 
     #[test]
     fn active_embedder_backend_kind_is_plaid_for_default() {
-        // colbert-plaid is multi_vector → PLAID, the D4 default dense path.
+        // lateon-colbert is multi_vector → PLAID, the D4 default dense path.
         let reg = registry_from_builtins();
         assert_eq!(reg.embedder_backend_kind().unwrap(), DenseBackendKind::ColbertPlaid);
     }
@@ -1390,9 +1393,9 @@ mod tests {
         // Selecting the single-vector embedder (the Phase-3 cutover target)
         // routes to HNSW purely from its capabilities.
         let mut cfg = SemantexConfig::default();
-        cfg.embedder = "coderank-hnsw".to_string();
+        cfg.embedder = "coderank-137m".to_string();
         let reg = ModelRegistry::from_config(&cfg, None).unwrap();
-        assert_eq!(reg.active_embedder().unwrap().id, "coderank-hnsw");
+        assert_eq!(reg.active_embedder().unwrap().id, "coderank-137m");
         assert_eq!(reg.embedder_backend_kind().unwrap(), DenseBackendKind::CoderankHnsw);
     }
 
@@ -1432,11 +1435,13 @@ Expected: FAIL — `no field 'embedder' on type 'SemantexConfig'`, `cannot find 
 In `config.rs`, add the three fields to `SemantexConfig` (after S1's `dense_backend: String`):
 
 ```rust
-    /// Active embedder model id (registry lookup key). Default `"colbert-plaid"`
+    /// Active embedder model id (registry lookup key). Default `"lateon-colbert"`
     /// (D4: PLAID is the shipped dense default until the Phase-3 cutover flips
-    /// this to `"coderank-hnsw"`). Override via `SEMANTEX_EMBEDDER`. A change here
-    /// triggers a versioned dense rebuild + atomic switchover (S8) — the
-    /// re-embedding compute is inherent.
+    /// this to `"coderank-137m"`). The embedder spec id is model-descriptive and
+    /// distinct from the dense backend name it routes to via capabilities
+    /// (`lateon-colbert` → `colbert-plaid`; `coderank-137m` → `coderank-hnsw`).
+    /// Override via `SEMANTEX_EMBEDDER`. A change here triggers a versioned dense
+    /// rebuild + atomic switchover (S8) — the re-embedding compute is inherent.
     pub embedder: String,
     /// Active reranker model id (registry lookup key). Default
     /// `"bge-reranker-v2-m3"`. Override via `SEMANTEX_RERANKER_MODEL`. A change
@@ -1450,7 +1455,7 @@ In `config.rs`, add the three fields to `SemantexConfig` (after S1's `dense_back
 Add the defaults in `impl Default` (after `dense_backend: "colbert-plaid".to_string(),`):
 
 ```rust
-            embedder: "colbert-plaid".to_string(),
+            embedder: "lateon-colbert".to_string(),
             reranker_model: "bge-reranker-v2-m3".to_string(),
             llm_model: String::new(),
 ```
@@ -1692,7 +1697,7 @@ use semantex_core::types::IndexMeta;
 use std::fs;
 
 /// Write a tiny synthetic repo so a real index can be built without network
-/// (the colbert-plaid path needs the ColBERT model; gate the model-dependent
+/// (the lateon-colbert path needs the ColBERT model; gate the model-dependent
 /// assertions with `#[ignore]`). This test only inspects meta.json shape.
 fn write_tiny_repo(dir: &std::path::Path) {
     fs::create_dir_all(dir).unwrap();
@@ -1710,10 +1715,10 @@ fn build_stamps_a_nonempty_embedder_fingerprint() {
     let project = tmp.path().join("proj");
     write_tiny_repo(&project);
     // Build with the single-vector embedder explicitly (the fingerprint-stamping
-    // path under test). The shipped DEFAULT embedder is colbert-plaid (D4) until
-    // cutover; we select coderank-hnsw here to exercise the new dense backend.
+    // path under test). The shipped DEFAULT embedder is lateon-colbert (D4) until
+    // cutover; we select coderank-137m here to exercise the new dense backend.
     let mut cfg = SemantexConfig::default();
-    cfg.embedder = "coderank-hnsw".to_string();
+    cfg.embedder = "coderank-137m".to_string();
     IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
 
     let meta_str = fs::read_to_string(project.join(".semantex").join("meta.json")).unwrap();
@@ -2162,9 +2167,9 @@ use semantex_core::search::dense_backend::DenseBackendKind;
 /// the model's known capability (no quality regression from the indirection).
 #[test]
 fn registry_resolved_backend_equals_direct_for_builtins() {
-    // coderank-hnsw (single-vector) → HNSW, both ways.
+    // coderank-137m (single-vector) → HNSW, both ways.
     let mut cfg = SemantexConfig::default();
-    cfg.embedder = "coderank-hnsw".to_string();
+    cfg.embedder = "coderank-137m".to_string();
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
     let resolved = reg.embedder_backend_kind().unwrap();
     // Direct construction: a single-vector capability maps to HNSW.
@@ -2172,8 +2177,8 @@ fn registry_resolved_backend_equals_direct_for_builtins() {
     assert_eq!(resolved, direct);
     assert_eq!(resolved, DenseBackendKind::CoderankHnsw);
 
-    // colbert-plaid (multi-vector) → PLAID, both ways.
-    cfg.embedder = "colbert-plaid".to_string();
+    // lateon-colbert (multi-vector) → PLAID, both ways.
+    cfg.embedder = "lateon-colbert".to_string();
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
     assert_eq!(reg.embedder_backend_kind().unwrap(), DenseBackendKind::ColbertPlaid);
     assert_eq!(BackendKind::ColbertPlaid.dense_kind(), DenseBackendKind::ColbertPlaid);
@@ -2237,7 +2242,7 @@ fn mismatched_index_errors_cleanly() {
         updated_at: "0".to_string(),
         file_count: 0,
         chunk_count: 0,
-        embedding_model: "coderank-hnsw".to_string(),
+        embedding_model: "coderank-137m".to_string(),
         embedding_dim: 768,
         use_bm25_stemmer: true,
         dense_backend: "coderank-hnsw".to_string(),
@@ -2372,12 +2377,12 @@ These are the **exact selection-code replacements** S8 introduces. The traits + 
 
 ### S1 deltas (`s1-dense-backend-seam.md`)
 - **REPLACED:** the embedder/backend *selection* call. S1's plan opens the dense channel in `hybrid.rs` via `DenseBackendKind::parse(&config.dense_backend)` and builds it in `builder.rs` via `DenseBackendKind::parse(...).unwrap_or_default()`. **Both call-sites become `ModelRegistry::from_config(config, project).embedder_backend_kind()?`** (S8 Tasks 9, 10). The `dense_backend.rs` `DenseBackendKind` enum, `parse`/`name`, `dense_subdir`, `verify_persisted_backend_matches`, the `DenseBackend`/`DenseIndexBuilder` traits, and `ColbertPlaidBackend`/`ColbertPlaidIndexBuilder` are **unchanged**.
-- **KEPT (now legacy-compatible):** `SemantexConfig.dense_backend` + `SEMANTEX_DENSE_BACKEND` remain as a *fallback / override*, but the authoritative selector is `config.embedder` → registry → capabilities → `DenseBackendKind`. (A user who sets only `SEMANTEX_DENSE_BACKEND` and not `SEMANTEX_EMBEDDER` still works because the built-in `colbert-plaid`/`coderank-hnsw` embedder ids match the backend names; the integration lead may choose to deprecate `dense_backend` in favor of `embedder` — flagged below.)
+- **KEPT (now legacy-compatible):** `SemantexConfig.dense_backend` + `SEMANTEX_DENSE_BACKEND` remain as a *fallback / override*, but the authoritative selector is `config.embedder` → registry → capabilities → `DenseBackendKind`. (Embedder spec ids are model-descriptive — `coderank-137m`, `lateon-colbert` — and distinct from the backend names — `coderank-hnsw`, `colbert-plaid` — that the registry routes them to via capabilities. A user who sets only `SEMANTEX_DENSE_BACKEND` and not `SEMANTEX_EMBEDDER` still gets the default embedder's backend, which agrees out of the box because the default `lateon-colbert` routes to `colbert-plaid` — matching S1's `dense_backend` default; the integration lead may choose to deprecate `dense_backend` in favor of `embedder` — flagged below.)
 - **ADDED next to S1's on-disk helpers:** `active_dense_dir` (versioned `<backend>/<fingerprint>/`), `read_active_pointer`/`write_active_pointer` (the `ACTIVE` file), `verify_persisted_fingerprint_matches`. S1's `dense/<backend>/` layout gains a `<fingerprint>/` leaf + an `ACTIVE` pointer.
 - **ADDED to `IndexMeta`:** `embedder_fingerprint: String` (rides on S1's 9→10 bump; no extra bump).
 
 ### S2 deltas (`s2-coderank-hnsw-dense.md`)
-- **REPLACED:** CodeRankEmbed's hardcoded constants as the *source of selection*. S2's `EMBEDDING_DIM`/`QUERY_PREFIX`/pooling constants in `embedding/single_vector.rs` are **kept as the encoder's defaults**, but the registry's built-in `coderank-hnsw` `ModelSpec` (Task 3) now carries dim=768/prefix/pooling=Cls/quant=Int8Symmetric as the authoritative **selection + fingerprint** data. The encoder impl, `single_vector_model.rs` download, and `hnsw_index.rs` backend are **unchanged**. (Optional follow-up: have `single_vector.rs` read dim/prefix from the resolved spec instead of consts — NOT required for S8; flagged below.)
+- **REPLACED:** CodeRankEmbed's hardcoded constants as the *source of selection*. S2's `EMBEDDING_DIM`/`QUERY_PREFIX`/pooling constants in `embedding/single_vector.rs` are **kept as the encoder's defaults**, but the registry's built-in `coderank-137m` embedder `ModelSpec` (Task 3) now carries dim=768/prefix/pooling=Cls/quant=Int8Symmetric as the authoritative **selection + fingerprint** data. The encoder impl, `single_vector_model.rs` download, and `hnsw_index.rs` backend are **unchanged**. (Optional follow-up: have `single_vector.rs` read dim/prefix from the resolved spec instead of consts — NOT required for S8; flagged below.)
 - **REPLACED:** the builder's dense-dir target. S2's `CoderankHnswIndexBuilder` persists into the dir the builder passes it; S8 makes that dir the versioned `active_dense_dir(index_dir, CoderankHnsw, fingerprint)` (Task 9) instead of a flat `dense_subdir(...)`. No change to the builder impl itself.
 - **KEPT:** S2's 10→11 schema bump is the final shipped value; S8 adds a field under it, not a new bump.
 
@@ -2390,6 +2395,6 @@ These are the **exact selection-code replacements** S8 introduces. The traits + 
 - `LlmBackend::from_env()` (in `llm/mod.rs`, feature-gated) still reads `SEMANTEX_LLM_MODEL`/`_PROVIDER`/`_ENDPOINT`/`_BACKEND` directly. S8 adds `config.llm_model` + an LLM-role registry spec, and `active_llm()` resolves it, but **wiring `LlmBackend` to construct from a resolved `LlmSpec` is intentionally left as a follow-up** (it touches the v0.7.1 HyDE call-site work in S5 and the genai backend constructor; doing it here would couple S8 to the `llm` feature's internals). The registry side is ready; the consumer side is a small later delta. Recorded so the integration lead schedules it after S5.
 
 ### Open flags for the integration lead
-1. **`dense_backend` vs `embedder` as the authoritative dense selector.** S8 makes `config.embedder` authoritative (capabilities → backend). `config.dense_backend`/`SEMANTEX_DENSE_BACKEND` (S1) become redundant for built-ins (both default to the same `colbert-plaid` per D4, so they agree out of the box). Decide whether to keep both (back-compat) or deprecate `dense_backend` once S8 lands. The S0 harness drives the A/B via `SEMANTEX_DENSE_BACKEND` (integration doc §3.6 note) — **if `dense_backend` is deprecated, the harness must switch to `SEMANTEX_EMBEDDER` (set it to `coderank-hnsw` for the new arm).** The Phase-3 cutover decision (integration doc §6.1) is the single place that flips the *default* `embedder` from `colbert-plaid` to `coderank-hnsw`, once the harness proves the single-vector path meets-or-beats PLAID — keep the S8 default at `colbert-plaid` until then.
+1. **`dense_backend` vs `embedder` as the authoritative dense selector.** S8 makes `config.embedder` authoritative (capabilities → backend). `config.dense_backend`/`SEMANTEX_DENSE_BACKEND` (S1) become redundant for built-ins (the default embedder `lateon-colbert` routes to the same `colbert-plaid` backend S1 defaults to per D4, so they agree out of the box). Decide whether to keep both (back-compat) or deprecate `dense_backend` once S8 lands. The S0 harness drives the A/B via `SEMANTEX_DENSE_BACKEND` (integration doc §3.6 note) — **if `dense_backend` is deprecated, the harness must switch to `SEMANTEX_EMBEDDER` (set it to the embedder id `coderank-137m` for the new arm — which capability-routes to the `coderank-hnsw` backend).** The Phase-3 cutover decision (integration doc §6.1) is the single place that flips the *default* `embedder` from `lateon-colbert` to `coderank-137m`, once the harness proves the single-vector path meets-or-beats PLAID — keep the S8 default at `lateon-colbert` until then.
 2. **Encoder consts → spec-sourced (S2).** Optional follow-up to have `single_vector.rs` read dim/prefix from the resolved spec; not required for the gates.
 

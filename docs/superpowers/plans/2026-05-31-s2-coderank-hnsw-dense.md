@@ -14,6 +14,8 @@
 
 Quoted from the real tree / pinned deps at plan-authoring time. Every type/method below exists today, is pinned in `Cargo.lock`, is added by an earlier task in this plan, or is **RECORDED by a Spike task** (Tasks 1–2). No later task invents a crate API or an export detail — it references a recorded value.
 
+- Active-embedder selection + the versioned `<fingerprint>/` dir + `embedder_fingerprint` come from S8's `ModelRegistry` (integration §4.1); this plan's `SEMANTEX_DENSE_BACKEND` selection is the pre-S8 baseline S8 supersedes.
+
 ### From S1 (LOCKED — consume verbatim, do NOT redefine)
 
 S1 (`docs/superpowers/plans/2026-05-31-s1-dense-backend-seam.md`) lands first and provides, in `crates/semantex-core/src/search/dense_backend.rs`:
@@ -24,6 +26,8 @@ S1 (`docs/superpowers/plans/2026-05-31-s1-dense-backend-seam.md`) lands first an
   - `fn search(&self, query: &str, k: usize) -> Result<Vec<DenseHit>>;`
   - `fn search_with_subset(&self, query: &str, k: usize, subset: &[u64]) -> Result<Vec<DenseHit>>;`
   - `fn positional_chunk_ids(&self) -> Option<&[u64]> { None }` (default). **Our HNSW backend keeps the default `None`** (G5): no positional doc→chunk array; the `file_filter` subset path then degrades to unfiltered dense + result-merge filtering. Document this in code.
+  - `fn embed_text_vector(&self, query: &str) -> Option<Vec<f32>> { None }` (default) — the EXACT query vector for S7's MMR + semantic cache (integration §3 item 2 + §4 D-mmr-cache). **Our HNSW backend OVERRIDES this** (Task 8b) to return `Some(...)` (single-vector encoder, L2-normalized), never `None`.
+  - `fn embed_doc_vectors(&self, chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> { None }` (default) — the EXACT stored doc vectors for the given chunk ids (integration §3 item 2 + §4 D-mmr-cache). **Our HNSW backend OVERRIDES this** (Task 8b) to dequantize the stored int8 vectors back to f32 and return `Some(...)` (skipping ids not present), never `None`.
 - **`pub trait DenseIndexBuilder: Send + Sync`** with:
   - `fn name(&self) -> &'static str;`
   - `fn build(&mut self, chunks: &[(u64, &str)]) -> Result<()>;`
@@ -66,7 +70,7 @@ Files created or modified, one responsibility each:
 
 - **Create `crates/semantex-core/src/embedding/single_vector.rs`** — the encoder. `SingleVectorEmbedder` (lazy `OnceLock<Mutex<Session>>` + `build_lock`, threads/EP per `colbert.rs`). `encode_document(&str) -> Result<Vec<f32>>` (raw code, no prefix), `encode_query(&str) -> Result<Vec<f32>>` (RECORDED prefix prepended), `embedding_dim() -> usize` (RECORDED), `for_indexing`/`new`/`global` constructors. Internal: tokenize → run → mean-pool over attention mask → L2-normalize. Plus `quantize_int8(&[f32]) -> (Vec<i8>, f32)` + `dequantize_int8(&[i8], f32) -> Vec<f32>` (symmetric per-vector scalar quant).
 
-- **Create `crates/semantex-core/src/search/simd.rs`** — distance kernels (S2's local copy; S6 may later replace the body). `dot_f32(&[f32],&[f32]) -> f32`, `cosine_f32`, plus `dot_i8(&[i8],&[i8]) -> i32`. Scalar now; `#[inline]`, documented as the swap-in point for S6 SIMD. (If S6 has already landed `search::simd`, SKIP creating this file and import S6's instead — Task 5 notes the check.)
+- **Create `crates/semantex-core/src/search/simd.rs`** — distance kernels (S2's local copy; S6 may later replace the body). `dot_f32(&[f32],&[f32]) -> f32`, `cosine_f32`, plus `dot_i8(&[i8],&[i8]) -> f32` (S6-locked signature: integer accumulator returned `as f32`). Scalar now; `#[inline]`, documented as the swap-in point for S6 SIMD. (If S6 has already landed `search::simd`, SKIP creating this file and import S6's instead — Task 5 notes the check.)
 
 - **Create `crates/semantex-core/src/index/hnsw_index.rs`** — the backend. `HnswParams` (M/ef_construction/ef_search/rescore_k + presets), `HnswDenseIndex` (on-disk int8 vectors + graph + chunk_id map), `CoderankHnswBackend` (impl `DenseBackend`), `CoderankHnswIndexBuilder` (impl `DenseIndexBuilder`). Brute-force fallback below `HNSW_MIN_VECTORS`; ANN→fp32-rescore query path; streaming encode→insert build. The HNSW crate calls are RECORDED from Spike 2.
 
@@ -543,7 +547,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Create: `crates/semantex-core/src/search/simd.rs`
 - Modify: `crates/semantex-core/src/search/mod.rs`
 
-> **First check:** if S6 has already created `crates/semantex-core/src/search/simd.rs`, SKIP this task entirely — verify it exposes `dot_f32`, `cosine_f32`, `dot_i8` with the signatures below; if it does, just reference them in Task 7. Only create the file if it is absent.
+> **First check:** if S6 has already created `crates/semantex-core/src/search/simd.rs`, SKIP this task entirely — verify it exposes all **five** locked kernels with their integration-doc §3-item-5 signatures: `dot_f32(&[f32],&[f32]) -> f32`, `cosine_f32(&[f32],&[f32]) -> f32` (cosine similarity), `l2_f32(&[f32],&[f32]) -> f32`, `dot_i8(&[i8],&[i8]) -> f32`, and `cosine_i8(&[i8],&[i8]) -> f32`. If S6's file has all five, just reference them in Task 7 (S2 needs `dot_f32`/`cosine_f32`/`dot_i8`; the other two come along for free). Only create the file if it is absent. **Ordering note:** if S2's local simd shim lands BEFORE S6, S6 MODIFIES (not re-creates) this file — it swaps the bodies in and adds `l2_f32`/`cosine_i8` behind the same signatures; do not let S6 clobber the S2 shim.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -572,13 +576,16 @@ pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
     dot / denom
 }
 
-/// Integer dot product of two equal-length i8 slices (for scoring quantized
-/// vectors before fp32 rescore). Accumulates in i32 — for 768-dim int8 the max
-/// magnitude is 768 * 127 * 127 ≈ 1.2e7, well within i32.
+/// Dot product of two equal-length i8 slices (for scoring quantized vectors
+/// before fp32 rescore). Accumulates in i32 then returns `as f32` — for 768-dim
+/// int8 the max magnitude is 768 * 127 * 127 ≈ 1.2e7, well within i32 AND within
+/// f32's exact-integer range (2^24 ≈ 1.7e7), so the `as f32` cast is lossless.
+/// Returns `f32` to match the S6-locked kernel signature (integration §3 item 5).
 #[inline]
-pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+pub fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
     assert_eq!(a.len(), b.len(), "dot_i8 length mismatch");
-    a.iter().zip(b).map(|(&x, &y)| i32::from(x) * i32::from(y)).sum()
+    let acc: i32 = a.iter().zip(b).map(|(&x, &y)| i32::from(x) * i32::from(y)).sum();
+    acc as f32
 }
 
 #[cfg(test)]
@@ -598,8 +605,9 @@ mod tests {
 
     #[test]
     fn dot_i8_basic() {
-        assert_eq!(dot_i8(&[1, 2, 3], &[4, 5, 6]), 32);
-        assert_eq!(dot_i8(&[127, -127], &[127, 127]), 127 * 127 - 127 * 127);
+        // dot_i8 returns f32 (S6-locked); exact-integer values compare cleanly.
+        assert!((dot_i8(&[1, 2, 3], &[4, 5, 6]) - 32.0_f32).abs() < 1e-6);
+        assert_eq!(dot_i8(&[127, -127], &[127, 127]), 0.0_f32); // 127*127 - 127*127
     }
 }
 ```
@@ -1114,13 +1122,13 @@ impl Int8VectorStore {
     /// cosine for L2-normalized inputs) then keeps the fp32-equivalent score.
     fn brute_force(&self, query: &[f32], k: usize) -> Vec<DenseHit> {
         let (q8, _qs) = quantize_int8(query);
-        let mut scored: Vec<(usize, i32)> = self
+        let mut scored: Vec<(usize, f32)> = self
             .vectors
             .iter()
             .enumerate()
             .map(|(i, v)| (i, dot_i8(&q8, v)))
             .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k.max(1));
         let positions: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
         // Always fp32-rescore the brute-force shortlist for exact ranking.
@@ -1516,6 +1524,147 @@ Expected: PASS — builder name/empty-build, persist round-trip, and `positional
 ```bash
 git add crates/semantex-core/src/index/hnsw_index.rs
 git commit -m "feat(index): CoderankHnswBackend + builder (persist, streaming build, ANN/brute-force) (S2)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8b: implement the S1 vector-accessor seam (`embed_text_vector` / `embed_doc_vectors`)
+
+S1's `DenseBackend` trait declares two more methods with default `None` (integration §3 item 2 + §4 D-mmr-cache): `embed_text_vector` (the EXACT query vector) and `embed_doc_vectors` (the EXACT stored doc vectors for given chunk ids). S7's MMR diversifier + semantic cache rely on these returning real vectors on the `coderank-hnsw` backend. PLAID can't (late-interaction has no single doc vector → it keeps the `None` default), but our single-vector backend MUST override both to return `Some(...)`. This task adds the two overrides to the existing `impl DenseBackend for CoderankHnswBackend` (the impl block created in Task 8) plus the `Int8VectorStore` dequantize-by-id helper they delegate to.
+
+**Files:**
+- Modify: `crates/semantex-core/src/index/hnsw_index.rs`
+
+- [ ] **Step 1: Write the failing test**
+
+Add to the `#[cfg(test)] mod tests` block in `hnsw_index.rs` (the store helper is model-free, so this unit test runs in the default suite; the end-to-end backend assertion is the `#[ignore]` gate added in Task 12):
+
+```rust
+    #[test]
+    fn vectors_for_dequantizes_stored_ids_and_skips_missing() {
+        // Build a tiny store; read back two present ids + one absent id.
+        let mut store = Int8VectorStore { dim: 3, ..Default::default() };
+        let (q10, s10) = quantize_int8(&[0.6, 0.8, 0.0]);
+        let (q20, s20) = quantize_int8(&[0.0, 0.6, 0.8]);
+        store.push(10, q10, s10);
+        store.push(20, q20, s20);
+
+        // Requested order is honored; the absent id (99) is skipped, not faked.
+        let got = store.vectors_for(&[20, 99, 10]);
+        assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![20, 10]);
+
+        // Each returned vector is EXACTLY the dequantization of the stored row
+        // (round-trips the stored ids) and has the store's dim.
+        for (id, v) in &got {
+            assert_eq!(v.len(), store.dim);
+            let row = store.chunk_ids.iter().position(|c| c == id).unwrap();
+            let expected = dequantize_int8(&store.vectors[row], store.scales[row]);
+            assert_eq!(v, &expected, "vectors_for must round-trip the stored int8 row");
+        }
+    }
+
+    /// End-to-end on a tiny built index: BOTH accessor methods return `Some`
+    /// with `EMBEDDING_DIM`-length vectors, and `embed_doc_vectors` round-trips
+    /// the stored ids. `#[ignore]` — needs the CodeRankEmbed model download.
+    #[test]
+    #[ignore]
+    fn vector_accessor_methods_return_some_on_built_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("dense");
+        let model_dir =
+            crate::embedding::single_vector_model::ensure_coderank_model(&tmp.path().join("models"))
+                .expect("model provisions");
+
+        // Build a 2-doc index through the real builder (encodes + quantizes).
+        let mut b = CoderankHnswIndexBuilder::new(&dir, HnswParams::default())
+            .with_models_dir(tmp.path().join("models"));
+        b.build(&[(7, "fn parse_int(s:&str)->i64 { s.parse().unwrap() }"), (9, "def add(a,b): return a+b")])
+            .unwrap();
+
+        let backend = CoderankHnswBackend::open(&dir, &model_dir, HnswParams::default()).unwrap();
+
+        // embed_text_vector → Some, L2-normalized, right dim.
+        let qv = backend.embed_text_vector("parse an integer").expect("Some on coderank-hnsw");
+        assert_eq!(qv.len(), SingleVectorEmbedder::embedding_dim());
+        let norm: f32 = qv.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "query vector must be L2-normalized, got {norm}");
+
+        // embed_doc_vectors → Some, present ids round-trip with right dim.
+        let dv = backend.embed_doc_vectors(&[9, 7, 404]).expect("Some on coderank-hnsw");
+        assert_eq!(dv.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![9, 7]); // 404 absent → skipped
+        assert!(dv.iter().all(|(_, v)| v.len() == SingleVectorEmbedder::embedding_dim()));
+    }
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p semantex-core index::hnsw_index::tests::vectors_for 2>&1 | tail -20`
+Expected: FAIL — `no method named 'vectors_for' found for struct 'Int8VectorStore'`. (The `#[ignore]` `vector_accessor_methods_return_some_on_built_index` test won't compile yet either: `embed_text_vector`/`embed_doc_vectors` are still the trait defaults, not overridden.)
+
+- [ ] **Step 3: Write minimal implementation**
+
+**(a)** Add the dequantize-by-id helper to `impl Int8VectorStore` in `hnsw_index.rs` (next to `brute_force`/`fp32_rescore`):
+
+```rust
+    /// Dequantize the stored int8 vectors for the given `chunk_ids` back to f32,
+    /// preserving the requested order and SKIPPING any id not present (no faked
+    /// rows). Powers `DenseBackend::embed_doc_vectors` (S7 MMR + semantic cache).
+    fn vectors_for(&self, chunk_ids: &[u64]) -> Vec<(u64, Vec<f32>)> {
+        use std::collections::HashMap;
+        let pos: HashMap<u64, usize> = self
+            .chunk_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+        chunk_ids
+            .iter()
+            .filter_map(|id| {
+                let &i = pos.get(id)?;
+                Some((*id, dequantize_int8(&self.vectors[i], self.scales[i])))
+            })
+            .collect()
+    }
+```
+
+**(b)** Add the two trait-method overrides to the existing `impl DenseBackend for CoderankHnswBackend` block (the one created in Task 8, alongside `name`/`search`/`search_with_subset`/`positional_chunk_ids`). They are VERBATIM the S1-declared signatures; both return `Some(...)` for this backend (never `None`):
+
+```rust
+    /// EXACT query vector for S7's MMR + semantic cache (integration §3 item 2 +
+    /// §4 D-mmr-cache). Encodes the query via the single-vector encoder
+    /// (CodeRankEmbed), already L2-normalized by `encode_query`. `Some` always on
+    /// this backend; `None` only if the encoder errors (e.g. model unavailable).
+    fn embed_text_vector(&self, query: &str) -> Option<Vec<f32>> {
+        self.embedder.encode_query(query).ok()
+    }
+
+    /// EXACT stored doc vectors for `chunk_ids`: dequantize the int8 vectors held
+    /// in the `Int8VectorStore` back to f32 (integration §3 item 2 + §4
+    /// D-mmr-cache). Ids not present are skipped. `Some` always on this backend.
+    fn embed_doc_vectors(&self, chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> {
+        Some(self.index.store.vectors_for(chunk_ids))
+    }
+```
+
+(`self.index.store` is the same-module private field set in Task 8; `encode_query` L2-normalizes per Task 6's `encode_text`. `embed_text_vector` returns `None` only on an encoder error — it never returns a hardcoded `None`, satisfying the integration-doc "Some(...) on coderank-hnsw" contract for the normal path.)
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p semantex-core index::hnsw_index::tests::vectors_for 2>&1 | tail -20`
+Expected: PASS — `vectors_for` round-trips the present ids in request order and skips the absent one.
+
+Then the model-dependent gate (asserts both methods return `Some` with `EMBEDDING_DIM`-length vectors on a real built index):
+
+Run: `cargo test -p semantex-core index::hnsw_index::tests::vector_accessor_methods_return_some_on_built_index -- --ignored --nocapture 2>&1 | tail -20`
+Expected: PASS — `embed_text_vector` returns a unit-norm `EMBEDDING_DIM` vector; `embed_doc_vectors` returns the present ids (`[9, 7]`, `404` skipped) each `EMBEDDING_DIM` long.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/semantex-core/src/index/hnsw_index.rs
+git commit -m "feat(index): implement S1 embed_text_vector/embed_doc_vectors seam on coderank-hnsw (S2)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -2080,17 +2229,18 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - ✅ "Config/env: SEMANTEX_DENSE_BACKEND, SEMANTEX_HNSW_EF_SEARCH, SEMANTEX_HNSW_PRESET, SEMANTEX_DENSE_RESCORE_K" → `SEMANTEX_DENSE_BACKEND` is S1's; the other three added in Task 9.
 - ✅ "May use S6 SIMD; start scalar, swap later" → Task 5 (scalar `search/simd.rs` with S6 swap-in note + skip-if-present check); Task 7/8 import it.
 - ✅ "Acceptance: indexes benchmark repos within RSS budget; on S0 harness coderank-hnsw Recall@10/nDCG@10 ≥ colbert-plaid" → Task 12 (end-to-end + determinism, RSS via `check_rss_or_abort` in the build loop) + Task 13 Step 5 (the exact S0 env-var call shape). The numeric leaderboard A/B is S0's job (env-selected), per its plan — this stream makes the path measurable.
-- ✅ LOCKED S1 interfaces: `DenseHit = ScoredChunkId` (5-field) used throughout; `DenseBackend`/`DenseIndexBuilder` signatures matched exactly; `DenseBackendKind::CoderankHnsw` added (name+parse); on-disk `.semantex/dense/coderank-hnsw/`; `positional_chunk_ids() → None` (G5) with documented subset degradation; schema → 11 (G3).
+- ✅ "S1 vector-accessor seam for S7 MMR + semantic cache (integration §3 item 2 + §4 D-mmr-cache): `coderank-hnsw` must override `embed_text_vector`/`embed_doc_vectors` to return EXACT vectors" → Task 8b (`embed_text_vector` = single-vector encoder, L2-normalized; `embed_doc_vectors` = dequantized stored int8 vectors via `Int8VectorStore::vectors_for`; both `Some(...)`, never `None`).
+- ✅ LOCKED S1 interfaces: `DenseHit = ScoredChunkId` (5-field) used throughout; `DenseBackend`/`DenseIndexBuilder` signatures matched exactly (incl. `embed_text_vector`/`embed_doc_vectors`, overridden in Task 8b); `dot_i8 -> f32` (S6-locked, integration §3 item 5); `DenseBackendKind::CoderankHnsw` added (name+parse); on-disk `.semantex/dense/coderank-hnsw/`; `positional_chunk_ids() → None` (G5) with documented subset degradation; schema → 11 (G3).
 
 **2. Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". The only intentional substitution points are the **RECORDED-from-spike** values (Spike 1 model constants; Spike 2 HNSW API) — these are explicitly marked, the spikes are the FIRST tasks, and the brute-force path keeps the crate compiling+correct before the HNSW-API substitution. `PlaceholderGraph` is a real, named, compiling stand-in (not a hand-wave) with a one-line doc explaining its lifecycle.
 
 **3. Type consistency:**
-- `DenseHit` / `ScoredChunkId` (5-field, via `ScoredChunkId::new`) everywhere; `DenseBackend`/`DenseIndexBuilder` method shapes identical to S1 and to the `CoderankHnsw*` impls and the `builder.rs`/`hybrid.rs` call sites.
-- `SingleVectorEmbedder`: `new`/`for_indexing`/`global`/`encode_document`/`encode_query`/`embedding_dim`/`is_initialized` — same names used in `hnsw_index.rs` and `builder.rs`.
-- `Int8VectorStore` fields (`dim/scales/vectors/chunk_ids`) + `push`/`brute_force`/`fp32_rescore`/`clone_for_persist` — consistent across Tasks 7 & 8.
+- `DenseHit` / `ScoredChunkId` (5-field, via `ScoredChunkId::new`) everywhere; `DenseBackend`/`DenseIndexBuilder` method shapes identical to S1 and to the `CoderankHnsw*` impls and the `builder.rs`/`hybrid.rs` call sites. The two extra `DenseBackend` accessors (`embed_text_vector`/`embed_doc_vectors`) are overridden in Task 8b with the verbatim S1 signatures (`Option<Vec<f32>>` / `Option<Vec<(u64, Vec<f32>)>>`).
+- `SingleVectorEmbedder`: `new`/`for_indexing`/`global`/`encode_document`/`encode_query`/`embedding_dim`/`is_initialized` — same names used in `hnsw_index.rs` (incl. Task 8b's `embed_text_vector`) and `builder.rs`.
+- `Int8VectorStore` fields (`dim/scales/vectors/chunk_ids`) + `push`/`brute_force`/`fp32_rescore`/`vectors_for`/`clone_for_persist` — consistent across Tasks 7, 8 & 8b.
 - `HnswParams` (`m/ef_construction/ef_search/rescore_k`) + `preset()` — consistent across Tasks 7, 9 (config→params), 11 (builder/hybrid).
 - `CoderankHnswBackend::NAME` and `CoderankHnswIndexBuilder::name()` both `"coderank-hnsw"`, matching `DenseBackendKind::CoderankHnsw.name()` and the on-disk subdir.
-- Kernel names `dot_f32`/`cosine_f32`/`dot_i8` consistent between `search/simd.rs` and `hnsw_index.rs`/`single_vector.rs`.
+- Kernel names `dot_f32`/`cosine_f32`/`dot_i8` consistent between `search/simd.rs` and `hnsw_index.rs`/`single_vector.rs`; `dot_i8` returns `f32` (S6-locked) and its `Vec<(usize, f32)>` consumer in `brute_force` sorts with `partial_cmp`.
 - Config fields `hnsw_ef_search: usize`, `hnsw_preset: String`, `dense_rescore_k: usize` set in Default + load + read in Task 11.
 
 ---
@@ -2100,7 +2250,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - **G3 — schema bump collision (RESOLVED here).** S1 bumps 9 → 10; S2 bumps 10 → 11. **Hard ordering dependency:** S2 Task 10 assumes S1 already moved the constant to 10 (it replaces S1's `current_schema_version_is_10` test). If S1 and S2 are merged together, do ONE bump to 11 and a single test. If S1 lands first (the intended order per §5), S2's 10→11 is clean. **S1/S2 integrators must confirm the final shipped number is 11, not two competing 10s.**
 - **S1-owned file edited by S2 (`dense_backend.rs`).** Task 9 adds the `CoderankHnsw` variant to `DenseBackendKind`. Per §5, S1 lands first; S2 then edits this file. If S1/S2 run truly concurrently, assign `dense_backend.rs` to one team or serialize this one-line enum edit (it's additive and low-conflict, but it IS a shared file). Same for the `match` arms in `hybrid.rs`/`builder.rs` (S1 creates the `match`, S2 adds an arm) — these are the §5 `hybrid.rs` contention points; S2 must rebase on S1's landed shape.
 - **G5 — `positional_chunk_ids() = None` (confirmed, documented).** The HNSW backend has no positional doc→chunk array, so the `hybrid.rs` `file_filter` subset prefilter degrades to unfiltered dense + result-merge filtering. S1 already designed the subset path to handle `None` (skip prefilter). S2's `search_with_subset` additionally post-filters a widened top-N if a subset is somehow passed, so correctness holds either way. **No S1 change needed** — just flagged so S1/S7 don't assume a positional array exists for the new backend.
+- **Vector-accessor seam for S7 (`embed_text_vector`/`embed_doc_vectors`).** S1 declares both on `DenseBackend` with a default `None` (integration §3 item 2 + §4 D-mmr-cache); Task 8b OVERRIDES both on `CoderankHnswBackend` to return `Some(...)` (exact query vector / dequantized stored doc vectors). **S7's MMR diversifier + semantic cache MUST tolerate `None`** (PLAID can't supply single doc vectors and keeps the default), but on `coderank-hnsw` they get exact f32 vectors. Flagged so S7 keys its MMR/cache off `Some` and falls back gracefully on the PLAID backend.
 - **`tokenizers` becomes a direct dependency.** It is already in the tree transitively (0.22.2 via fastembed/next-plaid-onnx), so this adds no new vendor surface, but the workspace/`Cargo.lock` owner should be aware. Confirm `features = ["onig"]` builds offline on the Linux CI box (the project's airgap constraint); if `onig` (C lib via `onig_sys`) violates the no-C/C++ rule, switch to the pure-Rust regex feature the spike confirms (`tokenizers` default uses `onig`; there is a `unstable_wasm`/`esaxx_fast`-free path — Spike 1 Step 1 should record which feature set compiles clean).
-- **S6 SIMD seam.** Task 5 creates a scalar `search/simd.rs` if S6 hasn't. If S6 owns that path, S2 should consume S6's module and skip Task 5. The kernel signatures (`dot_f32`, `cosine_f32`, `dot_i8`) are the shared contract — S6 must keep them (its parity test guards it). Flag to whoever sequences S2 vs S6.
+- **S6 SIMD seam (5 locked kernels, `dot_i8 -> f32`).** Task 5 creates a scalar `search/simd.rs` if S6 hasn't. If S6 owns that path, S2 should consume S6's module and skip Task 5. The shared contract is S6's five locked kernels with their integration-doc §3-item-5 signatures: `dot_f32 -> f32`, `cosine_f32 -> f32`, `l2_f32 -> f32`, `dot_i8 -> f32`, `cosine_i8 -> f32` (S6's parity test guards them). **Note the `dot_i8` return type is `f32`, not `i32`** — S2's scalar shim returns the integer accumulator `as f32` (lossless for ≤768-dim int8, ≤~12M ≪ 2^24), and its `brute_force` consumer uses `Vec<(usize, f32)>` + `partial_cmp`. If S2's shim lands first, S6 MODIFIES the file (swaps bodies, adds `l2_f32`/`cosine_i8`) rather than re-creating it. Flag to whoever sequences S2 vs S6.
 - **Model hosting (Task 1 Step 4) is an out-of-band artifact step.** The exported `model_int8.onnx` + `tokenizer.json` must be uploaded to a project-controlled HF repo before Task 3's downloader works end-to-end. The plan records the URL; the actual upload is a human/ops action (analogous to how `lightonai/LateOn-Code-edge` is hosted upstream). If the spec owner prefers a different host (self-hosted mirror via `SEMANTEX_*_BASE_URL`), record it and adjust `CODERANK_BASE_URL`.
 - **Acceptance numeric gate lives in S0, not here.** §4 S2's "Recall@10/nDCG@10 ≥ colbert-plaid" is measured by the S0 harness driving `SEMANTEX_DENSE_BACKEND`. S2's tests prove the path is functional/deterministic; the cutover decision (D4) is Phase 3 after the S0 A/B. No CLI flag work is needed in S2 (S0 confirmed env-var-only selection).

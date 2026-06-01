@@ -4,7 +4,7 @@
 
 **Goal:** Land the three cheap, high-leverage fusion/search polish items from spec §4 S7, each independently A/B-gated on the S0 relevance harness and shipped only if it shows no net regression: (1) **weighted-RRF** that consumes the existing per-query-type `FusionWeights` and makes the dead `config.rrf_k` field live; (2) an **MMR diversity pass** after rerank, before return, gated OFF by default behind `SEMANTEX_MMR_LAMBDA`; (3) a daemon-scoped **semantic query cache** (`search/semantic_cache.rs`) — exact-match fast path → cosine ≥ threshold over a capped LRU → reuse `(results, query_embedding)` — that MUST flush on reindex / schema-version change, with a concrete correctness test proving reindex invalidates it.
 
-**Architecture:** All three items are repo-agnostic, domain-neutral, and default-conservative (weighted-RRF behind a fusion-mode flag, MMR and the semantic cache off until A/B'd). Weighted-RRF adds a `triple_weighted_rrf_fuse` / `exp4_weighted_rrf_fuse` pair beside the existing parameter-free `triple_rrf_fuse` / `exp4_rrf_fuse` in `triple_fusion.rs`, selected by a new `FusionMode::WeightedRrf` arm; the weight contribution is `Σ wᵢ/(k + rank + 1)` with `k = config.rrf_k`. MMR is a pure function `search/mmr.rs::mmr_rerank` over `Vec<SearchResult>` slotted between Stage 3 (rerank) and Stage 4 (adaptive) in `hybrid.rs::search`, reusing per-result vectors obtained through a new optional `DenseBackend::embed_doc_vectors` seam method (default `None`, so MMR no-ops on backends without single-vector embeddings). The semantic cache is a self-contained `SemanticCache` struct owned by `HybridSearcher` (hence daemon-scoped), stamped with the index's `IndexMeta.updated_at` + `schema_version`; `HybridSearcher::search` wraps its work in an exact→cosine cache lookup and stores on miss. Both MMR's result-vector projection and the cache's query-vector projection go through a single new optional seam method `DenseBackend::embed_text_vector(&str) -> Option<Vec<f32>>` (default `None` → both features disable themselves on backends without a single-vector projection); the `embed_doc_vectors` method is the per-chunk-id variant a future vector-storing backend (S2) overrides. (The §4 S7 design names these `embed_query_vector`/`embed_doc_vectors`; this plan unifies the query/doc-text case under `embed_text_vector` since ColBERT must re-encode either way — see spec gap G1.)
+**Architecture:** All three items are repo-agnostic, domain-neutral, and default-conservative (weighted-RRF behind a fusion-mode flag, MMR and the semantic cache off until A/B'd). Weighted-RRF adds a `triple_weighted_rrf_fuse` / `exp4_weighted_rrf_fuse` pair beside the existing parameter-free `triple_rrf_fuse` / `exp4_rrf_fuse` in `triple_fusion.rs`, selected by a new `FusionMode::WeightedRrf` arm; the weight contribution is `Σ wᵢ/(k + rank + 1)` with `k = config.rrf_k`. MMR is a pure function `search/mmr.rs::mmr_rerank` over `Vec<SearchResult>` slotted between Stage 3 (rerank) and Stage 4 (adaptive) in `hybrid.rs::search`, reusing per-result vectors obtained by CONSUMING the S1-declared `DenseBackend::embed_doc_vectors` seam method (default `None`, so MMR no-ops on backends without single-vector embeddings). The semantic cache is a self-contained `SemanticCache` struct owned by `HybridSearcher` (hence daemon-scoped), stamped with the index's `IndexMeta.updated_at` + `schema_version`; `HybridSearcher::search` wraps its work in an exact→cosine cache lookup and stores on miss. Both MMR's result-vector projection and the cache's query-vector projection go through the S1-declared optional seam methods (integration §3 item 2) — `DenseBackend::embed_text_vector(&str) -> Option<Vec<f32>>` for the query/text projection and `DenseBackend::embed_doc_vectors(&[u64]) -> Option<Vec<(u64, Vec<f32>)>>` for the per-chunk-id variant — both default `None`, so MMR and the cache disable themselves on backends without a single-vector projection. **S1 owns the trait declaration AND the colbert-plaid impl; S2 owns the coderank-hnsw impl. S7 only consumes these methods — it does NOT add them to the trait.** At the MMR call site, `mmr_rerank` wants a `HashMap<u64, Vec<f32>>`, so the `Vec<(u64, Vec<f32>)>` from `embed_doc_vectors` is collected into a `HashMap` (`let doc_vecs: HashMap<u64, Vec<f32>> = backend.embed_doc_vectors(&ids)?.into_iter().collect();`). (The §4 S7 design originally named the query-embedding method `embed_query_vector`; S1's locked seam unifies the query/text case under `embed_text_vector` since ColBERT must re-encode either way — see spec gap G1.)
 
 **Tech Stack:** Rust 2024 edition, `anyhow`, `serde`/`serde_json` (for the `IndexMeta` stamp read), `parking_lot::Mutex` (already used by `HybridSearcher`), `std::collections::{HashMap, VecDeque}` for the LRU, `tempfile` + `cargo test` for tests. No new crate dependencies. Distance math is plain scalar `f32` (S6 SIMD kernels are a drop-in optimization later; this plan stays scalar so it has zero cross-stream build dependency).
 
@@ -81,13 +81,18 @@ These are quoted from the real tree at plan-authoring time. Every type/method re
   - **Semantic-cache wrap points:** `pub fn search(&self, query: &SearchQuery) -> Result<super::SearchOutput>` (line 180). The cache lookup goes at the very top of the non-grep path (after the grep-mode early return at line ~183-186); the cache store goes just before the final `Ok(super::SearchOutput { … })` (line 1162). The grep-mode path (`search_grep_mode`, line 1192) is NOT cached (it is exact+sparse, deterministic, and already cheap).
   - `fn is_exhaustive_query(query: &str) -> bool` (line 1493), `fn derive_cc_confidence(scored: &ScoredChunkId) -> (Confidence, f32)` (line 1676) bracket the post-rerank region; do not disturb them.
 
-- **`DenseBackend` trait (introduced by S1)** — `crates/semantex-core/src/search/dense_backend.rs`. After S1 lands it exposes `name(&self)`, `search(&self, query, k)`, `search_with_subset(&self, query, k, subset)`, and `positional_chunk_ids(&self) -> Option<&[u64]>` (default `None`). It has **no query-embedding accessor** — S7 adds two optional seam methods (Task 2.2 + Task 3.3). `HybridSearcher` field after S1 is `dense: Option<Box<dyn DenseBackend>>` (NOT `plaid`/`colbert`). **This plan rebases on S1; do not reintroduce `self.colbert`.**
+- **`DenseBackend` trait (introduced AND extended by S1)** — `crates/semantex-core/src/search/dense_backend.rs`. After S1 lands it exposes `name(&self)`, `search(&self, query, k)`, `search_with_subset(&self, query, k, subset)`, `positional_chunk_ids(&self) -> Option<&[u64]>` (default `None`), **and the two vector-projection seam methods S7 consumes** (integration §3 item 2, LOCKED signatures):
+  ```rust
+      fn embed_text_vector(&self, _query: &str) -> Option<Vec<f32>> { None }
+      fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> { None }
+  ```
+  **S1 owns these declarations AND the colbert-plaid impl (mean-pool + L2-normalize); S2 owns the coderank-hnsw impl. S7 does NOT add or modify these trait methods — it only CONSUMES them** (MMR call site + cache). `HybridSearcher` field after S1 is `dense: Option<Box<dyn DenseBackend>>` (NOT `plaid`/`colbert`). **This plan rebases on S1; do not reintroduce `self.colbert`, and do not re-declare the seam methods.**
 
 - **ColBERT is multi-vector.** `crates/semantex-core/src/embedding/colbert.rs:21`: `pub type TokenEmbeddings = Array2<f32>;` and `encode_query(&self, text: &str) -> Result<TokenEmbeddings>` (line 273) returns `[N_tokens, 48]`. There is **no single query vector** today. The semantic cache and MMR both need a fixed-length vector → the `ColbertPlaidBackend` seam impls mean-pool the token matrix to a single 48-dim vector + L2-normalize (Task 2.2 / 3.3). A future single-vector backend (S2 `coderank-hnsw`) returns its vector directly. (Recorded as spec gap G1 — see end.)
 
 - **Reindex / schema signals.** `crates/semantex-core/src/types.rs:178-208` — `IndexMeta { schema_version: u32, updated_at: String /* Unix epoch secs */, … }`. `index/state.rs:54` `index_age_secs` parses `updated_at` as epoch seconds. The daemon (`crates/semantex-core/src/server/mod.rs:119`) constructs ONE `HybridSearcher` via `HybridSearcher::open` for its lifetime and can swap it via `Listener::reload_searcher(HybridSearcher)` (`server/listener.rs:430-433`) on watch-triggered reindex. So a cache owned by `HybridSearcher` is daemon-scoped and is dropped when the searcher is swapped — but the spec requires an explicit, *testable* `updated_at`+`schema_version` stamp-flush (a reindex that rewrites `meta.json` in place must invalidate even without a searcher swap). The cache reads + stores that stamp (Task 3.4).
 
-- **`SemantexConfig`** (`crates/semantex-core/src/config.rs:14-98`, env overrides in `load()` lines 126-142). `#[serde(default)]`. After S1 it has a `dense_backend: String` field and a `config::env_string(key, default) -> String` helper beside `config::env_usize` (line 201). S7 adds no persisted config fields (its knobs are env-only, read at search time via `config::env_*`); the only `Default` it touches is leaving `rrf_k = 30.0` (now made live).
+- **`SemantexConfig`** (`crates/semantex-core/src/config.rs:14-98`, env overrides in `load()` lines 126-142). `#[serde(default)]`. After S1 it has a `dense_backend: String` field and a `config::env_string(key, default) -> String` helper beside `config::env_usize` (line 201). S7 adds no persisted config fields (its knobs are env-only, read at search time via `config::env_*`); the only `Default` it touches sets `rrf_k` default 30.0 → 60.0 per integration doc D-rrf-k (the parameter-free `RRF_K = 60.0` const is unchanged), and makes that field live on the weighted path.
 
 - **Agent path inherits S7 automatically.** `AgentPipeline` (`search/agent.rs:56-66`) holds `searcher: &'a HybridSearcher` and dispatches every route through `self.searcher.search(&sq)` (e.g. lines 141, 392, 426, 528, 588). MMR and the semantic cache live inside `HybridSearcher::search`, so the agent path inherits both with no extra wiring and no double-apply risk.
 
@@ -105,15 +110,13 @@ Files created or modified, one responsibility each. Organized so each sub-featur
 
 **Group B — MMR diversity pass (Tasks 2.1–2.5):**
 - **Create `crates/semantex-core/src/search/mmr.rs`** — `pub fn mmr_rerank(results: &mut Vec<SearchResult>, doc_vectors: &HashMap<u64, Vec<f32>>, lambda: f32, top_k: usize)` (greedy `λ·rel − (1−λ)·max_sim_to_selected`, O(K²), K≤top_k), `cosine(&[f32], &[f32]) -> f32`, and `pub fn mmr_lambda_from_env() -> Option<f32>` (reads `SEMANTEX_MMR_LAMBDA`; `None` = OFF). Pure functions + unit tests.
-- **Modify `crates/semantex-core/src/search/dense_backend.rs`** — add optional trait method `fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<HashMap<u64, Vec<f32>>> { None }` (default `None`). MMR no-ops when `None`.
-- **Modify `crates/semantex-core/src/search/colbert_plaid_backend.rs`** — implement `embed_doc_vectors` for `ColbertPlaidBackend` (fetch chunk content via the wrapped store-less path is N/A here → returns mean-pooled query-encoder vectors of the *content strings* it is given; see Task 2.3 for the exact contract).
+- **CONSUME the S1-declared `DenseBackend::embed_doc_vectors`** (signature LOCKED by S1: `fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> { None }`). S1 owns the trait declaration AND the colbert-plaid impl; S2 owns the coderank-hnsw impl. S7 does **not** add or modify this method on the trait — it only calls it from the MMR site. MMR no-ops when it returns `None`.
 - **Modify `crates/semantex-core/src/search/mod.rs:1-19`** — add `pub mod mmr;`.
-- **Modify `crates/semantex-core/src/search/hybrid.rs:1129-1131`** — slot the MMR pass between rerank and adaptive, gated by `mmr::mmr_lambda_from_env()` and a non-`None` `self.dense.embed_doc_vectors(...)`.
+- **Modify `crates/semantex-core/src/search/hybrid.rs:1129-1131`** — slot the MMR pass between rerank and adaptive, gated by `mmr::mmr_lambda_from_env()` and a non-`None` `self.dense.embed_doc_vectors(...)`. At the call site, convert the returned `Vec<(u64, Vec<f32>)>` into the `HashMap<u64, Vec<f32>>` that `mmr_rerank` wants: `let doc_vecs: HashMap<u64, Vec<f32>> = backend.embed_doc_vectors(&ids)?.into_iter().collect();`.
 
 **Group C — Semantic query cache (Tasks 3.1–3.7):**
 - **Create `crates/semantex-core/src/search/semantic_cache.rs`** — `pub struct SemanticCache` (capped LRU of `CacheEntry { query: String, embedding: Vec<f32>, results: Vec<SearchResult>, metrics: SearchMetrics }`), `CacheStamp { updated_at: String, schema_version: u32 }`, methods `new(capacity)`, `lookup(query, query_vec, threshold, stamp) -> Option<(Vec<SearchResult>, SearchMetrics)>` (exact-match fast path → cosine ≥ threshold linear scan; flushes self on stamp mismatch), `store(query, query_vec, results, metrics, stamp)`, `len()`, helpers `read_stamp(index_dir) -> Option<CacheStamp>`, `threshold_from_env()`, `capacity_from_env()`, `is_enabled()`. Unit tests + a daemon-style stamp-flush unit test.
-- **Modify `crates/semantex-core/src/search/dense_backend.rs`** — add optional trait method `fn embed_query_vector(&self, _query: &str) -> Option<Vec<f32>> { None }` (default `None`). Cache disables itself when `None`.
-- **Modify `crates/semantex-core/src/search/colbert_plaid_backend.rs`** — implement `embed_query_vector` for `ColbertPlaidBackend` (mean-pool + L2-normalize `encode_query`'s token matrix).
+- **CONSUME the S1-declared `DenseBackend::embed_text_vector`** (signature LOCKED by S1: `fn embed_text_vector(&self, _query: &str) -> Option<Vec<f32>> { None }`). S1 owns the declaration AND the colbert-plaid impl (mean-pool + L2-normalize `encode_query`'s token matrix); S2 owns the coderank-hnsw impl. S7 does **not** add this method — it only calls it to embed the query. The cache disables itself when it returns `None`.
 - **Modify `crates/semantex-core/src/search/mod.rs`** — add `pub mod semantic_cache;`.
 - **Modify `crates/semantex-core/src/search/hybrid.rs:24-31, 180, 1162`** — add a `semantic_cache: Mutex<SemanticCache>` + `index_dir: PathBuf` field to `HybridSearcher`; initialize in both `open` and `open_sparse_only`; wrap `search()` with lookup-at-entry / store-before-return.
 - **Create `crates/semantex-core/tests/semantic_cache_reindex_test.rs`** — the acceptance gate: index a synthetic repo, prime the cache, change a file + reindex (rewrites `meta.json` `updated_at`), assert the next identical query does NOT return stale cached results (cache invalidated by stamp change). Repo-agnostic.
@@ -132,6 +135,58 @@ The three groups are independent and may be A/B'd + shipped separately (spec S7 
 ---
 
 ## Group A — Weighted-RRF + revive adaptive weights
+
+### Task 1.0: align `config.rrf_k` default 30.0 → 60.0 (integration doc D-rrf-k)
+
+Per the authoritative integration doc §4 "D-rrf-k", the `config.rrf_k` default is aligned from 30.0 to 60.0 so the weighted-RRF A/Bs are apples-to-apples against the parameter-free RRF at `k = 60`. This is a one-field `Default` change; the parameter-free `RRF_K = 60.0` const in `triple_fusion.rs:9` is **unchanged** (it already equals 60.0). After this task, every weighted-RRF worked example/test that relies on the *default-derived* `k` uses 60.0.
+
+**Files:**
+- Modify: `crates/semantex-core/src/config.rs:82` (the `Default` value for `rrf_k`)
+
+- [ ] **Step 1: Write the failing test**
+
+Add to the `#[cfg(test)] mod tests` block in `config.rs`:
+
+```rust
+    #[test]
+    fn rrf_k_default_is_60_per_integration_doc_d_rrf_k() {
+        // Integration doc D-rrf-k: weighted-RRF default k aligns with the
+        // parameter-free RRF_K = 60.0 so A/Bs are apples-to-apples.
+        let cfg = SemantexConfig::default();
+        assert!((cfg.rrf_k - 60.0).abs() < f32::EPSILON, "rrf_k default = {}", cfg.rrf_k);
+    }
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p semantex-core config::tests::rrf_k_default_is_60_per_integration_doc_d_rrf_k 2>&1 | tail -20`
+Expected: FAIL — the default is still 30.0 (`rrf_k default = 30`).
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `config.rs`, change the `Default` value (line 82):
+
+```rust
+            rrf_k: 60.0,
+```
+
+(was `rrf_k: 30.0`).
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p semantex-core config::tests::rrf_k_default_is_60_per_integration_doc_d_rrf_k 2>&1 | tail -20`
+Expected: PASS. Then confirm no other test pinned the old 30.0 default: `cargo test -p semantex-core config::tests 2>&1 | tail -10` → green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/semantex-core/src/config.rs
+git commit -m "feat(config): align rrf_k default 30.0 -> 60.0 (integration doc D-rrf-k) (S7)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
 
 ### Task 1.1: `FusionMode::WeightedRrf` variant + env parse
 
@@ -372,8 +427,8 @@ Add to the `#[cfg(test)] mod tests` block in `triple_fusion.rs`:
         let dense = vec![s(5, 0.9)];
         let sparse = vec![s(7, 10.0)];
         let exact = vec![5u64];
-        let triple = triple_weighted_rrf_fuse(&dense, &sparse, &exact, weights, 30.0);
-        let exp4 = exp4_weighted_rrf_fuse(&dense, &sparse, &[], &[], &exact, weights, 30.0);
+        let triple = triple_weighted_rrf_fuse(&dense, &sparse, &exact, weights, 60.0);
+        let exp4 = exp4_weighted_rrf_fuse(&dense, &sparse, &[], &[], &exact, weights, 60.0);
         assert_eq!(triple.len(), exp4.len());
         assert_eq!(triple[0].channels_fired, exp4[0].channels_fired);
         assert_eq!(triple[0].channels_fired, 3);
@@ -917,18 +972,26 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 2.2: `DenseBackend::embed_doc_vectors` seam method (default None)
+### Task 2.2: confirm the S1-declared `DenseBackend::embed_doc_vectors` seam (CONSUME, do not add)
 
-**Files:**
-- Modify: `crates/semantex-core/src/search/dense_backend.rs` (add trait method + test)
-
-- [ ] **Step 1: Write the failing test**
-
-The trait method has a default `None` impl; the test asserts a stub backend inherits it. Add to the `#[cfg(test)] mod tests` block in `dense_backend.rs`:
+The MMR pass needs per-chunk vectors. The seam method it consumes — `embed_doc_vectors` — is **declared by S1** (integration §3 item 2) with this LOCKED signature on the `DenseBackend` trait:
 
 ```rust
-    /// S7: a backend that does not override `embed_doc_vectors` returns None,
-    /// so the MMR pass safely no-ops on it.
+    fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> { None }
+```
+
+**S1 owns this declaration AND the colbert-plaid impl (mean-pool + L2-normalize); S2 owns the coderank-hnsw impl.** S7 does **NOT** add or modify this method on the trait — it only calls it from the MMR site (Task 2.5). This task is a consumption-readiness check: assert a stub backend inherits the `None` default so MMR safely no-ops on backends without single-vector embeddings. No `dense_backend.rs` edit.
+
+**Files:**
+- None modified (read-only verification + a test asserting the S1 default). If S1's seam is in place this task adds only a regression test; if you choose to keep the assertion in S7's suite, place it in `dense_backend.rs` tests.
+
+- [ ] **Step 1: Write the test (asserts the S1 default — should already pass once S1 has landed)**
+
+Add to the `#[cfg(test)] mod tests` block in `dense_backend.rs`:
+
+```rust
+    /// S7 consumes (does NOT declare) the S1 seam: a backend that does not
+    /// override `embed_doc_vectors` returns None, so the MMR pass safely no-ops.
     #[test]
     fn embed_doc_vectors_defaults_to_none() {
         struct StubBackend;
@@ -940,233 +1003,49 @@ The trait method has a default `None` impl; the test asserts a stub backend inhe
             }
         }
         let b = StubBackend;
+        // S1's signature: Option<Vec<(u64, Vec<f32>)>>, default None.
         assert!(b.embed_doc_vectors(&[1, 2, 3]).is_none());
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run the test**
 
 Run: `cargo test -p semantex-core search::dense_backend::tests::embed_doc_vectors_defaults_to_none 2>&1 | tail -20`
-Expected: FAIL — `no method named embed_doc_vectors found for struct StubBackend`.
+Expected: PASS once S1 has landed (the method + its `None` default are S1's). If it fails with `no method named embed_doc_vectors`, **S1 has not merged — STOP** (this plan rebases on S1; do not add the method here).
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 3: (no implementation)**
 
-In `dense_backend.rs`, add to the `DenseBackend` trait (after `search_with_subset`, alongside S1's `positional_chunk_ids`). Ensure `use std::collections::HashMap;` is present at the top of the file (add it if S1 did not):
+There is no S7 implementation step — S1 declares the method and supplies the colbert-plaid impl. S7 only consumes it (Task 2.5).
 
-```rust
-    /// Optional: return per-chunk embedding vectors for the given `chunk_ids`,
-    /// keyed by chunk id. Used by the S7 MMR diversity pass (which needs a
-    /// fixed-length vector per result to compute pairwise cosine).
-    ///
-    /// Backends that cannot cheaply produce a single fixed-length vector per
-    /// chunk return `None` (the default) — MMR then no-ops. The colbert-plaid
-    /// backend mean-pools its token-level encoder output (Task 2.3); a future
-    /// single-vector backend returns its stored vectors directly.
-    ///
-    /// Returns `None` (not a partial map) if vectors are unavailable for any
-    /// reason, so the caller's "all-or-skip" contract holds.
-    fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<HashMap<u64, Vec<f32>>> {
-        None
-    }
-```
-
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Confirm the suite is green**
 
 Run: `cargo test -p semantex-core search::dense_backend::tests 2>&1 | tail -20`
-Expected: PASS — `embed_doc_vectors_defaults_to_none` passes; all S1 `dense_backend::tests` still pass.
+Expected: PASS — the consumption-readiness test passes; all S1 `dense_backend::tests` still pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit (only if you added the regression test)**
 
 ```bash
 git add crates/semantex-core/src/search/dense_backend.rs
-git commit -m "feat(search): optional DenseBackend::embed_doc_vectors seam for MMR (default None) (S7)
+git commit -m "test(search): assert S1 DenseBackend::embed_doc_vectors default None (S7 consumes it)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 2.3: implement `embed_doc_vectors` for `ColbertPlaidBackend`
+### Task 2.3: (removed) — colbert-plaid `embed_doc_vectors` impl is owned by S1
 
-`ColbertPlaidBackend` (from S1) wraps a `PlaidSearcher` + `&'static ColbertEmbedder` but does NOT hold the chunk store, so it cannot fetch chunk *content* by id — it only has the doc→chunk mapping and the encoder. The MMR caller therefore must pass content, OR the backend re-encodes content the caller supplies. To keep the trait minimal and backend-agnostic, the MMR call site (Task 2.5) fetches chunk content from `HybridSearcher`'s store and the backend exposes a **content-keyed** mean-pool helper. We adjust the contract: `embed_doc_vectors` is implemented to mean-pool the **already-known result content** the searcher passes via a thin wrapper. Concretely, `ColbertPlaidBackend` gains a public `mean_pooled_query_vector(&str) -> Option<Vec<f32>>` used by BOTH the MMR call site and the semantic cache (Task 3.3), and its `embed_doc_vectors` impl is a no-op `None` (it lacks the store). The MMR call site builds the vector map itself from result content via that helper.
+**This task is intentionally a no-op for S7.** The colbert-plaid single-vector projection (mean-pool + L2-normalize of `encode_query`'s token matrix) and its `embed_doc_vectors` / `embed_text_vector` impls are **declared and implemented by S1**, not S7. S7 must NOT add `mean_pool_l2`, `mean_pooled_query_vector`, or any `embed_doc_vectors` impl to `colbert_plaid_backend.rs`.
 
-> **Design note (important):** because the colbert-plaid backend cannot map `chunk_id → content` alone, its `embed_doc_vectors(&[u64])` stays `None`; MMR for colbert-plaid is driven from the call site (Task 2.5) using `mean_pooled_query_vector` over each result's `chunk.content`. A future single-vector backend that *stores* per-chunk vectors will override `embed_doc_vectors` properly. This keeps the trait honest and avoids leaking the store into the backend.
-
-**Files:**
-- Modify: `crates/semantex-core/src/search/colbert_plaid_backend.rs` (add `mean_pooled_query_vector`)
-
-- [ ] **Step 1: Write the failing test**
-
-Add to the `#[cfg(test)] mod tests` block in `colbert_plaid_backend.rs`:
-
-```rust
-    #[test]
-    fn mean_pool_l2_normalizes_a_token_matrix() {
-        // Pure helper test — no model load. Mean-pool then L2-normalize.
-        // tokens = [[3,0],[0,4]] -> mean = [1.5,2.0] -> norm = 2.5 -> [0.6,0.8].
-        use ndarray::array;
-        let tokens = array![[3.0f32, 0.0], [0.0, 4.0]];
-        let v = mean_pool_l2(&tokens).expect("non-empty matrix pools");
-        assert_eq!(v.len(), 2);
-        assert!((v[0] - 0.6).abs() < 1e-6, "v0 = {}", v[0]);
-        assert!((v[1] - 0.8).abs() < 1e-6, "v1 = {}", v[1]);
-        // unit length
-        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
-        assert!((norm - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mean_pool_empty_matrix_is_none() {
-        use ndarray::Array2;
-        let empty: Array2<f32> = Array2::zeros((0, 48));
-        assert!(mean_pool_l2(&empty).is_none());
-    }
-```
-
-**Verify `ndarray` is available to the test.** `TokenEmbeddings = Array2<f32>` (`embedding/colbert.rs:21`) re-exports `ndarray::Array2`, so `ndarray` is already a dependency of `semantex-core`. If `use ndarray::array;` fails to resolve in the test, fall back to constructing via `ndarray::arr2(&[[3.0f32, 0.0], [0.0, 4.0]])`.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p semantex-core search::colbert_plaid_backend::tests::mean_pool 2>&1 | tail -20`
-Expected: FAIL — `cannot find function mean_pool_l2 in this scope`.
-
-- [ ] **Step 3: Write minimal implementation**
-
-In `colbert_plaid_backend.rs`, add the free helper + the public method. Imports at the top need `use crate::embedding::colbert::TokenEmbeddings;` (already imported via `ColbertEmbedder` module path; add the type import explicitly):
-
-```rust
-use crate::embedding::colbert::TokenEmbeddings;
-
-/// Mean-pool a `[N_tokens, dim]` ColBERT token matrix to a single `dim`-vector
-/// and L2-normalize it. Returns `None` for an empty matrix (no tokens). This is
-/// the single-vector projection the S7 MMR pass + semantic cache use; ColBERT
-/// is natively multi-vector, so we collapse to a centroid for cosine work.
-/// (Spec gap G1: a true single-vector backend would skip this projection.)
-pub(crate) fn mean_pool_l2(tokens: &TokenEmbeddings) -> Option<Vec<f32>> {
-    let n_tokens = tokens.nrows();
-    if n_tokens == 0 {
-        return None;
-    }
-    let dim = tokens.ncols();
-    let mut pooled = vec![0.0f32; dim];
-    for row in tokens.rows() {
-        for (j, &x) in row.iter().enumerate() {
-            pooled[j] += x;
-        }
-    }
-    let inv_n = 1.0 / n_tokens as f32;
-    for p in &mut pooled {
-        *p *= inv_n;
-    }
-    let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm <= f32::EPSILON {
-        return None;
-    }
-    for p in &mut pooled {
-        *p /= norm;
-    }
-    Some(pooled)
-}
-```
-
-Add the public method to `impl ColbertPlaidBackend`:
-
-```rust
-    /// Encode `text` and project to a single L2-normalized vector via mean-pool
-    /// (S7). Used by the MMR call site and the semantic cache. Returns `None`
-    /// on encode failure or empty output — callers then skip the feature.
-    pub fn mean_pooled_query_vector(&self, text: &str) -> Option<Vec<f32>> {
-        let tokens = self.colbert.encode_query(text).ok()?;
-        mean_pool_l2(&tokens)
-    }
-```
-
-(`self.colbert` is the `&'static ColbertEmbedder` field S1 gave `ColbertPlaidBackend`.)
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p semantex-core search::colbert_plaid_backend::tests 2>&1 | tail -20`
-Expected: PASS — both mean-pool tests pass; all S1 `colbert_plaid_backend::tests` still pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/semantex-core/src/search/colbert_plaid_backend.rs
-git commit -m "feat(search): ColbertPlaidBackend mean-pooled single-vector projection for MMR/cache (S7)
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-```
+Nothing to do here. Proceed to Task 2.4 (also S1-owned) and then Task 2.5 (the actual S7 work — the MMR call site that consumes the seam).
 
 ---
 
-### Task 2.4: expose backend access + vector helper on `HybridSearcher`
+### Task 2.4: (removed) — `DenseBackend::embed_text_vector` declaration + colbert-plaid impl are owned by S1
 
-The MMR call site (Task 2.5) needs, from inside `hybrid.rs::search`, a way to turn each result's content into a vector. After S1, `self.dense: Option<Box<dyn DenseBackend>>` exposes only the trait surface — and `mean_pooled_query_vector` is a `ColbertPlaidBackend`-specific method, not on the trait. To keep this backend-agnostic and avoid downcasting, add an optional trait method `embed_text_vector` (default `None`) and implement it for `ColbertPlaidBackend` by delegating to `mean_pooled_query_vector`.
+**This task is intentionally a no-op for S7.** The `embed_text_vector` trait method (LOCKED signature `fn embed_text_vector(&self, _query: &str) -> Option<Vec<f32>> { None }`) and the colbert-plaid impl that delegates to the mean-pool projection are **declared and implemented by S1** (integration §3 item 2). S7 must NOT add `embed_text_vector` to the trait or implement it for `ColbertPlaidBackend`.
 
-**Files:**
-- Modify: `crates/semantex-core/src/search/dense_backend.rs` (add `embed_text_vector` to trait, default None)
-- Modify: `crates/semantex-core/src/search/colbert_plaid_backend.rs` (impl `embed_text_vector`)
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `dense_backend.rs` tests:
-
-```rust
-    #[test]
-    fn embed_text_vector_defaults_to_none() {
-        struct StubB;
-        impl DenseBackend for StubB {
-            fn name(&self) -> &'static str { "stub2" }
-            fn search(&self, _q: &str, _k: usize) -> Result<Vec<DenseHit>> { Ok(vec![]) }
-            fn search_with_subset(&self, _q: &str, _k: usize, _s: &[u64]) -> Result<Vec<DenseHit>> {
-                Ok(vec![])
-            }
-        }
-        assert!(StubB.embed_text_vector("anything").is_none());
-    }
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p semantex-core search::dense_backend::tests::embed_text_vector_defaults_to_none 2>&1 | tail -20`
-Expected: FAIL — `no method named embed_text_vector`.
-
-- [ ] **Step 3: Write minimal implementation**
-
-In `dense_backend.rs`, add to the `DenseBackend` trait:
-
-```rust
-    /// Optional: project an arbitrary text into this backend's single embedding
-    /// vector space (L2-normalized). Used by the S7 MMR pass (to embed result
-    /// content) and the semantic query cache (to embed the query). Backends
-    /// without a single-vector projection return `None` (default) — both
-    /// features then disable themselves for that backend.
-    fn embed_text_vector(&self, _text: &str) -> Option<Vec<f32>> {
-        None
-    }
-```
-
-In `colbert_plaid_backend.rs`, add to `impl DenseBackend for ColbertPlaidBackend`:
-
-```rust
-    fn embed_text_vector(&self, text: &str) -> Option<Vec<f32>> {
-        self.mean_pooled_query_vector(text)
-    }
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p semantex-core search::dense_backend::tests search::colbert_plaid_backend::tests 2>&1 | tail -20`
-Expected: PASS — `embed_text_vector_defaults_to_none` passes; all prior tests still pass; crate builds.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/semantex-core/src/search/dense_backend.rs crates/semantex-core/src/search/colbert_plaid_backend.rs
-git commit -m "feat(search): DenseBackend::embed_text_vector seam + colbert-plaid impl (S7)
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-```
+Nothing to do here. S7 consumes `embed_text_vector` (for the cache's query projection, Task 3.5) and `embed_doc_vectors` (for the MMR per-chunk vectors, Task 2.5) directly off the trait surface `self.dense: Option<Box<dyn DenseBackend>>` exposes — no downcasting, no S7 trait edits.
 
 ---
 
@@ -1231,29 +1110,32 @@ fn mmr_active(dense: Option<&dyn crate::search::dense_backend::DenseBackend>) ->
             if mmr_top_k >= 2
                 && let Some(ref dense) = self.dense
             {
-                // Build the per-result vector map from each result's content via
-                // the backend's single-vector projection. If any vector is
-                // missing, mmr_rerank no-ops (its all-or-skip contract).
-                let mut doc_vectors: std::collections::HashMap<u64, Vec<f32>> =
-                    std::collections::HashMap::with_capacity(mmr_top_k);
-                for r in results.iter().take(mmr_top_k) {
-                    if let Some(v) = dense.embed_text_vector(&r.chunk.content) {
-                        doc_vectors.insert(r.chunk.id, v);
-                    }
+                // Per-chunk vectors come from the S1-declared `embed_doc_vectors`
+                // seam (`Option<Vec<(u64, Vec<f32>)>>`). Collect the top-K chunk
+                // ids, ask the backend for their vectors, and fold the returned
+                // pairs into the `HashMap<u64, Vec<f32>>` that `mmr_rerank` wants.
+                // If the backend has no single-vector projection it returns None →
+                // `.map(...)` yields None and MMR no-ops.
+                let ids: Vec<u64> =
+                    results.iter().take(mmr_top_k).map(|r| r.chunk.id).collect();
+                let doc_vecs: Option<std::collections::HashMap<u64, Vec<f32>>> = dense
+                    .embed_doc_vectors(&ids)
+                    .map(|pairs| pairs.into_iter().collect());
+                if let Some(doc_vectors) = doc_vecs {
+                    let before_top = results.first().map(|r| r.chunk.id);
+                    mmr::mmr_rerank(&mut results, &doc_vectors, lambda, mmr_top_k);
+                    tracing::debug!(
+                        lambda,
+                        top_k = mmr_top_k,
+                        reordered = (results.first().map(|r| r.chunk.id) != before_top),
+                        "MMR diversity pass applied (S7)"
+                    );
                 }
-                let before_top = results.first().map(|r| r.chunk.id);
-                mmr::mmr_rerank(&mut results, &doc_vectors, lambda, mmr_top_k);
-                tracing::debug!(
-                    lambda,
-                    top_k = mmr_top_k,
-                    reordered = (results.first().map(|r| r.chunk.id) != before_top),
-                    "MMR diversity pass applied (S7)"
-                );
             }
         }
 ```
 
-**IMPORTANT:** confirm `results` is a `Vec<SearchResult>` (it is — built at lines 1039-1072 and reassigned by the rerank block at 1116-1125) and is still in scope at the insertion point. `self.dense.as_deref()` yields `Option<&dyn DenseBackend>` (matches `mmr_active`'s param). Do not move the insertion before the rerank block — MMR must run on the reranked order (relevance = post-rerank score).
+**IMPORTANT:** confirm `results` is a `Vec<SearchResult>` (it is — built at lines 1039-1072 and reassigned by the rerank block at 1116-1125) and is still in scope at the insertion point. `self.dense.as_deref()` yields `Option<&dyn DenseBackend>` (matches `mmr_active`'s param). The MMR vectors come from the S1 seam `embed_doc_vectors(&ids) -> Option<Vec<(u64, Vec<f32>)>>` — convert with `.into_iter().collect()` into the `HashMap<u64, Vec<f32>>` `mmr_rerank` expects; `None` (backend without single-vector projection) skips MMR. Do not move the insertion before the rerank block — MMR must run on the reranked order (relevance = post-rerank score).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1728,18 +1610,20 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 3.3: `DenseBackend::embed_query_vector` seam (default None)
+### Task 3.3: consume the S1-declared `DenseBackend::embed_text_vector` for the query projection
 
-The cache needs a single query vector. Group B (Task 2.4) already added `embed_text_vector(&self, text) -> Option<Vec<f32>>` to the trait + the colbert-plaid impl, which is exactly what the cache needs for the query. **If Group B landed, this task is a no-op** — reuse `embed_text_vector` for the query and skip to Task 3.4. This task exists only for the case where Group C ships WITHOUT Group B.
+The cache needs a single query vector. **S1 declares `embed_text_vector(&self, _query: &str) -> Option<Vec<f32>>` on the `DenseBackend` trait and supplies the colbert-plaid impl** (integration §3 item 2; mean-pool + L2-normalize). S7 does **NOT** add or modify this method — it only consumes it: the cache wrap (Task 3.5) calls `self.dense.as_ref().and_then(|d| d.embed_text_vector(&query.text))` to embed the query. The cache disables itself when that returns `None` (backend without a single-vector projection, or no dense backend at all).
 
-**Files:** (only if Group B did NOT land)
-- Modify: `crates/semantex-core/src/search/dense_backend.rs` + `colbert_plaid_backend.rs`
+**This task is a no-op for S7** — there is no trait edit and no colbert-plaid impl to write (both are S1's). It exists only as a checkpoint to confirm the S1 seam is present before Task 3.5 wires the cache.
 
-- [ ] **Step 1: Decide**
+**Files:**
+- None modified (S1 owns the `embed_text_vector` declaration + colbert-plaid impl).
 
-If `DenseBackend::embed_text_vector` already exists (Group B landed), **do nothing** — record "covered by Task 2.4" and move to Task 3.4. Otherwise, replicate Task 2.4's `embed_text_vector` trait method + colbert-plaid impl here verbatim (same code, same tests, same commit message but tagged for the cache), then proceed.
+- [ ] **Step 1: Confirm the S1 seam exists**
 
-- [ ] **Step 2-5:** identical to Task 2.4 if needed; otherwise skipped.
+Verify `DenseBackend::embed_text_vector` is declared by S1 (it is the same method Task 2.4 noted as S1-owned). A quick check: `grep -n "fn embed_text_vector" crates/semantex-core/src/search/dense_backend.rs` → the trait default `fn embed_text_vector(&self, _query: &str) -> Option<Vec<f32>> { None }`. If it is missing, **S1 has not merged — STOP** (this plan rebases on S1; do NOT add the method here).
+
+- [ ] **Steps 2-5:** none — Task 3.5 consumes `embed_text_vector` directly off the trait. Proceed to Task 3.4.
 
 ---
 
@@ -2198,7 +2082,7 @@ Per spec S7 acceptance, the semantic cache's gate is the **correctness test** (T
 
 ## Coordination notes (read before starting)
 
-- **Order vs S1 (spec §5):** all three groups land AFTER S1's `DenseBackend` seam refactor. This plan uses, from S1: `HybridSearcher.dense: Option<Box<dyn DenseBackend>>` (not `plaid`/`colbert`); the `DenseBackend` trait (extended here with `embed_doc_vectors`/`embed_text_vector`); `config.dense_backend` + `config::env_string`; and the schema-10 `IndexMeta` carrying `dense_backend`. If S1 has not merged, do NOT start S7 — the `hybrid.rs` edits will conflict and the trait methods have nowhere to attach.
+- **Order vs S1 (spec §5):** all three groups land AFTER S1's `DenseBackend` seam refactor. This plan uses, from S1: `HybridSearcher.dense: Option<Box<dyn DenseBackend>>` (not `plaid`/`colbert`); the `DenseBackend` trait **including the S1-declared `embed_text_vector` / `embed_doc_vectors` seam methods + their colbert-plaid impls** (integration §3 item 2 — S7 only consumes these, it does NOT declare or implement them); `config.dense_backend` + `config::env_string`; and the schema-10 `IndexMeta` carrying `dense_backend`. If S1 has not merged, do NOT start S7 — the `hybrid.rs` edits will conflict and the seam methods S7 calls (`embed_text_vector` / `embed_doc_vectors`) will not exist.
 - **`hybrid.rs` contention with S2 (spec §5):** S2 (dense channel) and S7 (fusion + MMR + cache wrap) both edit `hybrid.rs`. Per spec, assign them to the same team or serialize their edits. S7's `hybrid.rs` edits are localized: the fusion-mode `match` (Task 1.4), the MMR slot between rerank/adaptive (Task 2.5), and the search-entry/return cache wrap + struct fields (Tasks 3.4–3.5). S2 edits the dense `*_handle` channels (different regions). Rebase S7 on S2 if S2 lands first; the golden-output test S1 introduced (`tests/dense_backend_golden_test.rs`) catches any accidental dense-channel behavior drift.
 - **Use `crate::types::ScoredChunkId` (5 fields), never the §3 2-field sketch.** Every fusion fn in Group A produces/consumes it.
 - **CLAUDE.md compliance:** no hardcoded paths (tests use `TempDir`); the revived weights (`QueryType::fusion_weights`) and the new env knobs are universal/domain-neutral; no test-repo metadata; default build adds zero LLM deps (Task 3.6 Step 1 verifies). The synonym table is untouched.
@@ -2208,10 +2092,10 @@ Per spec S7 acceptance, the semantic cache's gate is the **correctness test** (T
 
 ## Spec gaps surfaced (for the controller)
 
-- **G1 — ColBERT is multi-vector; the semantic cache + MMR need a single query/doc vector.** The §4 S7 design says "embed query → cosine" and "reuse cached chunk embeddings," but the current `colbert-plaid` backend produces token-level `TokenEmbeddings = Array2<f32>` (`[N_tokens, 48]`), not a single vector, and (post-S1) `DenseBackend` exposes no embedding accessor at all. This plan resolves it by (a) adding optional `embed_text_vector`/`embed_doc_vectors` seam methods to `DenseBackend` (default `None` → both features self-disable on backends that can't provide vectors), and (b) implementing them for `ColbertPlaidBackend` via **mean-pool + L2-normalize** of the token matrix. This is a faithful single-vector projection but is NOT what ColBERT optimizes (late interaction), so MMR/cache cosine quality on the colbert-plaid backend is approximate. **On the S2 `coderank-hnsw` single-vector backend these features get a native, exact vector** — which is where their A/B wins are most likely. Recommendation: weight the Group B (MMR) and Group C (cache) A/B decisions toward the S2 backend once it exists; on colbert-plaid, treat MMR/cache as best-effort.
+- **G1 — ColBERT is multi-vector; the semantic cache + MMR need a single query/doc vector.** The §4 S7 design says "embed query → cosine" and "reuse cached chunk embeddings," but the `colbert-plaid` backend produces token-level `TokenEmbeddings = Array2<f32>` (`[N_tokens, 48]`), not a single vector. This is resolved by the **S1-declared** optional seam methods `embed_text_vector(&str) -> Option<Vec<f32>>` and `embed_doc_vectors(&[u64]) -> Option<Vec<(u64, Vec<f32>)>>` on `DenseBackend` (default `None` → both features self-disable on backends that can't provide vectors), with **S1 implementing them for `ColbertPlaidBackend`** via **mean-pool + L2-normalize** of the token matrix. S7 only consumes them. This is a faithful single-vector projection but is NOT what ColBERT optimizes (late interaction), so MMR/cache cosine quality on the colbert-plaid backend is approximate. **On the S2 `coderank-hnsw` single-vector backend these features get a native, exact vector** — which is where their A/B wins are most likely. Recommendation: weight the Group B (MMR) and Group C (cache) A/B decisions toward the S2 backend once it exists; on colbert-plaid, treat MMR/cache as best-effort.
 
-- **G2 — "reuse cached chunk embeddings" for MMR (spec §4 S7) assumes a per-chunk embedding store that does not exist today.** colbert-plaid stores quantized PLAID residuals, not retrievable fp32 chunk vectors. This plan re-encodes each top-K result's content at MMR time (K≤50, cheap) rather than reading a cache that isn't there. When S2 lands an HNSW index of int8 chunk vectors, `embed_doc_vectors` should be overridden to read those directly (true "reuse cached embeddings") instead of re-encoding — note for the S2 team.
+- **G2 — "reuse cached chunk embeddings" for MMR (spec §4 S7) assumes a per-chunk embedding store that does not exist today.** colbert-plaid stores quantized PLAID residuals, not retrievable fp32 chunk vectors. S7's MMR call site asks the backend for the top-K chunks' vectors via the S1 seam `embed_doc_vectors(&ids)`; the **S1 colbert-plaid impl** re-encodes those chunks (K≤50, cheap) rather than reading a cache that isn't there. When S2 lands an HNSW index of int8 chunk vectors, its `embed_doc_vectors` impl reads those directly (true "reuse cached embeddings") instead of re-encoding — note for the S2 team.
 
-- **G3 — `config.rrf_k` default is 30.0, but the parameter-free `RRF_K` const is 60.0.** Making `config.rrf_k` live (Group A) means weighted-RRF decays with `k=30` by default while parameter-free RRF uses `k=60`. The two paths are intentionally different (weighted is opt-in), but the controller may want to align the weighted default to 60 for apples-to-apples A/B; this plan keeps the existing `30.0` default and lets the S0 harness decide. Flag if a unified default is preferred.
+- **G3 — `config.rrf_k` default vs the parameter-free `RRF_K` const (RESOLVED).** Making `config.rrf_k` live (Group A) means weighted-RRF decays with `k = config.rrf_k` by default while parameter-free RRF uses `k = RRF_K`. **RESOLVED: default is 60.0 per integration doc D-rrf-k** — Task 1.0 aligns `config.rrf_k` default 30.0 → 60.0 so weighted-RRF and the parameter-free path both decay with `k = 60` by default, making the S0 A/Bs apples-to-apples. The const `RRF_K = 60.0` is unchanged.
 
 - **G4 — Daemon-scoped cache vs the daemon's existing searcher-swap reload.** The daemon already replaces the whole `HybridSearcher` (and thus drops the cache) on watch-triggered reindex via `Listener::reload_searcher`. The spec's explicit "flush on reindex / schema-version change" is implemented here as a redundant, *testable* `updated_at`+`schema_version` stamp-flush inside the cache — correct even if a future code path reuses a searcher across an in-place reindex. No conflict, but the controller should know the invalidation is belt-and-suspenders (searcher swap OR stamp flush), which is intentional.

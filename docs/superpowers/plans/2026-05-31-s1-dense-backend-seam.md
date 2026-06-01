@@ -14,6 +14,8 @@
 
 These are quoted from the real tree at plan-authoring time. Every type/method referenced below exists today or is introduced by an earlier task in this plan.
 
+- **Backend selection ownership (pre-S8 baseline).** Selection of the active embedder moves into S8's `ModelRegistry` per integration §4.1; this plan's `DenseBackendKind`/`SEMANTEX_DENSE_BACKEND` selection is the pre-S8 baseline S8 supersedes — see the integration doc.
+
 - **`ScoredChunkId` — REUSE the existing 5-field type, NOT the spec's 2-field sketch.** `crates/semantex-core/src/types.rs:219-241`:
   ```rust
   #[derive(Debug, Clone, Default)]
@@ -58,7 +60,7 @@ These are quoted from the real tree at plan-authoring time. Every type/method re
 
 Files created or modified, one responsibility each:
 
-- **Create `crates/semantex-core/src/search/dense_backend.rs`** — the seam. Defines `DenseBackend` (query: `name`, `search`, `search_with_subset`) and `DenseIndexBuilder` (build: `name`, `build`, `insert`, `delete`, `persist`) traits over `crate::types::ScoredChunkId`; the `DenseBackendKind` selector enum (`name()`, `from_env_or_config()`, `parse()`); the `dense_subdir(index_dir, backend) -> PathBuf` path helper; and `verify_persisted_backend_matches(index_dir, expected) -> Result<()>` (mirrors the stemmer guard). Unit tests for parse/default/path/guard live here.
+- **Create `crates/semantex-core/src/search/dense_backend.rs`** — the seam. Defines `DenseBackend` (query: `name`, `search`, `search_with_subset`, plus optional `positional_chunk_ids`/`embed_text_vector`/`embed_doc_vectors` accessors that default to `None`) and `DenseIndexBuilder` (build: `name`, `build`, `insert`, `delete`, `persist`) traits over `crate::types::ScoredChunkId`; the `DenseBackendKind` selector enum (`name()`, `from_env_or_config()`, `parse()`); the `dense_subdir(index_dir, backend) -> PathBuf` path helper; and `verify_persisted_backend_matches(index_dir, expected) -> Result<()>` (mirrors the stemmer guard). Unit tests for parse/default/path/guard live here.
 
 - **Create `crates/semantex-core/src/search/colbert_plaid_backend.rs`** — impl #1. `ColbertPlaidBackend` wraps an owned `PlaidSearcher` + `&'static ColbertEmbedder` and implements `DenseBackend` by delegating to `PlaidSearcher::search`/`search_with_subset` (byte-identical). `ColbertPlaidIndexBuilder` implements `DenseIndexBuilder` by owning the PLAID build/update logic lifted out of `builder.rs`. `name()` returns `"colbert-plaid"`. Tests: name constant, empty-subset short-circuit parity.
 
@@ -216,6 +218,17 @@ pub trait DenseBackend: Send + Sync {
     /// Restrict scoring to a candidate `subset` of chunk IDs (used by the
     /// `file_filter` prefilter). An empty subset MUST yield an empty result.
     fn search_with_subset(&self, query: &str, k: usize, subset: &[u64]) -> Result<Vec<DenseHit>>;
+
+    /// Positional doc→chunk mapping, if this backend keeps one (colbert-plaid
+    /// does; HNSW will not). Used by `hybrid.rs` to build the `file_filter`
+    /// candidate subset. Returns `None` for backends without positional docs.
+    fn positional_chunk_ids(&self) -> Option<&[u64]> {
+        None
+    }
+
+    // optional vector accessors for S7 (MMR / semantic cache); colbert-plaid provides a mean-pooled+L2-normalized projection, coderank-hnsw (S2) returns its exact int8-store vectors.
+    fn embed_text_vector(&self, _query: &str) -> Option<Vec<f32>> { None }
+    fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> { None }
 }
 
 /// Build-time dense index builder. Mirrors the dense build/update lifecycle
@@ -598,6 +611,7 @@ use crate::embedding::colbert::ColbertEmbedder;
 use crate::search::dense_backend::{DenseBackend, DenseHit, DenseIndexBuilder};
 use crate::search::plaid_search::PlaidSearcher;
 use anyhow::Result;
+use ndarray::Axis;
 use std::path::Path;
 
 /// Query-time `colbert-plaid` backend: owns a `PlaidSearcher` and a reference
@@ -614,6 +628,44 @@ mod tests {
     #[test]
     fn backend_name_is_colbert_plaid() {
         assert_eq!(ColbertPlaidBackend::NAME, "colbert-plaid");
+    }
+
+    /// S1/S7 seam: `embed_text_vector` returns a `Some(Vec<f32>)` of the model
+    /// dimension (48) for a non-empty query. Opening a real backend needs a
+    /// PLAID index + the ColBERT model, so this is `#[ignore]`'d (run with
+    /// `--ignored`); it builds a tiny synthetic repo (repo-agnostic tempdir,
+    /// no hardcoded paths) and opens the colbert-plaid backend from the
+    /// per-backend dense subdir.
+    #[test]
+    #[ignore] // builds a PLAID index + loads the ColBERT model; run with --ignored
+    fn embed_text_vector_returns_some_with_model_dim() {
+        use crate::config::SemantexConfig;
+        use crate::index::builder::IndexBuilder;
+        use crate::search::dense_backend::{DenseBackendKind, dense_subdir};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.rs"), "pub fn hello() -> u32 { 41 + 1 }\n").unwrap();
+
+        let cfg = SemantexConfig::default();
+        IndexBuilder::new(&cfg).unwrap().build(&project).unwrap();
+
+        let index_dir = project.join(".semantex");
+        let dense_dir = dense_subdir(&index_dir, DenseBackendKind::ColbertPlaid);
+        let mapping_path = dense_dir.join("plaid_mapping.bin");
+        let model_dir =
+            crate::embedding::model_manager::ensure_colbert_model(&cfg.models_dir()).unwrap();
+
+        let backend = ColbertPlaidBackend::open(&dense_dir, &mapping_path, &model_dir).unwrap();
+        let v = backend
+            .embed_text_vector("open a database connection")
+            .expect("query projection must be Some for a non-empty query");
+        // ColBERT model dim is 48 (see colbert.rs / IndexMeta.embedding_dim).
+        assert_eq!(v.len(), 48, "mean-pooled query vector must have the model dim");
+        // L2-normalized → unit length (within float tolerance).
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "projection must be L2-normalized, got norm={norm}");
     }
 }
 ```
@@ -679,6 +731,44 @@ impl DenseBackend for ColbertPlaidBackend {
         self.plaid
             .search_with_subset(self.colbert, query, k, Some(subset))
     }
+
+    /// Single-vector query projection for S7 (MMR / semantic cache): encode the
+    /// query with the same ColBERT encoder the search path uses, then
+    /// mean-pool + L2-normalize its per-token vectors into one `Vec<f32>`.
+    /// `coderank-hnsw` (S2) overrides this with its exact int8-store vectors;
+    /// colbert-plaid's mean-pool is an approximate projection of the
+    /// late-interaction representation.
+    fn embed_text_vector(&self, query: &str) -> Option<Vec<f32>> {
+        // `encode_query` returns `[N_query_tokens, dim]` (the same call the
+        // PLAID search path makes internally). Mean-pool over tokens → `[dim]`.
+        let tokens = self.colbert.encode_query(query).ok()?;
+        mean_pool_l2(&tokens)
+    }
+
+    fn embed_doc_vectors(&self, _chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>> {
+        // PLAID stores compressed/quantized residuals, not per-chunk fp32 token
+        // vectors, and this backend does not hold the ChunkStore — so a faithful
+        // per-doc projection isn't recoverable from the colbert-plaid index.
+        // Returns None; S7's doc-side features (MMR over stored doc vectors) are
+        // exact only on `coderank-hnsw`, which keeps real int8 vectors. (Per the
+        // integration doc D-mmr-cache: validate MMR/semantic-cache on S2.)
+        None
+    }
+}
+
+/// Mean-pool the per-token embedding matrix `[N_tokens, dim]` over the token
+/// axis and L2-normalize the result into a single `[dim]` vector. Returns
+/// `None` for an empty matrix (no tokens) or a degenerate zero norm.
+fn mean_pool_l2(tokens: &crate::embedding::colbert::TokenEmbeddings) -> Option<Vec<f32>> {
+    if tokens.nrows() == 0 {
+        return None;
+    }
+    let mean = tokens.mean_axis(Axis(0))?; // `[dim]`
+    let norm = mean.dot(&mean).sqrt();
+    if norm <= f32::EPSILON {
+        return None;
+    }
+    Some(mean.iter().map(|&x| x / norm).collect())
 }
 ```
 
@@ -686,6 +776,11 @@ impl DenseBackend for ColbertPlaidBackend {
 
 Run: `cargo test -p semantex-core colbert_plaid_backend::tests 2>&1 | tail -20`
 Expected: PASS — `backend_name_is_colbert_plaid` passes; crate compiles.
+
+The model-gated `embed_text_vector_returns_some_with_model_dim` test is `#[ignore]`'d. It opens the backend from the per-backend `dense/colbert-plaid/` subdir, so it passes only once the build path writes that layout (Task 9) — like the golden test (Task 8), run it after Task 9:
+
+Run: `cargo test -p semantex-core colbert_plaid_backend::tests::embed_text_vector -- --ignored --nocapture 2>&1 | tail -20`
+Expected (after Task 9): PASS — `embed_text_vector` returns `Some` with `len == 48` and unit L2 norm.
 
 - [ ] **Step 5: Commit**
 
@@ -1153,7 +1248,7 @@ pub struct HybridSearcher {
                     // ... (unchanged batch-fetch + filter.matches loop) ...
 ```
 
-**IMPORTANT — `downcast_ref` requires `Any`.** `dyn DenseBackend` is not `Any` by default. Rather than add a fallthrough method, take the simpler, behavior-preserving route: add an optional accessor to the `DenseBackend` trait that returns the positional mapping when the backend has one. Edit `dense_backend.rs` to add to the trait (and a default impl):
+**IMPORTANT — `downcast_ref` requires `Any`.** `dyn DenseBackend` is not `Any` by default. Rather than add a fallthrough method, take the simpler, behavior-preserving route: use the optional `positional_chunk_ids` accessor on the `DenseBackend` trait, which returns the positional mapping when the backend has one. That method is already declared on the trait in Task 1 (with a default `None` impl, alongside the `embed_text_vector`/`embed_doc_vectors` accessors), so no further trait edit is needed here:
 
 ```rust
     /// Positional doc→chunk mapping, if this backend keeps one (colbert-plaid
@@ -1318,7 +1413,7 @@ Expected: PASS — `test result: ok` for the lib suite.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/semantex-core/src/search/hybrid.rs crates/semantex-core/src/search/dense_backend.rs crates/semantex-core/src/search/colbert_plaid_backend.rs
+git add crates/semantex-core/src/search/hybrid.rs crates/semantex-core/src/search/colbert_plaid_backend.rs
 git commit -m "refactor(search): route hybrid dense channel through DenseBackend trait (S1)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1765,7 +1860,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Self-Review
 
 **1. Spec coverage (§4 S1 + §3):**
-- ✅ "Define in `dense_backend.rs` the `DenseBackend` + `DenseIndexBuilder` traits" → Task 1 (+ Task 4 guard, + Task 7 `positional_chunk_ids` addition).
+- ✅ "Define in `dense_backend.rs` the `DenseBackend` + `DenseIndexBuilder` traits" → Task 1 (including the optional `positional_chunk_ids` + `embed_text_vector`/`embed_doc_vectors` accessors; + Task 4 guard).
 - ✅ "`PlaidSearcher` becomes impl #1 (`colbert-plaid`), behavior-identical" → Tasks 5 (query) + 6 (build); gate in Task 8.
 - ✅ "Refactor call sites in `hybrid.rs` (dense_handle ~351-389) and `builder.rs` (PLAID block ~575-854)" → Tasks 7 + 9.
 - ✅ "Backend selection: `dense_backend` config field + `SEMANTEX_DENSE_BACKEND` env; default `colbert-plaid`" → Task 2.
@@ -1777,7 +1872,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **3. Type consistency:**
 - `ScoredChunkId` = `crate::types::ScoredChunkId` (5 fields) everywhere; `DenseHit` is a type alias for it. The traits, `ColbertPlaidBackend`, and `hybrid.rs` all use it consistently.
-- `DenseBackend` methods: `name(&self) -> &'static str`, `search(&self, query: &str, k: usize) -> Result<Vec<DenseHit>>`, `search_with_subset(&self, query: &str, k: usize, subset: &[u64]) -> Result<Vec<DenseHit>>`, `positional_chunk_ids(&self) -> Option<&[u64]>` (default `None`). Used identically in `colbert_plaid_backend.rs` and `hybrid.rs`.
+- `DenseBackend` methods: `name(&self) -> &'static str`, `search(&self, query: &str, k: usize) -> Result<Vec<DenseHit>>`, `search_with_subset(&self, query: &str, k: usize, subset: &[u64]) -> Result<Vec<DenseHit>>`, `positional_chunk_ids(&self) -> Option<&[u64]>` (default `None`), and the optional vector accessors `embed_text_vector(&self, query: &str) -> Option<Vec<f32>>` / `embed_doc_vectors(&self, chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>>` (both default `None`; declared in Task 1 for S7). `colbert-plaid` implements `embed_text_vector` (mean-pool + L2 of the ColBERT query encoding) and leaves `embed_doc_vectors`/`positional_chunk_ids`'s default behavior overridden only where it has data (`positional_chunk_ids` → `Some`; `embed_doc_vectors` → `None`). Used identically in `colbert_plaid_backend.rs` and `hybrid.rs`.
 - `DenseIndexBuilder` methods: `name`, `build(&mut self, &[(u64, &str)])`, `insert(&mut self, &[(u64, &str)])`, `delete(&mut self, &[u64])`, `persist(&self, &Path)` — all `-> Result<()>` (except `name`). Used identically in `colbert_plaid_backend.rs` and `builder.rs`.
 - `DenseBackendKind` API: `default()`, `name(self) -> &'static str`, `parse(&str) -> Option<Self>`. `dense_subdir(&Path, DenseBackendKind) -> PathBuf`. Consistent across Tasks 1, 7, 9.
 - `IndexMeta.dense_backend: String` and `SemantexConfig.dense_backend: String` — both `String`, set/read consistently (Tasks 2, 3, 9; guard in 4).
@@ -1791,4 +1886,4 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - **G2 — golden test corpus.** The gate says "golden test on the 6 indexed repos." Those live at absolute paths (`/Users/tk/dev/...`), which CLAUDE.md Hard Rule #1 forbids in `crates/`. The plan's golden test uses a synthetic tempdir repo + a committed baseline string, proving byte-identical dense ranking without hardcoded paths. A separate, machine-local benchmark over the 6 repos can live under `benchmarks/` (exempt) if desired, but it must not gate the crate test suite.
 - **G3 — schema bump number.** §1 targets v0.9 and S1 says "record active backend in meta.json"; it does not state a schema version. This plan bumps `CURRENT_SCHEMA_VERSION` 9 → 10 (S2 also "bumps the index schema version" per §4 S2 — coordinate so the two streams don't both claim "10"; if S2 lands after S1, it should bump to 11, or S1+S2 share one bump if merged together).
 - **G4 — `DenseIndexBuilder` lifecycle vs. today's builder.** The spec's `DenseIndexBuilder` has `build`/`insert`/`delete`/`persist` as separate methods. Today's PLAID code interleaves delete+insert in one incremental pass and persists the mapping at the end of each op. The adapter (Task 6) keeps that exact behavior; `persist` is a no-op for colbert-plaid because next-plaid writes eagerly. S2's HNSW backend will likely want `persist` to do real work — the trait already supports that.
-- **G5 — `positional_chunk_ids` trait method (added beyond the sketch).** The `file_filter` subset optimization in `hybrid.rs` needs the dense index's positional chunk list. The §3 sketch had no way to expose it through the trait. This plan adds `fn positional_chunk_ids(&self) -> Option<&[u64]>` (default `None`) so the subset path stays backend-agnostic. **S2's HNSW backend returns `None` here** (no positional doc array), and the subset path correctly degrades to unfiltered dense + result-merge file_filter — document this in S2.
+- **G5 — optional trait accessors (added beyond the §3 sketch, declared in Task 1).** The `file_filter` subset optimization in `hybrid.rs` needs the dense index's positional chunk list, and S7 (MMR / semantic cache) needs single-vector projections. The §3 sketch had no way to expose either through the trait. This plan declares three optional accessors on `DenseBackend` (all default `None`) in **Task 1**, per integration doc §3 item 2: `fn positional_chunk_ids(&self) -> Option<&[u64]>`, `fn embed_text_vector(&self, query: &str) -> Option<Vec<f32>>`, and `fn embed_doc_vectors(&self, chunk_ids: &[u64]) -> Option<Vec<(u64, Vec<f32>)>>`. `colbert-plaid` implements `positional_chunk_ids` (`Some`) + `embed_text_vector` (mean-pool + L2 of the ColBERT query encoding) and returns `None` for `embed_doc_vectors` (PLAID stores no recoverable per-chunk fp32 vectors). **S2's `coderank-hnsw` returns `None` for `positional_chunk_ids`** (no positional doc array; subset path degrades to unfiltered dense + result-merge file_filter) and implements `embed_text_vector`/`embed_doc_vectors` with its exact int8-store vectors — document this in S2. S7 consumes these accessors (the integration doc moves their declaration to S1 so S7 doesn't retro-patch the trait).

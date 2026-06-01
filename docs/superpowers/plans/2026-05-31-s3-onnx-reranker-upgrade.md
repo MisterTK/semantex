@@ -6,7 +6,7 @@
 
 **Architecture:** Today's reranker is `FastembedReranker` (search/fastembed_reranker.rs) wrapping `fastembed::TextRerank`, gated by `SEMANTEX_RERANKER`, selected by `select_model_from_env() -> fastembed::RerankerModel`. fastembed 5.9's `RerankerModel` enum has no entry for Qwen3-Reranker-0.6B or other new checkpoints, so we cannot route them through fastembed. We introduce a sibling `OnnxReranker` that loads `model_int8.onnx` + `tokenizer.json` directly through `ort` (the exact `Session::builder().with_execution_providers(..).with_intra_threads(..).commit_from_file(..)` + `session.run(inputs!{..})` + `try_extract_tensor::<f32>()` shape that is already proven by the `ort 2.0.0-rc.11` crate and mirrors how `embedding/colbert.rs` pins the CPU execution provider). A new `RerankerChoice` enum sits in front of both impls: the fastembed-native models (bge-v2-m3 default, bge-base, jina-v1/v2) keep going through `FastembedReranker`; the ONNX-only models (Qwen3-Reranker-0.6B; bge-reranker-v2-m3 is *also* exposed via the ONNX path as a generic-loader smoke target) go through `OnnxReranker` with a `ScoreStrategy` (`ClassifierLogit` or `YesNoLogit`). The hybrid call site swaps its `Option<FastembedReranker>` field for an `Option<RerankerEngine>` enum that exposes the same `rerank(query, docs, top_k)` signature, so `hybrid.rs` reranking logic is unchanged. The Qwen3 ONNX export is a **spike** (Task 1) that records the prompt template, the "yes"/"no" token ids, and the input/output tensor names into `docs/superpowers/plans/2026-05-31-research-notes.md`; every later ONNX task references those recorded values rather than inventing them.
 
-**Tech Stack:** Rust 2024 edition (rust-version 1.91), `anyhow`, `ort = 2.0.0-rc.11` (already a direct dep, `load-dynamic` mode), `tokenizers` (NEW direct dep, `default-features = false, features = ["onig"]` — mirrors fastembed's own usage), `ndarray` (already present), `fastembed = 5.9` (unchanged, still the bge path), `tempfile` + `cargo test` for tests. Python + `optimum`/`onnxruntime` only for the offline export spike (not a build dependency).
+**Tech Stack:** Rust 2024 edition (rust-version 1.91), `anyhow`, `ort = 2.0.0-rc.11` (already a direct dep, `load-dynamic` mode), `tokenizers` (NEW direct dep; exact feature set deferred to the Task-1 spike — **prefer the pure-Rust tokenizer path per integration §5**; `onig`/`onig_sys` are a C dep but ALREADY transitive via fastembed per `Cargo.lock`, so `onig` is acceptable only because it adds no NEW vendor surface — do not adopt it as a NEW requirement if a pure-Rust feature set tokenizes the model), `ndarray` (already present), `fastembed = 5.9` (unchanged, still the bge path), `tempfile` + `cargo test` for tests. Python + `optimum`/`onnxruntime` only for the offline export spike (not a build dependency).
 
 ---
 
@@ -28,7 +28,7 @@ These are quoted from the real tree / pinned dependency sources at plan-authorin
   - Output: `SessionOutputs` indexes by output name — `outputs["logits"]` (`Index<&str>`, `session/output.rs:189`) yields a `&DynValue`. Extract floats with `value.try_extract_tensor::<f32>() -> Result<(&Shape, &[f32])>` (`value/impl_tensor/extract.rs:156`). `Shape` is a slice-like of dims (used as `shape[shape.len()-1]` etc.).
   - **There is NO existing raw-`ort`-Session call site in semantex.** All current ONNX inference goes through `next_plaid_onnx::Colbert` (`embedding/colbert.rs`). This plan is the first direct `ort::Session` user, so the inference shape above is taken verbatim from the crate, not from in-tree precedent. The execution-provider list, however, mirrors `colbert.rs`/`fastembed_reranker.rs`: CoreML only if `SEMANTEX_COREML=1` on macOS, CUDA under `#[cfg(feature="cuda")]`, then always CPU.
 
-- **`tokenizers` API** (pinned `0.21.4`/`0.22.2` are both in `Cargo.lock` transitively; we add a direct dep): `tokenizers::Tokenizer::from_file<P: AsRef<Path>>(file) -> Result<Tokenizer, Box<dyn Error + Send + Sync>>` (`tokenizer/mod.rs:438`), `tokenizer.encode(text, add_special_tokens: bool) -> Result<Encoding, ...>` (`:827`), `Encoding::get_ids() -> &[u32]` (`encoding.rs:147`), `get_attention_mask() -> &[u32]` (`:171`), `get_type_ids() -> &[u32]` (`:151`). fastembed pulls it as `features = ["onig"], default-features = false` (`fastembed-5.9.0/Cargo.toml:179`) — we mirror that to avoid the `progressbar`/`esaxx_fast` defaults.
+- **`tokenizers` API** (pinned `0.21.4`/`0.22.2` are both in `Cargo.lock` transitively; we add a direct dep): `tokenizers::Tokenizer::from_file<P: AsRef<Path>>(file) -> Result<Tokenizer, Box<dyn Error + Send + Sync>>` (`tokenizer/mod.rs:438`), `tokenizer.encode(text, add_special_tokens: bool) -> Result<Encoding, ...>` (`:827`), `Encoding::get_ids() -> &[u32]` (`encoding.rs:147`), `get_attention_mask() -> &[u32]` (`:171`), `get_type_ids() -> &[u32]` (`:151`). fastembed pulls it as `features = ["onig"], default-features = false` (`fastembed-5.9.0/Cargo.toml:179`) — so `onig`/`onig_sys` are already in the tree transitively. We keep `default-features = false` to avoid the `progressbar`/`esaxx_fast` defaults, but the exact regex feature is deferred to the Task-1 spike: **prefer the pure-Rust path (integration §5)**; reuse `onig` only because it adds no NEW vendor surface, not as a new requirement.
 
 - **ColBERT EP-pinning precedent** (`crates/semantex-core/src/embedding/colbert.rs:166-198`): `Colbert::builder(dir).with_quantized(true).with_threads(self.threads).with_execution_provider(...)`. CoreML iff `self.use_coreml` (macOS), else `Cpu`. Threads from `SEMANTEX_ORT_THREADS` (query, default 4) / `SEMANTEX_INDEX_ORT_THREADS`. Lazy `OnceLock` session built under a `build_lock` (lines 214-234). We reuse the same lazy/`OnceLock`+`Mutex` discipline for `OnnxReranker`.
 
@@ -50,13 +50,15 @@ These are quoted from the real tree / pinned dependency sources at plan-authorin
 
 - **Permissive licenses** (spec §8): Qwen3-Reranker-0.6B = Apache-2.0; bge-reranker-v2-m3 = permissive (already shipped). jina-reranker-v3 is **NC → excluded** (D3) and must never appear in any selector. No model name is hardcoded into a production default beyond what env/selection chooses; the default stays `BGERerankerV2M3` (already in the tree).
 
+- **Reranker model SELECTION moves into S8's `ModelRegistry`** (`RerankerChoice::from_spec(registry.active_reranker())`) per integration §4.1; this plan's `SEMANTEX_RERANKER_MODEL` selection is the pre-S8 baseline S8 supersedes. The `SEMANTEX_RERANKER` master switch + off-by-default behavior are unchanged.
+
 ---
 
 ## File Structure
 
 Files created or modified, one responsibility each:
 
-- **Create `docs/superpowers/plans/2026-05-31-research-notes.md`** (Task 1 spike output) — records the Qwen3-Reranker-0.6B ONNX export facts that later tasks depend on: exact ONNX input tensor names + dtypes, output tensor name + shape, the reranker prompt template (system/instruction wrapper), and the integer token ids for `"yes"` and `"no"` under the model's tokenizer. Also records bge-reranker-v2-m3's classifier ONNX I/O names for the generic-loader smoke test. Append-only; shared with sibling streams (S2 records dense facts in the same file).
+- **Append to (create if first) `docs/superpowers/plans/2026-05-31-research-notes.md`** under a `## S3 — Reranker ONNX export contract` section; never overwrite (Task 1 spike output) — records the Qwen3-Reranker-0.6B ONNX export facts that later tasks depend on: exact ONNX input tensor names + dtypes, output tensor name + shape, the reranker prompt template (system/instruction wrapper), and the integer token ids for `"yes"` and `"no"` under the model's tokenizer. Also records bge-reranker-v2-m3's classifier ONNX I/O names for the generic-loader smoke test. Append-only; shared with sibling streams (S2 records dense facts in the same file).
 
 - **Create `crates/semantex-core/src/search/onnx_reranker.rs`** — the generic ONNX cross-encoder loader. Defines: `ScoreStrategy` enum (`ClassifierLogit`, `YesNoLogit { yes_id: i64, no_id: i64, prompt: PromptTemplate }`); `PromptTemplate` (holds the prefix/suffix strings recorded by the spike, with a `render(query, doc) -> String`); `OnnxReranker` (lazy `OnceLock<Mutex<Session>>` + owned `Tokenizer` + `ScoreStrategy` + threads/coreml flags); pure scoring helpers `classifier_score_from_logits` and `yes_no_score_from_logits` (unit-testable without a model); `score_pair(query, doc) -> Result<f32>`; `rerank(&self, query, docs, top_k) -> Result<Vec<(usize, f32)>>`. Tests: the two pure logit→score functions, prompt rendering, and an `#[ignore]`'d real-model integration test gated on `SEMANTEX_RERANKER=on`.
 
@@ -68,7 +70,7 @@ Files created or modified, one responsibility each:
 
 - **Modify `crates/semantex-core/src/search/mod.rs:1-19`** — add `pub mod onnx_reranker;`, `pub mod reranker_model;`, `pub mod reranker_engine;`, `pub mod reranker_download;`.
 
-- **Modify `crates/semantex-core/Cargo.toml:17-50`** — add `tokenizers = { version = "0.22", default-features = false, features = ["onig"] }` to `[dependencies]`.
+- **Modify `crates/semantex-core/Cargo.toml:17-50`** — add `tokenizers = { version = "0.22", default-features = false, features = [...] }` to `[dependencies]`, with the exact feature set deferred to the Task-1 spike (record the feature set that compiles offline; **prefer the pure-Rust path per integration §5**; `onig` is acceptable only because it is already a transitive dep — do not add it as a NEW requirement if a pure-Rust feature set tokenizes the model).
 
 - **Modify `crates/semantex-core/src/search/hybrid.rs:8, 28, 58, 139, 1092-1106`** — change the import + field type from `FastembedReranker` to `RerankerEngine`; lazy-load via `RerankerEngine::new_default(false)`. The rerank call (`reranker.rerank(&query.text, &docs, query.max_results)`) is unchanged because `RerankerEngine::rerank` has the identical signature.
 
@@ -97,7 +99,7 @@ Task 9 adds an explicit regression test for this. Do not regress it in any earli
 **This task produces no Rust. It records the values every later ONNX task depends on. Do it first.** Run the export offline (network + ~1.2 GB scratch); commit only the research-notes file, never the weights.
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-05-31-research-notes.md`
+- Append to (create if first): `docs/superpowers/plans/2026-05-31-research-notes.md` under a `## S3 …` section; never overwrite (sibling streams share this file — clobber risk if S2/S5's spike ran first)
 
 - [ ] **Step 1: Create a throwaway export venv and export Qwen3-Reranker-0.6B**
 
@@ -176,9 +178,9 @@ PY
 
 Expected: bge-v2-m3 inputs `input_ids`, `attention_mask` (XLM-RoBERTa has no `token_type_ids`), output `logits` shape `[batch, 1]`. **Record these names** — Task 4's classifier strategy reads the last logit.
 
-- [ ] **Step 5: Write `docs/superpowers/plans/2026-05-31-research-notes.md`**
+- [ ] **Step 5: Append to (create if first) `docs/superpowers/plans/2026-05-31-research-notes.md`**
 
-Create the file with a dedicated S3 section recording, verbatim, every value from Steps 1-4. Template (fill in REAL values, no placeholders left):
+Append a dedicated `## S3 …` section recording, verbatim, every value from Steps 1-4; **never overwrite** (sibling streams share this file — S2/S5's spike may have created it and the top-level header already). Write the top-level `# …` header only if the file does not yet exist. Template (fill in REAL values, no placeholders left):
 
 ```markdown
 # 2026-05-31 SOTA overhaul — research notes (shared across streams)
@@ -262,9 +264,14 @@ Edit `crates/semantex-core/Cargo.toml`, after the `fastembed = "5.9"` line (in `
 
 ```toml
 # Tokenizer for the generic ONNX cross-encoder reranker (search/onnx_reranker.rs).
-# Mirrors fastembed's own usage (onig, no progressbar/esaxx defaults) so we don't
-# pull indicatif twice or a C++ esaxx build. `from_file` + `encode` are all we use.
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# `from_file` + `encode` are all we use. Use the EXACT feature set the Task-1 spike
+# recorded as compiling offline. PREFER the pure-Rust tokenizer path (integration
+# §5): a pure-Rust regex feature avoids the `onig`/`onig_sys` C dep. `onig` is
+# acceptable ONLY because it is already a transitive dep (via fastembed, per
+# Cargo.lock) — so it adds no NEW vendor surface — but do not adopt `onig` as a
+# NEW requirement if a pure-Rust feature set tokenizes the model. (No progressbar/
+# esaxx defaults either way, so we don't pull indicatif twice or a C++ esaxx build.)
+tokenizers = { version = "0.22", default-features = false, features = [ /* spike-recorded; prefer pure-Rust per integration §5 */ ] }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -279,9 +286,10 @@ git add crates/semantex-core/Cargo.toml Cargo.lock crates/semantex-core/tests/to
 git commit -m "$(cat <<'EOF'
 feat(rerank): add tokenizers as a direct semantex-core dependency
 
-Needed by the upcoming generic ONNX cross-encoder reranker. Mirrors
-fastembed's feature set (onig, default-features=false) to avoid pulling
-indicatif/esaxx twice.
+Needed by the upcoming generic ONNX cross-encoder reranker. Feature set
+per the Task-1 spike, default-features=false to avoid pulling indicatif/
+esaxx; prefer the pure-Rust tokenizer path (integration §5) — onig is only
+acceptable because it is already transitive via fastembed (no new C dep).
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF

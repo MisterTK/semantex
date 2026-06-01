@@ -84,7 +84,7 @@ Phase 3 (integration):        run S0 A/B → tune → cutover decisions → sche
 
 6. **S3 selector:** the spec said "add models to `select_model_from_env`," but that fn returns `fastembed::RerankerModel` (no Qwen3). S3 introduces a `RerankerChoice` enum + `select_reranker_choice_from_env()` layer instead — same intent. The `SEMANTEX_RERANKER` master switch + off-by-default identity pass-through are preserved. **Under S8, `RerankerChoice` is built from the registry-resolved reranker spec** (`RerankerChoice::from_spec(...)`).
 
-7. **S8 model registry (selection layer):** `ModelRegistry::from_config(config, project)?` resolves the active embedder/reranker/llm `ModelSpec`; `embedder_backend_kind() -> DenseBackendKind` drives capability routing (`multi_vector=true` → ColbertPlaid, else CoderankHnsw). `IndexMeta` gains `embedder_fingerprint: String` (xxh64 of id+dims+pooling+quant+norm+prefix), stamped at build; dense on-disk layout gains the `<fingerprint>/` leaf + `ACTIVE` pointer (`active_dense_dir`/`read_active_pointer`/`write_active_pointer`/`verify_persisted_fingerprint_matches`). `toml` is added as a (pure-Rust, airgap-clean) dep. Full `ModelSpec`/`ModelCapabilities`/`ModelRegistry` signatures: see the S8 plan.
+7. **S8 model registry (selection layer):** `ModelRegistry::from_config(config, project)?` resolves the active embedder/reranker/llm `ModelSpec`; `embedder_backend_kind() -> DenseBackendKind` drives capability routing (`multi_vector=true` → ColbertPlaid, else CoderankHnsw). **Embedder spec ids are model-descriptive (`coderank-137m`, `lateon-colbert`) and are distinct from backend names (`coderank-hnsw`, `colbert-plaid`)** — the registry resolves embedder id → spec → `BackendKind` via the `multi_vector` capability. `IndexMeta` gains `embedder_fingerprint: String` (xxh64 of id+dims+pooling+quant+norm+prefix), stamped at build; dense on-disk layout gains the `<fingerprint>/` leaf + `ACTIVE` pointer (`active_dense_dir`/`read_active_pointer`/`write_active_pointer`/`verify_persisted_fingerprint_matches`). `toml` is added as a (pure-Rust, airgap-clean) dep. Full `ModelSpec`/`ModelCapabilities`/`ModelRegistry` signatures: see the S8 plan.
 
 ---
 
@@ -122,7 +122,7 @@ Phase 3 (integration):        run S0 A/B → tune → cutover decisions → sche
 ## 6. Cutover criteria (Phase 3 — the decisions the harness makes)
 
 After S2–S7 land and S0 is green, run the full A/B on the harness and decide:
-1. **Dense default (D4):** flip the default `embedder` from `colbert-plaid` to the `coderank-137m` spec (which routes to the `coderank-hnsw` backend) **only if** it meets-or-beats `colbert-plaid` on CoIR + CSN Recall@10/nDCG@10. If it loses, keep `colbert-plaid` and reassess (do **not** delete ColBERT).
+1. **Dense default (D4):** flip the default `embedder` from **`lateon-colbert`** to **`coderank-137m`** (which routes to the `coderank-hnsw` backend) **only if** it meets-or-beats `colbert-plaid` on CoIR + CSN Recall@10/nDCG@10. If it loses, keep `colbert-plaid` and reassess (do **not** delete ColBERT).
 2. **Reranker (S3):** flip the `SEMANTEX_RERANKER` default to on with the winning model **only if** net-positive nDCG@10/MRR vs rerank-off within the latency budget; else leave off.
 3. **Fusion polish (S7):** ship weighted-RRF, MMR, semantic-cache **individually** only where each is net-non-negative on the harness; gate the rest behind env.
 4. **Graph (S4):** ship the tuned decays/hops only with a measured SWE-loc lift and no CoIR/CSN regression.

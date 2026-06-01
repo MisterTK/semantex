@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Promote semantex's existing code-graph propagation from an untuned post-fusion boost to a **measured, tuned, first-class pipeline stage**. Concretely: (1) make graph propagation a named stage (`GraphStage`) with explicit, env-tunable decays and a single graph-on/off switch (`SEMANTEX_GRAPH_DISABLE`); (2) gate optional 2-hop transitive expansion per query route (architectural / exhaustive / feature-planning) via route predicates rather than only the existing `is_architectural_query` keyword check; (3) add a localization-oriented expansion preset that, after dense+sparse fusion, expands the top seeds 1–2 hops along call/import/type edges, re-scores, and tags `GraphExpanded`; (4) tune the decays + hop count on the S0 SWE-loc localization eval for best file/function Recall@{5,10} **without regressing** CoIR/CSN/in-domain. Acceptance: measurable SWE-loc Recall@{5,10} lift vs graph-off, no net regression on CoIR/CSN/in-domain.
+**Goal:** Promote semantex's existing code-graph propagation from an untuned post-fusion boost to a **measured, tuned, first-class pipeline stage**. Concretely: (1) make graph propagation a named stage (`GraphStage`) with explicit, env-tunable decays and a single graph-on/off switch (`SEMANTEX_GRAPH_DISABLE`); (2) gate optional 2-hop transitive expansion per query route (architectural / exhaustive / feature-planning) via route predicates rather than only the existing `is_architectural_query` keyword check; (3) add a localization-oriented expansion preset that, after dense+sparse fusion, expands the top seeds 1–2 hops along call/import/type edges, re-scores, and tags `GraphExpanded`; (4) tune the decays + hop count on the S0 SWE-loc localization eval for best **file-level** Recall@{5,10} **without regressing** CoIR/CSN/in-domain. Acceptance: measurable SWE-loc Recall@{5,10} lift vs graph-off, no net regression on CoIR/CSN/in-domain. (The S0 harness ships file-level recall only; function-level recall is an S0 follow-up per integration §4 D-graph — S4's gate is file-level.)
 
 **Architecture:** S4 is almost entirely a **refactor + extension of two existing files** — `crates/semantex-core/src/search/graph_propagation.rs` (the propagation algorithm + per-query-type `GraphPropagationConfig`) and `crates/semantex-core/src/search/hybrid.rs` (where `graph_propagation::propagate` runs as "Phase 6" of the post-fusion boost chain at lines ~861–913). It is **backend-agnostic**: it operates on the already-fused `Vec<ScoredChunkId>` and the SQLite graph tables (`call_graph`, `type_refs`, `type_hierarchy`, `module_edges`) via `ChunkStore`, so it works identically under `colbert-plaid` and `coderank-hnsw`. The graph edges themselves are extracted at index time by `chunking/structured_meta.rs` (`StructuredChunkMeta.calls` / `called_by` / `type_refs` / `implements` / `resolved_imports`) and resolved into `storage.rs`'s graph tables — **S4 changes none of the indexing/extraction path**, only the search-time consumption.
 
@@ -52,7 +52,7 @@ crates/semantex-core/src/search/
 
 ### Task S4.0: Record the graph-off vs graph-on SWE-loc baseline (research-only, no commit)
 
-**Files:** none (write findings to `docs/superpowers/plans/2026-05-31-research-notes.md` under a `## S4 code-graph fusion` section).
+**Files:** none (Append to (create if first): `docs/superpowers/plans/2026-05-31-research-notes.md` under a `## S4 code-graph fusion` section; never overwrite — sibling streams share this file).
 
 This is the "graph-off baseline" the acceptance gate compares against. It must be captured **before** any S4 code change, on TODAY's `main`, so the lift is attributable. It depends on the S0 harness being built (S0 Tasks through 7.x) and the SWE-bench Phase-A repos being indexed (`benchmarks/swe_bench/scripts/pre_index.py`). If the Phase-A cache is empty, the SWE-loc runner indexes on demand (S0 `ensure_index`), so the first run is slow.
 
@@ -103,7 +103,7 @@ Record CSN `mrr_at_10` / `ndcg_at_10` / `recall_at_10` as **CSN no-regression ba
 
 - [ ] **Step 4: Write the baseline table to research notes (no commit — controller commits)**
 
-Write a small table (graph-off vs graph-on-default for SWE-loc R@5/R@10/MRR@10, plus the CSN no-regression numbers) under `## S4 code-graph fusion`. **All later tuning tasks (S4.7) compare against these recorded numbers.** Leave version control to the controller.
+Append to (create if first) `docs/superpowers/plans/2026-05-31-research-notes.md` a small table (graph-off vs graph-on-default for SWE-loc R@5/R@10/MRR@10, plus the CSN no-regression numbers) under the `## S4 code-graph fusion` section; never overwrite (sibling streams share this file). **All later tuning tasks (S4.7) compare against these recorded numbers.** Leave version control to the controller.
 
 **Outputs locked after this task:** the graph-off SWE-loc baseline, the current-default SWE-loc number, and the CSN no-regression baseline — the three numbers the acceptance gate is stated against.
 
@@ -116,7 +116,7 @@ Write a small table (graph-off vs graph-on-default for SWE-loc R@5/R@10/MRR@10, 
 **Files:**
 - Modify: `crates/semantex-core/src/search/graph_propagation.rs`
 
-The current `GraphPropagationConfig` has fields `call_decay, caller_decay, type_ref_decay, transitive_decay, hierarchy_decay, max_propagated, enable_transitive` and presets `for_query_type(&QueryType, top_k)` / `architectural_mode(top_k)` / `with_env_overrides(self)`. We add: a `disabled` flag honored from `SEMANTEX_GRAPH_DISABLE`, a `hops` field (1 or 2) honored from `SEMANTEX_GRAPH_HOPS` that drives `enable_transitive`, and a `localization_mode(top_k)` preset tuned for SWE-loc-style file/function localization.
+The current `GraphPropagationConfig` has fields `call_decay, caller_decay, type_ref_decay, transitive_decay, hierarchy_decay, max_propagated, enable_transitive` and presets `for_query_type(&QueryType, top_k)` / `architectural_mode(top_k)` / `with_env_overrides(self)`. We add: a `disabled` flag honored from `SEMANTEX_GRAPH_DISABLE`, a `hops` field (1 or 2) honored from `SEMANTEX_GRAPH_HOPS` that drives `enable_transitive`, and a `localization_mode(top_k)` preset tuned for SWE-loc-style **file-level** localization (function-level recall is an S0 follow-up per integration §4 D-graph; S4's gate is file-level).
 
 - [ ] **Step 1: Write failing tests**
 
@@ -221,11 +221,12 @@ Every existing struct literal that constructs `GraphPropagationConfig` must now 
 Add the new preset after `architectural_mode`:
 
 ```rust
-    /// Localization mode: recall-oriented expansion for SWE-bench-style file/
-    /// function localization. Expands top seeds 1–2 hops along call + import/
+    /// Localization mode: recall-oriented expansion for SWE-bench-style
+    /// file-level localization. Expands top seeds 1–2 hops along call + import/
     /// type edges with generous decays and a high propagated cap so structurally
     /// related (but textually dissimilar) sites surface in the top-k. Tuned on
-    /// the S0 SWE-loc eval (S4 Task S4.7).
+    /// the S0 SWE-loc eval (S4 Task S4.7); S4's gate is file-level recall —
+    /// function-level recall is an S0 follow-up (integration §4 D-graph).
     #[must_use]
     pub fn localization_mode(top_k: usize) -> Self {
         Self {
@@ -1010,7 +1011,7 @@ EOF
 
 ### Task S4.7: Grid-tune decays + hop count on SWE-loc; verify no CoIR/CSN regression (measure-only, no crate commit)
 
-**Files:** none modified in `crates/` (tuning is env-driven). Final tuned defaults, if they differ from the shipped presets, are applied in Task S4.8. Write all measurements to `docs/superpowers/plans/2026-05-31-research-notes.md` under `## S4 code-graph fusion → tuning`.
+**Files:** none modified in `crates/` (tuning is env-driven). Final tuned defaults, if they differ from the shipped presets, are applied in Task S4.8. Append to (create if first) `docs/superpowers/plans/2026-05-31-research-notes.md` all measurements under the `## S4 code-graph fusion` section (a `→ tuning` subsection); never overwrite (sibling streams share this file).
 
 This is the measured-tuning step that satisfies spec §4 S4's acceptance gate. It uses the S0 harness exactly as in S0 Task 8.x, toggling graph behavior through the env knobs added in Task S4.1. All commands target the real harness; the comparison baselines are the numbers recorded in Task S4.0.
 
@@ -1086,7 +1087,7 @@ If the S0 CoIR loader is live on this machine (S0 Task 0.1 Step 4 may have defer
 
 - [ ] **Step 6: Write the tuning report (no commit — controller commits the research note)**
 
-Write the hop sweep, the decay grid, the winning config, and the two acceptance deltas (SWE-loc lift vs graph-off; CSN no-regression) to research notes. **Decision recorded here drives Task S4.8.** If no cell beats graph-off without regressing CSN, record that and skip Task S4.8 (ship the refactor + on/off switch only; the spec's "promote to a measured signal" is still satisfied by the named stage + measurement, with defaults unchanged).
+Append (never overwrite) the hop sweep, the decay grid, the winning config, and the two acceptance deltas (SWE-loc lift vs graph-off; CSN no-regression) to the `## S4 code-graph fusion` section of `docs/superpowers/plans/2026-05-31-research-notes.md`. **Decision recorded here drives Task S4.8.** If no cell beats graph-off without regressing CSN, record that and skip Task S4.8 (ship the refactor + on/off switch only; the spec's "promote to a measured signal" is still satisfied by the named stage + measurement, with defaults unchanged).
 
 ---
 
@@ -1139,7 +1140,7 @@ python -m scripts.run --dataset csn     --ablation hybrid --run-id s4-csn-final-
 echo "=== SWE-loc (tuned defaults, no env) ==="; cat results/s4-final-default/report.md
 echo "=== CSN (tuned defaults, no env) ==="; cat results/s4-csn-final-default/report.md
 ```
-Expected: SWE-loc `recall_at_5/10` above the S4.0 graph-off baseline **with no env set** (the gain is now the default for localization-routed queries), and CSN within noise of baseline. Record the final numbers in research notes.
+Expected: SWE-loc `recall_at_5/10` above the S4.0 graph-off baseline **with no env set** (the gain is now the default for localization-routed queries), and CSN within noise of baseline. Append the final numbers (never overwrite) to the `## S4 code-graph fusion` section of research notes.
 
 - [ ] **Step 6: Commit**
 
