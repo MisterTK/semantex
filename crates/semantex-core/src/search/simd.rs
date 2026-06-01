@@ -232,7 +232,11 @@ mod scalar {
             nb += yi * yi;
         }
         let denom = (na as f32).sqrt() * (nb as f32).sqrt();
-        if denom == 0.0 { 0.0 } else { dot as f32 / denom }
+        if denom == 0.0 {
+            0.0
+        } else {
+            dot as f32 / denom
+        }
     }
 }
 
@@ -243,23 +247,86 @@ mod scalar {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
+    use std::arch::x86_64::*;
+
+    /// Horizontal sum of an 8-lane f32 AVX register → scalar f32.
+    /// # Safety
+    /// Caller must ensure AVX2 is available (the `__m256` argument already implies it).
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256_ps(v: __m256) -> f32 {
+        unsafe {
+            // Fold the high 128 lanes onto the low 128.
+            let low = _mm256_castps256_ps128(v);
+            let high = _mm256_extractf128_ps(v, 1);
+            let sum128 = _mm_add_ps(low, high);
+            // Fold 4 → 2 → 1.
+            let shuf = _mm_movehdup_ps(sum128); // [a1,a1,a3,a3]
+            let sums = _mm_add_ps(sum128, shuf); // [a0+a1, _, a2+a3, _]
+            let hi64 = _mm_movehl_ps(shuf, sums); // bring a2+a3 to lane 0
+            let final_sum = _mm_add_ss(sums, hi64);
+            _mm_cvtss_f32(final_sum)
+        }
+    }
+
     /// # Safety
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-        super::scalar::dot_f32(a, b)
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7; // process 8 f32 at a time
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
+            while i < chunks {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                // fused multiply-add: acc += va * vb
+                acc = _mm256_fmadd_ps(va, vb, acc);
+                i += 8;
+            }
+            let mut result = hsum256_ps(acc);
+            // scalar tail
+            while i < len {
+                result += a[i] * b[i];
+                i += 1;
+            }
+            result
+        }
     }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let len = a.len();
+            let chunks = len & !7;
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
+            while i < chunks {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                let diff = _mm256_sub_ps(va, vb);
+                acc = _mm256_fmadd_ps(diff, diff, acc); // acc += diff²
+                i += 8;
+            }
+            let mut sumsq = hsum256_ps(acc);
+            while i < len {
+                let d = a[i] - b[i];
+                sumsq += d * d;
+                i += 1;
+            }
+            sumsq.sqrt()
+        }
+    }
+
+    // --- still stubs until later tasks ---
+
     /// # Safety
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
         super::scalar::cosine_f32(a, b)
-    }
-    /// # Safety
-    /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn l2_f32(a: &[f32], b: &[f32]) -> f32 {
-        super::scalar::l2_f32(a, b)
     }
     /// # Safety
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
@@ -332,10 +399,14 @@ mod tests {
 
     /// Tiny deterministic LCG → reproducible test vectors (no rand dep).
     fn make_vec(len: usize, seed: u64) -> Vec<f32> {
-        let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        let mut s = seed
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
         (0..len)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 // map high bits to [-1, 1)
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
             })
@@ -395,6 +466,26 @@ mod tests {
             let bi: Vec<i8> = b.iter().map(|x| (x * 100.0) as i8).collect();
             assert_close(dot_i8(&ai, &bi), scalar::dot_i8(&ai, &bi));
             assert_close(cosine_i8(&ai, &bi), scalar::cosine_i8(&ai, &bi));
+        }
+    }
+
+    /// x86_64-only: directly exercise the AVX2 dot/L2 kernels and assert parity with
+    /// scalar. `#[cfg]`-gated so it compiles only where the kernel exists; on aarch64
+    /// hosts this test is absent (the dispatch test covers NEON there).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_dot_l2_match_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping avx2 parity: AVX2 not present on this host");
+            return;
+        }
+        for &len in &[8usize, 15, 16, 17, 64, 768, 769] {
+            let a = make_vec(len, 0x55 ^ len as u64);
+            let b = make_vec(len, 0xAA ^ len as u64);
+            // SAFETY: AVX2 detected above; equal-length slices.
+            let (d, l) = unsafe { (avx2::dot_f32(&a, &b), avx2::l2_f32(&a, &b)) };
+            assert_close(d, scalar::dot_f32(&a, &b));
+            assert_close(l, scalar::l2_f32(&a, &b));
         }
     }
 
