@@ -16,6 +16,7 @@ pub mod query_classifier;
 pub mod query_expander;
 pub mod regex_semantic;
 pub mod ripgrep_fallback;
+pub mod simd;
 pub mod sparse_search;
 pub mod summarize;
 pub mod triple_fusion;
