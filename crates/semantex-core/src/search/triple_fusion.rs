@@ -451,6 +451,51 @@ fn accumulate_rrf_exact(scores: &mut HashMap<u64, RrfAccum>, ids: &[u64], channe
     }
 }
 
+/// Weighted variant of `accumulate_rrf_channel` (S7). Each rank contributes
+/// `weight * 1/(k + rank + 1)` instead of the parameter-free `1/(RRF_K + rank + 1)`.
+/// `weight` is the query-type per-channel weight (dense or sparse); `k` is the
+/// configurable decay constant (`config.rrf_k`). Channel-agreement tracking is
+/// identical to the unweighted path so E6 confidence labels are unaffected.
+fn accumulate_weighted_rrf_channel(
+    scores: &mut HashMap<u64, RrfAccum>,
+    ranked: &[ScoredChunkId],
+    channel_bit: u32,
+    score_field: ChannelKind,
+    weight: f32,
+    k: f32,
+) {
+    for (rank, item) in ranked.iter().enumerate() {
+        let contribution = weight * (1.0 / (k + rank as f32 + 1.0));
+        let entry = scores.entry(item.chunk_id).or_insert_with(RrfAccum::new);
+        entry.total += contribution;
+        entry.channels_hit_mask |= channel_bit;
+        match score_field {
+            ChannelKind::Dense => entry.dense += contribution,
+            ChannelKind::Sparse => entry.sparse += contribution,
+        }
+    }
+}
+
+/// Weighted variant of `accumulate_rrf_exact` (S7). The exact channel has no
+/// per-channel `FusionWeights` field (those are dense/sparse only), so callers
+/// pass an explicit `exact_weight` — `triple_weighted_rrf_fuse` uses `1.0`,
+/// preserving the exact channel's full rank-decay contribution.
+fn accumulate_weighted_rrf_exact(
+    scores: &mut HashMap<u64, RrfAccum>,
+    ids: &[u64],
+    channel_bit: u32,
+    exact_weight: f32,
+    k: f32,
+) {
+    for (rank, &id) in ids.iter().enumerate() {
+        let contribution = exact_weight * (1.0 / (k + rank as f32 + 1.0));
+        let entry = scores.entry(id).or_insert_with(RrfAccum::new);
+        entry.total += contribution;
+        entry.exact += contribution;
+        entry.channels_hit_mask |= channel_bit;
+    }
+}
+
 /// Internal: which per-channel field receives a rank contribution.
 /// The `Exact` channel uses a dedicated `accumulate_rrf_exact` path because
 /// exact-id lists have no scores; only `Dense` and `Sparse` flow through
@@ -622,6 +667,33 @@ mod tests {
 
     fn s(id: u64, score: f32) -> ScoredChunkId {
         ScoredChunkId::new(id, score)
+    }
+
+    // --- S7 weighted-RRF accumulation tests ---
+
+    #[test]
+    fn test_weighted_accumulate_scales_by_weight_and_k() {
+        // One dense channel, weight 2.0, k=30. Rank-0 contribution must be
+        // 2.0 * 1/(30+0+1) = 2/31. Rank-1 must be 2.0 * 1/(30+1+1) = 2/32.
+        let mut scores: HashMap<u64, RrfAccum> = HashMap::new();
+        let dense = vec![s(1, 0.9), s(2, 0.5)];
+        accumulate_weighted_rrf_channel(&mut scores, &dense, 0b001, ChannelKind::Dense, 2.0, 30.0);
+
+        let c1 = &scores[&1];
+        let c2 = &scores[&2];
+        assert!((c1.total - 2.0 / 31.0).abs() < 1e-6, "rank0 total = {}", c1.total);
+        assert!((c1.dense - 2.0 / 31.0).abs() < 1e-6, "rank0 dense = {}", c1.dense);
+        assert!((c2.total - 2.0 / 32.0).abs() < 1e-6, "rank1 total = {}", c2.total);
+        assert_eq!(c1.channels_hit_mask, 0b001);
+    }
+
+    #[test]
+    fn test_weighted_accumulate_exact_scales_by_weight() {
+        let mut scores: HashMap<u64, RrfAccum> = HashMap::new();
+        accumulate_weighted_rrf_exact(&mut scores, &[42, 7], 0b100, 3.0, 60.0);
+        // rank-0 (id 42): 3.0 * 1/(60+0+1) = 3/61
+        assert!((scores[&42].total - 3.0 / 61.0).abs() < 1e-6);
+        assert!((scores[&42].exact - 3.0 / 61.0).abs() < 1e-6);
     }
 
     // --- top_score_normalize tests ---
