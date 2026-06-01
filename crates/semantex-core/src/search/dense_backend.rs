@@ -210,6 +210,29 @@ pub trait DenseIndexBuilder: Send + Sync {
 mod tests {
     use super::*;
 
+    /// S7 consumes (does NOT declare) the S1 seam: a backend that does not
+    /// override `embed_doc_vectors` returns None, so the MMR pass safely no-ops.
+    #[test]
+    fn embed_doc_vectors_defaults_to_none() {
+        struct StubBackend;
+        impl DenseBackend for StubBackend {
+            fn name(&self) -> &'static str {
+                "stub"
+            }
+            fn search(&self, _q: &str, _k: usize) -> Result<Vec<DenseHit>> {
+                Ok(vec![])
+            }
+            fn search_with_subset(&self, _q: &str, _k: usize, _s: &[u64]) -> Result<Vec<DenseHit>> {
+                Ok(vec![])
+            }
+        }
+        let b = StubBackend;
+        // S1's signature: Option<Vec<(u64, Vec<f32>)>>, default None.
+        assert!(b.embed_doc_vectors(&[1, 2, 3]).is_none());
+        // And the text-vector seam (consumed by the cache) also defaults None.
+        assert!(b.embed_text_vector("anything").is_none());
+    }
+
     #[test]
     fn dense_backend_kind_default_is_colbert_plaid() {
         assert_eq!(DenseBackendKind::default(), DenseBackendKind::ColbertPlaid);
