@@ -3,11 +3,23 @@
 //! Behavior is byte-identical to the pre-seam inline PLAID code.
 
 use crate::embedding::colbert::ColbertEmbedder;
-use crate::search::dense_backend::{DenseBackend, DenseHit};
+use crate::embedding::model_manager;
+use crate::search::dense_backend::{DenseBackend, DenseHit, DenseIndexBuilder};
 use crate::search::plaid_search::PlaidSearcher;
+use crate::types::PLAID_TOMBSTONE;
 use anyhow::Result;
 use ndarray::Axis;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// PLAID UpdateConfig buffer_size — pending-doc threshold below which next-plaid
+/// writes to a buffer without full k-means (v0.4_SPEC §6.3). Mirrors the
+/// constant previously in `index/builder.rs`.
+const PLAID_BUFFER_SIZE: usize = 50;
+
+/// PLAID encode batch size. MUST stay strictly below `PLAID_BUFFER_SIZE` so a
+/// single-file incremental refresh skips k-means (v0.4.1 W-Index #12). Mirrors
+/// the constant previously in `index/builder.rs`.
+const PLAID_BATCH: usize = 32;
 
 /// Query-time `colbert-plaid` backend: owns a `PlaidSearcher` and a reference
 /// to the process-global ColBERT encoder.
@@ -103,6 +115,215 @@ fn mean_pool_l2(tokens: &crate::embedding::colbert::TokenEmbeddings) -> Option<V
     Some(mean.iter().map(|&x| x / norm).collect())
 }
 
+/// Build-time `colbert-plaid` index builder. Owns the PLAID full-rebuild and
+/// incremental update logic lifted verbatim from `index/builder.rs` so the
+/// dense build path routes through `DenseIndexBuilder`.
+///
+/// `model_dir` is resolved lazily on first `build`/`insert` (the embedder
+/// construction defers the ONNX session). `nbits` is `SemantexConfig.plaid_nbits`.
+pub struct ColbertPlaidIndexBuilder {
+    plaid_dir: PathBuf,
+    mapping_path: PathBuf,
+    models_dir: PathBuf,
+    nbits: usize,
+}
+
+impl ColbertPlaidIndexBuilder {
+    /// `index_dir` is the per-backend dense subdir (`dense/colbert-plaid/`).
+    /// The mapping sidecar lives at `<index_dir>/plaid_mapping.bin`.
+    pub fn new(index_dir: &Path, nbits: usize) -> Self {
+        Self {
+            plaid_dir: index_dir.to_path_buf(),
+            mapping_path: index_dir.join("plaid_mapping.bin"),
+            models_dir: crate::config::SemantexConfig::default().models_dir(),
+            nbits,
+        }
+    }
+
+    /// Override the models directory (so the indexer can pass the configured
+    /// `SemantexConfig.models_dir()` rather than the global default).
+    pub fn with_models_dir(mut self, models_dir: PathBuf) -> Self {
+        self.models_dir = models_dir;
+        self
+    }
+
+    fn next_plaid_configs(&self) -> (next_plaid::IndexConfig, next_plaid::UpdateConfig) {
+        let index_config = next_plaid::IndexConfig {
+            nbits: self.nbits,
+            batch_size: 1024,
+            force_cpu: true,
+            ..Default::default()
+        };
+        let update_config = next_plaid::UpdateConfig {
+            batch_size: 1024,
+            buffer_size: PLAID_BUFFER_SIZE,
+            force_cpu: true,
+            ..Default::default()
+        };
+        (index_config, update_config)
+    }
+}
+
+impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
+    fn name(&self) -> &'static str {
+        ColbertPlaidBackend::NAME
+    }
+
+    fn build(&mut self, chunks: &[(u64, &str)]) -> Result<()> {
+        use next_plaid::MmapIndex;
+
+        if chunks.is_empty() {
+            tracing::info!("No chunks to encode for PLAID index");
+            return Ok(());
+        }
+
+        let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
+        let embedder = ColbertEmbedder::for_indexing(&model_dir)?;
+        let (index_config, update_config) = self.next_plaid_configs();
+        let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
+
+        if self.plaid_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.plaid_dir);
+        }
+        std::fs::create_dir_all(&self.plaid_dir)?;
+
+        // Full rebuild: encode in small batches (memory bound), accumulate all
+        // embeddings, then ONE update_or_create call (identical to the pre-seam
+        // single-call strategy in builder.rs:646-720).
+        let mut full_mapping: Vec<u64> = Vec::with_capacity(chunks.len());
+        let mut all_embeddings: Vec<_> = Vec::with_capacity(chunks.len());
+        for batch in chunks.chunks(PLAID_BATCH) {
+            if let Err(e) = crate::memory::check_rss_or_abort("PLAID encode batch") {
+                anyhow::bail!("Indexing aborted: {e}");
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| (*c).to_string()).collect();
+            let embeddings = embedder.encode_documents(&contents)?;
+            all_embeddings.extend(embeddings);
+            full_mapping.extend(batch.iter().map(|(id, _)| *id));
+        }
+
+        if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (single call)") {
+            anyhow::bail!("Indexing aborted: {e}");
+        }
+        let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
+            &all_embeddings,
+            &plaid_dir_str,
+            &index_config,
+            &update_config,
+        )?;
+        anyhow::ensure!(
+            plaid_doc_ids.len() == full_mapping.len(),
+            "PLAID returned {} doc IDs for {} chunks — contract violated",
+            plaid_doc_ids.len(),
+            full_mapping.len(),
+        );
+        drop(all_embeddings);
+        crate::memory::purge_allocator();
+
+        let mapping_bytes = postcard::to_stdvec(&full_mapping)?;
+        std::fs::write(&self.mapping_path, mapping_bytes)?;
+        tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
+        Ok(())
+    }
+
+    fn insert(&mut self, chunks: &[(u64, &str)]) -> Result<()> {
+        use next_plaid::MmapIndex;
+
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
+        let embedder = ColbertEmbedder::for_indexing(&model_dir)?;
+        let (index_config, update_config) = self.next_plaid_configs();
+        let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
+
+        let mut mapping: Vec<u64> = if self.mapping_path.exists() {
+            postcard::from_bytes::<Vec<u64>>(&std::fs::read(&self.mapping_path)?)?
+        } else {
+            Vec::new()
+        };
+
+        for batch in chunks.chunks(PLAID_BATCH) {
+            if let Err(e) = crate::memory::check_rss_or_abort("PLAID incremental batch") {
+                anyhow::bail!("Indexing aborted: {e}");
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| (*c).to_string()).collect();
+            let embeddings = embedder.encode_documents(&contents)?;
+            let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
+                &embeddings,
+                &plaid_dir_str,
+                &index_config,
+                &update_config,
+            )?;
+            anyhow::ensure!(
+                plaid_doc_ids.len() == batch.len(),
+                "PLAID returned {} doc IDs for {} chunks — contract violated",
+                plaid_doc_ids.len(),
+                batch.len(),
+            );
+            for (&doc_id, (chunk_id, _)) in plaid_doc_ids.iter().zip(batch.iter()) {
+                anyhow::ensure!(doc_id >= 0, "PLAID returned negative doc_id {doc_id}");
+                let idx = doc_id as usize;
+                while mapping.len() <= idx {
+                    mapping.push(PLAID_TOMBSTONE);
+                }
+                mapping[idx] = *chunk_id;
+            }
+        }
+
+        std::fs::write(&self.mapping_path, postcard::to_stdvec(&mapping)?)?;
+        Ok(())
+    }
+
+    fn delete(&mut self, chunk_ids: &[u64]) -> Result<()> {
+        use next_plaid::MmapIndex;
+
+        if chunk_ids.is_empty() || !self.mapping_path.exists() {
+            return Ok(());
+        }
+        let mut mapping: Vec<u64> =
+            postcard::from_bytes::<Vec<u64>>(&std::fs::read(&self.mapping_path)?)?;
+        let removed_set: std::collections::HashSet<u64> = chunk_ids.iter().copied().collect();
+        let plaid_delete_ids: Vec<i64> = mapping
+            .iter()
+            .enumerate()
+            .filter_map(|(plaid_id, &cid)| {
+                if cid != PLAID_TOMBSTONE && removed_set.contains(&cid) {
+                    Some(plaid_id as i64)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if plaid_delete_ids.is_empty() {
+            return Ok(());
+        }
+        let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
+        match MmapIndex::load(&plaid_dir_str) {
+            Ok(mut index) => {
+                if let Err(e) = index.delete(&plaid_delete_ids) {
+                    tracing::warn!("PLAID delete failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("PLAID load for delete failed: {e}"),
+        }
+        for plaid_id in &plaid_delete_ids {
+            if let Some(slot) = mapping.get_mut(*plaid_id as usize) {
+                *slot = PLAID_TOMBSTONE;
+            }
+        }
+        std::fs::write(&self.mapping_path, postcard::to_stdvec(&mapping)?)?;
+        Ok(())
+    }
+
+    fn persist(&self, _dir: &Path) -> Result<()> {
+        // PLAID writes its index + mapping eagerly during build/insert/delete
+        // (next-plaid persists to `plaid_dir` on each update_or_create; the
+        // mapping is written at the end of each op). Nothing extra to flush.
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +331,36 @@ mod tests {
     #[test]
     fn backend_name_is_colbert_plaid() {
         assert_eq!(ColbertPlaidBackend::NAME, "colbert-plaid");
+    }
+
+    #[test]
+    fn index_builder_name_is_colbert_plaid() {
+        // A builder pointed at a temp dir; we only assert identity here (a full
+        // build needs the ColBERT model, exercised by the golden test in
+        // tests/dense_backend_golden_test.rs).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let b = ColbertPlaidIndexBuilder::new(tmp.path(), 4);
+        assert_eq!(DenseIndexBuilder::name(&b), "colbert-plaid");
+    }
+
+    #[test]
+    fn empty_build_writes_nothing_and_is_ok() {
+        // Building with zero chunks must be a no-op success (mirrors the
+        // `all_ids.is_empty()` early return in the inline PLAID code).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut b = ColbertPlaidIndexBuilder::new(tmp.path(), 4);
+        b.build(&[]).unwrap();
+        // No mapping file is written for an empty corpus.
+        assert!(!tmp.path().join("plaid_mapping.bin").exists());
+    }
+
+    #[test]
+    fn plaid_batch_strictly_below_buffer_size() {
+        assert!(
+            PLAID_BATCH < PLAID_BUFFER_SIZE,
+            "PLAID_BATCH ({PLAID_BATCH}) must be < PLAID_BUFFER_SIZE ({PLAID_BUFFER_SIZE}) \
+             so single-file incremental updates hit the buffer-only fast path"
+        );
     }
 
     /// S1/S7 seam: `embed_text_vector` returns a `Some(Vec<f32>)` of the model
