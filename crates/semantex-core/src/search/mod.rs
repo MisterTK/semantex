@@ -9,6 +9,7 @@ pub mod dense_backend;
 pub mod fastembed_reranker;
 pub mod graph_propagation;
 pub mod hybrid;
+pub mod onnx_reranker;
 pub mod path_signals;
 pub mod plaid_search;
 pub mod planner;
