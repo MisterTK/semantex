@@ -48,6 +48,35 @@ the **aggregate** — the wrong target for this hard subtask, which is why "0.28
 7. **[L, cpu-blocked] Do NOT adopt SPLADE-Code as the BM25 replacement.** +0.268 CoIR & ~50× faster query than BM25, BUT CC-BY-NC-SA-4.0 (non-commercial — disqualifying) + no ONNX + 596M encode-per-chunk indexing. BM25 stays the default sparse channel.
 8. **[L, parked] qwen3-embed-0.6b dormant** (no last-token pooling in `single_vector.rs` + 4–5× index cost); **MMR / graph dormant** (downside-only on single-gold; need a multi-gold/SWE-loc eval — CPU-infeasible to build locally → VM).
 
+## Query architecture: LateOn first-stage vs LateOn reranker (decide on real-repo data)
+
+The choice is NOT "reranker vs no reranker" — it's **how you query the LateOn multi-vector index
+you build either way** (same engineering: re-vendor next-plaid + the seam backend). Late
+interaction's CPU advantage comes entirely from **precomputing doc multi-vectors at INDEX time**,
+which forces three options:
+
+- **(A) LateOn as first-stage** — PLAID-search the whole corpus. Best recall (measured R@10 0.80
+  edge / 0.86 130M vs coderank 0.73) + precision; drops the 438 MB coderank channel (index = 23.5 MB).
+  Open question = real-repo PLAID query latency (~500 ms is a micro-corpus fixed-cost floor; should
+  amortize, not yet measured).
+- **(B) coderank first-stage → LateOn MaxSim rerank top-k** (over PRECOMPUTED LateOn vectors).
+  Likely lower query latency (coderank HNSW in ms + MaxSim over k precomputed docs) but **recall-capped
+  at coderank's recall@k**, and keeps BOTH indexes (438 MB + 23.5 MB). A latency hedge, not a separate win.
+- **(C) reranker that encodes candidates at QUERY time** — DEAD. Re-encoding k×≤2048-tok code docs per
+  query (~500 ms–1 s on CPU, every query) is a cross-encoder in disguise; throws away the precompute
+  advantage. **Do not build.**
+
+**Decision criterion (measure both in the chunked real-repo A/B):**
+1. **real-repo LateOn-PLAID query latency** — if acceptable → (A), it dominates on quality + index size.
+2. **coderank's recall@50** = the (B) reranker's quality ceiling. The probe shows LateOn finds golds
+   coderank's dense channel misses (R@10 0.80 vs 0.73); some may not be in coderank's top-50 at all, so
+   (B) can never recover them. If **coderank R@50 ≥ LateOn R@10** → (B) can match (A)'s quality at lower
+   latency → reranker wins. If **coderank R@50 < LateOn R@10** → (A) wins on recall.
+
+**Recommendation:** build the multi-vector backend regardless (same work); make **first-stage-search
+vs rerank-top-k a query-time knob**. Default to **(A) first-stage** (dominates on quality + drops 438 MB);
+fall back to **(B) coderank→LateOn-MaxSim rerank** only if real-repo PLAID latency demands it. Never (C).
+
 ## Decisive conclusions (settled, with reproduced evidence)
 - **Adaptive pruning** = measurement confound, not a product bug. OFF→ON = −38% nDCG / −45% R@10. ON in product, OFF for A/Bs.
 - **Late interaction is IN** as the next dense channel (edge +22.5%, 130M +46.6%); edge is the workstation default, 130M an opt-in. **PLAID, not Voyager, is the deployable index** (equal/better nDCG at ~10× smaller).
