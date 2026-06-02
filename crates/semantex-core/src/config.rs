@@ -25,6 +25,10 @@ pub struct SemantexConfig {
     pub chunk_overlap: usize,
     /// RRF fusion constant k
     pub rrf_k: f32,
+    /// PLAID residual-quantization bits for the opt-in `lateon-colbert` dense
+    /// backend (2 or 4; default 4). Ignored by the default `coderank-hnsw`
+    /// backend, which stores int8 single vectors, not PLAID residuals.
+    pub plaid_nbits: usize,
     /// Base retrieval-candidate pool width. This is the number of fused
     /// candidates retrieval targets for EVERY query (then oversampled per query
     /// type — Identifier ×5, Keyword ×2, Semantic ×2–3, Mixed ×1 — see
@@ -127,6 +131,7 @@ impl Default for SemantexConfig {
             chunk_size: 512,
             chunk_overlap: 128,
             rrf_k: 60.0,
+            plaid_nbits: 4,
             rerank_candidates: 100,
             rerank_top_n: 25,
             model_dir: None,

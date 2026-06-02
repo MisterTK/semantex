@@ -7,7 +7,45 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const LATEON_CODE_EDGE_BASE_URL: &str =
+    "https://huggingface.co/lightonai/LateOn-Code-edge/resolve/main";
+const LATEON_CODE_EDGE_FILES: &[&str] = &["model_int8.onnx", "tokenizer.json", "onnx_config.json"];
+const LATEON_CODE_EDGE_DIR: &str = "LateOn-Code-edge";
+
+/// Download LateOn-Code-edge ColBERT model if not already cached. Provisioning for
+/// the opt-in `lateon-colbert` late-interaction backend (the only model whose
+/// download lives here rather than in its own module — it has no separate
+/// `*_model.rs`). Uses the shared [`download_file`] primitive.
+#[allow(clippy::similar_names)]
+pub fn ensure_colbert_model(models_dir: &Path) -> Result<PathBuf> {
+    let model_dir = models_dir.join(LATEON_CODE_EDGE_DIR);
+    if model_dir.join("model_int8.onnx").exists() {
+        return Ok(model_dir);
+    }
+    fs::create_dir_all(&model_dir)
+        .with_context(|| format!("Failed to create model dir: {}", model_dir.display()))?;
+    tracing::info!("Downloading LateOn-Code-edge ColBERT model (~17MB)...");
+    for file_name in LATEON_CODE_EDGE_FILES {
+        let url = format!("{LATEON_CODE_EDGE_BASE_URL}/{file_name}");
+        let dest = model_dir.join(file_name);
+        if !dest.exists() {
+            download_file(&url, &dest)
+                .with_context(|| format!("Failed to download {file_name} for LateOn-Code-edge"))?;
+        }
+    }
+    Ok(model_dir)
+}
+
+/// Check if the ColBERT model is already downloaded.
+#[allow(clippy::similar_names)]
+pub fn is_colbert_downloaded(models_dir: &Path) -> bool {
+    let model_dir = models_dir.join(LATEON_CODE_EDGE_DIR);
+    LATEON_CODE_EDGE_FILES
+        .iter()
+        .all(|f| model_dir.join(f).exists())
+}
 
 /// Download `url` to `dest` atomically (temp file + rename), showing a progress
 /// bar. Shared with `runtime_manager` for fetching the ONNX Runtime archive and
