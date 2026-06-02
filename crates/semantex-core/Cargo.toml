@@ -29,7 +29,7 @@ fastembed = "5.9"
 # dependency edge adds NO net-new C/C++ vendor surface (no `progressbar`/
 # `esaxx_fast` C++ defaults of our own). NOTE: `onig`/`onig_sys` are NOT removed
 # from the build — `cargo tree -i onig` still shows them, because `fastembed 5.9`
-# pulls the same `tokenizers` crate WITH the `onig`
+# (and `next-plaid-onnx`) pull the same `tokenizers` crate WITH the `onig`
 # feature, and Cargo unifies features across the graph onto the shared crate.
 # So onig is unavoidable via fastembed's feature unification; it is airgap-safe
 # because it is already vendored transitively (S3 introduces no new requirement).
@@ -140,6 +140,12 @@ postcard = { workspace = true }
 parking_lot = "0.12"
 regex = { workspace = true }
 rust-stemmers = "1.2"
+# Opt-in late-interaction dense backend (SEMANTEX_EMBEDDER=lateon-colbert): the
+# vendored PLAID engine + its ONNX ColBERT encoder. Non-optional (the backend is
+# selected at runtime via the model registry, not a compile feature); pulls no
+# genai, so the zero-LLM default build is preserved.
+next-plaid.workspace = true
+next-plaid-onnx.workspace = true
 # Optional — pulled in only with `--features llm` (Spec L Phase 1)
 genai = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }

@@ -31,6 +31,19 @@ regex = "1"
 genai = "0.5"
 async-trait = "0.1"
 which = "8"
+# next-plaid 1.3: vendored PLAID engine (Apache-2.0, pure-Rust over ndarray, mmap,
+# residual quantization; pulls NO ort) + next-plaid-onnx (crates.io, the ONNX
+# ColBERT encoder; pulls ort). Powers the OPT-IN late-interaction dense backend
+# (SEMANTEX_EMBEDDER=lateon-colbert); coderank-hnsw stays the default. CPU-only by
+# default (force_cpu); CoreML opt-in via SEMANTEX_COREML. next-plaid-onnx 1.3
+# resolves ort to the same 2.0.0-rc.11 this crate's load-dynamic ort uses
+# (proven: identical Cargo.lock checksum at 26e71ba), so the graph unifies cleanly.
+next-plaid = "1.3"
+# Pinned to =1.3.1: the resurrected encoder glue (embedding/colbert.rs) was
+# written against next-plaid-onnx 1.3.1's Colbert::builder() API and paired with
+# vendored next-plaid 1.3.1 — the exact known-good set at 26e71ba. ^1.3 floats to
+# 1.5.x, whose API may have drifted; revisit a bump as a deliberate, tested step.
+next-plaid-onnx = "=1.3.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -57,3 +70,10 @@ panic = "unwind"
 inherits = "release"
 debug = true
 strip = false
+
+# Vendored next-plaid carries the kmeans chunk_size_data memory fix (26GB→9GB on
+# 2k-chunk repos, commit d4930a9) that upstream crates.io 1.3 lacks — keep the
+# path override so the patched engine is what builds. Only next-plaid is vendored;
+# next-plaid-onnx comes from crates.io unchanged.
+[patch.crates-io]
+next-plaid = { path = "vendor/next-plaid" }
