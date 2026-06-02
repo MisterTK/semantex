@@ -143,6 +143,9 @@ pub struct McpServer {
     /// Controls which tools are visible to `tools/list` and callable via
     /// `tools/call`. Defaults to `all`.
     toolset: String,
+    /// Server-side `semantex_agent` output defaults (budget/full_code/depth),
+    /// read once from env at construction. Per-call MCP args override these.
+    mcp_defaults: McpAgentDefaults,
     /// Optional LLM backend, initialised once at MCP server construction via
     /// `LlmBackend::from_env()` (Spec L §4 Item 1.4). When `Some`, every
     /// `AgentPipeline::new` call chains `.with_llm(...)`, enabling the LLM
@@ -241,6 +244,7 @@ impl McpServer {
             index_states: Arc::new(Mutex::new(HashMap::new())),
             log_level: Mutex::new(LogLevel::default()),
             toolset,
+            mcp_defaults: McpAgentDefaults::from_env(),
             #[cfg(feature = "llm")]
             llm,
             #[cfg(feature = "llm")]
@@ -753,11 +757,11 @@ impl McpServer {
                         },
                         "full_code": {
                             "type": "boolean",
-                            "description": "Include full source code blocks in response (default: false)"
+                            "description": "Include full source code blocks (default: server SEMANTEX_MCP_FULL_CODE, normally false)"
                         },
                         "budget": {
                             "type": "integer",
-                            "description": "Response size budget in bytes (default: 12000, ~3K tokens)"
+                            "description": "Response size budget in bytes (default: server SEMANTEX_MCP_BUDGET, normally 12000 ≈3K tokens)"
                         },
                         "depth": {
                             "type": "string",
@@ -1150,10 +1154,14 @@ impl McpServer {
         let full_code = args
             .get("full_code")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(self.mcp_defaults.full_code);
 
         // Parse the optional `depth` parameter and map it to an AgentRoute override.
-        let depth_route: Option<AgentRoute> = match args.get("depth").and_then(|v| v.as_str()) {
+        let depth_arg = args
+            .get("depth")
+            .and_then(|v| v.as_str())
+            .or(self.mcp_defaults.depth.as_deref());
+        let depth_route: Option<AgentRoute> = match depth_arg {
             Some("quick") => Some(AgentRoute::ExactSymbol),
             Some("search") => Some(AgentRoute::Semantic),
             Some("deep") => Some(AgentRoute::Deep),
@@ -1205,7 +1213,7 @@ impl McpServer {
         let budget = args
             .get("budget")
             .and_then(serde_json::Value::as_u64)
-            .map_or(12_000, |v| v as usize);
+            .map_or(self.mcp_defaults.budget, |v| v as usize);
 
         // Run each query and collect formatted results.
         let mut parts: Vec<String> = Vec::with_capacity(queries.len());
@@ -2593,6 +2601,47 @@ fn query_pattern_examples(
 // agent path (`AgentRoute::Architecture`) and this MCP handler.
 
 // =============================================================================
+// MCP agent output defaults
+// =============================================================================
+
+/// Server-side defaults for the `semantex_agent` output shape, read ONCE from
+/// the environment at MCP server construction (the in-process config model).
+/// A per-call MCP arg always overrides these. `depth == None` means auto-classify.
+#[derive(Debug, Clone)]
+struct McpAgentDefaults {
+    budget: usize,
+    full_code: bool,
+    depth: Option<String>,
+}
+
+impl McpAgentDefaults {
+    fn from_env() -> Self {
+        let budget = std::env::var("SEMANTEX_MCP_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(12_000);
+        let full_code = std::env::var("SEMANTEX_MCP_FULL_CODE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let depth = match std::env::var("SEMANTEX_MCP_DEPTH")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("quick") => Some("quick".to_string()),
+            Some("search") => Some("search".to_string()),
+            Some("deep") => Some("deep".to_string()),
+            _ => None, // "auto", empty, unset, or unknown -> auto-classify
+        };
+        Self {
+            budget,
+            full_code,
+            depth,
+        }
+    }
+}
+
+// =============================================================================
 // Tool output helper
 // =============================================================================
 
@@ -2739,7 +2788,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TOOLSET, McpServer, TOOLSETS, apply_focus};
+    use super::{DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus};
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
     use semantex_core::index::state::IndexState;
@@ -2807,6 +2856,78 @@ mod tests {
         assert!(!out.contains("body_a"));
         assert!(out.contains("fn b() {}"));
         assert!(!out.contains("body_b"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // McpAgentDefaults — env-tunable output defaults
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Serializes the `SEMANTEX_MCP_*` env mutation in this test binary so the
+    /// agent-defaults test never races other tests on process env. Mirrors
+    /// `MCP_LLM_ENV_LOCK` (in `llm_runtime_wiring_tests`); kept module-local
+    /// here so it works in the default (no-`llm`) build too.
+    static MCP_AGENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mcp_agent_defaults_from_env_overrides_and_falls_back() {
+        let _guard = MCP_AGENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: guarded by MCP_AGENT_ENV_LOCK; restored before the lock drops.
+        // All env work + reads happen first; the prior values are restored
+        // BEFORE any assert, so a failing assert can never leak the keys.
+        let prev_budget = std::env::var("SEMANTEX_MCP_BUDGET").ok();
+        let prev_full_code = std::env::var("SEMANTEX_MCP_FULL_CODE").ok();
+        let prev_depth = std::env::var("SEMANTEX_MCP_DEPTH").ok();
+
+        // Case 1: unset -> fallback defaults.
+        unsafe {
+            std::env::remove_var("SEMANTEX_MCP_BUDGET");
+            std::env::remove_var("SEMANTEX_MCP_FULL_CODE");
+            std::env::remove_var("SEMANTEX_MCP_DEPTH");
+        }
+        let unset = McpAgentDefaults::from_env();
+
+        // Case 2: explicit overrides.
+        unsafe {
+            std::env::set_var("SEMANTEX_MCP_BUDGET", "6000");
+            std::env::set_var("SEMANTEX_MCP_FULL_CODE", "1");
+            std::env::set_var("SEMANTEX_MCP_DEPTH", "deep");
+        }
+        let overridden = McpAgentDefaults::from_env();
+
+        // Case 3: depth "auto" collapses to None (auto-classify).
+        unsafe {
+            std::env::set_var("SEMANTEX_MCP_DEPTH", "auto");
+        }
+        let auto = McpAgentDefaults::from_env();
+
+        // SAFETY: guarded by MCP_AGENT_ENV_LOCK; restore prior values before
+        // the lock drops (and before the asserts, so a panic can't leak).
+        unsafe {
+            match prev_budget {
+                Some(v) => std::env::set_var("SEMANTEX_MCP_BUDGET", v),
+                None => std::env::remove_var("SEMANTEX_MCP_BUDGET"),
+            }
+            match prev_full_code {
+                Some(v) => std::env::set_var("SEMANTEX_MCP_FULL_CODE", v),
+                None => std::env::remove_var("SEMANTEX_MCP_FULL_CODE"),
+            }
+            match prev_depth {
+                Some(v) => std::env::set_var("SEMANTEX_MCP_DEPTH", v),
+                None => std::env::remove_var("SEMANTEX_MCP_DEPTH"),
+            }
+        }
+
+        assert_eq!(unset.budget, 12_000);
+        assert!(!unset.full_code);
+        assert_eq!(unset.depth, None); // None == auto-classify
+
+        assert_eq!(overridden.budget, 6_000);
+        assert!(overridden.full_code);
+        assert_eq!(overridden.depth.as_deref(), Some("deep"));
+
+        assert_eq!(auto.depth, None);
     }
 
     // ─────────────────────────────────────────────────────────────────────
