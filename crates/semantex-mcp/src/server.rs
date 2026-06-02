@@ -772,6 +772,11 @@ impl McpServer {
                             "type": "string",
                             "enum": ["implementation", "callers", "signatures", "patterns"],
                             "description": "What to emphasize in results. 'implementation'=full code bodies, 'callers'=who calls these functions, 'signatures'=function signatures only, 'patterns'=usage examples."
+                        },
+                        "response_format": {
+                            "type": "string",
+                            "enum": ["concise", "detailed"],
+                            "description": "Output verbosity. 'concise' returns ~1/3 the context (paths + minimal snippets); 'detailed' returns fuller results. Omit for the server default. Ignored if an explicit 'budget' is set."
                         }
                     }
                 }),
@@ -1214,6 +1219,13 @@ impl McpServer {
             .get("budget")
             .and_then(serde_json::Value::as_u64)
             .map_or(self.mcp_defaults.budget, |v| v as usize);
+
+        let response_format = args.get("response_format").and_then(|v| v.as_str());
+        let budget = if args.get("budget").is_some() {
+            budget // explicit byte budget wins
+        } else {
+            budget_for_format(response_format, budget)
+        };
 
         // Run each query and collect formatted results.
         let mut parts: Vec<String> = Vec::with_capacity(queries.len());
@@ -2713,6 +2725,15 @@ fn truncate_lines_mcp(content: &str, n: usize) -> String {
     }
 }
 
+/// Map an optional `response_format` to an effective budget given the base budget.
+/// `concise` ≈ ⅓ tokens (best-practice "return less by default"); `detailed`/None = base.
+fn budget_for_format(response_format: Option<&str>, base_budget: usize) -> usize {
+    match response_format {
+        Some("concise") => (base_budget / 3).max(1),
+        _ => base_budget, // "detailed", None, or unknown -> base
+    }
+}
+
 /// Apply `focus` formatting to a pre-formatted agent result string.
 ///
 /// - `"signatures"`: Strip code block bodies, keeping only the first content line (signature) of
@@ -2788,7 +2809,9 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus};
+    use super::{
+        DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
+    };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
     use semantex_core::index::state::IndexState;
@@ -2856,6 +2879,19 @@ mod tests {
         assert!(!out.contains("body_a"));
         assert!(out.contains("fn b() {}"));
         assert!(!out.contains("body_b"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // response_format — budget tier mapping
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn response_format_maps_to_budget_tier() {
+        // concise ~= 1/3, detailed = base, default(None) = base.
+        assert_eq!(budget_for_format(Some("concise"), 12_000), 4_000);
+        assert_eq!(budget_for_format(Some("detailed"), 12_000), 12_000);
+        assert_eq!(budget_for_format(None, 12_000), 12_000);
+        assert_eq!(budget_for_format(Some("bogus"), 12_000), 12_000);
     }
 
     // ─────────────────────────────────────────────────────────────────────
