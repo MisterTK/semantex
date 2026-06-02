@@ -34,6 +34,15 @@ two biggest being measurement mismatch and model choice (not the originally-susp
    −18% agent CCB win. The error was measuring feature A/Bs with it ON. (0.28 is still <
    published ~0.60 → ~half the residual gap is our 180q-subset/chunking protocol or a mid-tier
    embedder.)
+   - **Phase-1 generalization sweep (verified, both ablations × both corpora):** recovery is
+     broad WHERE THERE IS HEADROOM, null where saturated — i.e. it bites exactly the corpus
+     that matters for A/B. CoIR dense 0.2032/R@10 0.5056 → 0.2805/0.7333 (+38%/+45%); CoIR
+     hybrid 0.2054/0.5111 → 0.2760/0.7222 (+34%/+41%); CSN-py dense & hybrid both ~0.9091/0.96
+     → ~0.9106/0.965 (+0.2%/+0.5%, saturated). Corollaries: (a) CSN is SATURATED → useless as
+     an A/B corpus (regression gate only); (b) on CoIR adaptive-off, hybrid (0.276) < dense
+     (0.281) — sparse mildly HURTS on code-translation, independently confirming weighted-RRF's
+     "sparse is the weak channel" finding. **Adaptive-OFF is the correct measurement config for
+     all feature A/Bs.**
 
 3. **MODEL CHOICE (real).**
    - Reranker: `bge-reranker-v2-m3` is a generic multilingual TEXT reranker — **CoIR 35.97,
