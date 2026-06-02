@@ -733,11 +733,12 @@ impl McpServer {
                 name: "semantex_agent".into(),
                 title: Some("Intelligent Code Search".into()),
                 description: concat!(
-                    "Intelligent code search with automatic query classification. ",
-                    "Analyzes your query, selects the best search strategy (semantic, exact symbol, ",
-                    "graph walk, deep search, regex, file pattern), executes with fallbacks, and returns ",
-                    "a formatted answer. This is the recommended default — use it for all code search queries. ",
-                    "Returns pre-formatted text ready for direct use."
+                    "Intelligent code search: auto-classifies the query (semantic, exact symbol, ",
+                    "graph walk, deep search, regex, file glob), runs the best strategy with fallbacks, ",
+                    "and returns a ready-to-use answer. THE recommended tool for ALL code-search needs — ",
+                    "one call in, one complete answer out. Do NOT chain semantex_* calls to assemble an ",
+                    "answer; if the result is incomplete, refine the QUESTION and call semantex_agent again. ",
+                    "Accepts a natural-language question, a symbol, a regex, or a glob."
                 ).into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -3853,6 +3854,24 @@ mod tests {
         assert!(
             !names.contains(&"log"),
             "outgoing macro/call target `log` leaked into methods list: {names:?}"
+        );
+    }
+
+    #[test]
+    fn agent_tool_description_is_self_describing() {
+        let agent = McpServer::all_tools()
+            .into_iter()
+            .find(|t| t.name == "semantex_agent")
+            .expect("semantex_agent present");
+        let d = agent.description.to_lowercase();
+        assert!(d.contains("one call"), "must state one-call contract: {d}");
+        assert!(
+            d.contains("do not chain") || d.contains("don't chain"),
+            "must say don't chain: {d}"
+        );
+        assert!(
+            d.contains("refine"),
+            "must tell the agent to refine the query: {d}"
         );
     }
 }
