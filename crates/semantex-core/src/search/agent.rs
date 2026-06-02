@@ -44,6 +44,11 @@ pub(crate) struct HandlerResult {
     formatted: String,
     fallback_used: bool,
     result_count: usize,
+    /// Structured hits for item-list routes (semantic/exact/structural/exhaustive/
+    /// regex/file_pattern/analytical). Empty for synthesis routes (deep/architecture)
+    /// whose answer is prose-only. Surfaced to MCP `structuredContent` IN-PROCESS;
+    /// NOT part of the wire `AgentResponse` (postcard protocol stays unchanged).
+    hits: Vec<crate::server::protocol::SearchResultItem>,
     /// v0.5 Item 6: when the search's top result was `Confidence::Ambiguous`,
     /// up to 3 runner-up suggestions are surfaced here so `handle()` can
     /// populate the matching field on `AgentResponse`. `None` when the
@@ -142,6 +147,34 @@ impl<'a> AgentPipeline<'a> {
     }
 
     pub fn handle(&self, request: &AgentRequest) -> AgentResponse {
+        self.handle_inner(request).0
+    }
+
+    /// Like `handle`, but also returns the structured hits (item-list routes) for
+    /// in-process consumers (the MCP `structuredContent` path). The wire
+    /// `AgentResponse` is unchanged; hits ride alongside it, not inside it.
+    pub fn handle_with_hits(
+        &self,
+        request: &AgentRequest,
+    ) -> (
+        AgentResponse,
+        Vec<crate::server::protocol::SearchResultItem>,
+    ) {
+        self.handle_inner(request)
+    }
+
+    /// Shared body for `handle` / `handle_with_hits`. Returns the (unchanged)
+    /// wire `AgentResponse` plus the structured item-list hits (empty for
+    /// prose-only synthesis routes). `handle` discards the hits to keep the
+    /// daemon's postcard path byte-identical; the in-process MCP path keeps
+    /// them via `handle_with_hits`.
+    fn handle_inner(
+        &self,
+        request: &AgentRequest,
+    ) -> (
+        AgentResponse,
+        Vec<crate::server::protocol::SearchResultItem>,
+    ) {
         let start = std::time::Instant::now();
         let classify_start = std::time::Instant::now();
 
@@ -179,7 +212,11 @@ impl<'a> AgentPipeline<'a> {
         let formatted = format!("[route: {route}]\n\n{}", result.formatted);
         let format_ms = format_start.elapsed().as_millis() as u64;
 
-        AgentResponse {
+        // Capture the structured hits BEFORE moving `result.disambiguation` into
+        // the response. These ride alongside the (unchanged) wire `AgentResponse`
+        // for the in-process MCP `structuredContent` path; `handle` drops them.
+        let hits = result.hits;
+        let response = AgentResponse {
             route,
             formatted,
             metrics: AgentMetrics {
@@ -191,7 +228,8 @@ impl<'a> AgentPipeline<'a> {
                 result_count: result.result_count,
             },
             disambiguation: result.disambiguation,
-        }
+        };
+        (response, hits)
     }
 
     /// Classify the query route, preferring the LLM classifier when one is
@@ -305,6 +343,7 @@ impl<'a> AgentPipeline<'a> {
                 let confidence = compute_confidence(&items);
                 let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
+                let hits = items.clone();
                 let resp = SearchResponse {
                     results: items,
                     duration_ms: output.metrics.total_ms,
@@ -323,6 +362,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted,
                     fallback_used: is_fallback,
                     result_count: count,
+                    hits,
                     disambiguation: disambig,
                 }
             }
@@ -332,6 +372,7 @@ impl<'a> AgentPipeline<'a> {
                         formatted: format!("No results found for: {query}"),
                         fallback_used: is_fallback,
                         result_count: 0,
+                        hits: Vec::new(),
                         disambiguation: None,
                     }
                 } else {
@@ -344,6 +385,7 @@ impl<'a> AgentPipeline<'a> {
                                 formatted: format_deep_results(&resp, budget),
                                 fallback_used: true,
                                 result_count: count,
+                                hits: Vec::new(),
                                 disambiguation: None,
                             }
                         }
@@ -351,6 +393,7 @@ impl<'a> AgentPipeline<'a> {
                             formatted: format!("No results found for: {query}"),
                             fallback_used: is_fallback,
                             result_count: 0,
+                            hits: Vec::new(),
                             disambiguation: None,
                         },
                     }
@@ -368,6 +411,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted: format_deep_results(&resp, budget),
                     fallback_used: is_fallback,
                     result_count: count,
+                    hits: Vec::new(),
                     disambiguation: None,
                 }
             }
@@ -377,6 +421,7 @@ impl<'a> AgentPipeline<'a> {
                         formatted: format!("No results found for: {query}"),
                         fallback_used: true,
                         result_count: 0,
+                        hits: Vec::new(),
                         disambiguation: None,
                     }
                 } else {
@@ -400,6 +445,7 @@ impl<'a> AgentPipeline<'a> {
             let confidence = compute_confidence(&items);
             let disambig = disambiguation_from_results(&output.results);
             let count = items.len();
+            let hits = items.clone();
             let resp = SearchResponse {
                 results: items,
                 duration_ms: output.metrics.total_ms,
@@ -418,6 +464,7 @@ impl<'a> AgentPipeline<'a> {
                 formatted,
                 fallback_used: false,
                 result_count: count,
+                hits,
                 disambiguation: disambig,
             };
         }
@@ -431,6 +478,7 @@ impl<'a> AgentPipeline<'a> {
                     .map(|r| search_result_to_item(r, true))
                     .collect();
                 let count = items.len();
+                let hits = items.clone();
                 let resp = SearchResponse {
                     results: items,
                     duration_ms: output.metrics.total_ms,
@@ -445,6 +493,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted: format_search_results(&resp, FormatStyle::Default, budget),
                     fallback_used: true,
                     result_count: count,
+                    hits,
                     disambiguation: None,
                 }
             }
@@ -452,6 +501,7 @@ impl<'a> AgentPipeline<'a> {
                 formatted: format!("Symbol not found: {symbol}"),
                 fallback_used: true,
                 result_count: 0,
+                hits: Vec::new(),
                 disambiguation: None,
             },
         }
@@ -515,6 +565,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted,
                     fallback_used: false,
                     result_count: total,
+                    hits: Vec::new(),
                     disambiguation: None,
                 };
             }
@@ -534,6 +585,7 @@ impl<'a> AgentPipeline<'a> {
                     .collect();
                 let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
+                let hits = items.clone();
                 if full_code {
                     let code_contents: Vec<String> = items
                         .iter()
@@ -550,6 +602,7 @@ impl<'a> AgentPipeline<'a> {
                         formatted,
                         fallback_used: false,
                         result_count: count,
+                        hits,
                         disambiguation: disambig,
                     }
                 } else {
@@ -572,6 +625,7 @@ impl<'a> AgentPipeline<'a> {
                         formatted,
                         fallback_used: false,
                         result_count: count,
+                        hits,
                         disambiguation: disambig,
                     }
                 }
@@ -595,6 +649,7 @@ impl<'a> AgentPipeline<'a> {
                 let confidence = compute_confidence(&items);
                 let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
+                let hits = items.clone();
                 let resp = SearchResponse {
                     results: items,
                     duration_ms: output.metrics.total_ms,
@@ -614,6 +669,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted,
                     fallback_used: false,
                     result_count: count,
+                    hits,
                     disambiguation: disambig,
                 }
             }
@@ -639,6 +695,7 @@ impl<'a> AgentPipeline<'a> {
             }
             Err(_) => (vec![], 0u64, 0usize, 0usize),
         };
+        let hits = items.clone();
         let resp = SearchResponse {
             results: items.clone(),
             duration_ms,
@@ -653,6 +710,7 @@ impl<'a> AgentPipeline<'a> {
             formatted: format_search_results(&resp, FormatStyle::Grep, budget),
             fallback_used: false,
             result_count: items.len(),
+            hits,
             disambiguation: None,
         }
     }
@@ -783,6 +841,7 @@ impl<'a> AgentPipeline<'a> {
             formatted: out,
             fallback_used: false,
             result_count: total,
+            hits: Vec::new(),
             disambiguation: None,
         }
     }
@@ -815,6 +874,7 @@ impl<'a> AgentPipeline<'a> {
                 let confidence = compute_confidence(&items);
                 let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
+                let hits = items.clone();
                 let resp = SearchResponse {
                     results: items,
                     duration_ms: output.metrics.total_ms,
@@ -834,6 +894,7 @@ impl<'a> AgentPipeline<'a> {
                     formatted,
                     fallback_used: false,
                     result_count: count,
+                    hits,
                     disambiguation: disambig,
                 }
             }
@@ -934,6 +995,7 @@ impl<'a> AgentPipeline<'a> {
             formatted: enriched,
             fallback_used: false,
             result_count: deep_result.result_count + added,
+            hits: Vec::new(),
             disambiguation: None,
         }
     }
@@ -1006,6 +1068,7 @@ impl<'a> AgentPipeline<'a> {
                     .iter()
                     .filter(|s| !s.output.is_empty())
                     .count(),
+                hits: Vec::new(),
                 disambiguation: None,
             },
             Err(_) => self.handle_deep(query, budget, true),
@@ -1145,6 +1208,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
             formatted: format!("Invalid glob pattern: {pattern}"),
             fallback_used: false,
             result_count: 0,
+            hits: Vec::new(),
             disambiguation: None,
         };
     };
@@ -1191,6 +1255,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
         formatted: lines.join("\n"),
         fallback_used: false,
         result_count: total,
+        hits: Vec::new(),
         disambiguation: None,
     }
 }
@@ -1198,6 +1263,143 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SemantexConfig;
+    use crate::index::storage::ChunkStore;
+    use crate::search::hybrid::HybridSearcher;
+    use crate::search::sparse_search::SparseIndex;
+    use crate::types::{AstNodeKind, Chunk, ChunkType};
+    use tempfile::TempDir;
+
+    /// Build a sparse-only `HybridSearcher` backed by a small populated index:
+    /// a chunk store with two AST-node chunks plus a matching Tantivy sparse
+    /// index, so `searcher.search` returns genuine non-empty hits. Mirrors the
+    /// `build_empty_searcher` pattern in `server::handler`, but actually
+    /// inserts content so item-list routes surface structured hits.
+    fn build_populated_searcher() -> (TempDir, HybridSearcher) {
+        let dir = TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let db_path = semantex_dir.join("chunks.db");
+
+        // Insert two AST-node chunks (write-mode store), then drop so the
+        // sparse-only searcher can re-open in search mode.
+        let chunk_ids: Vec<u64> = {
+            let store = ChunkStore::open(&db_path).expect("create chunk store");
+            let chunks = [
+                (
+                    "auth/login.rs",
+                    "authenticateUser",
+                    "fn authenticateUser(creds: Credentials) -> Session { /* login */ }",
+                ),
+                (
+                    "auth/logout.rs",
+                    "endSession",
+                    "fn endSession(session: Session) { /* logout */ }",
+                ),
+            ];
+            chunks
+                .iter()
+                .map(|(file, name, content)| {
+                    let chunk = Chunk {
+                        id: 0,
+                        file_path: std::path::PathBuf::from(file),
+                        start_line: 1,
+                        end_line: 3,
+                        content: (*content).to_string(),
+                        chunk_type: ChunkType::AstNode {
+                            name: (*name).to_string(),
+                            kind: AstNodeKind::Function,
+                            language: "rust".into(),
+                            structured_meta: None,
+                        },
+                    };
+                    store.insert_chunk(&chunk, 0, 0).expect("insert chunk")
+                })
+                .collect()
+        };
+
+        // Build the matching sparse index. `use_bm25_stemmer` defaults to true
+        // (SemantexConfig::default), so create with stemmer=true to match.
+        {
+            let index = SparseIndex::create(&semantex_dir.join("sparse"), true).expect("create");
+            let mut writer = index.writer().expect("writer");
+            writer
+                .add_document(
+                    chunk_ids[0],
+                    "fn authenticateUser creds Credentials Session login authentication",
+                    "auth/login.rs",
+                )
+                .expect("add 0");
+            writer
+                .add_document(
+                    chunk_ids[1],
+                    "fn endSession session Session logout authentication",
+                    "auth/logout.rs",
+                )
+                .expect("add 1");
+            writer.commit().expect("commit");
+        }
+
+        let config = SemantexConfig::default();
+        let searcher = HybridSearcher::open_sparse_only(&semantex_dir, &config)
+            .expect("open sparse-only searcher");
+        (dir, searcher)
+    }
+
+    /// Task 6 (A2): `handle_with_hits` must surface the structured
+    /// `SearchResultItem` hits for an item-list route (Semantic), alongside the
+    /// unchanged prose `AgentResponse`. The wire `AgentResponse` is untouched;
+    /// hits ride alongside it for the in-process MCP `structuredContent` path.
+    #[test]
+    fn handle_with_hits_returns_structured_hits_for_item_route() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline = AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/a2-hits-test"));
+
+        let (resp, hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Semantic),
+            budget: Some(12_000),
+            full_code: false,
+        });
+
+        assert!(!resp.formatted.is_empty());
+        assert!(
+            !hits.is_empty(),
+            "Semantic route must surface structured hits"
+        );
+        assert!(hits.iter().all(|h| !h.file.is_empty()));
+    }
+
+    /// `handle` (the wire path) must produce the SAME `AgentResponse` shape as
+    /// `handle_with_hits(...).0` — both delegate to `handle_inner`, so the
+    /// daemon's postcard `AgentResponse` is unaffected by the hits surfacing.
+    ///
+    /// NOTE: the formatted body embeds the live per-search `duration_ms`
+    /// (`agent_formatter`: "[N results, {ms}ms ...]"), so two independent live
+    /// searches can differ on that one number. We therefore assert structural
+    /// parity (route, result_count, fallback, disambiguation, and the
+    /// route-header prefix) rather than a byte-for-byte body match.
+    #[test]
+    fn handle_matches_handle_with_hits_response() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline = AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/a2-parity"));
+        let req = AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Semantic),
+            budget: Some(12_000),
+            full_code: false,
+        };
+        let wire = pipeline.handle(&req);
+        let (with_hits, _hits) = pipeline.handle_with_hits(&req);
+        assert_eq!(wire.route, with_hits.route);
+        // Both carry the identical route-header prefix that `handle_inner`
+        // prepends; the wire path is byte-identical up to embedded timings.
+        assert!(wire.formatted.starts_with("[route: semantic]"));
+        assert!(with_hits.formatted.starts_with("[route: semantic]"));
+        assert_eq!(wire.metrics.result_count, with_hits.metrics.result_count);
+        assert_eq!(wire.metrics.fallback_used, with_hits.metrics.fallback_used);
+        assert_eq!(wire.disambiguation, with_hits.disambiguation);
+    }
 
     #[test]
     fn test_dispatch_routes_file_pattern() {
