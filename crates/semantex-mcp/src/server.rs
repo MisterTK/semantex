@@ -3904,6 +3904,31 @@ mod tests {
             Ok(_) => panic!("expected Err for missing query, got Ok"),
         }
     }
+
+    #[test]
+    fn agent_tool_schema_shape_is_stable() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let props = t.input_schema["properties"].as_object().unwrap();
+        for k in [
+            "query",
+            "queries",
+            "path",
+            "full_code",
+            "budget",
+            "depth",
+            "focus",
+            "response_format",
+        ] {
+            assert!(props.contains_key(k), "agent must expose '{k}'");
+        }
+        assert!(
+            t.annotations.is_some(),
+            "agent must keep read-only annotations"
+        );
+    }
 }
 
 #[cfg(all(feature = "llm", test))]
