@@ -1263,18 +1263,20 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
 
     let sqlite_path = index_dir.join("chunks.db");
     let sparse_dir = index_dir.join("sparse");
-    // The dense vector store the daemon actually opens. Backend-resolution lives
-    // in `hybrid.rs`; here we warm the sole built-in backend's store file
-    // directly (a best-effort page-cache touch — a missing file just yields
-    // dense_ok=false, exactly as the old plaid path did when absent).
-    // S8: warm the LIVE store the daemon will open — resolve via the ACTIVE
-    // pointer (versioned dir), falling back to the legacy plain layout for
-    // pre-versioned indexes.
-    let dense_store = crate::search::dense_backend::resolve_active_dense_dir(
-        index_dir,
-        crate::search::dense_backend::DenseBackendKind::CoderankHnsw,
-    )
-    .join("vectors.bin");
+    // The dense vector store the daemon actually opens, for WHICHEVER backend this
+    // index was built with (default colbert-plaid; opt-in coderank-hnsw). Read the
+    // persisted backend from meta.json (best-effort; conservative CoderankHnsw
+    // fallback if meta is absent/unparseable), then S8-resolve the LIVE store dir
+    // via the ACTIVE pointer (versioned dir), falling back to the legacy plain
+    // layout for pre-versioned indexes. We warm the whole dense DIR (a missing
+    // dir just yields dense_ok=false) — this covers coderank's `vectors.bin` AND
+    // colbert-plaid's PLAID residual/codes/centroid files in one recursive touch.
+    let backend = std::fs::read_to_string(index_dir.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::types::IndexMeta>(&s).ok())
+        .and_then(|m| crate::search::dense_backend::DenseBackendKind::parse(&m.dense_backend))
+        .unwrap_or_default();
+    let dense_store = crate::search::dense_backend::resolve_active_dense_dir(index_dir, backend);
 
     // E8(b): fan out the three reads to the rayon thread pool. Rayon only
     // provides binary `join`, so we nest one call inside the other —
@@ -1290,7 +1292,7 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
                 || prefetch_dir_timed(&sparse_dir),
                 || {
                     if dense_store.exists() {
-                        prefetch_file_timed(&dense_store)
+                        prefetch_dir_timed(&dense_store)
                     } else {
                         (0, false)
                     }
@@ -1410,6 +1412,44 @@ mod e8_storage_tests {
         let outcome = prefetch_index_files(tmp.path());
         assert!(outcome.sqlite_ok);
         assert!(outcome.dense_ok);
+    }
+
+    #[test]
+    fn prefetch_warms_colbert_plaid_store_from_meta() {
+        // The default backend is colbert-plaid: prefetch must read the persisted
+        // backend from meta.json and warm the PLAID store dir (not coderank's
+        // vectors.bin, which won't exist). Regression guard for the cutover.
+        use crate::search::dense_backend::{DenseBackendKind, dense_subdir};
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("chunks.db"), b"fake").unwrap();
+        // Minimal meta.json stamping the colbert-plaid backend.
+        let meta = crate::types::IndexMeta {
+            schema_version: crate::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            project_path: tmp.path().to_path_buf(),
+            created_at: "0".into(),
+            updated_at: "0".into(),
+            file_count: 0,
+            chunk_count: 1,
+            embedding_model: "LateOn-Code-edge".into(),
+            embedding_dim: 48,
+            use_bm25_stemmer: true,
+            dense_backend: "colbert-plaid".into(),
+            embedder_fingerprint: "fp".into(),
+        };
+        std::fs::write(
+            tmp.path().join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        // The colbert-plaid store dir (legacy plain layout) with its PLAID sidecar.
+        let dense_dir = dense_subdir(tmp.path(), DenseBackendKind::ColbertPlaid);
+        std::fs::create_dir_all(&dense_dir).unwrap();
+        std::fs::write(dense_dir.join("plaid_mapping.bin"), b"m").unwrap();
+        let outcome = prefetch_index_files(tmp.path());
+        assert!(
+            outcome.dense_ok,
+            "colbert-plaid store should be warmed from meta"
+        );
     }
 }
 

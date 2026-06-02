@@ -60,10 +60,11 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 quant: QuantKind::Int8Symmetric,
             }),
         },
-        // LateOn-Code-edge ColBERT — the OPT-IN late-interaction path (17M, dim-48,
-        // int8, Apache-2.0). The spec id is model-descriptive (`lateon-colbert`); its
-        // multi-vector capability routes it to the `colbert-plaid` BACKEND. NOT the
-        // default — coderank-137m / coderank-hnsw stays the shipped default.
+        // LateOn-Code-edge ColBERT — the late-interaction path (17M, dim-48, int8,
+        // Apache-2.0) and the SHIPPED DEFAULT embedder (2026-06-02 cutover). The
+        // spec id is model-descriptive (`lateon-colbert`); its multi-vector
+        // capability routes it to the `colbert-plaid` BACKEND. coderank-137m /
+        // coderank-hnsw remains a first-class opt-in.
         ModelSpec {
             id: "lateon-colbert".to_string(),
             role: ModelRole::Embedder,
@@ -426,9 +427,9 @@ mod tests {
 
     #[test]
     fn only_lateon_colbert_is_multi_vector() {
-        // Exactly one built-in is multi-vector — the opt-in lateon-colbert
-        // (routes to colbert-plaid). Every other embedder is single-vector
-        // (routes to coderank-hnsw), so the shipped default stays single-vector.
+        // Exactly one built-in is multi-vector — lateon-colbert, the shipped
+        // default (routes to colbert-plaid). Every other embedder is single-vector
+        // (routes to coderank-hnsw, now opt-in).
         for s in builtin_specs() {
             let expect_mv = s.id == "lateon-colbert";
             assert_eq!(

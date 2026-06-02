@@ -13,12 +13,11 @@ use semantex_core::model::spec::RoleData;
 use semantex_core::search::dense_backend::DenseBackendKind;
 use std::fs;
 
-/// Gate 4 + spec §6: the dense backend the registry resolves for the default
-/// single-vector built-in embedder is IDENTICAL to constructing the
-/// `DenseBackendKind` directly from the model's known capability (no quality
-/// regression from the indirection).
+/// Gate 4 + spec §6: the dense backend the registry resolves for a single-vector
+/// built-in embedder is IDENTICAL to constructing the `DenseBackendKind` directly
+/// from the model's known capability (no quality regression from the indirection).
 #[test]
-fn registry_resolved_backend_equals_direct_for_default() {
+fn registry_resolved_backend_equals_direct_for_coderank() {
     // coderank-137m (single-vector) → coderank-hnsw, both ways.
     let mut cfg = SemantexConfig::default();
     cfg.embedder = "coderank-137m".to_string();

@@ -105,7 +105,8 @@ impl ModelRegistry {
     ///   active embedder (`config.embedder` / `SEMANTEX_EMBEDDER`) routes via its
     ///   capabilities to a backend — `coderank-137m`/`qwen3-embed-0.6b` (single-
     ///   vector) → coderank-hnsw; `lateon-colbert` (multi-vector) → colbert-plaid.
-    ///   The shipped all-default config resolves here (→ coderank-hnsw).
+    ///   The shipped all-default config resolves here (→ colbert-plaid, the
+    ///   default embedder being `lateon-colbert`).
     /// * Deprecated override: if `config.dense_backend` is set (via
     ///   `SEMANTEX_DENSE_BACKEND`) and parses to a known backend name, that alias
     ///   WINS directly, overriding the embedder path.
@@ -187,20 +188,21 @@ mod tests {
 
     #[test]
     fn resolves_active_embedder_default() {
-        // D4 cutover: the shipped default embedder is coderank-137m.
+        // 2026-06-02 cutover: the shipped default embedder is lateon-colbert.
         let reg = registry_from_builtins();
         let spec = reg.active_embedder().unwrap();
-        assert_eq!(spec.id, "coderank-137m");
+        assert_eq!(spec.id, "lateon-colbert");
         assert_eq!(spec.role, ModelRole::Embedder);
     }
 
     #[test]
-    fn active_embedder_backend_kind_is_hnsw_for_default() {
-        // coderank-137m is single_vector → coderank-hnsw, the D4 default dense path.
+    fn active_embedder_backend_kind_is_colbert_plaid_for_default() {
+        // 2026-06-02 cutover: lateon-colbert is multi_vector → colbert-plaid, the
+        // default dense path.
         let reg = registry_from_builtins();
         assert_eq!(
             reg.embedder_backend_kind().unwrap(),
-            DenseBackendKind::CoderankHnsw
+            DenseBackendKind::ColbertPlaid
         );
     }
 
@@ -282,10 +284,12 @@ mod tests {
     #[test]
     fn resolve_dense_backend_unknown_alias_falls_through_to_embedder() {
         // An unknown/typo alias doesn't parse — it falls through to the canonical
-        // embedder path (default coderank-hnsw) rather than erroring. This is how
-        // a stale or mistyped config degrades gracefully. (A KNOWN alias like
-        // "colbert-plaid" parses and wins directly — covered separately.)
+        // embedder path rather than erroring. This is how a stale or mistyped
+        // config degrades gracefully. (A KNOWN alias like "colbert-plaid" parses
+        // and wins directly — covered separately.) Embedder pinned explicitly so
+        // the fall-through target is deterministic regardless of the shipped default.
         let mut cfg = SemantexConfig::default();
+        cfg.embedder = "coderank-137m".to_string();
         cfg.dense_backend = "totally-made-up".to_string();
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
@@ -322,12 +326,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dense_backend_all_default_is_coderank_hnsw() {
-        // D4: the shipped all-default config resolves to coderank-hnsw.
+    fn resolve_dense_backend_all_default_is_colbert_plaid() {
+        // 2026-06-02 cutover: the shipped all-default config resolves to
+        // colbert-plaid (via the lateon-colbert embedder's multi_vector capability).
         let cfg = SemantexConfig::default();
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
-            DenseBackendKind::CoderankHnsw
+            DenseBackendKind::ColbertPlaid
         );
     }
 

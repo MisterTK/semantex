@@ -25,9 +25,10 @@ pub struct SemantexConfig {
     pub chunk_overlap: usize,
     /// RRF fusion constant k
     pub rrf_k: f32,
-    /// PLAID residual-quantization bits for the opt-in `lateon-colbert` dense
-    /// backend (2 or 4; default 4). Ignored by the default `coderank-hnsw`
-    /// backend, which stores int8 single vectors, not PLAID residuals.
+    /// PLAID residual-quantization bits for the `lateon-colbert` / `colbert-plaid`
+    /// dense backend (2 or 4; default 4) — the shipped default backend. Ignored by
+    /// the opt-in `coderank-hnsw` backend, which stores int8 single vectors, not
+    /// PLAID residuals.
     pub plaid_nbits: usize,
     /// Base retrieval-candidate pool width. This is the number of fused
     /// candidates retrieval targets for EVERY query (then oversampled per query
@@ -81,7 +82,7 @@ pub struct SemantexConfig {
     pub use_bm25_stemmer: bool,
     /// DEPRECATED dense-backend alias / explicit override knob. Default EMPTY:
     /// when unset, the canonical `embedder` selection decides the backend (the
-    /// default `coderank-137m` → `coderank-hnsw`), so `SEMANTEX_EMBEDDER` is the
+    /// default `lateon-colbert` → `colbert-plaid`), so `SEMANTEX_EMBEDDER` is the
     /// primary selector. When set (via `SEMANTEX_DENSE_BACKEND`) to a known
     /// backend name, that alias WINS directly — overriding the embedder path; an
     /// UNKNOWN value falls through to the embedder path (see
@@ -90,12 +91,13 @@ pub struct SemantexConfig {
     /// against the persisted `IndexMeta.dense_backend` and refuses to load on
     /// mismatch (mirrors `use_bm25_stemmer`).
     pub dense_backend: String,
-    /// Active embedder model id (registry lookup key). Default `"coderank-137m"`
-    /// (CodeRankEmbed-137M, single-vector → the `coderank-hnsw` dense backend).
-    /// The embedder spec id is model-descriptive and distinct from the dense
-    /// backend name it routes to via capabilities. Override via
-    /// `SEMANTEX_EMBEDDER`. A change here triggers a versioned dense rebuild +
-    /// atomic switchover (S8) — the re-embedding compute is inherent.
+    /// Active embedder model id (registry lookup key). Default `"lateon-colbert"`
+    /// (LateOn-Code-edge, multi-vector → the `colbert-plaid` late-interaction
+    /// backend). The embedder spec id is model-descriptive and distinct from the
+    /// dense backend name it routes to via capabilities. Override via
+    /// `SEMANTEX_EMBEDDER` (e.g. `coderank-137m` → `coderank-hnsw`). A change here
+    /// triggers a versioned dense rebuild + atomic switchover (S8) — the
+    /// re-embedding compute is inherent.
     pub embedder: String,
     /// Active reranker model id (registry lookup key). Default
     /// `"bge-reranker-v2-m3"`. Override via `SEMANTEX_RERANKER_MODEL`. A change
@@ -151,9 +153,14 @@ impl Default for SemantexConfig {
             // permanently shadow SEMANTEX_EMBEDDER — e.g. make lateon-colbert
             // unselectable — since the alias wins whenever it parses.)
             dense_backend: String::new(),
-            // coderank-137m → coderank-hnsw is the default dense path (resolved
-            // via the embedder capabilities, since the alias above is empty).
-            embedder: "coderank-137m".to_string(),
+            // lateon-colbert → colbert-plaid (late-interaction PLAID) is the
+            // default dense path, resolved via the embedder capabilities (the
+            // alias above is empty). Cutover 2026-06-02 on the measured
+            // chunked-real-pipeline A/B (+6.2% nDCG@10 / +12% MRR@10 over
+            // coderank, ~10x lower query latency, ~19x smaller index — see
+            // docs/superpowers/plans/2026-06-02-item3-realrepo-ab-results.md).
+            // coderank-137m stays a first-class opt-in (SEMANTEX_EMBEDDER=coderank-137m).
+            embedder: "lateon-colbert".to_string(),
             reranker_model: "bge-reranker-v2-m3".to_string(),
             llm_model: String::new(),
             hnsw_ef_search: 0, // 0 ⇒ use the preset's ef_search (default preset = 64)
@@ -357,8 +364,8 @@ mod tests {
     #[test]
     fn default_selection_fields() {
         let cfg = SemantexConfig::default();
-        // D4 cutover: coderank-137m (→ coderank-hnsw) is the shipped default.
-        assert_eq!(cfg.embedder, "coderank-137m");
+        // 2026-06-02 cutover: lateon-colbert (→ colbert-plaid) is the shipped default.
+        assert_eq!(cfg.embedder, "lateon-colbert");
         assert_eq!(cfg.reranker_model, "bge-reranker-v2-m3");
         assert_eq!(
             cfg.llm_model, "",

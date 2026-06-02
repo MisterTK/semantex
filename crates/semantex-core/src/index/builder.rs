@@ -527,7 +527,8 @@ impl IndexBuilder {
         // Selection (S2 re-point): resolve the active dense backend via the S8
         // ModelRegistry (canonical `SEMANTEX_EMBEDDER`), with the deprecated
         // `SEMANTEX_DENSE_BACKEND`/`config.dense_backend` alias honored when set
-        // non-default. D4 cutover: all-defaults now resolve to coderank-hnsw.
+        // non-default. 2026-06-02 cutover: all-defaults now resolve to colbert-plaid
+        // (the default embedder is lateon-colbert).
         let backend_kind =
             crate::model::ModelRegistry::resolve_dense_backend(&self.config, Some(&project_path))
                 .unwrap_or_default();
