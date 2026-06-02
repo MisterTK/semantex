@@ -478,48 +478,61 @@ def _mean(xs):
     return statistics.mean(xs) if xs else 0.0
 
 
+def pareto_table(results: list[dict]) -> dict[str, dict]:
+    """Per-arm means of the 3 Pareto axes (CCB, quality, latency) + turns + count,
+    over valid (non-error) rows. Arm-agnostic — covers builtin + every sx-* arm.
+    Insertion-ordered by first appearance."""
+    valid = [r for r in results if not r.get("error")]
+    arms: list[str] = []
+    for r in valid:
+        if r["arm"] not in arms:
+            arms.append(r["arm"])
+    out: dict[str, dict] = {}
+    for arm in arms:
+        rs = [r for r in valid if r["arm"] == arm]
+        out[arm] = {
+            "ccb": round(_mean([r.get("ccb") for r in rs])),
+            "quality": round(_mean([r.get("quality") for r in rs]), 2),
+            "wall_secs": round(_mean([r.get("wall_secs") for r in rs])),
+            "turns": round(_mean([r.get("num_turns") for r in rs]), 1),
+            "n": len(rs),
+        }
+    return out
+
+
 def cmd_report(args):
     inp = Path(args.input)
     results = json.loads((inp / "all_results.json").read_text())
+    table = pareto_table(results)
+    if not table:
+        print("no valid results"); return
+    arms = list(table)
+    ref = "builtin" if "builtin" in table else arms[0]
+
+    lines = ["# Bare-MCP system Pareto: " + " vs ".join(arms) + "\n",
+             "## 3-way Pareto (mean per question-run; lower CCB/latency better, higher quality better)\n",
+             "| arm | quality (1-5) | CCB | latency s | turns | n | CCB vs " + ref + " |",
+             "|---|---|---|---|---|---|---|"]
+    for arm in arms:
+        t = table[arm]
+        rc = table[ref]["ccb"]
+        d = "ref" if arm == ref else ("N/A" if not rc else f"{(t['ccb'] / rc - 1) * 100:+.0f}%")
+        lines.append(f"| {arm} | {t['quality']:.2f} | {t['ccb']:,} | {t['wall_secs']} "
+                     f"| {t['turns']} | {t['n']} | {d} |")
+
     valid = [r for r in results if not r.get("error")]
-
-    def agg(arm, field, bucket=None):
-        rs = [r for r in valid if r["arm"] == arm and (bucket is None or r.get("bucket") == bucket)]
-        return _mean([r.get(field) for r in rs])
-
-    lines = ["# Claude head-to-head: builtin vs graphify vs semantex\n"]
-    lines.append(f"*model={args.input}*  arms={', '.join(ARMS)}\n")
-    lines.append("## Aggregate (mean per question-run)\n")
-    lines.append("| Metric | builtin | graphify | semantex | sx vs builtin | sx vs graphify |")
-    lines.append("|---|---|---|---|---|---|")
-
-    def row(label, field, fmt="{:.0f}"):
-        b, g, s = agg("builtin", field), agg("graphify", field), agg("semantex", field)
-        def d(ref):
-            return "N/A" if not ref else f"{(s/ref-1)*100:+.0f}%"
-        lines.append(f"| {label} | {fmt.format(b)} | {fmt.format(g)} | {fmt.format(s)} "
-                     f"| {d(b)} | {d(g)} |")
-
-    row("CCB (real)", "ccb", "{:,.0f}")
-    row("peak context", "peak_context", "{:,.0f}")
-    row("turns", "num_turns", "{:.1f}")
-    row("tool calls", "tool_calls", "{:.1f}")
-    row("cost USD", "cost_usd", "{:.3f}")
-    row("CAF", "caf", "{:.2f}")
-    row("quality (1-5)", "quality", "{:.2f}")
-    row("wall secs", "wall_secs", "{:.0f}")
-
-    # semantic vs structural split (Layer 3 preview)
-    lines.append("\n## CCB by bucket (semantic vs structural)\n")
-    lines.append("| bucket | builtin | graphify | semantex |")
-    lines.append("|---|---|---|---|")
+    lines += ["\n## CCB by bucket (semantic vs structural)\n",
+              "| bucket | " + " | ".join(arms) + " |",
+              "|---|" + "|".join("---" for _ in arms) + "|"]
     for bucket in ("semantic", "structural"):
-        b, g, s = (agg(a, "ccb", bucket) for a in ARMS)
-        lines.append(f"| {bucket} | {b:,.0f} | {g:,.0f} | {s:,.0f} |")
+        cells = []
+        for arm in arms:
+            rs = [r for r in valid if r["arm"] == arm and r.get("bucket") == bucket]
+            cells.append(f"{round(_mean([r.get('ccb') for r in rs])):,}")
+        lines.append(f"| {bucket} | " + " | ".join(cells) + " |")
 
-    # quality gate note
-    lines.append("\n> Compare CCB **only at equal-or-better quality**. If "
-                 "semantex's quality ≥ the others', the CCB reduction is a clean win.\n")
+    lines.append("\n> Pareto: an arm dominates if it is >= on quality AND <= on CCB AND "
+                 "<= on latency. Read the table for the frontier; ties keep the current default.\n")
     report = "\n".join(lines) + "\n"
     (inp / "report.md").write_text(report)
     print(report)
