@@ -52,8 +52,13 @@ two biggest being measurement mismatch and model choice (not the originally-susp
      weak degradation. `qwen3-reranker-0.6b` is ALREADY built-in (OnnxReranker, yes/no-logit)
      and was never A/B'd; jina-reranker-v3 (CoIR 63.28, +27pts) is the real upgrade.
    - Embedder: `coderank-137m` is mid-tier (CoIR ~60 published; ~0.19-0.28 measured here).
-     `qwen3-embed-0.6b` (75.41 MTEB-Code) is a **built-in env swap** (`SEMANTEX_EMBEDDER=
-     qwen3-embed-0.6b`, same coderank-hnsw backend, zero new code) — never A/B'd.
+     `qwen3-embed-0.6b` (75.41 MTEB-Code) is a built-in SPEC but **NOT a drop-in swap** —
+     VERIFIED 2026-06-01: the spec (`manifest.rs:71-73`) points at upstream `Qwen/Qwen3-
+     Embedding-0.6B`, which is **safetensors-only (no ONNX)**, while the spec expects
+     `model_int8.onnx` → `SEMANTEX_EMBEDDER=qwen3-embed-0.6b` would 404. Using it needs the
+     CodeRankEmbed-style convert→int8→host pipeline (`benchmarks/onnx_models/prepare_models.py`
+     → host e.g. `MisterTK/Qwen3-Embedding-0.6B-onnx-int8` → repoint the spec repo), then the
+     env swap works. ~hour prep, not zero-code. Never A/B'd.
 
 ## Confirmed bugs (file:line)
 1. `crates/semantex-core/src/search/hybrid.rs:301` — weighted-RRF A/B is **asymmetric**:
@@ -72,15 +77,19 @@ two biggest being measurement mismatch and model choice (not the originally-susp
    ever enabled. Dormant because HyDE is never measured.
 
 ## Remediation (ranked — do in order)
-1. **[S, do first] Re-run ALL feature A/Bs with `SEMANTEX_ADAPTIVE_SIZING=0`.** Free; uses the
-   F4 knob shipped today; raises the base ~38-45% AND un-clips the rank region where
-   rerank/graph/MMR operate. This is the prerequisite that makes every other A/B meaningful.
-2. **[S] Flip `SEMANTEX_EMBEDDER=qwen3-embed-0.6b`** (built-in, +15 MTEB-Code, zero code) and
-   re-measure base CoIR/CSN. Restores headroom downstream levers need.
-3. **[M] Swap the reranker** to qwen3-reranker (built-in) or jina-reranker-v3; A/B on an
-   NL→code corpus (CSN, orientation-matched) at window ≤15 (the "Drowning in Documents"
-   degradation curve). Distinguishes "reranking doesn't help" (false) from "bge is wrong for
-   code" (the real finding). CPU latency (~47-120s/q) remains a separate deployment blocker.
+1. **[DONE — base] `SEMANTEX_ADAPTIVE_SIZING=0` baseline established (Phase 1).** Adaptive-OFF
+   is the correct A/B measurement config; recovers CoIR ~+38-45% (dense+hybrid), no-op on
+   saturated CSN. NEXT: re-A/B the FEATURES on this base.
+2. **[now, cheap — no reindex/prep] Reranker A/B on the adaptive-OFF base.** A/B the cached
+   `qwen3-reranker-0.6b` (code-capable ONNX) vs bge vs off, on CoIR (recovered R@10 0.72) +
+   CSN (NL→code, orientation-matched), window ≤15 ("Drowning in Documents" curve). Directly
+   tests the #2 root cause: distinguishes "reranking doesn't help" (false) from "bge is wrong
+   for code" (real). CPU latency (~seconds/q) is a deployment blocker but orthogonal to the
+   quality signal. This is the immediate next experiment.
+3. **[prep, ~1h, THEN S] qwen3-embed-0.6b is NOT drop-in** — convert+host its ONNX int8 first
+   (`prepare_models.py`; upstream is safetensors-only), repoint the spec, THEN
+   `SEMANTEX_EMBEDDER=qwen3-embed-0.6b` + reindex (small corpora, fast) + re-measure base
+   adaptive-OFF vs the coderank baseline. Restores the headroom downstream levers need.
 4. **[L] Build a multi-gold / SWE-loc eval on a GPU VM** — the only benchmark shape that can
    register MMR / graph localization / recall-side rerank gains. Gate reordering-feature A/Bs
    on it; keep CSN/CoIR single-gold as regression gates only, NOT A/B arbiters for reordering.
