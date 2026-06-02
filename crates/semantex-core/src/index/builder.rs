@@ -578,7 +578,24 @@ impl IndexBuilder {
         );
         let dense_missing = decision.full_rebuild;
 
-        if total_chunks == 0 && total_removals == 0 && decision.present_no_migration {
+        // The early return is valid only if the PERSISTED meta.json already records
+        // the active embedder + backend. If a prior index stamped a DIFFERENT
+        // embedder (re-selecting an already-built dense store with unchanged chunks),
+        // meta is STALE — fall through so the meta-stamp below re-writes it, else
+        // state::detect_for_config sees the index as Stale and search falls back.
+        let meta_is_current = std::fs::read_to_string(index_dir.join("meta.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<crate::types::IndexMeta>(&s).ok())
+            .is_some_and(|m| {
+                m.embedder_fingerprint == embedder_fingerprint
+                    && m.dense_backend == backend_kind.name()
+            });
+
+        if can_skip_index_build(
+            total_chunks == 0 && total_removals == 0,
+            decision.present_no_migration,
+            meta_is_current,
+        ) {
             tracing::info!(
                 files_scanned,
                 files_indexed,
@@ -866,6 +883,21 @@ impl IndexBuilder {
 struct DenseBuildDecision {
     full_rebuild: bool,
     present_no_migration: bool,
+}
+
+/// The no-op early return in `build()` is valid ONLY when there are no chunk
+/// changes (`no_chunk_changes`), the dense store is present with no migration
+/// owed (`present_no_migration`), AND the persisted meta already records the
+/// active embedder/backend (`meta_is_current`). The last condition is the fix
+/// for the embedder-re-switch bug: re-selecting an already-built backend's store
+/// leaves meta stamped with the PREVIOUS embedder unless we fall through to the
+/// meta re-stamp.
+fn can_skip_index_build(
+    no_chunk_changes: bool,
+    present_no_migration: bool,
+    meta_is_current: bool,
+) -> bool {
+    no_chunk_changes && present_no_migration && meta_is_current
 }
 
 fn decide_dense_build(
@@ -1198,6 +1230,28 @@ mod tests {
         let d = decide_dense_build(Some("FP1"), "FP1", false, false);
         assert!(d.full_rebuild);
         assert!(!d.present_no_migration);
+    }
+
+    #[test]
+    fn skip_index_requires_meta_to_match_current_embedder() {
+        // no chunk changes + store present-no-migration, BUT meta still records a
+        // DIFFERENT embedder -> must NOT skip (so meta gets re-stamped).
+        assert!(
+            can_skip_index_build(true, true, true),
+            "all-current + no changes -> skip"
+        );
+        assert!(
+            !can_skip_index_build(true, true, false),
+            "stale meta -> must re-stamp, no skip"
+        );
+        assert!(
+            !can_skip_index_build(false, true, true),
+            "chunk changes -> no skip"
+        );
+        assert!(
+            !can_skip_index_build(true, false, true),
+            "migration owed -> no skip"
+        );
     }
 
     /// v0.4.1 W-Index #3 — positional doc→chunk map reader contract:
