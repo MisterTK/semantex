@@ -741,6 +741,7 @@ impl McpServer {
                     "Accepts a natural-language question, a symbol, a regex, or a glob."
                 ).into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "query": {
@@ -796,6 +797,7 @@ impl McpServer {
                     "search parameters (max_results, rerank, grep_mode)."
                 ).into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Natural language search query" },
@@ -807,6 +809,7 @@ impl McpServer {
                     "required": ["query"]
                 }),
                 output_schema: Some(serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "results": {
@@ -845,6 +848,7 @@ impl McpServer {
                     "Call only to force a rebuild after major changes."
                 ).into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Project path to index" }
@@ -859,6 +863,7 @@ impl McpServer {
                 title: Some("Index Status".into()),
                 description: "Check semantex index status: whether it exists, file count, chunk count, freshness. Use to verify indexing is complete.".into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Project path to check" }
@@ -872,6 +877,7 @@ impl McpServer {
                 title: Some("Health Check".into()),
                 description: "Health check for the semantex system, including model availability and configuration.".into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {},
                     "additionalProperties": false
@@ -884,6 +890,7 @@ impl McpServer {
                 title: Some("Validate Index".into()),
                 description: "Run consistency checks on a semantex index: meta-DB sync, stale files, dense/sparse index integrity, graph consistency. Returns per-check pass/fail with details.".into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Project path (defaults to cwd)" }
@@ -904,6 +911,7 @@ impl McpServer {
                     "The answer is authoritative — do not re-read source files listed in the response."
                 ).into(),
                 input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "query": {
@@ -918,6 +926,7 @@ impl McpServer {
                     "required": ["query"]
                 }),
                 output_schema: Some(serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
                     "properties": {
                         "answer": { "type": "string" },
@@ -3873,6 +3882,27 @@ mod tests {
             d.contains("refine"),
             "must tell the agent to refine the query: {d}"
         );
+    }
+
+    #[test]
+    fn agent_input_schema_declares_2020_12_dialect() {
+        let agent = McpServer::all_tools()
+            .into_iter()
+            .find(|t| t.name == "semantex_agent")
+            .unwrap();
+        assert_eq!(
+            agent.input_schema.get("$schema").and_then(|v| v.as_str()),
+            Some("https://json-schema.org/draft/2020-12/schema")
+        );
+    }
+
+    #[test]
+    fn agent_missing_query_errors_actionably() {
+        let srv = McpServer::new(SemantexConfig::default());
+        match srv.tool_agent(&serde_json::json!({})) {
+            Err(err) => assert!(err.to_string().contains("query"), "actionable: {err}"),
+            Ok(_) => panic!("expected Err for missing query, got Ok"),
+        }
     }
 }
 
