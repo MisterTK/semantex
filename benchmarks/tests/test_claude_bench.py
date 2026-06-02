@@ -68,3 +68,14 @@ def test_plain_semantex_arm_has_no_env_key():
     # bare-vs-env boundary: a config-arm emits env; plain `semantex` must NOT.
     assert "env" not in cb.mcp_config_for("semantex")["mcpServers"]["semantex"]
     assert "env" in cb.mcp_config_for("sx-coderank")["mcpServers"]["semantex"]
+
+
+def test_embedders_for_arms():
+    embs = cb.embedders_for_arms(["builtin", "sx-lateon", "sx-coderank", "sx-stacked"])
+    assert embs == ["lateon-colbert", "coderank-137m"]  # dedup, order-stable
+    assert cb.embedders_for_arms(["builtin"]) == []
+    assert cb.embedders_for_arms(["sx-budget-low"]) == ["lateon-colbert"]
+
+
+def test_assert_ready_false_without_meta(tmp_path):
+    assert cb._assert_ready(str(tmp_path), "lateon-colbert") is False

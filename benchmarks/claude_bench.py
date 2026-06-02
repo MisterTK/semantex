@@ -138,6 +138,9 @@ SX_CONFIG_ARMS: dict[str, dict[str, str]] = {
     "sx-depth-deep":   {"SEMANTEX_EMBEDDER": "lateon-colbert", "SEMANTEX_MCP_DEPTH": "deep"},
 }
 
+# Embedder -> the dense_backend name it builds (must match .semantex/meta.json).
+_EMBEDDER_TO_BACKEND = {"lateon-colbert": "colbert-plaid", "coderank-137m": "coderank-hnsw"}
+
 
 def is_semantex_arm(arm: str) -> bool:
     """True for the plain `semantex` arm and every `sx-*` config-arm."""
@@ -243,6 +246,104 @@ def cmd_setup(args):
     key = load_api_key()
     eprint(f"\nANTHROPIC_API_KEY: {'FOUND' if key else 'MISSING — set it before `run`'}")
     eprint("Setup complete. `run` will cost API tokens (gated).")
+
+
+# ── preflight: per-embedder pre-index + Ready-assert ─────────────────────
+
+
+def embedders_for_arms(arms: list[str]) -> list[str]:
+    """Distinct SEMANTEX_EMBEDDER values the given config-arms need pre-indexed
+    (order-stable, deduped). builtin/graphify/plain-semantex contribute nothing
+    (plain `semantex` uses whatever index already exists)."""
+    out: list[str] = []
+    for arm in arms:
+        emb = SX_CONFIG_ARMS.get(arm, {}).get("SEMANTEX_EMBEDDER")
+        if emb and emb not in out:
+            out.append(emb)
+    return out
+
+
+def _stop_daemon(repo: str) -> None:
+    subprocess.run([SEMANTEX_BIN, "stop", "."], cwd=repo, capture_output=True, text=True)
+
+
+def _index_repo(repo: str, embedder: str, timeout: int = 7200) -> bool:
+    env = {**os.environ, "SEMANTEX_EMBEDDER": embedder, "SEMANTEX_QUIET_LIMITS": "1"}
+    eprint(f"  index {Path(repo).name} [{embedder}] …", end="", flush=True)
+    r = subprocess.run([SEMANTEX_BIN, "index", "."], cwd=repo, capture_output=True,
+                       text=True, env=env, timeout=timeout)
+    ok = r.returncode == 0
+    eprint(" ok" if ok else f" FAILED rc={r.returncode} {r.stderr[:160]}")
+    return ok
+
+
+def _assert_ready(repo: str, embedder: str) -> bool:
+    """Assert the arm's dense index is genuinely Ready, NOT a ripgrep/BM25 fallback.
+
+    PRIMARY (authoritative, daemon-timing-robust): read `.semantex/meta.json` and
+    require `dense_backend` == the backend this embedder builds — i.e. the right
+    dense store actually landed on disk. SECONDARY (proves it serves, not empty):
+    a `--dense-only` probe for the generic query "function" must return a NON-empty
+    JSON array. Both a stale-dense ripgrep fallback and a cold-daemon BM25 fallback
+    also emit a JSON array, so the meta.json check is what guards the gate."""
+    name = Path(repo).name
+    meta_path = Path(repo) / ".semantex" / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        eprint(f"  ready[{embedder}] {name}: NO (no/unparseable .semantex/meta.json)")
+        return False
+    expected = _EMBEDDER_TO_BACKEND.get(embedder)
+    actual = meta.get("dense_backend")
+    backend_ok = (actual == expected) if expected is not None else True
+
+    env = {**os.environ, "SEMANTEX_EMBEDDER": embedder, "SEMANTEX_QUIET_LIMITS": "1"}
+
+    def _probe() -> list | None:
+        r = subprocess.run([SEMANTEX_BIN, "--dense-only", "--json", "--no-content", "-m", "3",
+                            "--", "function"], cwd=repo, capture_output=True, text=True, env=env)
+        try:
+            return json.loads(r.stdout) if r.stdout.strip() else []
+        except json.JSONDecodeError:
+            return None
+
+    data = _probe()
+    # Bounded retry for cold-daemon timing — meta.json is the authoritative check;
+    # the serve-probe just confirms non-empty results once the daemon is warm.
+    if not (isinstance(data, list) and data):
+        time.sleep(1)
+        data = _probe()
+    n = len(data) if isinstance(data, list) else 0
+    serves = isinstance(data, list) and n > 0
+
+    ready = backend_ok and serves
+    if ready:
+        msg = "YES"
+    else:
+        msg = f"NO (dense_backend={actual!r} expected={expected!r}, results={n})"
+    eprint(f"  ready[{embedder}] {name}: {msg}")
+    return ready
+
+
+def cmd_preflight(args):
+    arms = getattr(args, "arms", list(SX_CONFIG_ARMS))
+    embs = embedders_for_arms(arms)
+    if not embs:
+        eprint("No sx-* arms selected — nothing to pre-index."); return
+    eprint(f"Preflight: embedders {embs} on {len(args.repos)} repos (free).")
+    all_ok = True
+    for repo in args.repos:
+        _stop_daemon(repo)
+        for emb in embs:
+            if not _index_repo(repo, emb):
+                all_ok = False; continue
+            if not _assert_ready(repo, emb):
+                all_ok = False
+        _stop_daemon(repo)
+    eprint("Preflight " + ("OK — all (repo x embedder) Ready." if all_ok
+                           else "INCOMPLETE — some indexes not Ready; fix before `run`."))
+    if not all_ok:
+        sys.exit(2)
 
 
 # ── stream-json parser → real CCB ───────────────────────────────────────
@@ -550,6 +651,10 @@ if __name__ == "__main__":
                     help="which arms to prepare (default: all). graphify graphs are "
                          "only built when the graphify arm is selected.")
 
+    pf = sub.add_parser("preflight", help="stop daemons + pre-index each repo per embedder + assert Ready (free)")
+    pf.add_argument("--repos", nargs="+", required=True)
+    pf.add_argument("--arms", nargs="+", default=list(SX_CONFIG_ARMS), choices=all_arm_names())
+
     rp = sub.add_parser("run", help="run the benchmark (COSTS API tokens)")
     rp.add_argument("--repos", nargs="+", required=True)
     rp.add_argument("--output", required=True)
@@ -567,5 +672,6 @@ if __name__ == "__main__":
     rep.add_argument("--input", required=True)
 
     a = p.parse_args()
-    {"setup": cmd_setup, "run": cmd_run, "judge": cmd_judge, "report": cmd_report}.get(
+    {"setup": cmd_setup, "preflight": cmd_preflight, "run": cmd_run,
+     "judge": cmd_judge, "report": cmd_report}.get(
         a.command, lambda _: p.print_help())(a)
