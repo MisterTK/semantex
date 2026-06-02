@@ -86,10 +86,27 @@ two biggest being measurement mismatch and model choice (not the originally-susp
    tests the #2 root cause: distinguishes "reranking doesn't help" (false) from "bge is wrong
    for code" (real). CPU latency (~seconds/q) is a deployment blocker but orthogonal to the
    quality signal. This is the immediate next experiment.
-3. **[prep, ~1h, THEN S] qwen3-embed-0.6b is NOT drop-in** — convert+host its ONNX int8 first
-   (`prepare_models.py`; upstream is safetensors-only), repoint the spec, THEN
-   `SEMANTEX_EMBEDDER=qwen3-embed-0.6b` + reindex (small corpora, fast) + re-measure base
-   adaptive-OFF vs the coderank baseline. Restores the headroom downstream levers need.
+3. **[BLOCKED on a code change — bigger than "conversion"] qwen3-embed-0.6b needs LAST-TOKEN
+   pooling support first.** Two gaps, verified 2026-06-01:
+   (a) ARTIFACT: upstream `Qwen/Qwen3-Embedding-0.6B` is safetensors-only; usable ONNX exports
+       exist (`onnx-community/Qwen3-Embedding-0.6B-ONNX` ships `onnx/model_int8.onnx` + config +
+       tokenizer, 16K dl; `shawnw3i/...` float; `electroglyph/...-uint8`). Re-host to
+       `MisterTK/...` (HF access available) — easy.
+   (b) **POOLING (the real blocker):** Qwen3-Embedding is a causal decoder that requires
+       **last-token (EOS) pooling**, but semantex's `single_vector.rs` ONLY mask-mean-pools
+       (or uses a pre-pooled `sentence_embedding` if the export bakes one in), and the `Pooling`
+       enum (`spec.rs:43`) is `Mean | Cls | LateInteraction` — NO last-token. The built-in spec
+       even asserts `pooling=Mean` (`manifest.rs:385`), which is WRONG for Qwen3-Embedding. The
+       onnx-community export emits raw `last_hidden_state` → semantex would mean-pool it →
+       degraded embeddings → qwen3-embed would UNDERPERFORM (a false-negative, the exact trap
+       this doc is about). **This is why it was "never A/B'd" — the pooling to run it correctly
+       was never implemented.**
+   REAL path: (1) add `Pooling::LastToken` + implement EOS/last-non-pad-token pooling in
+   `single_vector.rs` (use the attention mask) + fold into the fingerprint; (2) fix the spec to
+   `pooling=LastToken` + point at the hosted int8 ONNX; (3) reindex (small corpora, fast) +
+   re-measure adaptive-OFF vs the coderank baseline. Effort: S-M code change, NOT a flag.
+   Restores the headroom downstream levers need — but verify pooling correctness on a probe
+   (last-token vs mean should differ markedly) before trusting the A/B.
 4. **[L] Build a multi-gold / SWE-loc eval on a GPU VM** — the only benchmark shape that can
    register MMR / graph localization / recall-side rerank gains. Gate reordering-feature A/Bs
    on it; keep CSN/CoIR single-gold as regression gates only, NOT A/B arbiters for reordering.
