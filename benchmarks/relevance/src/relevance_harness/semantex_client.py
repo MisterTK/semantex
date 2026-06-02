@@ -72,10 +72,36 @@ class SemantexClient:
     def _build_env(self) -> dict:
         env = os.environ.copy()
         env["SEMANTEX_QUIET_LIMITS"] = "1"
+        # Canonical A/B measurement config: adaptive result sizing OFF. Adaptive
+        # pruning (confidence threshold + per-file dedup) clips ~45% of
+        # recoverable recall before any feature runs, so feature A/Bs measured
+        # with it ON are invalid. It stays ON in the product (the -18% agent-CCB
+        # feature) but must be OFF for relevance A/Bs. setdefault lets an explicit
+        # export still measure the adaptive-ON behaviour. See
+        # docs/superpowers/plans/2026-06-01-why-no-feature-uplift-rootcause.md §2.
+        env.setdefault("SEMANTEX_ADAPTIVE_SIZING", "0")
         if self.embedder:
             # Canonical embedder selector (integration §4 D-env-knob).
             env["SEMANTEX_EMBEDDER"] = self.embedder
         return env
+
+    def reset_daemon(self) -> None:
+        """Stop any running daemon for this corpus so the next search spawns a
+        fresh one under the locked A/B env.
+
+        The daemon caches its config (incl. adaptive_sizing) at spawn time and
+        lives 30 min idle, so a stale daemon from a prior run would silently
+        serve A/B queries under the wrong config. Best-effort: `stop` is a no-op
+        when no daemon is running, and we never raise on its result.
+        """
+        subprocess.run(
+            [self.binary, "stop", "."],
+            cwd=self.corpus_dir,
+            capture_output=True,
+            text=True,
+            env=self._build_env(),
+            check=False,
+        )
 
     def search(self, query_id: str, query: str, *, ablation: str, k: int) -> RankedResult:
         args = self._build_args(query, ablation=ablation, k=k)

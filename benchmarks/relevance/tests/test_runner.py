@@ -32,6 +32,7 @@ def test_run_corpus_doc_id_match_builds_relevances(tmp_path):
         return fake[qid]
 
     with patch("relevance_harness.runner.SemantexClient.search", _search), \
+         patch("relevance_harness.runner.SemantexClient.reset_daemon"), \
          patch("relevance_harness.runner.ensure_index"):
         out = run_corpus(corpus, ablation="hybrid", k=10, semantex_binary="semantex")
     assert isinstance(out, RunOutput)
@@ -50,6 +51,7 @@ def test_run_corpus_file_match_mode(tmp_path):
     fake = RankedResult("q1", ("x.py:1-2", "auth.py:10-20"),
                         ranked_files=("x.py", "auth.py"))
     with patch("relevance_harness.runner.SemantexClient.search", lambda self, q, t, *, ablation, k: fake), \
+         patch("relevance_harness.runner.SemantexClient.reset_daemon"), \
          patch("relevance_harness.runner.ensure_index"):
         out = run_corpus(corpus, ablation="hybrid", k=10, semantex_binary="semantex",
                          match_mode="file")
@@ -62,6 +64,33 @@ def test_run_corpus_calls_ensure_index_once(tmp_path):
     corpus = _corpus(tmp_path)
     with patch("relevance_harness.runner.SemantexClient.search",
                lambda self, q, t, *, ablation, k: RankedResult(q, ())), \
+         patch("relevance_harness.runner.SemantexClient.reset_daemon"), \
          patch("relevance_harness.runner.ensure_index") as mi:
         run_corpus(corpus, ablation="hybrid", k=10, semantex_binary="semantex")
     mi.assert_called_once()
+
+
+def test_run_corpus_resets_daemon_before_searching(tmp_path):
+    # Defeats stale-daemon reuse: a daemon caches adaptive_sizing at spawn time and
+    # lives 30 min idle, so the run must stop any existing daemon before searching
+    # to guarantee the canonical adaptive-OFF A/B config takes effect.
+    corpus = _corpus(tmp_path)
+    with patch("relevance_harness.runner.SemantexClient.search",
+               lambda self, q, t, *, ablation, k: RankedResult(q, ())), \
+         patch("relevance_harness.runner.SemantexClient.reset_daemon") as mreset, \
+         patch("relevance_harness.runner.ensure_index"):
+        run_corpus(corpus, ablation="hybrid", k=10, semantex_binary="semantex")
+    mreset.assert_called_once()
+
+
+def test_run_corpus_skips_daemon_reset_for_rerank(tmp_path):
+    # The rerank ablation requires a manually pre-started daemon (rerank env + a
+    # raised RSS cap); resetting it would kill that daemon and silently disable
+    # reranking, so rerank runs leave any existing daemon alone.
+    corpus = _corpus(tmp_path)
+    with patch("relevance_harness.runner.SemantexClient.search",
+               lambda self, q, t, *, ablation, k: RankedResult(q, ())), \
+         patch("relevance_harness.runner.SemantexClient.reset_daemon") as mreset, \
+         patch("relevance_harness.runner.ensure_index"):
+        run_corpus(corpus, ablation="rerank", k=10, semantex_binary="semantex")
+    mreset.assert_not_called()

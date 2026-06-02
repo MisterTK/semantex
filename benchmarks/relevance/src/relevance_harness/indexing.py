@@ -45,6 +45,11 @@ def index_is_complete(corpus_dir: Path) -> bool:
 def _index_env(embedder: Optional[str]) -> dict:
     env = os.environ.copy()
     env["SEMANTEX_QUIET_LIMITS"] = "1"
+    # Mirror the search-side canonical A/B lock so the daemon the first search
+    # spawns is adaptive-OFF (it caches config at spawn time). Harmless at index
+    # time; keeps the harness env uniform. See semantex_client._build_env and
+    # docs/superpowers/plans/2026-06-01-why-no-feature-uplift-rootcause.md §2.
+    env.setdefault("SEMANTEX_ADAPTIVE_SIZING", "0")
     if embedder:
         # Canonical embedder selector (integration §4 D-env-knob). Set at INDEX
         # time so the right dense backend is built + persisted into meta.json.

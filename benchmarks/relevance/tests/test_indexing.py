@@ -60,6 +60,25 @@ def test_ensure_index_threads_embedder_into_index_env(tmp_path):
     assert mr.call_args.kwargs["env"]["SEMANTEX_EMBEDDER"] == "coderank-137m"
 
 
+def test_index_env_locks_adaptive_sizing_off_by_default(tmp_path, monkeypatch):
+    # The index subprocess inherits the same canonical A/B lock as search, so the
+    # daemon it (or the first search) spawns is adaptive-OFF. Harmless at index
+    # time; keeps the harness env uniform. See the rootcause doc §2.
+    monkeypatch.delenv("SEMANTEX_ADAPTIVE_SIZING", raising=False)
+    with patch("relevance_harness.indexing.subprocess.run") as mr:
+        mr.return_value = _Proc(returncode=0)
+        ensure_index(corpus_dir=tmp_path, semantex_binary="semantex")
+    assert mr.call_args.kwargs["env"]["SEMANTEX_ADAPTIVE_SIZING"] == "0"
+
+
+def test_index_env_respects_explicit_adaptive_sizing_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("SEMANTEX_ADAPTIVE_SIZING", "1")
+    with patch("relevance_harness.indexing.subprocess.run") as mr:
+        mr.return_value = _Proc(returncode=0)
+        ensure_index(corpus_dir=tmp_path, semantex_binary="semantex")
+    assert mr.call_args.kwargs["env"]["SEMANTEX_ADAPTIVE_SIZING"] == "1"
+
+
 def test_ensure_index_raises_on_failed_build(tmp_path):
     with patch("relevance_harness.indexing.subprocess.run") as mr:
         mr.return_value = _Proc(returncode=1, stderr="kaboom")

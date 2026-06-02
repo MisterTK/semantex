@@ -77,6 +77,15 @@ def run_corpus(
         embedder=embedder,  # canonical SEMANTEX_EMBEDDER selector (integration §4)
     )
 
+    # Defeat stale-daemon reuse: a daemon caches its config (incl. the canonical
+    # adaptive-OFF A/B lock) at spawn time and lives 30 min idle, so stop any
+    # existing daemon before searching to force a fresh spawn under the lock. The
+    # rerank ablation is exempt — it relies on a manually pre-started daemon
+    # (rerank env + a raised RSS cap) that a reset would kill, silently disabling
+    # reranking.
+    if ablation != "rerank":
+        client.reset_daemon()
+
     relevances: list[list[int]] = []
     n_relevant: list[int] = []
     per_query: list[RankedResult] = []

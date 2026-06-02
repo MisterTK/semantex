@@ -100,6 +100,48 @@ def test_embedder_sets_env():
     assert env["SEMANTEX_EMBEDDER"] == "coderank-137m"
 
 
+def test_search_env_locks_adaptive_sizing_off_by_default(monkeypatch):
+    # Canonical A/B measurement config: adaptive result sizing is OFF for
+    # relevance A/Bs because it clips ~45% of recoverable recall (confidence
+    # threshold + per-file dedup) before any feature runs, invalidating the
+    # comparison. It stays ON in the product (the -18% agent-CCB feature). See
+    # docs/superpowers/plans/2026-06-01-why-no-feature-uplift-rootcause.md §2.
+    monkeypatch.delenv("SEMANTEX_ADAPTIVE_SIZING", raising=False)
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        client.search("q1", "x", ablation="hybrid", k=5)
+    assert mr.call_args.kwargs["env"]["SEMANTEX_ADAPTIVE_SIZING"] == "0"
+
+
+def test_search_env_respects_explicit_adaptive_sizing_override(monkeypatch):
+    # An explicit export wins over the lock, so the harness can still measure the
+    # shipped adaptive-ON behaviour (e.g. to reproduce the OFF-vs-ON delta).
+    monkeypatch.setenv("SEMANTEX_ADAPTIVE_SIZING", "1")
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        client.search("q1", "x", ablation="hybrid", k=5)
+    assert mr.call_args.kwargs["env"]["SEMANTEX_ADAPTIVE_SIZING"] == "1"
+
+
+def test_reset_daemon_runs_stop_in_corpus_dir(monkeypatch):
+    # The daemon caches adaptive_sizing at spawn time and lives 30 min idle, so a
+    # stale adaptive-ON daemon from a prior run would silently serve A/B queries.
+    # reset_daemon stops it so the next search spawns a fresh one under the lock.
+    monkeypatch.delenv("SEMANTEX_ADAPTIVE_SIZING", raising=False)
+    client = SemantexClient(semantex_binary="/abs/semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        client.reset_daemon()
+    assert mr.call_args.args[0] == ["/abs/semantex", "stop", "."]
+    assert mr.call_args.kwargs["cwd"] == "/tmp/c"
+    # never raises even when no daemon is running (stop is best-effort)
+    assert mr.call_args.kwargs["check"] is False
+    # carries the locked env so a respawn inherits the canonical A/B config
+    assert mr.call_args.kwargs["env"]["SEMANTEX_ADAPTIVE_SIZING"] == "0"
+
+
 def test_failed_search_raises_with_stderr():
     client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
     with patch("subprocess.run") as mr:
