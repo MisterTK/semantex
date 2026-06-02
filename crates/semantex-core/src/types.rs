@@ -235,12 +235,13 @@ impl IndexMeta {
     /// new on-disk layout (`dense/coderank-hnsw/vectors.bin`). Bumping forces a
     /// clean reindex so an old PLAID-only index isn't half-read by the new path.
     ///
-    /// v12 (D4): the ColBERT/PLAID dense backend was removed — coderank-hnsw is
-    /// now the sole built-in dense backend. Bumping forces any straggler index
-    /// still stamped `dense_backend:"colbert-plaid"` to be detected `Stale` and
-    /// rebuilt cleanly (belt-and-braces alongside the open-time backend-mismatch
-    /// guard in `hybrid.rs`, which already refuses such an index with rebuild
-    /// guidance rather than panicking).
+    /// v12 (D4): bumped when the ColBERT/PLAID dense backend was briefly removed
+    /// (coderank-hnsw the sole backend), to force any straggler index stamped
+    /// `dense_backend:"colbert-plaid"` `Stale` for a clean reindex. colbert-plaid
+    /// was later RESTORED as the default backend (2026-06-02 cutover), but needs
+    /// NO further schema bump — a change of active embedder/backend is caught by
+    /// the per-embedder `embedder_fingerprint` staleness (auto-rebuild into the
+    /// versioned dense dir) + the open-time backend-mismatch guard in `hybrid.rs`.
     pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 }
 

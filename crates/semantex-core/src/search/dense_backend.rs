@@ -1,10 +1,10 @@
 //! The `DenseBackend` seam: a trait abstraction over the dense search/build
 //! channel so dense backends can be selected by config/env without touching call
-//! sites. Two built-ins: `coderank-hnsw` (CodeRankEmbed single-vector +
-//! instant-distance HNSW — the default) and the opt-in `colbert-plaid` (ColBERT
-//! late-interaction per-token vectors over a next-plaid PLAID index, selected by
-//! the `lateon-colbert` multi-vector embedder). A further backend slots in as one
-//! more variant and one more match arm. See the design doc
+//! sites. Two built-ins: `colbert-plaid` (ColBERT late-interaction per-token
+//! vectors over a next-plaid PLAID index, selected by the `lateon-colbert`
+//! multi-vector embedder — the shipped default) and `coderank-hnsw` (CodeRankEmbed
+//! single-vector + instant-distance HNSW — opt-in). A further backend slots in as
+//! one more variant and one more match arm. See the design doc
 //! `docs/superpowers/specs/2026-05-31-semantex-sota-overhaul-design.md` §3/§4 S1.
 
 use crate::types::ScoredChunkId;
@@ -13,17 +13,22 @@ use std::path::{Path, PathBuf};
 
 /// Identity of a dense backend — drives config selection and on-disk paths.
 ///
-/// `coderank-hnsw` is the default; `colbert-plaid` is the opt-in late-interaction
-/// backend (selected when a `multi_vector` embedder like `lateon-colbert` is
-/// chosen). The string form is what gets written into `meta.json` and read from
-/// `SEMANTEX_DENSE_BACKEND`.
+/// `colbert-plaid` is the SHIPPED DEFAULT backend (the default embedder is
+/// `lateon-colbert`, 2026-06-02 cutover); `coderank-hnsw` is a first-class opt-in
+/// (`SEMANTEX_EMBEDDER=coderank-137m`). NOTE: the derived `Default` below is
+/// `CoderankHnsw` — that is the conservative FALLBACK used only when backend
+/// resolution catastrophically fails (single-vector, always loadable); it is
+/// deliberately NOT the product default, which is resolved from the config
+/// embedder's capabilities. The string form is written into `meta.json` and read
+/// from `SEMANTEX_DENSE_BACKEND`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DenseBackendKind {
-    /// CodeRankEmbed single-vector embeddings over a pure-Rust HNSW index.
+    /// CodeRankEmbed single-vector embeddings over a pure-Rust HNSW index. Opt-in;
+    /// also the conservative resolution FALLBACK (hence `#[default]`).
     #[default]
     CoderankHnsw,
     /// ColBERT late-interaction per-token vectors over a PLAID (next-plaid) index.
-    /// Opt-in; served by the `lateon-colbert` multi-vector embedder.
+    /// The shipped default; served by the `lateon-colbert` multi-vector embedder.
     ColbertPlaid,
 }
 
