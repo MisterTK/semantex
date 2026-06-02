@@ -49,3 +49,21 @@ for short queries its encode is cheap (~56 ms) but lateon's 17M encode is cheape
 latency win holds across query distributions — lateon is never slower.** The default flip's
 load-bearing latency argument is confirmed; remaining caveats (one single-gold corpus, modest
 quality magnitude) stand. Probe is ad-hoc bash (timing `semantex --dense-only` per query).
+
+## Addendum 2 — hybrid (production fusion) A/B confirms the win (2026-06-02)
+The shipped search path is HYBRID (dense+BM25 fused), not dense-only. Re-ran the A/B with
+`ablation="hybrid"` on the cached indexes (adaptive-OFF):
+
+| arm (hybrid, 180q) | nDCG@10 | R@10 | MRR@10 | warm ms |
+|---|---|---|---|---|
+| coderank-137m | 0.2801 | 0.739 | 0.1473 | 901 |
+| lateon-colbert | **0.2966 (+5.9%)** | 0.744 | **0.1654 (+12%)** | 88 |
+
+The win HOLDS in the production fusion path (+5.9% nDCG@10, ~same as dense-only's +6.2%) — on
+CoIR-CodeTransDL the sparse channel adds little (hybrid ≈ dense; matches the prior "sparse mildly
+hurts on code-translation" finding). Latency unchanged (dense query-encode dominates fusion).
+
+**Cutover validation summary:** quality +5.9–6.2% nDCG (dense AND hybrid) / +12% MRR; latency
+faster on BOTH long-code (10×) and short-NL (48 vs 56 ms) queries; ~19× smaller index; graceful
+migration (no re-chunk). The default flip is thoroughly validated on this corpus. Remaining gap:
+generalization (one single-gold corpus) + agent-CCB — the explicit, reversible residual risk.
