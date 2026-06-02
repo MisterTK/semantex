@@ -32,3 +32,20 @@ Index footprint: PLAID ~23.5 MB vs single-vector HNSW ~438 MB (the D4 RSS object
 - If flipping toward lateon: first broaden — (i) a short-NL-query latency probe, (ii) re-run on ≥1 other CoIR sub-task or a real indexed repo with known-item queries, (iii) an agent-CCB A/B (claude_bench) lateon vs coderank. Then flip the default with a multi-corpus number.
 - Keep lateon-colbert OPT-IN until the above; it ships and works today (`SEMANTEX_EMBEDDER=lateon-colbert`).
 - Item 4 (SWE-loc on a VM) remains the venue for the at-scale + multi-gold confirmation.
+
+## Addendum — short-NL-query latency probe (2026-06-02, de-risks the cutover)
+Caveat 3 (the latency win may be long-CODE-query-specific) — TESTED and resolved FAVORABLY.
+10 short agent-style NL queries ("authenticate a user", "database connection pool", "handle
+error and retry", …), warm daemon, subprocess round-trip (equal overhead both arms), CoIR index:
+
+| query type | coderank-137m (HNSW) | lateon-colbert (PLAID) |
+|---|---|---|
+| long code (CoIR, 180q) | 903 ms warm | 92 ms (~10× faster) |
+| **short NL (10q)** | **56 ms** median (51–83) | **48 ms** median (40–52, tighter) |
+
+For SHORT NL queries (semantex's real agent traffic) lateon is still slightly FASTER (48 vs 56 ms)
+and more consistent. coderank's 903 ms was specific to LONG code queries (137M encode dominates);
+for short queries its encode is cheap (~56 ms) but lateon's 17M encode is cheaper still. **The
+latency win holds across query distributions — lateon is never slower.** The default flip's
+load-bearing latency argument is confirmed; remaining caveats (one single-gold corpus, modest
+quality magnitude) stand. Probe is ad-hoc bash (timing `semantex --dense-only` per query).
