@@ -79,15 +79,16 @@ pub struct SemantexConfig {
     /// error at startup, not a silent recall regression. Run
     /// `semantex index --rebuild` after toggling.
     pub use_bm25_stemmer: bool,
-    /// DEPRECATED dense-backend alias / selection knob. Default `"coderank-hnsw"`
-    /// (the [`DenseBackendKind::default`] name + sole built-in backend). When it
-    /// parses to a known backend name that alias wins; an UNKNOWN value (e.g. a
-    /// stale `"colbert-plaid"` from an old config) falls through to the canonical
-    /// `embedder` selection (see [`ModelRegistry::resolve_dense_backend`]). Set
-    /// via `SEMANTEX_DENSE_BACKEND`. MUST match the value the index was built with
-    /// — `HybridSearcher::open` re-validates it against the persisted
-    /// `IndexMeta.dense_backend` and refuses to load on mismatch (mirrors
-    /// `use_bm25_stemmer`).
+    /// DEPRECATED dense-backend alias / explicit override knob. Default EMPTY:
+    /// when unset, the canonical `embedder` selection decides the backend (the
+    /// default `coderank-137m` → `coderank-hnsw`), so `SEMANTEX_EMBEDDER` is the
+    /// primary selector. When set (via `SEMANTEX_DENSE_BACKEND`) to a known
+    /// backend name, that alias WINS directly — overriding the embedder path; an
+    /// UNKNOWN value falls through to the embedder path (see
+    /// [`ModelRegistry::resolve_dense_backend`]). MUST match the value the index
+    /// was built with — `HybridSearcher::open` re-validates the RESOLVED backend
+    /// against the persisted `IndexMeta.dense_backend` and refuses to load on
+    /// mismatch (mirrors `use_bm25_stemmer`).
     pub dense_backend: String,
     /// Active embedder model id (registry lookup key). Default `"coderank-137m"`
     /// (CodeRankEmbed-137M, single-vector → the `coderank-hnsw` dense backend).
@@ -144,11 +145,14 @@ impl Default for SemantexConfig {
             min_score_semantic: 0.10,
             min_score_mixed: 0.10,
             use_bm25_stemmer: true,
-            // Default = DenseBackendKind::default() name (the sole built-in
-            // backend). The canonical `embedder` selection resolves to the same
-            // backend; an explicit SEMANTEX_DENSE_BACKEND can still override.
-            dense_backend: "coderank-hnsw".to_string(),
-            // coderank-137m → coderank-hnsw is the default dense path.
+            // EMPTY by default: the deprecated alias is unset, so the canonical
+            // `embedder` selection decides the backend. An explicit
+            // SEMANTEX_DENSE_BACKEND overrides it. (A non-empty default here would
+            // permanently shadow SEMANTEX_EMBEDDER — e.g. make lateon-colbert
+            // unselectable — since the alias wins whenever it parses.)
+            dense_backend: String::new(),
+            // coderank-137m → coderank-hnsw is the default dense path (resolved
+            // via the embedder capabilities, since the alias above is empty).
             embedder: "coderank-137m".to_string(),
             reranker_model: "bge-reranker-v2-m3".to_string(),
             llm_model: String::new(),
@@ -337,15 +341,16 @@ mod tests {
     }
 
     #[test]
-    fn default_dense_backend_alias_is_coderank_hnsw() {
+    fn default_dense_backend_alias_is_empty() {
         let cfg = SemantexConfig::default();
-        // D4: the `dense_backend` alias default is the DenseBackendKind::default()
-        // name ("coderank-hnsw"), the sole built-in backend. The all-default
-        // resolution yields coderank-hnsw — see
+        // The deprecated alias defaults EMPTY so it does NOT shadow the canonical
+        // `embedder` selection (a non-empty default would make SEMANTEX_EMBEDDER
+        // ineffective — e.g. lateon-colbert unselectable). The all-default
+        // resolution still yields coderank-hnsw via the embedder path — see
         // resolve_dense_backend_all_default_is_coderank_hnsw in registry.rs.
         assert_eq!(
-            cfg.dense_backend, "coderank-hnsw",
-            "alias default is the sole built-in backend name"
+            cfg.dense_backend, "",
+            "deprecated alias default must be empty (canonical embedder decides)"
         );
     }
 

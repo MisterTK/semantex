@@ -100,17 +100,20 @@ impl ModelRegistry {
     /// `SEMANTEX_EMBEDDER` selection AND the DEPRECATED `SEMANTEX_DENSE_BACKEND`
     /// / `config.dense_backend` alias.
     ///
-    /// Selection (D4 — coderank-hnsw is the sole built-in dense backend):
-    /// * Deprecated alias: if `config.dense_backend` parses to a known backend
-    ///   name, that alias WINS directly (keeps the `SEMANTEX_DENSE_BACKEND` knob
-    ///   live for explicit selection / future backends).
-    /// * Canonical path: otherwise the active embedder (`config.embedder`) routes
-    ///   via its capabilities to a backend (`coderank-137m` / `qwen3-embed-0.6b`
-    ///   → coderank-hnsw). The shipped all-default config resolves here.
+    /// Selection:
+    /// * Canonical path (the default): `config.dense_backend` is EMPTY, so the
+    ///   active embedder (`config.embedder` / `SEMANTEX_EMBEDDER`) routes via its
+    ///   capabilities to a backend — `coderank-137m`/`qwen3-embed-0.6b` (single-
+    ///   vector) → coderank-hnsw; `lateon-colbert` (multi-vector) → colbert-plaid.
+    ///   The shipped all-default config resolves here (→ coderank-hnsw).
+    /// * Deprecated override: if `config.dense_backend` is set (via
+    ///   `SEMANTEX_DENSE_BACKEND`) and parses to a known backend name, that alias
+    ///   WINS directly, overriding the embedder path.
     ///
-    /// An UNKNOWN alias value (e.g. a stale `colbert-plaid` from an old config or
-    /// a typo) does NOT match — it falls through to the canonical embedder path,
-    /// so a removed backend name degrades to the default rather than erroring.
+    /// An UNKNOWN alias value (a typo) does NOT match — it falls through to the
+    /// canonical embedder path rather than erroring. The alias MUST default empty:
+    /// a non-empty default would always parse and permanently shadow
+    /// `SEMANTEX_EMBEDDER` (making e.g. lateon-colbert unselectable).
     pub fn resolve_dense_backend(
         config: &SemantexConfig,
         project_path: Option<&Path>,
@@ -296,6 +299,22 @@ mod tests {
         // deprecated SEMANTEX_DENSE_BACKEND path), independent of the embedder.
         let mut cfg = SemantexConfig::default();
         cfg.dense_backend = "colbert-plaid".to_string();
+        assert_eq!(
+            ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
+            DenseBackendKind::ColbertPlaid
+        );
+    }
+
+    #[test]
+    fn resolve_dense_backend_lateon_embedder_routes_to_colbert_plaid() {
+        // The canonical selector: SEMANTEX_EMBEDDER=lateon-colbert with the DEFAULT
+        // (empty) dense_backend alias must resolve to colbert-plaid via the
+        // embedder's multi_vector capability. This is the exact path the indexer +
+        // searcher use; a non-empty alias default would shadow it (regression guard
+        // for the e2e "lateon-colbert silently built coderank-hnsw" bug).
+        let mut cfg = SemantexConfig::default();
+        assert_eq!(cfg.dense_backend, "", "precondition: alias defaults empty");
+        cfg.embedder = "lateon-colbert".to_string();
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::ColbertPlaid
