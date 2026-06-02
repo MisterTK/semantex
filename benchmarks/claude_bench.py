@@ -362,6 +362,7 @@ def parse_claude_stream(raw: str) -> dict:
 
     ctx_per_turn: list[int] = []
     tool_calls = 0
+    tool_calls_by_name: dict[str, int] = {}
     answer = ""
     result_stats: dict = {}
     for ev in events:
@@ -377,6 +378,8 @@ def parse_claude_stream(raw: str) -> dict:
             for block in msg.get("content", []):
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     tool_calls += 1
+                    nm = block.get("name", "?")
+                    tool_calls_by_name[nm] = tool_calls_by_name.get(nm, 0) + 1
         elif t == "result":
             result_stats = ev
             answer = ev.get("result", "") or answer
@@ -386,12 +389,17 @@ def parse_claude_stream(raw: str) -> dict:
     first = ctx_per_turn[0] if ctx_per_turn else 0
     num_turns = result_stats.get("num_turns", len(ctx_per_turn))
     caf = (ccb / (len(ctx_per_turn) * first)) if (ctx_per_turn and first) else 0.0
+    sx_tool_calls = sum(v for k, v in tool_calls_by_name.items() if k.startswith("mcp__semantex__"))
+    native_tool_calls = tool_calls - sx_tool_calls
 
     return {
         "ccb": ccb,
         "peak_context": peak,
         "num_turns": num_turns,
         "tool_calls": tool_calls,
+        "tool_calls_by_name": tool_calls_by_name,
+        "sx_tool_calls": sx_tool_calls,
+        "native_tool_calls": native_tool_calls,
         "caf": round(caf, 3),
         "cost_usd": result_stats.get("total_cost_usd", 0.0),
         "duration_ms": result_stats.get("duration_ms", 0),
@@ -596,6 +604,8 @@ def pareto_table(results: list[dict]) -> dict[str, dict]:
             "quality": round(_mean([r.get("quality") for r in rs]), 2),
             "wall_secs": round(_mean([r.get("wall_secs") for r in rs])),
             "turns": round(_mean([r.get("num_turns") for r in rs]), 1),
+            "sx_tool_calls": round(_mean([r.get("sx_tool_calls") for r in rs]), 1),
+            "native_tool_calls": round(_mean([r.get("native_tool_calls") for r in rs]), 1),
             "n": len(rs),
         }
     return out
@@ -634,6 +644,14 @@ def cmd_report(args):
 
     lines.append("\n> Pareto: an arm dominates if it is >= on quality AND <= on CCB AND "
                  "<= on latency. Read the table for the frontier; ties keep the current default.\n")
+
+    lines += ["\n## Tool usage (mean calls/run — did the arm use semantex?)\n",
+              "| arm | semantex_agent calls | native (grep/read/...) calls |",
+              "|---|---|---|"]
+    for arm in arms:
+        t = table[arm]
+        lines.append(f"| {arm} | {t['sx_tool_calls']} | {t['native_tool_calls']} |")
+
     report = "\n".join(lines) + "\n"
     (inp / "report.md").write_text(report)
     print(report)

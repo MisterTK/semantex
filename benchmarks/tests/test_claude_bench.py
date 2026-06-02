@@ -79,3 +79,37 @@ def test_embedders_for_arms():
 
 def test_assert_ready_false_without_meta(tmp_path):
     assert cb._assert_ready(str(tmp_path), "lateon-colbert") is False
+
+
+def test_parse_stream_records_tool_names():
+    import json
+    # minimal claude stream-json: two assistant turns w/ tool_use blocks + a result.
+    events = [
+        {"type": "assistant", "message": {"usage": {"input_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [
+                {"type": "tool_use", "name": "mcp__semantex__semantex_agent"},
+                {"type": "tool_use", "name": "Grep"},
+                {"type": "tool_use", "name": "Read"}]}},
+        {"type": "assistant", "message": {"usage": {"input_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [{"type": "tool_use", "name": "mcp__semantex__semantex_agent"}]}},
+        {"type": "result", "result": "done", "num_turns": 2},
+    ]
+    raw = "\n".join(json.dumps(e) for e in events)
+    m = cb.parse_claude_stream(raw)
+    assert m["tool_calls"] == 4
+    assert m["tool_calls_by_name"]["mcp__semantex__semantex_agent"] == 2
+    assert m["tool_calls_by_name"]["Grep"] == 1
+    assert m["tool_calls_by_name"]["Read"] == 1
+    assert m["sx_tool_calls"] == 2          # semantex MCP calls
+    assert m["native_tool_calls"] == 2      # Grep + Read
+
+
+def test_pareto_table_includes_tool_usage():
+    rows = [{"arm": "sx-lateon", "ccb": 60000, "quality": 4.0, "wall_secs": 40,
+             "num_turns": 4, "sx_tool_calls": 2, "native_tool_calls": 6},
+            {"arm": "builtin", "ccb": 100000, "quality": 4.0, "wall_secs": 80,
+             "num_turns": 5, "sx_tool_calls": 0, "native_tool_calls": 20}]
+    t = cb.pareto_table(rows)
+    assert t["sx-lateon"]["sx_tool_calls"] == 2
+    assert t["sx-lateon"]["native_tool_calls"] == 6
+    assert t["builtin"]["sx_tool_calls"] == 0
