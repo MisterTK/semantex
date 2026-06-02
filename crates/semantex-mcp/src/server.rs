@@ -782,7 +782,32 @@ impl McpServer {
                         }
                     }
                 }),
-                output_schema: None,
+                // NOTE: name/lang are nullable (the agent always emits these keys,
+                // null when absent) — intentional divergence from semantex_search,
+                // which omits them. `results` is required: it's always present when
+                // structuredContent is emitted (only set when hits exist).
+                output_schema: Some(serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file": {"type":"string"},
+                                    "lines": {"type":"string"},
+                                    "score": {"type":"number"},
+                                    "name": {"type":["string","null"]},
+                                    "snippet": {"type":"string"},
+                                    "lang": {"type":["string","null"]}
+                                },
+                                "required": ["file","lines","score","snippet"]
+                            }
+                        }
+                    },
+                    "required": ["results"]
+                })),
                 annotations: Some(ToolAnnotations::read_only("Intelligent Code Search")),
             },
             Tool {
@@ -1239,6 +1264,7 @@ impl McpServer {
 
         // Run each query and collect formatted results.
         let mut parts: Vec<String> = Vec::with_capacity(queries.len());
+        let mut all_hits: Vec<serde_json::Value> = Vec::new();
         for q in &queries {
             let request = AgentRequest {
                 query: q.clone(),
@@ -1246,7 +1272,17 @@ impl McpServer {
                 budget: Some(budget),
                 full_code,
             };
-            let response = pipeline.handle(&request);
+            let (response, hits) = pipeline.handle_with_hits(&request);
+            for h in &hits {
+                all_hits.push(serde_json::json!({
+                    "file": h.file,
+                    "lines": format!("{}-{}", h.start_line, h.end_line),
+                    "score": h.score,
+                    "name": h.name,
+                    "snippet": h.summary.clone().or_else(|| h.content.clone()).unwrap_or_default(),
+                    "lang": h.language,
+                }));
+            }
             parts.push(response.formatted);
         }
 
@@ -1265,7 +1301,14 @@ impl McpServer {
         // Apply focus formatting to the result.
         combined = apply_focus(combined, focus);
 
-        Ok(ToolOutput::text(combined))
+        if all_hits.is_empty() {
+            Ok(ToolOutput::text(combined))
+        } else {
+            Ok(ToolOutput::text_with_structured(
+                combined,
+                serde_json::json!({ "results": all_hits }),
+            ))
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -2680,6 +2723,13 @@ impl ToolOutput {
             structured: None,
         }
     }
+
+    fn text_with_structured(text: String, structured: serde_json::Value) -> Self {
+        Self {
+            text,
+            structured: Some(structured),
+        }
+    }
 }
 
 // =============================================================================
@@ -3903,6 +3953,50 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("query"), "actionable: {err}"),
             Ok(_) => panic!("expected Err for missing query, got Ok"),
         }
+    }
+
+    #[test]
+    fn agent_output_has_structured_and_text() {
+        let srv = McpServer::new(SemantexConfig::default());
+        let cwd = std::env::current_dir().unwrap();
+        // Only meaningful when this repo has a built index; skip cleanly otherwise.
+        if !cwd.join(".semantex/meta.json").exists() {
+            return;
+        }
+        let out = srv
+            .tool_agent(&serde_json::json!({"query":"dense backend","depth":"search"}))
+            .unwrap();
+        // search route over a built index is expected to surface item hits.
+        let s = out
+            .structured
+            .expect("search route over a built index must emit structuredContent");
+        assert!(
+            s.get("results").is_some(),
+            "structuredContent must have results[]"
+        );
+        assert!(!out.text.is_empty(), "prose summary must stay in content[]");
+    }
+
+    #[test]
+    fn agent_synthesis_route_is_text_only_no_structured() {
+        let srv = McpServer::new(SemantexConfig::default());
+        let cwd = std::env::current_dir().unwrap();
+        if !cwd.join(".semantex/meta.json").exists() {
+            return;
+        }
+        // 'deep' routes to the synthesis path, which yields no item-list hits ->
+        // structuredContent must be None, but the prose answer must still ride in content[].
+        let out = srv
+            .tool_agent(&serde_json::json!({"query":"how does indexing work","depth":"deep"}))
+            .unwrap();
+        assert!(
+            !out.text.is_empty(),
+            "synthesis route must still return prose in content[]"
+        );
+        assert!(
+            out.structured.is_none(),
+            "synthesis route (no item hits) must not emit structuredContent"
+        );
     }
 
     #[test]
