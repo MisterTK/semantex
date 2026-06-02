@@ -60,6 +60,35 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 quant: QuantKind::Int8Symmetric,
             }),
         },
+        // LateOn-Code-edge ColBERT — the OPT-IN late-interaction path (17M, dim-48,
+        // int8, Apache-2.0). The spec id is model-descriptive (`lateon-colbert`); its
+        // multi-vector capability routes it to the `colbert-plaid` BACKEND. NOT the
+        // default — coderank-137m / coderank-hnsw stays the shipped default.
+        ModelSpec {
+            id: "lateon-colbert".to_string(),
+            role: ModelRole::Embedder,
+            source: ModelSource::Hf {
+                repo: "lightonai/LateOn-Code-edge".to_string(),
+                files: vec![
+                    "model_int8.onnx".to_string(),
+                    "tokenizer.json".to_string(),
+                    "onnx_config.json".to_string(),
+                ],
+            },
+            capabilities: ModelCapabilities {
+                multi_vector: true,
+                ..ModelCapabilities::default()
+            },
+            role_data: RoleData::Embedder(EmbedderSpec {
+                dims: 48,
+                max_context: 512,
+                query_prefix: String::new(),
+                doc_prefix: String::new(),
+                pooling: Pooling::LateInteraction,
+                normalize: true,
+                quant: QuantKind::Int8Symmetric,
+            }),
+        },
         // Qwen3-Embedding-0.6B (Apache-2.0) — the 2026-SOTA single-vector A/B
         // candidate (semantica review). Single-vector → capabilities route it to
         // the `coderank-hnsw` BACKEND exactly like coderank-137m (no S2 dep). The
@@ -338,10 +367,11 @@ mod tests {
             ids.contains(&"qwen3-reranker-0.6b"),
             "missing qwen3: {ids:?}"
         );
-        // D4: the ColBERT/PLAID embedder built-in was removed.
+        // The opt-in late-interaction embedder is a built-in (routes to the
+        // colbert-plaid backend via its multi_vector capability).
         assert!(
-            !ids.contains(&"lateon-colbert"),
-            "lateon-colbert must be removed (D4): {ids:?}"
+            ids.contains(&"lateon-colbert"),
+            "missing lateon-colbert: {ids:?}"
         );
     }
 
@@ -395,13 +425,15 @@ mod tests {
     }
 
     #[test]
-    fn no_builtin_is_multi_vector() {
-        // D4: the ColBERT/PLAID multi-vector built-in was removed, so every
-        // built-in embedder is single-vector (routes to coderank-hnsw).
+    fn only_lateon_colbert_is_multi_vector() {
+        // Exactly one built-in is multi-vector — the opt-in lateon-colbert
+        // (routes to colbert-plaid). Every other embedder is single-vector
+        // (routes to coderank-hnsw), so the shipped default stays single-vector.
         for s in builtin_specs() {
-            assert!(
-                !s.capabilities.multi_vector,
-                "built-in `{}` must not be multi-vector after D4",
+            let expect_mv = s.id == "lateon-colbert";
+            assert_eq!(
+                s.capabilities.multi_vector, expect_mv,
+                "built-in `{}` multi_vector should be {expect_mv}",
                 s.id
             );
         }

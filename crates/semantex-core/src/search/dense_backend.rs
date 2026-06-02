@@ -1,8 +1,10 @@
 //! The `DenseBackend` seam: a trait abstraction over the dense search/build
-//! channel so dense backends can be selected by config/env and future backends
-//! slot in without touching call sites. Today the sole built-in backend is
-//! `coderank-hnsw` (CodeRankEmbed single-vector + instant-distance HNSW); the
-//! enum is kept so a new backend is one variant + one match arm away. See
+//! channel so dense backends can be selected by config/env without touching call
+//! sites. Two built-ins: `coderank-hnsw` (CodeRankEmbed single-vector +
+//! instant-distance HNSW — the default) and the opt-in `colbert-plaid` (ColBERT
+//! late-interaction per-token vectors over a next-plaid PLAID index, selected by
+//! the `lateon-colbert` multi-vector embedder). A further backend slots in as one
+//! more variant and one more match arm. See the design doc
 //! `docs/superpowers/specs/2026-05-31-semantex-sota-overhaul-design.md` §3/§4 S1.
 
 use crate::types::ScoredChunkId;
@@ -11,14 +13,18 @@ use std::path::{Path, PathBuf};
 
 /// Identity of a dense backend — drives config selection and on-disk paths.
 ///
-/// Single-variant today (`coderank-hnsw`), but kept an enum behind the seam so a
-/// future backend slots in. The string form is what gets written into
-/// `meta.json` and read from `SEMANTEX_DENSE_BACKEND`.
+/// `coderank-hnsw` is the default; `colbert-plaid` is the opt-in late-interaction
+/// backend (selected when a `multi_vector` embedder like `lateon-colbert` is
+/// chosen). The string form is what gets written into `meta.json` and read from
+/// `SEMANTEX_DENSE_BACKEND`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DenseBackendKind {
     /// CodeRankEmbed single-vector embeddings over a pure-Rust HNSW index.
     #[default]
     CoderankHnsw,
+    /// ColBERT late-interaction per-token vectors over a PLAID (next-plaid) index.
+    /// Opt-in; served by the `lateon-colbert` multi-vector embedder.
+    ColbertPlaid,
 }
 
 impl DenseBackendKind {
@@ -26,16 +32,18 @@ impl DenseBackendKind {
     pub fn name(self) -> &'static str {
         match self {
             DenseBackendKind::CoderankHnsw => "coderank-hnsw",
+            DenseBackendKind::ColbertPlaid => "colbert-plaid",
         }
     }
 
     /// Parse a backend name (case-insensitive, whitespace-trimmed).
-    /// Returns `None` for an unknown name (e.g. a stale `colbert-plaid` from an
-    /// old config, or a typo) so callers fall back to the default rather than
-    /// panicking — old indexes degrade to a clean rebuild, not a crash.
+    /// Returns `None` for an unknown name (a typo, or a backend not built into
+    /// this binary) so callers fall back to the default rather than panicking —
+    /// old indexes degrade to a clean rebuild, not a crash.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "coderank-hnsw" => Some(DenseBackendKind::CoderankHnsw),
+            "colbert-plaid" => Some(DenseBackendKind::ColbertPlaid),
             _ => None,
         }
     }
@@ -64,6 +72,7 @@ pub fn active_dense_dir(index_dir: &Path, backend: DenseBackendKind, fingerprint
 pub fn dense_sentinel_file(backend: DenseBackendKind) -> &'static str {
     match backend {
         DenseBackendKind::CoderankHnsw => "vectors.bin",
+        DenseBackendKind::ColbertPlaid => "plaid_mapping.bin",
     }
 }
 
@@ -272,8 +281,7 @@ mod tests {
 
     #[test]
     fn parse_unknown_backend_is_none() {
-        // A removed/stale backend name no longer parses → falls back to default.
-        assert_eq!(DenseBackendKind::parse("colbert-plaid"), None);
+        // An unknown/typo name doesn't parse → falls back to the default.
         assert_eq!(DenseBackendKind::parse("totally-made-up"), None);
         assert_eq!(DenseBackendKind::parse(""), None);
     }
@@ -289,6 +297,24 @@ mod tests {
             Some(DenseBackendKind::CoderankHnsw)
         );
         assert_eq!(DenseBackendKind::CoderankHnsw.name(), "coderank-hnsw");
+    }
+
+    #[test]
+    fn parse_colbert_plaid_backend() {
+        assert_eq!(
+            DenseBackendKind::parse("colbert-plaid"),
+            Some(DenseBackendKind::ColbertPlaid)
+        );
+        assert_eq!(
+            DenseBackendKind::parse("  Colbert-PLAID "),
+            Some(DenseBackendKind::ColbertPlaid)
+        );
+        assert_eq!(DenseBackendKind::ColbertPlaid.name(), "colbert-plaid");
+        // Its dense store is marked present by the plaid mapping sidecar.
+        assert_eq!(
+            dense_sentinel_file(DenseBackendKind::ColbertPlaid),
+            "plaid_mapping.bin"
+        );
     }
 
     #[test]
@@ -308,10 +334,10 @@ mod tests {
 
     #[test]
     fn verify_backend_errors_on_mismatch() {
-        // An old index built with a now-removed backend (`colbert-plaid`) opened
-        // under the current default (`coderank-hnsw`) must error CLEANLY with
+        // An index built with one backend (`colbert-plaid`) opened under a
+        // different configured backend (`coderank-hnsw`) must error CLEANLY with
         // rebuild guidance — NOT panic. This is the graceful-degradation guard
-        // for stragglers that survived the schema bump.
+        // when the active embedder/backend changes out from under an index.
         let tmp = tempfile::TempDir::new().unwrap();
         let index_dir = tmp.path();
         write_meta_with_backend(index_dir, "colbert-plaid");

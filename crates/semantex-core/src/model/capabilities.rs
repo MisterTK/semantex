@@ -1,15 +1,10 @@
 //! `ModelCapabilities` + capability→backend negotiation.
 //!
 //! The engine NEGOTIATES against these descriptors rather than branching on a
-//! model id: a single-vector model routes to the HNSW backend. Adding a future
-//! capability = one field here (defaulted off) + one handler; existing models
-//! keep working unchanged — the "new capabilities ship without an engine
-//! refactor" guarantee (design §4 S8).
-//!
-//! The `multi_vector` field is RETAINED (a future multi-vector backend slots in
-//! behind the `DenseBackend` seam), but no built-in backend serves it today:
-//! `backend_for` errors on a multi-vector model rather than silently
-//! mis-routing it to the single-vector path.
+//! model id: `multi_vector=true` routes to the ColBERT/PLAID late-interaction
+//! backend, `false` to single-vector/HNSW. Adding a future capability = one field
+//! here (defaulted off) + one handler; existing models keep working unchanged —
+//! the "new capabilities ship without an engine refactor" guarantee (design §4 S8).
 
 use crate::search::dense_backend::DenseBackendKind;
 use anyhow::Result;
@@ -20,9 +15,9 @@ use serde::{Deserialize, Serialize};
 /// that predates a new capability — keeps working with the capability OFF.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelCapabilities {
-    /// `true` → per-token vectors (late-interaction / MaxSim); `false` →
-    /// single-vector. RETAINED for a future multi-vector backend; no built-in
-    /// backend serves `true` today (see [`backend_for`]).
+    /// `true` → per-token vectors (ColBERT late-interaction / PLAID MaxSim);
+    /// `false` → single-vector. Routes to the opt-in `colbert-plaid` backend via
+    /// [`backend_for`] (the `lateon-colbert` embedder sets this).
     #[serde(default)]
     pub multi_vector: bool,
     /// Matryoshka truncation dims, if the model is MRL-trained (else `None` →
@@ -45,30 +40,24 @@ pub struct ModelCapabilities {
 /// Which dense backend a model's capabilities select. S8's own enum; maps to
 /// S1's `DenseBackendKind` via [`BackendKind::dense_kind`] (the single coupling
 /// point between the registry and S1's seam).
-///
-/// Single-variant today (D4: coderank-hnsw is the sole built-in dense backend),
-/// but kept an enum so a future backend slots in alongside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// CodeRankEmbed single-vector + HNSW.
+    /// ColBERT late-interaction + PLAID (multi-vector). Opt-in.
+    ColbertPlaid,
+    /// CodeRankEmbed single-vector + HNSW. Default.
     CoderankHnsw,
 }
 
 /// Negotiate the dense backend from capabilities alone (no model id branching).
-/// A single-vector model routes to the HNSW backend. A `multi_vector=true` model
-/// has NO built-in backend (D4 removed the ColBERT/PLAID path) — `Err`, so the
-/// caller surfaces a clear "no multi-vector backend" message rather than
-/// silently mis-routing it to the single-vector path.
+/// `multi_vector=true` → the opt-in ColBERT/PLAID backend; otherwise the default
+/// single-vector/HNSW backend. The `Result` return is kept for source stability
+/// with existing call sites — it never returns `Err` today.
 pub fn backend_for(caps: &ModelCapabilities) -> Result<BackendKind> {
     if caps.multi_vector {
-        anyhow::bail!(
-            "model declares multi_vector=true but no multi-vector dense backend \
-             is available (the coderank-hnsw backend is single-vector). Use a \
-             single-vector embedder, or add a multi-vector backend behind the \
-             DenseBackend seam."
-        )
+        Ok(BackendKind::ColbertPlaid)
+    } else {
+        Ok(BackendKind::CoderankHnsw)
     }
-    Ok(BackendKind::CoderankHnsw)
 }
 
 impl BackendKind {
@@ -77,6 +66,7 @@ impl BackendKind {
     /// source stability with existing call sites — it never returns `Err` today.
     pub fn dense_kind(self) -> Result<DenseBackendKind> {
         match self {
+            BackendKind::ColbertPlaid => Ok(DenseBackendKind::ColbertPlaid),
             BackendKind::CoderankHnsw => Ok(DenseBackendKind::CoderankHnsw),
         }
     }
@@ -96,15 +86,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_vector_has_no_backend() {
-        // D4 removed the ColBERT/PLAID path: a multi-vector model no longer
-        // resolves to a built-in backend and must error (not mis-route).
+    fn multi_vector_routes_to_plaid() {
+        // A multi-vector model (e.g. lateon-colbert) routes to the opt-in
+        // ColBERT/PLAID backend.
         let mv = ModelCapabilities {
             multi_vector: true,
             ..Default::default()
         };
-        let err = backend_for(&mv).expect_err("multi-vector must have no backend");
-        assert!(err.to_string().contains("multi-vector"), "got: {err}");
+        assert_eq!(backend_for(&mv).unwrap(), BackendKind::ColbertPlaid);
     }
 
     #[test]
@@ -112,6 +101,14 @@ mod tests {
         assert_eq!(
             BackendKind::CoderankHnsw.dense_kind().unwrap(),
             DenseBackendKind::CoderankHnsw
+        );
+    }
+
+    #[test]
+    fn colbert_plaid_dense_kind_maps_to_s1_dense_kind() {
+        assert_eq!(
+            BackendKind::ColbertPlaid.dense_kind().unwrap(),
+            DenseBackendKind::ColbertPlaid
         );
     }
 

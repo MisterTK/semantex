@@ -1,10 +1,10 @@
 //! S8 acceptance: capability routing, user-manifest 2nd-model end-to-end,
 //! fingerprint stamping, and the clean-mismatch error arm.
 //!
-//! POST-D4 NOTE: D4 removed the ColBERT/PLAID dense backend, leaving
-//! `coderank-hnsw` as the sole built-in. `DenseBackendKind` is now a
-//! single-variant enum and `backend_for` errors on a multi-vector model (no
-//! built-in backend serves it). These golden tests assert that contract.
+//! BACKEND ROUTING: `coderank-hnsw` is the default single-vector backend;
+//! `colbert-plaid` is the opt-in late-interaction backend that a `multi_vector`
+//! embedder (e.g. `lateon-colbert`) routes to via `backend_for`. These golden
+//! tests assert that capability-routing contract.
 
 use semantex_core::config::SemantexConfig;
 use semantex_core::model::ModelRegistry;
@@ -105,12 +105,12 @@ fn user_manifest_second_model_loads_and_routes() {
     );
 }
 
-/// D4: a user `models.toml` multi-vector embedder LOADS but has no built-in
-/// backend — `embedder_backend_kind` errors cleanly rather than mis-routing it
-/// to the single-vector path. The capability field is retained for a future
-/// multi-vector backend behind the DenseBackend seam.
+/// A user `models.toml` multi-vector embedder LOADS and capability-routes to the
+/// opt-in `colbert-plaid` late-interaction backend (`embedder_backend_kind` →
+/// `DenseBackendKind::ColbertPlaid`), with no code change — the capability-driven
+/// negotiation in action.
 #[test]
-fn user_manifest_multi_vector_model_has_no_backend() {
+fn user_manifest_multi_vector_model_routes_to_colbert_plaid() {
     let tmp = tempfile::TempDir::new().unwrap();
     let project = tmp.path().join("proj");
     let semantex_dir = project.join(".semantex");
@@ -142,10 +142,11 @@ fn user_manifest_multi_vector_model_has_no_backend() {
     let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
     // Loads as a spec…
     assert_eq!(reg.active_embedder().unwrap().id, "my-multivec-variant");
-    // …but routes to no built-in backend.
-    assert!(
-        reg.embedder_backend_kind().is_err(),
-        "multi-vector embedder must have no built-in backend after D4"
+    // …and routes to the opt-in colbert-plaid late-interaction backend.
+    assert_eq!(
+        reg.embedder_backend_kind().unwrap(),
+        DenseBackendKind::ColbertPlaid,
+        "multi-vector embedder must route to the colbert-plaid backend"
     );
 }
 

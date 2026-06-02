@@ -158,6 +158,36 @@ impl HybridSearcher {
                     None
                 }
             }
+            DenseBackendKind::ColbertPlaid => {
+                // S8: resolve the LIVE store dir via the ACTIVE pointer
+                // (`dense/colbert-plaid/<fingerprint>/`), whose presence sentinel
+                // is the PLAID mapping sidecar. Opt-in late-interaction backend.
+                let plaid_dir = resolve_active_dense_dir(index_dir, DenseBackendKind::ColbertPlaid);
+                let mapping_path = plaid_dir.join("plaid_mapping.bin");
+                if mapping_path.exists() {
+                    match crate::embedding::model_manager::ensure_colbert_model(
+                        &config.models_dir(),
+                    )
+                    .and_then(|model_dir| {
+                        crate::search::colbert_plaid_backend::ColbertPlaidBackend::open(
+                            &plaid_dir,
+                            &mapping_path,
+                            &model_dir,
+                        )
+                    }) {
+                        Ok(b) => {
+                            tracing::info!("Dense backend loaded: colbert-plaid");
+                            Some(Box::new(b) as Box<dyn DenseBackend>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("colbert-plaid backend failed to load: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
         };
 
         // Reranker is loaded lazily on first use to save ~200MB for cold searches
