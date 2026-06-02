@@ -80,12 +80,31 @@ two biggest being measurement mismatch and model choice (not the originally-susp
 1. **[DONE — base] `SEMANTEX_ADAPTIVE_SIZING=0` baseline established (Phase 1).** Adaptive-OFF
    is the correct A/B measurement config; recovers CoIR ~+38-45% (dense+hybrid), no-op on
    saturated CSN. NEXT: re-A/B the FEATURES on this base.
-2. **[now, cheap — no reindex/prep] Reranker A/B on the adaptive-OFF base.** A/B the cached
-   `qwen3-reranker-0.6b` (code-capable ONNX) vs bge vs off, on CoIR (recovered R@10 0.72) +
-   CSN (NL→code, orientation-matched), window ≤15 ("Drowning in Documents" curve). Directly
-   tests the #2 root cause: distinguishes "reranking doesn't help" (false) from "bge is wrong
-   for code" (real). CPU latency (~seconds/q) is a deployment blocker but orthogonal to the
-   quality signal. This is the immediate next experiment.
+2. **[CORRECTED 2026-06-01 — the big one] Reranking IS CPU-viable, but via LATE INTERACTION,
+   not cross-encoders.** Product constraint: semantex ships on CPU developer workstations, no
+   GPU. CROSS-ENCODER reranking is therefore OUT (bge-v2-m3 regresses; qwen3-reranker-0.6b
+   >120s/query at window 15 on CPU — confirmed, the harness 120s timeout killed it). BUT a
+   field scour found the right architecture, already in the cache:
+   **`lightonai/LateOn-Code-edge`** (LightOn, Feb 2026, ColBERT late-interaction on ModernBERT,
+   **17M params, Apache-2.0, ONNX int8, MTEB-Code 66.64**) and **`LateOn-Code` (130M, 74.12)**.
+   Late interaction precomputes doc multi-vectors at INDEX time → query-time = a 17M query
+   encode (~ms CPU) + cheap MaxSim over the top-k = tens of ms. CoIR 66.64 vs bge's 35.97, at
+   1/33 the params. **`LateOn-Code-edge` is already at `~/.semantex/models/LateOn-Code-edge/`
+   (17 MB int8)**, referenced in `types.rs:428`.
+   KICKER: LightOn's `ColGrep` (CPU code search, regex+semantic, Claude Code integration, "70%
+   win vs grep / 15.7% token reduction for Claude Opus") is built on **`next-plaid` — the exact
+   multi-vector engine semantex VENDORED and REMOVED in D4/PR#1.** D4's RSS rationale (12.3 GB)
+   was for the OLD heavy colbert; the modern path is 17M + dim-48 + residual-quantization +
+   mmap. **D4 may have been one release too early.**
+   This is a BACKEND re-implementation, not a flag — but the seam was RETAINED for it
+   (`Pooling::LateInteraction`, `multi_vector` capability, `positional_chunk_ids()`/
+   `search_with_subset`). Dual use: (i) a CPU reranker (MaxSim over top-k), and/or (ii) a
+   better dense backend than coderank-137m (60.1 → 66.64/74.12). NEXT EXPERIMENT: stand up a
+   multi-vector backend behind the retained seam (re-vendor next-plaid or a lean MaxSim+residual
+   store), index a corpus with LateOn-Code-edge, A/B vs coderank-hnsw adaptive-OFF on CoIR
+   (quality) AND measure the dim-48 index RSS vs the 438 MB single-vector baseline (the D4
+   re-litigation). Separately: SPLADE-Code (Naver, learned sparse, sub-ms CPU, arXiv 2603.22008)
+   is a CPU-viable SPARSE-channel upgrade worth a look.
 3. **[BLOCKED on a code change — bigger than "conversion"] qwen3-embed-0.6b needs LAST-TOKEN
    pooling support first.** Two gaps, verified 2026-06-01:
    (a) ARTIFACT: upstream `Qwen/Qwen3-Embedding-0.6B` is safetensors-only; usable ONNX exports
