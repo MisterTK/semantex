@@ -202,9 +202,9 @@ mod tests {
     }
 
     #[test]
-    fn multi_vector_embedder_has_no_backend() {
-        // D4 removed the ColBERT/PLAID path: a multi-vector embedder (declared via
-        // a user manifest) no longer resolves to a built-in backend and errors.
+    fn multi_vector_embedder_routes_to_colbert_plaid() {
+        // A multi-vector embedder (declared via a user manifest) routes to the
+        // opt-in colbert-plaid late-interaction backend via capabilities.
         let tmp = tempfile::TempDir::new().unwrap();
         let project = tmp.path().join("proj");
         let semantex_dir = project.join(".semantex");
@@ -233,9 +233,10 @@ mod tests {
         let mut cfg = SemantexConfig::default();
         cfg.embedder = "some-multivec".to_string();
         let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
-        assert!(
-            reg.embedder_backend_kind().is_err(),
-            "multi-vector embedder must have no built-in backend"
+        assert_eq!(
+            reg.embedder_backend_kind().unwrap(),
+            DenseBackendKind::ColbertPlaid,
+            "multi-vector embedder must route to the colbert-plaid backend"
         );
     }
 
@@ -277,14 +278,27 @@ mod tests {
 
     #[test]
     fn resolve_dense_backend_unknown_alias_falls_through_to_embedder() {
-        // A stale/unknown alias (e.g. an old "colbert-plaid" string) no longer
-        // parses — it falls through to the canonical embedder path (coderank-hnsw)
-        // rather than erroring. This is how old configs degrade gracefully.
+        // An unknown/typo alias doesn't parse — it falls through to the canonical
+        // embedder path (default coderank-hnsw) rather than erroring. This is how
+        // a stale or mistyped config degrades gracefully. (A KNOWN alias like
+        // "colbert-plaid" parses and wins directly — covered separately.)
+        let mut cfg = SemantexConfig::default();
+        cfg.dense_backend = "totally-made-up".to_string();
+        assert_eq!(
+            ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
+            DenseBackendKind::CoderankHnsw
+        );
+    }
+
+    #[test]
+    fn resolve_dense_backend_colbert_plaid_alias_parses() {
+        // The known colbert-plaid backend alias parses and wins directly (the
+        // deprecated SEMANTEX_DENSE_BACKEND path), independent of the embedder.
         let mut cfg = SemantexConfig::default();
         cfg.dense_backend = "colbert-plaid".to_string();
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
-            DenseBackendKind::CoderankHnsw
+            DenseBackendKind::ColbertPlaid
         );
     }
 

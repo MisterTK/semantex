@@ -707,6 +707,59 @@ impl IndexBuilder {
                     );
                     Ok(did_full_build)
                 }
+                DenseBackendKind::ColbertPlaid => {
+                    use crate::search::colbert_plaid_backend::ColbertPlaidIndexBuilder;
+                    // Mirror the coderank arm's full-vs-incremental discipline into
+                    // the SAME versioned `dense_dir`: a full build streams the whole
+                    // corpus one PLAID_BATCH at a time (the 26GB→9GB memory bound)
+                    // under the build-slot gate, then earns the ACTIVE flip;
+                    // incremental reuses the live dir in place. SEMANTEX_DENSE_CONTEXT
+                    // is single-vector-only (graph-annotation prefix), so the
+                    // late-interaction backend always embeds raw chunk content.
+                    let did_full_build = if dense_missing {
+                        let _slot = crate::index::gate::acquire(|| {
+                            tracing::info!(
+                                "Waiting for a free index-build slot (max {} concurrent full builds)",
+                                crate::index::gate::max_concurrent_builds()
+                            );
+                        });
+                        let all_ids = store.get_all_chunk_ids()?;
+                        if all_ids.is_empty() {
+                            // Empty corpus — no store written, so do NOT flip ACTIVE.
+                            return Ok(false);
+                        }
+                        let mut dense_builder =
+                            ColbertPlaidIndexBuilder::new(&dense_dir, self.config.plaid_nbits)
+                                .with_models_dir(self.config.models_dir());
+                        dense_builder.build_streaming_ids(&all_ids, |batch_ids| {
+                            let mut chunks = store.get_chunks(batch_ids)?;
+                            chunks.sort_by_key(|c| c.id);
+                            Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                        })?;
+                        true
+                    } else {
+                        let mut dense_builder =
+                            ColbertPlaidIndexBuilder::new(&dense_dir, self.config.plaid_nbits)
+                                .with_models_dir(self.config.models_dir());
+                        if !removed_chunk_ids.is_empty() {
+                            dense_builder.delete(&removed_chunk_ids)?;
+                        }
+                        if !new_chunk_ids.is_empty() {
+                            dense_builder.insert_streaming_ids(&new_chunk_ids, |batch_ids| {
+                                let chunks = store.get_chunks(batch_ids)?;
+                                Ok(chunks.into_iter().map(|c| (c.id, c.content)).collect())
+                            })?;
+                        }
+                        false
+                    };
+                    tracing::info!(
+                        added = new_chunk_ids.len(),
+                        removed = removed_chunk_ids.len(),
+                        full_build = did_full_build,
+                        "Dense index (colbert-plaid) build complete"
+                    );
+                    Ok(did_full_build)
+                }
             }
         })();
         let full_build_ok = match dense_result {
@@ -752,6 +805,7 @@ impl IndexBuilder {
                 "CodeRankEmbed".to_string(),
                 crate::embedding::single_vector::SingleVectorEmbedder::embedding_dim() as u32,
             ),
+            DenseBackendKind::ColbertPlaid => ("LateOn-Code-edge".to_string(), 48u32),
         };
         let meta = IndexMeta {
             schema_version: IndexMeta::CURRENT_SCHEMA_VERSION,
