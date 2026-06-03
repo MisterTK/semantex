@@ -404,8 +404,118 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
+    // 7b. NL lookup that names a distinctive symbol → lexical family.
+    //
+    // A multi-word natural-language *locate/lookup* query that embeds a
+    // distinctive code identifier ("the HandlerFunc type", "where is
+    // allocateContext called") is served better by precise lexical retrieval
+    // than by dense semantic search. The measured mis-routes all fell through
+    // to Semantic here, so this rule runs LAST — it can only reclassify a
+    // query that nothing above claimed, which makes the guardrails structural:
+    //
+    //   - Synthesis intent (how/why/explain/describe/walk-me-through/trace)
+    //     is already claimed by the Deep prefix scan (step 5) and never
+    //     reaches this point, so "how does HandlerFunc work" stays Deep.
+    //   - Understanding questions ("what does X do", "what is X") are guarded
+    //     out explicitly below so they fall to Semantic, not the lexical route.
+    //   - Genuine semantic NL with no distinctive identifier
+    //     ("authentication middleware") finds no symbol and falls to Semantic.
+    //
+    // Symbol shape is detected with the SAME helpers the single-token
+    // ExactSymbol step (step 3) uses — no new heuristics. Domain-neutral: any
+    // codebase with PascalCase / camelCase / CAPS-prefixed / snake_case
+    // identifiers benefits; no hardcoded symbol names.
+    if let Some(route) = classify_nl_symbol_lookup(query, &lower) {
+        return route;
+    }
+
     // 8. Semantic — default
     AgentRoute::Semantic
+}
+
+/// True if a single whitespace-free token has the shape of a distinctive code
+/// identifier, using the exact same shape predicates as the step-3 ExactSymbol
+/// path: camelCase/PascalCase, a CAPS-prefixed symbol (`HTMLParser`), a
+/// snake_case identifier, or a dotted path. A trailing punctuation char (e.g.
+/// the `(` in `abort(` or a closing paren/comma) is stripped first so call
+/// phrasing reads as a clean identifier.
+///
+/// Deliberately stricter than `extract_symbol`: a bare lowercase word
+/// (`authenticate`, `middleware`) is NOT a distinctive identifier and must not
+/// trip the lexical route.
+fn is_distinctive_symbol_token(token: &str) -> bool {
+    // A token written as a call site (`abort(`) is a distinctive code signal in
+    // its own right, even when the identifier itself is a plain lowercase word:
+    // the trailing open-paren only appears when the user is naming code, not
+    // prose. Require an identifier-shaped prefix so a bare "(" doesn't match.
+    if let Some(prefix) = token.strip_suffix('(')
+        && prefix.len() >= 2
+        && prefix
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        && prefix.chars().next().is_some_and(|c| !c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.');
+    if t.len() < 3 {
+        return false;
+    }
+    is_camel_case(t)
+        || has_caps_prefix_symbol(t)
+        || (t.contains('_') && t.len() > 2)
+        || (t.contains('.') && t.len() > 2)
+}
+
+/// Classify a multi-word NL lookup query that embeds a distinctive identifier.
+///
+/// Returns `Structural` for call/usage phrasing ("where is X called", "what
+/// calls X", "places that call X"), `ExactSymbol` for a plain symbol lookup
+/// ("the X type", "find the X struct"), or `None` when the query is not a
+/// symbol-bearing lookup (no distinctive identifier, or it is an understanding
+/// question that should stay Semantic).
+///
+/// `lower` is the caller's already-lowercased copy of `query`.
+fn classify_nl_symbol_lookup(query: &str, lower: &str) -> Option<AgentRoute> {
+    // Guard: "what does X do" / "what is X" / "what are X" are understanding
+    // questions, not locate queries — let them fall to Semantic. (Synthesis
+    // prefixes how/why/explain/… are already claimed by Deep upstream and
+    // never reach here.)
+    if lower.starts_with("what does ")
+        || lower.starts_with("what do ")
+        || lower.starts_with("what is ")
+        || lower.starts_with("what are ")
+    {
+        return None;
+    }
+
+    // Need at least one distinctive identifier token; a lone-token query was
+    // already handled by step 3, so require multi-word here.
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    if !tokens.iter().any(|t| is_distinctive_symbol_token(t)) {
+        return None;
+    }
+
+    // Call/usage phrasing → Structural (call-graph walk). Universal English
+    // signals only; "what calls"/"who calls" are also Structural keywords
+    // upstream, repeated here so the symbol-bearing variants route the same.
+    let call_usage = lower.contains("where is")
+        || lower.contains("where are")
+        || lower.contains("call ")
+        || lower.contains("calls ")
+        || lower.contains("called")
+        || lower.contains("invoke")
+        || lower.contains("usage of");
+    if call_usage {
+        return Some(AgentRoute::Structural);
+    }
+
+    // Plain symbol lookup → ExactSymbol (precise lexical retrieval).
+    Some(AgentRoute::ExactSymbol)
 }
 
 /// Extract the most relevant symbol from a query string.
@@ -934,6 +1044,121 @@ mod tests {
         assert_eq!(
             classify_agent_query("who calls authenticate"),
             AgentRoute::Structural
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // NL lookup that names a distinctive symbol → lexical family
+    // (step 7b — fires only on queries that would otherwise fall to Semantic)
+    // ────────────────────────────────────────────────────────────────────
+
+    // ── POSITIVE: lookup phrasing + embedded identifier → ExactSymbol ────
+    #[test]
+    fn nl_lookup_the_x_type_is_exact_symbol() {
+        // Multi-word NL lookup naming a PascalCase identifier. Previously fell
+        // through to Semantic (measured 0.63 vs oracle Regex 1.00). A precise
+        // lexical lookup serves it better.
+        assert_eq!(
+            classify_agent_query("the HandlerFunc type"),
+            AgentRoute::ExactSymbol
+        );
+    }
+    #[test]
+    fn nl_lookup_the_x_class_is_exact_symbol() {
+        // "class" is a type-lookup noun, not call/usage phrasing → ExactSymbol.
+        // (Oracle scored Structural 1.00, but the lookup intent is symbol
+        // location, which ExactSymbol serves; both are lexical-family wins.)
+        assert_eq!(
+            classify_agent_query("the AppContext class"),
+            AgentRoute::ExactSymbol
+        );
+    }
+    #[test]
+    fn nl_lookup_find_the_x_struct_is_exact_symbol() {
+        assert_eq!(
+            classify_agent_query("find the RouterGroup struct"),
+            AgentRoute::ExactSymbol
+        );
+    }
+
+    // ── POSITIVE: call/usage phrasing + identifier → Structural ─────────
+    #[test]
+    fn nl_lookup_where_is_x_called_is_structural() {
+        // Call/usage phrasing ("where is X called") → Structural, the route
+        // that walks the call graph. Previously fell to Semantic (0.53 vs
+        // oracle Regex 1.00).
+        assert_eq!(
+            classify_agent_query("where is allocateContext called"),
+            AgentRoute::Structural
+        );
+    }
+    #[test]
+    fn nl_lookup_places_that_call_x_is_structural() {
+        // "places that call X(" — usage phrasing; the trailing "(" is not a
+        // regex trigger, so this previously fell to Semantic (0.27).
+        assert_eq!(
+            classify_agent_query("places that call abort("),
+            AgentRoute::Structural
+        );
+    }
+    #[test]
+    fn nl_lookup_what_calls_x_is_structural() {
+        // Already covered by the Structural keyword "what calls" — re-verified
+        // here so the new rule does not regress it.
+        assert_eq!(
+            classify_agent_query("what calls RouterGroup"),
+            AgentRoute::Structural
+        );
+    }
+
+    // ── NEGATIVE: synthesis intent + symbol → still Deep (guardrail) ─────
+    #[test]
+    fn nl_lookup_how_does_x_work_stays_deep() {
+        // Synthesis ("how … work") with an embedded symbol MUST stay Deep —
+        // routing synthesis to a retrieval route was measured to HURT (+26%
+        // context). The Deep prefix scan claims it before the new rule.
+        assert_eq!(
+            classify_agent_query("how does HandlerFunc work"),
+            AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn nl_lookup_explain_x_lifecycle_stays_deep() {
+        assert_eq!(
+            classify_agent_query("explain the AppContext lifecycle"),
+            AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn nl_lookup_why_does_x_fail_stays_deep() {
+        assert_eq!(
+            classify_agent_query("why does AuthService fail on retry"),
+            AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn nl_lookup_what_does_x_do_stays_semantic() {
+        // "what does X do" is an understanding question, not a locate query —
+        // it must NOT be stolen by the lexical rule.
+        assert_eq!(
+            classify_agent_query("what does HandlerFunc do"),
+            AgentRoute::Semantic
+        );
+    }
+
+    // ── NEGATIVE: genuine semantic NL (no distinctive symbol) → Semantic ─
+    #[test]
+    fn nl_lookup_authentication_middleware_stays_semantic() {
+        assert_eq!(
+            classify_agent_query("authentication middleware"),
+            AgentRoute::Semantic
+        );
+    }
+    #[test]
+    fn nl_lookup_error_handling_patterns_stays_semantic() {
+        assert_eq!(
+            classify_agent_query("error handling patterns"),
+            AgentRoute::Semantic
         );
     }
 
