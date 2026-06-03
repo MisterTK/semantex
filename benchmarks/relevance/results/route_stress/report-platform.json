@@ -1,79 +1,79 @@
 {
   "repo": "platform",
-  "total_queries": 22,
+  "total_queries": 27,
   "synthesis_count": 6,
-  "overall_regret": 0.1964,
-  "overall_router_accuracy": 0.3182,
-  "router_matches_oracle_count": 7,
+  "overall_regret": 0.136,
+  "overall_router_accuracy": 0.5185,
+  "router_matches_oracle_count": 14,
   "oracle_win_counts": {
-    "file_pattern": 0,
-    "regex": 11,
+    "file_pattern": 5,
+    "regex": 12,
     "exact_symbol": 9,
-    "structural": 8,
-    "semantic": 9
+    "structural": 9,
+    "semantic": 11
   },
   "per_route_mean_ndcg": {
-    "file_pattern": 0.0,
-    "regex": 0.5177,
-    "exact_symbol": 0.423,
-    "structural": 0.3456,
-    "semantic": 0.4563
+    "file_pattern": 0.1852,
+    "regex": 0.4218,
+    "exact_symbol": 0.4096,
+    "structural": 0.3823,
+    "semantic": 0.4654
   },
   "per_mechanism_route_ndcg": {
     "glob": {
-      "file_pattern": 0.0,
-      "regex": 0.4152,
-      "exact_symbol": 0.104,
-      "structural": 0.1515,
-      "semantic": 0.1799
+      "file_pattern": 0.5556,
+      "regex": 0.1845,
+      "exact_symbol": 0.2018,
+      "structural": 0.0514,
+      "semantic": 0.2704
     },
     "lexical": {
       "file_pattern": 0.0,
       "regex": 0.9262,
-      "exact_symbol": 0.9262,
+      "exact_symbol": 1.0,
       "structural": 1.0,
-      "semantic": 0.9262
+      "semantic": 1.0
     },
     "regex": {
       "file_pattern": 0.0,
       "regex": 0.4479,
-      "exact_symbol": 0.2491,
-      "structural": 0.2165,
-      "semantic": 0.3567
+      "exact_symbol": 0.4032,
+      "structural": 0.3988,
+      "semantic": 0.5287
     },
     "semantic": {
       "file_pattern": 0.0,
       "regex": 0.4769,
-      "exact_symbol": 0.5436,
-      "structural": 0.377,
-      "semantic": 0.5436
+      "exact_symbol": 0.3333,
+      "structural": 0.4769,
+      "semantic": 0.4623
     },
     "structural": {
       "file_pattern": 0.0,
       "regex": 0.625,
       "exact_symbol": 0.5436,
-      "structural": 0.0,
+      "structural": 0.5059,
       "semantic": 0.5436
     },
     "usage": {
       "file_pattern": 0.0,
       "regex": 0.0,
       "exact_symbol": 0.0,
-      "structural": 0.0,
+      "structural": 0.1052,
       "semantic": 0.0
     }
   },
   "per_mechanism_regret": {
-    "glob": 0.3173,
-    "lexical": 0.0738,
-    "regex": 0.1099,
-    "semantic": 0.5436,
-    "structural": 0.2044,
-    "usage": 0.0
+    "glob": 0.1173,
+    "lexical": 0.0,
+    "regex": 0.1613,
+    "semantic": 0.4769,
+    "structural": 0.0754,
+    "usage": 0.1052
   },
   "per_mechanism_router_accuracy": {
-    "glob": 0.0,
-    "lexical": 0.8,
+    "glob": 0.6667,
+    "lexical": 1.0,
     "regex": 0.25,
     "semantic": 0.0,
     "structural": 0.6667,
@@ -81,19 +81,23 @@
   },
   "confusion_matrix": {
     "glob": {
-      "semantic": 4
+      "exact_symbol": 1,
+      "semantic": 3,
+      "file_pattern": 5
     },
     "lexical": {
-      "semantic": 5
+      "exact_symbol": 5
     },
     "regex": {
-      "semantic": 4
+      "exact_symbol": 3,
+      "semantic": 1
     },
     "semantic": {
       "deep": 3
     },
     "structural": {
-      "semantic": 3
+      "exact_symbol": 2,
+      "structural": 1
     },
     "usage": {
       "feature_planning": 1,
@@ -110,26 +114,26 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 0.0,
-        "exact_symbol": 0.0,
-        "structural": 0.32776097292662437,
-        "semantic": 0.0
+        "exact_symbol": 0.4690000933206748,
+        "structural": 0.2489083270225946,
+        "semantic": 0.6830838076905165
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.0,
-        "exact_symbol": 0.0,
-        "structural": 0.3333333333333333,
-        "semantic": 0.0
+        "exact_symbol": 0.25,
+        "structural": 0.16666666666666666,
+        "semantic": 0.5
       },
-      "oracle_route": "structural",
+      "oracle_route": "semantic",
       "oracle_routes_tied": [
-        "structural"
+        "semantic"
       ],
-      "oracle_ndcg": 0.3278,
-      "router_choice": "semantic",
+      "oracle_ndcg": 0.6831,
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.0,
-      "regret": 0.3278
+      "router_ndcg": 0.469,
+      "regret": 0.2141
     },
     {
       "query_id": "plat-glob-2",
@@ -142,14 +146,14 @@
         "regex": 0.6410457898283652,
         "exact_symbol": 0.0,
         "structural": 0.0,
-        "semantic": 0.06943122193677727
+        "semantic": 0.0
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.5333333333333333,
         "exact_symbol": 0.0,
         "structural": 0.0,
-        "semantic": 0.06666666666666667
+        "semantic": 0.0
       },
       "oracle_route": "regex",
       "oracle_routes_tied": [
@@ -158,8 +162,8 @@
       "oracle_ndcg": 0.641,
       "router_choice": "semantic",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.0694,
-      "regret": 0.5716
+      "router_ndcg": 0.0,
+      "regret": 0.641
     },
     {
       "query_id": "plat-glob-3",
@@ -170,16 +174,16 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 0.3589542101716347,
-        "exact_symbol": 0.13886244387355454,
-        "structural": 0.2781981696179509,
-        "semantic": 0.13886244387355454
+        "exact_symbol": 0.08514311764162098,
+        "structural": 0.0,
+        "semantic": 0.15850703974098102
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.11764705882352941,
         "exact_symbol": 0.058823529411764705,
-        "structural": 0.17647058823529413,
-        "semantic": 0.058823529411764705
+        "structural": 0.0,
+        "semantic": 0.11764705882352941
       },
       "oracle_route": "regex",
       "oracle_routes_tied": [
@@ -188,8 +192,8 @@
       "oracle_ndcg": 0.359,
       "router_choice": "semantic",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.1389,
-      "regret": 0.2201
+      "router_ndcg": 0.1585,
+      "regret": 0.2004
     },
     {
       "query_id": "plat-glob-4",
@@ -200,26 +204,176 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 0.6608397947263839,
-        "exact_symbol": 0.27727342735504823,
+        "exact_symbol": 0.3391602052736161,
         "structural": 0.0,
-        "semantic": 0.5111381318124144
+        "semantic": 0.6690620354632857
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.8,
-        "exact_symbol": 0.4,
+        "exact_symbol": 0.2,
         "structural": 0.0,
         "semantic": 0.8
       },
-      "oracle_route": "regex",
+      "oracle_route": "semantic",
       "oracle_routes_tied": [
-        "regex"
+        "semantic"
       ],
-      "oracle_ndcg": 0.6608,
+      "oracle_ndcg": 0.6691,
       "router_choice": "semantic",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.5111,
-      "regret": 0.1497
+      "router_ndcg": 0.6691,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-glob-lit-1",
+      "query": "apps/api/src/controllers/*.ts",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 5,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-glob-lit-2",
+      "query": "apps/api/src/middleware/*.ts",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 6,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-glob-lit-3",
+      "query": ".github/workflows/*.yaml",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-glob-lit-4",
+      "query": "apps/frontend_flutter/integration_test/*.dart",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.75369761125927,
+        "structural": 0.0,
+        "semantic": 0.75369761125927
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.75,
+        "structural": 0.0,
+        "semantic": 0.75
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-glob-lit-5",
+      "query": "apps/api/src/repos/*.test.ts",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 5,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.16958010263680806,
+        "structural": 0.21398626473452756,
+        "semantic": 0.16958010263680806
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.2,
+        "structural": 0.2,
+        "semantic": 0.2
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
     },
     {
       "query_id": "plat-regex-1",
@@ -230,27 +384,26 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 0.07839826897867533,
-        "exact_symbol": 0.13886244387355454,
-        "structural": 0.13886244387355454,
-        "semantic": 0.13886244387355454
+        "exact_symbol": 0.4537425745411855,
+        "structural": 0.4220949603708207,
+        "semantic": 0.4537425745411855
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.04,
-        "exact_symbol": 0.04,
-        "structural": 0.04,
-        "semantic": 0.04
+        "exact_symbol": 0.12,
+        "structural": 0.16,
+        "semantic": 0.12
       },
       "oracle_route": "exact_symbol",
       "oracle_routes_tied": [
         "exact_symbol",
-        "structural",
         "semantic"
       ],
-      "oracle_ndcg": 0.1389,
-      "router_choice": "semantic",
+      "oracle_ndcg": 0.4537,
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.1389,
+      "router_ndcg": 0.4537,
       "regret": 0.0
     },
     {
@@ -262,16 +415,16 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 1.0,
-        "exact_symbol": 0.4288398090337664,
-        "structural": 0.0,
-        "semantic": 0.7162874455029681
+        "exact_symbol": 0.6489315753318465,
+        "structural": 0.09478836436955078,
+        "semantic": 0.9305687780632227
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.6666666666666666,
-        "exact_symbol": 0.26666666666666666,
-        "structural": 0.0,
-        "semantic": 0.5333333333333333
+        "exact_symbol": 0.3333333333333333,
+        "structural": 0.06666666666666667,
+        "semantic": 0.6
       },
       "oracle_route": "regex",
       "oracle_routes_tied": [
@@ -280,8 +433,8 @@
       "oracle_ndcg": 1.0,
       "router_choice": "semantic",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.7163,
-      "regret": 0.2837
+      "router_ndcg": 0.9306,
+      "regret": 0.0694
     },
     {
       "query_id": "plat-regex-3",
@@ -292,9 +445,9 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 0.7133080652109928,
-        "exact_symbol": 0.4288398090337664,
-        "structural": 0.7273298443105218,
-        "semantic": 0.5716349530699036
+        "exact_symbol": 0.5100691314582919,
+        "structural": 0.7059054020403311,
+        "semantic": 0.6520881886359191
       },
       "route_recall": {
         "file_pattern": 0.0,
@@ -303,15 +456,15 @@
         "structural": 0.4,
         "semantic": 0.4
       },
-      "oracle_route": "structural",
+      "oracle_route": "regex",
       "oracle_routes_tied": [
-        "structural"
+        "regex"
       ],
-      "oracle_ndcg": 0.7273,
-      "router_choice": "semantic",
+      "oracle_ndcg": 0.7133,
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.5716,
-      "regret": 0.1557
+      "router_ndcg": 0.5101,
+      "regret": 0.2032
     },
     {
       "query_id": "plat-regex-4",
@@ -323,23 +476,25 @@
         "file_pattern": 0.0,
         "regex": 0.0,
         "exact_symbol": 0.0,
-        "structural": 0.0,
-        "semantic": 0.0
+        "structural": 0.3725907541108227,
+        "semantic": 0.07839826897867533
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.0,
         "exact_symbol": 0.0,
-        "structural": 0.0,
-        "semantic": 0.0
+        "structural": 0.19230769230769232,
+        "semantic": 0.038461538461538464
       },
-      "oracle_route": "file_pattern",
-      "oracle_routes_tied": [],
-      "oracle_ndcg": 0.0,
-      "router_choice": "semantic",
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 0.3726,
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 0.0,
-      "regret": 0.0
+      "regret": 0.3726
     },
     {
       "query_id": "plat-lex-1",
@@ -369,7 +524,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -401,7 +556,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -415,9 +570,9 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 1.0,
-        "exact_symbol": 0.6309297535714575,
+        "exact_symbol": 1.0,
         "structural": 1.0,
-        "semantic": 0.6309297535714575
+        "semantic": 1.0
       },
       "route_recall": {
         "file_pattern": 0.0,
@@ -429,13 +584,15 @@
       "oracle_route": "regex",
       "oracle_routes_tied": [
         "regex",
-        "structural"
+        "exact_symbol",
+        "structural",
+        "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.6309,
-      "regret": 0.3691
+      "router_ndcg": 1.0,
+      "regret": 0.0
     },
     {
       "query_id": "plat-lex-4",
@@ -465,7 +622,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -498,7 +655,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -513,14 +670,14 @@
         "file_pattern": 0.0,
         "regex": 0.6309297535714575,
         "exact_symbol": 0.6309297535714575,
-        "structural": 0.0,
+        "structural": 0.5,
         "semantic": 0.6309297535714575
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 1.0,
         "exact_symbol": 1.0,
-        "structural": 0.0,
+        "structural": 1.0,
         "semantic": 1.0
       },
       "oracle_route": "regex",
@@ -530,7 +687,7 @@
         "semantic"
       ],
       "oracle_ndcg": 0.6309,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 0.6309,
       "regret": 0.0
@@ -545,14 +702,14 @@
         "file_pattern": 0.0,
         "regex": 0.6131471927654584,
         "exact_symbol": 0.0,
-        "structural": 0.0,
+        "structural": 0.38685280723454163,
         "semantic": 0.0
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.5,
         "exact_symbol": 0.0,
-        "structural": 0.0,
+        "structural": 0.5,
         "semantic": 0.0
       },
       "oracle_route": "regex",
@@ -560,10 +717,10 @@
         "regex"
       ],
       "oracle_ndcg": 0.6131,
-      "router_choice": "semantic",
+      "router_choice": "structural",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.0,
-      "regret": 0.6131
+      "router_ndcg": 0.3869,
+      "regret": 0.2263
     },
     {
       "query_id": "plat-struct-3",
@@ -575,14 +732,14 @@
         "file_pattern": 0.0,
         "regex": 0.6309297535714575,
         "exact_symbol": 1.0,
-        "structural": 0.0,
+        "structural": 0.6309297535714575,
         "semantic": 1.0
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 1.0,
         "exact_symbol": 1.0,
-        "structural": 0.0,
+        "structural": 1.0,
         "semantic": 1.0
       },
       "oracle_route": "exact_symbol",
@@ -591,7 +748,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -634,7 +791,7 @@
         "file_pattern": 0.0,
         "regex": 1.0,
         "exact_symbol": 1.0,
-        "structural": 0.6309297535714575,
+        "structural": 1.0,
         "semantic": 1.0
       },
       "route_recall": {
@@ -648,6 +805,7 @@
       "oracle_routes_tied": [
         "regex",
         "exact_symbol",
+        "structural",
         "semantic"
       ],
       "oracle_ndcg": 1.0,
@@ -665,27 +823,27 @@
       "route_ndcg": {
         "file_pattern": 0.0,
         "regex": 0.43067655807339306,
-        "exact_symbol": 0.6309297535714575,
-        "structural": 0.5,
-        "semantic": 0.6309297535714575
+        "exact_symbol": 0.0,
+        "structural": 0.43067655807339306,
+        "semantic": 0.38685280723454163
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 1.0,
-        "exact_symbol": 1.0,
+        "exact_symbol": 0.0,
         "structural": 1.0,
         "semantic": 1.0
       },
-      "oracle_route": "exact_symbol",
+      "oracle_route": "regex",
       "oracle_routes_tied": [
-        "exact_symbol",
-        "semantic"
+        "regex",
+        "structural"
       ],
-      "oracle_ndcg": 0.6309,
+      "oracle_ndcg": 0.4307,
       "router_choice": "deep",
       "router_chose_synthesis": true,
       "router_ndcg": 0.0,
-      "regret": 0.6309
+      "regret": 0.4307
     },
     {
       "query_id": "plat-use-1",
@@ -697,23 +855,25 @@
         "file_pattern": 0.0,
         "regex": 0.0,
         "exact_symbol": 0.0,
-        "structural": 0.0,
+        "structural": 0.31546487678572877,
         "semantic": 0.0
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.0,
         "exact_symbol": 0.0,
-        "structural": 0.0,
+        "structural": 1.0,
         "semantic": 0.0
       },
-      "oracle_route": "file_pattern",
-      "oracle_routes_tied": [],
-      "oracle_ndcg": 0.0,
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 0.3155,
       "router_choice": "feature_planning",
       "router_chose_synthesis": true,
       "router_ndcg": 0.0,
-      "regret": 0.0
+      "regret": 0.3155
     },
     {
       "query_id": "plat-use-2",
