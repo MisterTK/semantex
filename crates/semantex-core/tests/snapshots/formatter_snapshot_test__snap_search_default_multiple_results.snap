@@ -1,0 +1,12 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+src/auth.rs:10-25 AuthMiddleware [struct] (0.92)
+  pub struct AuthMiddleware { token: String }
+
+src/handler.rs:42-67 handle_request [fn] (0.77)
+  pub fn handle_request(req: Request) -> Response { todo!() }
+
+
+[2 results, 22ms, confidence: medium]

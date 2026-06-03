@@ -1,0 +1,10 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: base
+---
+search results here
+
+[uncertainty: this query matches 3 distinct concepts. Refine with:]
+- "userAuthHandler" (auth/users.rs:42)
+- "tokenAuthHandler" (auth/tokens.rs:18)
+- "sessionAuth" (sessions/handler.rs:107)

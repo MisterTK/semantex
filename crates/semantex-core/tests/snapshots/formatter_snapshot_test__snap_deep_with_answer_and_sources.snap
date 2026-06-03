@@ -1,0 +1,11 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+Authentication uses JWT tokens validated via the `AuthMiddleware` struct in `src/auth.rs`. The middleware chain calls `handle_request` which delegates to the token validator.
+
+Sources:
+  src/auth.rs:10-50 AuthMiddleware [struct]
+  src/handler.rs:42-80 handle_request [fn]
+
+[searched: 25 chunks, read: 6, 42ms]

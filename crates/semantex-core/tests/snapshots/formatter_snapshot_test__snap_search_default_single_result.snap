@@ -1,0 +1,9 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+src/auth.rs:10-25 AuthMiddleware [struct] (0.92)
+  pub struct AuthMiddleware { token: String }
+
+
+[1 results, 18ms, confidence: high]

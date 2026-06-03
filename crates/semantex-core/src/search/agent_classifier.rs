@@ -34,6 +34,24 @@ fn has_caps_prefix_symbol(s: &str) -> bool {
 /// pipeline now routes architecture/exhaustive/deep-pattern queries
 /// internally to the same logic those tools used, without inviting agents
 /// to chain multiple structural tools additively.
+///
+/// # Wire-format invariant — append-only variants
+///
+/// `AgentRoute` is serialized by postcard (a non-self-describing binary
+/// format) using **positional discriminants**: the first variant is `0`,
+/// the second is `1`, and so on. Reordering or removing a variant silently
+/// changes the meaning of every discriminant that follows it on the wire.
+///
+/// **Rules:**
+/// - New routes **must be appended at the end** of this enum.
+/// - Removing or reordering a variant **requires a `BINARY_PROTOCOL_VERSION`
+///   bump** in `crates/semantex-core/src/server/protocol.rs` so that
+///   mixed-version client/daemon pairs fail fast with `UnsupportedVersion`
+///   instead of silently mis-decoding.
+/// - `v3` is the first version where the route set changes; all daemons
+///   must be restarted on upgrade from a v2 build. Mixed-version
+///   client/daemon pairs will mis-decode `AgentRoute` silently if this
+///   discipline is not followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRoute {
