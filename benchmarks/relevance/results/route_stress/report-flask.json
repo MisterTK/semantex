@@ -2,7 +2,7 @@
   "repo": "flask",
   "total_queries": 34,
   "synthesis_count": 10,
-  "overall_regret": 0.3859,
+  "overall_regret": 0.3678,
   "overall_router_accuracy": 0.3824,
   "router_matches_oracle_count": 13,
   "oracle_win_counts": {
@@ -64,7 +64,7 @@
     }
   },
   "per_mechanism_regret": {
-    "glob": 0.2728,
+    "glob": 0.2042,
     "lexical": 0.1139,
     "regex": 0.0854,
     "semantic": 1.0,
@@ -81,8 +81,9 @@
   },
   "confusion_matrix": {
     "glob": {
-      "file_pattern": 5,
-      "exact_symbol": 4
+      "regex": 1,
+      "exact_symbol": 4,
+      "file_pattern": 4
     },
     "lexical": {
       "semantic": 2,
@@ -129,10 +130,10 @@
         "structural"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "file_pattern",
+      "router_choice": "regex",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.0,
-      "regret": 1.0
+      "router_ndcg": 0.6173,
+      "regret": 0.3827
     },
     {
       "query_id": "flask-glob-2",

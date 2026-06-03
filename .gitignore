@@ -59,3 +59,4 @@ settings.local.json
 # AI editors
 .gemini/
 .cursor/
+**/.remember/

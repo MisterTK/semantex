@@ -1,7 +1,7 @@
 # Route-stress oracle-regret evaluation
 
-- git rev: `90c6601`
-- generated: 2026-06-03 18:11:26
+- git rev: `c2a4e93`
+- generated: 2026-06-03 18:47:17
 - config: `SEMANTEX_ADAPTIVE_SIZING=0` (canonical A/B lock)
 - retrieval routes scored: file_pattern, regex, exact_symbol, structural, semantic
 - synthesis routes (scored 0 for file-gold): analytical, architecture, deep, exhaustive, feature_planning
