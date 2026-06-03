@@ -342,7 +342,12 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
-    // 6. Analytical — keyword matching
+    // 6. Analytical — keyword matching.
+    // NOTE (post-DWE-removal): prefix-less "most complex …" phrasings (e.g.
+    // "the most complex algorithm in this repo", with no leading "explain"/
+    // "how") used to route to DeepWithExamples. They now divert here via the
+    // "most " + "complex" keywords → Analytical. Deep-prefixed variants
+    // ("explain the most complex …") still hit the Deep prefix scan above.
     let analytical_keywords = [
         "most ",
         "least ",
@@ -715,14 +720,9 @@ mod tests {
         );
     }
     #[test]
-    fn former_dwe_show_me_how_now_analytical() {
-        // "show me how" → no deep prefix; "most " in "show me how" does not
-        // appear; "show" + "complex" is not present. No prefix match →
-        // falls to Analytical via "complex" keyword.
-        // Actually "show me how" → does not match any deep prefix ("how " would
-        // need to start the query). "complex" IS in the analytical keywords.
-        // But "show me how the retry backoff..." has no analytical keyword
-        // present. Falls to Semantic.
+    fn former_dwe_show_me_how_now_semantic() {
+        // "show me how …" → no deep prefix, no analytical keyword, no exhaustive
+        // marker → Semantic (default).
         assert_eq!(
             classify_agent_query("show me how the retry backoff is implemented"),
             AgentRoute::Semantic
@@ -754,6 +754,26 @@ mod tests {
         assert_eq!(
             classify_agent_query("how does the retry mechanism work step by step"),
             AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn former_dwe_bare_most_complex_now_analytical() {
+        // Surprising re-route: a prefix-less "most complex …" phrase (no leading
+        // "explain"/"how") used to hit DeepWithExamples via the "most complex
+        // algorithm" marker. With DWE gone it now matches "most " AND "complex"
+        // in the analytical keyword table → Analytical (not Deep/Semantic).
+        assert_eq!(
+            classify_agent_query("the most complex algorithm in this repo"),
+            AgentRoute::Analytical
+        );
+    }
+    #[test]
+    fn former_dwe_give_examples_now_semantic() {
+        // "give examples of X" → no prefix, no analytical keyword, no exhaustive
+        // marker → Semantic (default). Previously hit DWE via "give examples of".
+        assert_eq!(
+            classify_agent_query("give examples of the retry backoff usage"),
+            AgentRoute::Semantic
         );
     }
 
@@ -831,7 +851,6 @@ mod tests {
     //   - Not Architecture (no architecture keyword matches).
     //   - Not Structural (none of: callers/callees/who calls/used by/uses/
     //     depends on/references/imports/etc. appear in the query).
-    //   - Not DeepWithExamples (no marker matches).
     //   - Deep prefix `"how "` matches → AgentRoute::Deep.
     //
     // Conclusion (§4.2 branch (a)): The classifier ALREADY routes platform

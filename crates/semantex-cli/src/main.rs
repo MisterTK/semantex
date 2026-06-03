@@ -314,7 +314,7 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
 
-        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern, architecture, exhaustive_structural, deep_with_examples, feature_planning
+        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern, architecture, feature_planning
         #[arg(long)]
         route: Option<String>,
 
@@ -1001,8 +1001,7 @@ fn main() -> Result<()> {
                         anyhow::anyhow!(
                             "Unknown route: {other}. Valid: file_pattern (files), regex, \
                              exact_symbol (exact), structural, deep, analytical, exhaustive, \
-                             semantic (search), architecture, exhaustive_structural, \
-                             deep_with_examples, feature_planning"
+                             semantic (search), architecture, feature_planning"
                         )
                     })?,
                 }),
