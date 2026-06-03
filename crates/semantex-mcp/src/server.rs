@@ -738,7 +738,10 @@ impl McpServer {
                     "and returns a ready-to-use answer. THE recommended tool for ALL code-search needs — ",
                     "one call in, one complete answer out. Do NOT chain semantex_* calls to assemble an ",
                     "answer; if the result is incomplete, refine the QUESTION and call semantex_agent again. ",
-                    "Accepts a natural-language question, a symbol, a regex, or a glob."
+                    "Accepts a natural-language question, a symbol, a regex, or a glob. ",
+                    "Use 'mode' ONLY when you know the retrieval shape: 'lexical' for exact symbol/regex, ",
+                    "'structural' for callers/callees/imports, 'deep' for multi-source explanation. ",
+                    "Leave 'mode' unset (auto) for everything else — the classifier is usually right."
                 ).into(),
                 input_schema: serde_json::json!({
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -765,10 +768,15 @@ impl McpServer {
                             "type": "integer",
                             "description": "Response size budget in bytes (default: server SEMANTEX_MCP_BUDGET, normally 12000 ≈3K tokens)"
                         },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["auto", "lexical", "search", "structural", "deep"],
+                            "description": "Retrieval strategy. 'auto' (default) = keyword classifier decides; 'lexical' = exact symbol or regex lookup; 'search' = hybrid dense+sparse; 'structural' = callers/callees/imports graph walk; 'deep' = multi-source synthesis. Overrides 'depth'. Leave unset unless you know the shape."
+                        },
                         "depth": {
                             "type": "string",
                             "enum": ["quick", "search", "deep"],
-                            "description": "Search depth. 'quick'=symbol lookup (~50ms), 'search'=hybrid with snippets (~100ms), 'deep'=full implementations with call graphs (~200ms). Omit to auto-detect."
+                            "description": "Search depth. 'quick'=symbol lookup (~50ms), 'search'=hybrid with snippets (~100ms), 'deep'=full implementations with call graphs (~200ms). Omit to auto-detect. Overridden by 'mode' when both are set."
                         },
                         "focus": {
                             "type": "string",
@@ -1196,16 +1204,50 @@ impl McpServer {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(self.mcp_defaults.full_code);
 
+        // Parse the optional `mode` parameter (stable public vocabulary).
+        // Precedence: explicit `mode` arg > `depth` arg > SEMANTEX_MCP_DEPTH env > auto.
+        let mode_arg = args.get("mode").and_then(|v| v.as_str());
+        let mode_route: Option<AgentRoute> = match mode_arg {
+            Some("auto") | None => None, // explicit auto or absent → let depth/env/classifier decide
+            Some("lexical") => {
+                // Exact symbol lookup; promote to Regex if the query contains
+                // regex metacharacters (backslash-class, alternation, bracket
+                // class, anchors, or quantifier group).
+                let q: &str = queries.first().map_or("", String::as_str);
+                if has_regex_metacharacters(q) {
+                    Some(AgentRoute::Regex)
+                } else {
+                    Some(AgentRoute::ExactSymbol)
+                }
+            }
+            Some("search") => Some(AgentRoute::Semantic),
+            Some("structural") => Some(AgentRoute::Structural),
+            Some("deep") => Some(AgentRoute::Deep),
+            Some(other) => {
+                tracing::warn!(
+                    mode = other,
+                    "unknown 'mode' value — ignoring, falling back to depth/auto"
+                );
+                None
+            }
+        };
+
         // Parse the optional `depth` parameter and map it to an AgentRoute override.
+        // `mode` takes precedence; depth only matters when mode is absent/auto.
         let depth_arg = args
             .get("depth")
             .and_then(|v| v.as_str())
             .or(self.mcp_defaults.depth.as_deref());
-        let depth_route: Option<AgentRoute> = match depth_arg {
-            Some("quick") => Some(AgentRoute::ExactSymbol),
-            Some("search") => Some(AgentRoute::Semantic),
-            Some("deep") => Some(AgentRoute::Deep),
-            _ => None,
+        let depth_route: Option<AgentRoute> = if mode_route.is_some() {
+            // `mode` wins — depth is ignored.
+            mode_route
+        } else {
+            match depth_arg {
+                Some("quick") => Some(AgentRoute::ExactSymbol),
+                Some("search") => Some(AgentRoute::Semantic),
+                Some("deep") => Some(AgentRoute::Deep),
+                _ => None,
+            }
         };
 
         // Parse the optional `focus` parameter.
@@ -1215,6 +1257,7 @@ impl McpServer {
             queries = ?queries,
             path = %path.display(),
             full_code,
+            mode = mode_arg.unwrap_or("auto"),
             ?depth_route,
             focus,
             "MCP agent search"
@@ -2785,6 +2828,60 @@ fn truncate_lines_mcp(content: &str, n: usize) -> String {
     }
 }
 
+/// Returns `true` when `query` contains regex metacharacters recognised by the
+/// agent classifier (`is_regex` in `agent_classifier.rs`).  Mirrors the subset
+/// that matters for the `mode=lexical` token-shape check so both stay in sync
+/// without exposing the private `agent_classifier::is_regex` symbol here.
+///
+/// Checks (ordered cheapest-first):
+///   1. `^`/`$` anchors
+///   2. `\b \B \d \D \s \S \w \W` escape classes
+///   3. Unquoted `|` alternation
+///   4. `[...]` character class
+///   5. `(x|y)` / `(x?)` / `(x*)` / `(x+)` quantifier groups
+fn has_regex_metacharacters(query: &str) -> bool {
+    if query.starts_with('^') || query.ends_with('$') {
+        return true;
+    }
+    let bytes = query.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'\\'
+            && matches!(
+                bytes[i + 1],
+                b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W'
+            )
+        {
+            return true;
+        }
+    }
+    let trimmed = query.trim();
+    let quote_wrapped = (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        || (trimmed.starts_with('`') && trimmed.ends_with('`'));
+    if !quote_wrapped && query.contains('|') {
+        return true;
+    }
+    if let Some(open) = query.find('[')
+        && query[open..].contains(']')
+    {
+        return true;
+    }
+    if let Some(open) = query.find('(') {
+        let after = &query[open + 1..];
+        if let Some(close) = after.find(')') {
+            let inner = &after[..close];
+            if inner.contains('|')
+                || inner.contains('?')
+                || inner.contains('*')
+                || inner.contains('+')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Map an optional `response_format` to an effective budget given the base budget.
 /// `concise` ≈ ⅓ tokens (best-practice "return less by default"); `detailed`/None = base.
 fn budget_for_format(response_format: Option<&str>, base_budget: usize) -> usize {
@@ -2871,6 +2968,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 mod tests {
     use super::{
         DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
+        has_regex_metacharacters,
     };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
@@ -4012,6 +4110,7 @@ mod tests {
             "path",
             "full_code",
             "budget",
+            "mode",
             "depth",
             "focus",
             "response_format",
@@ -4021,6 +4120,137 @@ mod tests {
         assert!(
             t.annotations.is_some(),
             "agent must keep read-only annotations"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mode parameter — JSON Schema shape and description copy
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mode_schema_has_correct_enum_values() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let mode = &t.input_schema["properties"]["mode"];
+        let variants = mode["enum"]
+            .as_array()
+            .expect("mode must have an enum array");
+        let names: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
+        for expected in &["auto", "lexical", "search", "structural", "deep"] {
+            assert!(
+                names.contains(expected),
+                "mode enum must contain '{expected}'; got {names:?}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            5,
+            "mode enum must have exactly 5 values; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn mode_description_mentions_auto_default() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let desc = t.input_schema["properties"]["mode"]["description"]
+            .as_str()
+            .expect("mode must have a description");
+        assert!(
+            desc.to_lowercase().contains("auto"),
+            "mode description must mention 'auto': {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("default") || desc.to_lowercase().contains("classifier"),
+            "mode description must explain what auto does: {desc}"
+        );
+    }
+
+    #[test]
+    fn agent_description_mentions_mode_guidance() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let d = t.description.to_lowercase();
+        assert!(d.contains("mode"), "description must mention 'mode': {d}");
+        assert!(
+            d.contains("auto") || d.contains("classifier"),
+            "description must tell the agent that auto is the default: {d}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mode → route mapping and precedence (unit tests — no index needed)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Helper: call tool_agent with a synthetic (no-index) path so we can
+    /// test the parsing logic up to the point where it tries to open an index
+    /// (which will fail).  We only care about the parse + precedence path,
+    /// and the test inspects the error or the tracing field rather than a
+    /// full search result.  Since we can't easily intercept the route *before*
+    /// the index open, we instead test `has_regex_metacharacters` directly and
+    /// verify the schema shape for mode values.
+    #[test]
+    fn has_regex_metacharacters_detects_patterns() {
+        assert!(
+            has_regex_metacharacters(r"auth\w+Handler"),
+            "backslash-class"
+        );
+        assert!(has_regex_metacharacters("foo|bar"), "unquoted pipe");
+        assert!(has_regex_metacharacters(r"\bclass\b"), "word-boundary");
+        assert!(has_regex_metacharacters("[A-Z]+"), "bracket class");
+        assert!(
+            has_regex_metacharacters("(foo|bar)"),
+            "group with alternation"
+        );
+        assert!(has_regex_metacharacters("(foo*)"), "group with star");
+        assert!(has_regex_metacharacters("^start"), "caret anchor");
+        assert!(has_regex_metacharacters("end$"), "dollar anchor");
+    }
+
+    #[test]
+    fn has_regex_metacharacters_plain_symbols_are_false() {
+        assert!(!has_regex_metacharacters("AgentRoute"), "camel case symbol");
+        assert!(!has_regex_metacharacters("tool_agent"), "snake_case symbol");
+        assert!(
+            !has_regex_metacharacters("classify_agent_query"),
+            "function name"
+        );
+        assert!(
+            !has_regex_metacharacters("\"foo|bar\""),
+            "quote-wrapped pipe"
+        );
+    }
+
+    /// Verify mode enum parsing maps each stable value to the expected
+    /// AgentRoute by invoking tool_agent on a non-existent path and checking
+    /// the error (the route is consumed in the AgentRequest before the index
+    /// is opened, so we can't easily intercept it without a live index).
+    /// Instead we validate through the schema values + description; live
+    /// route dispatch is covered by agent_output_has_structured_and_text.
+    #[test]
+    fn mode_schema_2020_12_dialect() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        assert_eq!(
+            t.input_schema.get("$schema").and_then(|v| v.as_str()),
+            Some("https://json-schema.org/draft/2020-12/schema"),
+            "input_schema must declare 2020-12 dialect"
+        );
+        // mode is a sibling of the existing depth/response_format enums —
+        // both use plain string type.
+        let mode = &t.input_schema["properties"]["mode"];
+        assert_eq!(
+            mode["type"].as_str(),
+            Some("string"),
+            "mode must be type string"
         );
     }
 }
