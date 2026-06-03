@@ -90,6 +90,16 @@ pub enum Request {
     MultiSearch(MultiSearchRequest),
     DeepSearch(DeepSearchRequest),
     Agent(AgentRequest),
+    /// Run a (usually forced-route) agent query and return the structured
+    /// ranked hits the engine already computes — the same `Vec<SearchResultItem>`
+    /// the in-process MCP `structuredContent` path consumes via
+    /// `AgentPipeline::handle_with_hits`. Used by the route-stress benchmark
+    /// harness to score a SPECIFIC retrieval route against file-level gold.
+    ///
+    /// Reuses `AgentRequest` (no new request fields). Appended LAST so the
+    /// postcard discriminants of every existing variant are unchanged — no
+    /// `BINARY_PROTOCOL_VERSION` bump.
+    AgentHits(AgentRequest),
 }
 
 /// Search request parameters
@@ -199,6 +209,10 @@ pub enum Response {
     MultiSearch(MultiSearchResponse),
     DeepSearch(DeepSearchResponse),
     Agent(AgentResponse),
+    /// Structured ranked hits for a forced-route agent query (see
+    /// `Request::AgentHits`). Appended LAST — existing variant discriminants
+    /// are unchanged, so no `BINARY_PROTOCOL_VERSION` bump.
+    AgentHits(AgentHitsResponse),
 }
 
 /// Search results response
@@ -332,6 +346,9 @@ pub enum BinaryRequest {
     MultiSearch(MultiSearchRequest),
     DeepSearch(DeepSearchRequest),
     Agent(AgentRequest),
+    /// Forced-route agent query returning structured ranked hits. Appended
+    /// LAST so existing postcard discriminants are unchanged (no version bump).
+    AgentHits(AgentRequest),
 }
 
 /// Binary response type for postcard.
@@ -345,6 +362,9 @@ pub enum BinaryResponse {
     MultiSearch(MultiSearchResponse),
     DeepSearch(DeepSearchResponse),
     Agent(AgentResponse),
+    /// Structured ranked hits for a forced-route agent query. Appended LAST
+    /// (no version bump).
+    AgentHits(AgentHitsResponse),
 }
 
 impl From<BinaryRequest> for Request {
@@ -357,6 +377,7 @@ impl From<BinaryRequest> for Request {
             BinaryRequest::MultiSearch(m) => Request::MultiSearch(m),
             BinaryRequest::DeepSearch(d) => Request::DeepSearch(d),
             BinaryRequest::Agent(a) => Request::Agent(a),
+            BinaryRequest::AgentHits(a) => Request::AgentHits(a),
         }
     }
 }
@@ -372,6 +393,7 @@ impl From<Response> for BinaryResponse {
             Response::MultiSearch(m) => BinaryResponse::MultiSearch(m),
             Response::DeepSearch(d) => BinaryResponse::DeepSearch(d),
             Response::Agent(a) => BinaryResponse::Agent(a),
+            Response::AgentHits(a) => BinaryResponse::AgentHits(a),
         }
     }
 }
@@ -494,6 +516,24 @@ pub struct AgentResponse {
     pub disambiguation: Option<Vec<DisambigSuggestion>>,
 }
 
+/// Structured ranked hits from a forced-route agent query.
+///
+/// Carries the `Vec<SearchResultItem>` the engine already computes for
+/// item-list routes (`semantic` / `exact_symbol` / `analytical` / `exhaustive`
+/// / `regex`, plus `file_pattern` and `structural` which now populate hits
+/// too) so a benchmark harness can score a SPECIFIC retrieval route. Each
+/// item's `file` is repo-relative — exactly what the file-level gold matcher
+/// consumes. Synthesis routes (`deep` / `architecture` / `feature_planning`)
+/// are prose-only and return an empty `hits` vec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHitsResponse {
+    /// The route that actually ran (the forced route, or the classifier's
+    /// pick when no route was forced).
+    pub route: AgentRoute,
+    /// Ranked hits, best-first. Empty for prose-only synthesis routes.
+    pub hits: Vec<SearchResultItem>,
+}
+
 /// Performance metrics for agent queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMetrics {
@@ -551,6 +591,85 @@ mod agent_protocol_tests {
         let parsed: AgentResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.route, AgentRoute::Semantic);
         assert!(parsed.formatted.contains("[route: semantic]"));
+    }
+
+    /// The `AgentHits` request/response variants (route-stress measurement
+    /// seam) survive a full binary encode/decode roundtrip. `AgentHits` was
+    /// appended LAST to both `BinaryRequest` and `BinaryResponse`, so no
+    /// `BINARY_PROTOCOL_VERSION` bump was required.
+    #[test]
+    fn test_agent_hits_binary_roundtrip() {
+        use crate::search::agent_classifier::AgentRoute;
+        let req = BinaryRequest::AgentHits(AgentRequest {
+            query: "auth".into(),
+            route: Some(AgentRoute::Semantic),
+            budget: None,
+            full_code: false,
+        });
+        let enc = encode_binary_request(&req);
+        let dec = decode_binary_request(&enc[BINARY_FRAME_HEADER_LEN..]).unwrap();
+        match dec {
+            BinaryRequest::AgentHits(r) => {
+                assert_eq!(r.query, "auth");
+                assert_eq!(r.route, Some(AgentRoute::Semantic));
+            }
+            _ => panic!("Wrong request variant"),
+        }
+
+        let resp = BinaryResponse::AgentHits(AgentHitsResponse {
+            route: AgentRoute::Semantic,
+            hits: vec![SearchResultItem {
+                file: "auth/login.rs".into(),
+                start_line: 1,
+                end_line: 3,
+                score: 0.9,
+                source: "Hybrid".into(),
+                chunk_type: "AstNode".into(),
+                name: Some("authenticate".into()),
+                language: Some("rust".into()),
+                content: None,
+                kind: Some("function".into()),
+                summary: None,
+            }],
+        });
+        let enc = encode_binary_response(&resp);
+        let dec = decode_binary_response(&enc[BINARY_FRAME_HEADER_LEN..]).unwrap();
+        match dec {
+            BinaryResponse::AgentHits(r) => {
+                assert_eq!(r.route, AgentRoute::Semantic);
+                assert_eq!(r.hits.len(), 1);
+                assert_eq!(r.hits[0].file, "auth/login.rs");
+            }
+            _ => panic!("Wrong response variant"),
+        }
+    }
+
+    /// Appending the `AgentHits` variant must NOT shift the postcard
+    /// discriminant of any pre-existing variant. We assert a `Health` request
+    /// (the cheapest existing variant) still encodes to the exact byte that
+    /// older builds produced for it — proving the wire is backward-compatible
+    /// and the no-version-bump claim holds.
+    #[test]
+    fn appending_agent_hits_keeps_existing_discriminants() {
+        // BinaryRequest::Health is the 2nd variant (index 1). Postcard encodes
+        // a fieldless enum variant as a single varint discriminant byte.
+        let enc = encode_binary_request(&BinaryRequest::Health);
+        // body = [VERSION][postcard]; postcard payload is just [0x01].
+        let body = &enc[BINARY_FRAME_HEADER_LEN..];
+        assert_eq!(body[0], BINARY_PROTOCOL_VERSION);
+        assert_eq!(body[1], 1, "Health discriminant must stay at index 1");
+        // And the agent variant (index 6) must also be unchanged.
+        let agent = encode_binary_request(&BinaryRequest::Agent(AgentRequest {
+            query: String::new(),
+            route: None,
+            budget: None,
+            full_code: false,
+        }));
+        assert_eq!(
+            agent[BINARY_FRAME_HEADER_LEN + 1],
+            6,
+            "Agent discriminant must stay at index 6"
+        );
     }
 
     #[test]

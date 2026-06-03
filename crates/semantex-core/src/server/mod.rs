@@ -394,6 +394,25 @@ pub fn daemon_agent_binary(
     }
 }
 
+/// Send a binary agent-HITS request to the daemon at the given port.
+///
+/// Like [`daemon_agent_binary`] but returns the engine's structured ranked
+/// hits (`AgentHitsResponse`) instead of the prose `AgentResponse`. Used by
+/// the route-stress benchmark harness to score a SPECIFIC retrieval route:
+/// each returned `SearchResultItem.file` is repo-relative, so the file-level
+/// gold matcher consumes it directly.
+pub fn daemon_agent_hits_binary(
+    port: u16,
+    request: protocol::AgentRequest,
+) -> Result<protocol::AgentHitsResponse> {
+    let bin_req = protocol::BinaryRequest::AgentHits(request);
+    match send_binary_request(port, &bin_req, 60)? {
+        protocol::BinaryResponse::AgentHits(ar) => Ok(ar),
+        protocol::BinaryResponse::Error(e) => anyhow::bail!("Daemon error: {}", e.message),
+        other => anyhow::bail!("Unexpected response type: {other:?}"),
+    }
+}
+
 /// Perform a graph walk directly against the index without a running daemon.
 /// Used as a fallback when the daemon is unavailable.
 pub fn graph_walk_direct(

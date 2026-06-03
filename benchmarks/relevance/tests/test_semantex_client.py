@@ -151,3 +151,84 @@ def test_failed_search_raises_with_stderr():
             assert False, "expected RuntimeError"
         except RuntimeError as e:
             assert "boom" in str(e)
+
+
+# --- route-stress: forced-route measurement seam -----------------------------
+
+# The agent `--json-hits` path returns the SAME JSON array shape as
+# `search --json`, so parse_results / the file-level gold matcher are unchanged.
+ROUTE_HITS_JSON = json.dumps([
+    {"file": "routergroup.go", "start_line": 30, "end_line": 45, "score": 0.09,
+     "source": "Hybrid", "chunk_type": "AstNode", "name": "Group", "language": "go"},
+    {"file": "ginS/gins.go", "start_line": 1, "end_line": 9, "score": 0.06,
+     "source": "Hybrid", "chunk_type": "AstNode", "name": "Group"},
+])
+
+
+def test_route_forces_agent_json_hits_command():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=ROUTE_HITS_JSON, stderr=""
+        )
+        rr = client.search("q1", "router group", ablation="hybrid", k=10, route="semantic")
+    args = mr.call_args.args[0]
+    # Forced-route path uses `agent --route <name> --json-hits`, NOT `search`.
+    assert args[:2] == ["semantex", "agent"]
+    assert "--route" in args and args[args.index("--route") + 1] == "semantic"
+    assert "--json-hits" in args
+    # ablation flags are NOT passed in route mode (route owns mechanism choice).
+    assert "--dense-only" not in args and "--sparse-only" not in args
+    # query is the LAST arg, behind a `--` separator (dash-leading-safe).
+    assert args[-1] == "router group"
+    assert args[args.index("--") + 1] == "router group"
+    # the result shape is identical to the search path — files are repo-relative.
+    assert rr.ranked_files == ("routergroup.go", "ginS/gins.go")
+    assert rr.ranked_doc_ids == ("routergroup.go:30-45", "ginS/gins.go:1-9")
+
+
+def test_route_none_keeps_search_path_unchanged():
+    # Regression guard: the routeless default must still hit `search --json`.
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="[]", stderr=""
+        )
+        client.search("q1", "x", ablation="hybrid", k=5)
+    args = mr.call_args.args[0]
+    assert args[0] == "semantex" and "agent" not in args
+    assert "--json" in args and "--json-hits" not in args
+
+
+def test_route_alias_files_is_accepted():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="[]", stderr=""
+        )
+        client.search("q1", "**/*_test.go", ablation="hybrid", k=5, route="files")
+    args = mr.call_args.args[0]
+    assert args[args.index("--route") + 1] == "files"
+
+
+def test_unknown_route_raises():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    try:
+        client.search("q1", "x", ablation="hybrid", k=5, route="deep")
+        assert False, "synthesis route 'deep' must be rejected (prose-only)"
+    except ValueError as e:
+        assert "deep" in str(e)
+
+
+def test_route_failure_raises_with_stderr():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="daemon not running"
+        )
+        try:
+            client.search("q1", "x", ablation="hybrid", k=5, route="semantic")
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            assert "daemon not running" in str(e)
+            assert "json-hits" in str(e)

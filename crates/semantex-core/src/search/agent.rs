@@ -557,11 +557,29 @@ impl<'a> AgentPipeline<'a> {
                     formatted.push_str(s);
                     formatted.push('\n');
                 }
+                // Structured hits: flatten the graph-walk sections into one
+                // ranked, file-bearing list (target → callers → callees →
+                // type_refs → hierarchy). Each item already carries a
+                // repo-relative `file` (via `chunk_to_item`), so a route-stress
+                // harness scoring the structural/`usage` mechanism against
+                // file-level gold gets the SAME files the formatter rendered.
+                // When a section was collapsed to a summary (Item 7) its `Vec`
+                // is empty, so those items don't appear here — matching the
+                // formatted output.
+                let hits: Vec<SearchResultItem> = resp
+                    .target
+                    .iter()
+                    .chain(resp.callers.iter())
+                    .chain(resp.callees.iter())
+                    .chain(resp.type_refs.iter())
+                    .chain(resp.hierarchy.iter())
+                    .cloned()
+                    .collect();
                 return HandlerResult {
                     formatted,
                     fallback_used: false,
                     result_count: total,
-                    hits: Vec::new(),
+                    hits,
                     disambiguation: None,
                 };
             }
@@ -1034,6 +1052,29 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
 
     files.sort();
     let total = files.len();
+    // Structured hits: one file-level item per match (repo-relative `file`),
+    // capped to match the formatted listing so a route-stress harness can
+    // score the file_pattern route against file-level gold. file_pattern is a
+    // pure filesystem glob, so there is no chunk/line/score — items carry the
+    // repo-relative path with a synthetic "File" chunk_type and rank-implied
+    // ordering (files are already sorted; first-listed = rank 1).
+    let hits: Vec<crate::server::protocol::SearchResultItem> = files
+        .iter()
+        .take(50)
+        .map(|f| crate::server::protocol::SearchResultItem {
+            file: f.clone(),
+            start_line: 0,
+            end_line: 0,
+            score: 0.0,
+            source: "FilePattern".to_string(),
+            chunk_type: "File".to_string(),
+            name: None,
+            language: None,
+            content: None,
+            kind: None,
+            summary: None,
+        })
+        .collect();
     let mut lines: Vec<String> = files.into_iter().take(50).collect();
     if total > 50 {
         lines.push(format!("... and {} more files", total - 50));
@@ -1043,7 +1084,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
         formatted: lines.join("\n"),
         fallback_used: false,
         result_count: total,
-        hits: Vec::new(),
+        hits,
         disambiguation: None,
     }
 }
@@ -1158,6 +1199,42 @@ mod tests {
         assert!(hits.iter().all(|h| !h.file.is_empty()));
     }
 
+    /// Route-stress seam (daemon path): the `Request::AgentHits` handler must
+    /// return a `Response::AgentHits` carrying the forced route plus the
+    /// engine's structured ranked hits. This is the exact path the benchmark
+    /// harness drives via `daemon_agent_hits_binary` / `agent --json-hits`.
+    #[test]
+    fn handle_agent_hits_returns_structured_hits_response() {
+        use crate::server::handler::Handler;
+        use crate::server::protocol::{Request, Response};
+        use std::sync::atomic::AtomicU64;
+
+        let (_dir, searcher) = build_populated_searcher();
+        let count = AtomicU64::new(0);
+        let handler = Handler::new(
+            &searcher,
+            &count,
+            std::path::PathBuf::from("/tmp/agent-hits-handler"),
+        );
+
+        let resp = handler.handle(
+            Request::AgentHits(AgentRequest {
+                query: "authentication".into(),
+                route: Some(AgentRoute::Semantic),
+                budget: Some(12_000),
+                full_code: false,
+            }),
+            std::time::Instant::now(),
+        );
+
+        let Response::AgentHits(ah) = resp else {
+            panic!("expected Response::AgentHits");
+        };
+        assert_eq!(ah.route, AgentRoute::Semantic);
+        assert!(!ah.hits.is_empty(), "forced semantic route must yield hits");
+        assert!(ah.hits.iter().all(|h| !h.file.is_empty()));
+    }
+
     /// `handle` (the wire path) must produce the SAME `AgentResponse` shape as
     /// `handle_with_hits(...).0` — both delegate to `handle_inner`, so the
     /// daemon's postcard `AgentResponse` is unaffected by the hits surfacing.
@@ -1207,6 +1284,29 @@ mod tests {
         assert!(result.formatted.contains("bar.rs"));
         assert!(!result.formatted.contains("baz.py"));
         assert_eq!(result.result_count, 2);
+    }
+
+    /// Route-stress seam: the `file_pattern` (glob) route must surface
+    /// structured, repo-relative hits — not just a formatted listing — so the
+    /// harness can score the glob mechanism against file-level gold.
+    #[test]
+    fn file_pattern_route_surfaces_repo_relative_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("foo.rs"), "").unwrap();
+        std::fs::write(dir.path().join("sub/bar.rs"), "").unwrap();
+        std::fs::write(dir.path().join("baz.py"), "").unwrap();
+
+        let result = glob_files(dir.path(), "**/*.rs");
+        let files: Vec<&str> = result.hits.iter().map(|h| h.file.as_str()).collect();
+        assert!(files.contains(&"foo.rs"), "files: {files:?}");
+        // Repo-relative, not absolute — exactly what the gold matcher expects.
+        assert!(files.contains(&"sub/bar.rs"), "files: {files:?}");
+        assert!(!files.iter().any(|f| f.contains("baz.py")));
+        assert!(
+            result.hits.iter().all(|h| !h.file.starts_with('/')),
+            "hits must be repo-relative, got {files:?}"
+        );
     }
 
     #[test]
