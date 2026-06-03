@@ -1207,30 +1207,8 @@ impl McpServer {
         // Parse the optional `mode` parameter (stable public vocabulary).
         // Precedence: explicit `mode` arg > `depth` arg > SEMANTEX_MCP_DEPTH env > auto.
         let mode_arg = args.get("mode").and_then(|v| v.as_str());
-        let mode_route: Option<AgentRoute> = match mode_arg {
-            Some("auto") | None => None, // explicit auto or absent → let depth/env/classifier decide
-            Some("lexical") => {
-                // Exact symbol lookup; promote to Regex if the query contains
-                // regex metacharacters (backslash-class, alternation, bracket
-                // class, anchors, or quantifier group).
-                let q: &str = queries.first().map_or("", String::as_str);
-                if has_regex_metacharacters(q) {
-                    Some(AgentRoute::Regex)
-                } else {
-                    Some(AgentRoute::ExactSymbol)
-                }
-            }
-            Some("search") => Some(AgentRoute::Semantic),
-            Some("structural") => Some(AgentRoute::Structural),
-            Some("deep") => Some(AgentRoute::Deep),
-            Some(other) => {
-                tracing::warn!(
-                    mode = other,
-                    "unknown 'mode' value — ignoring, falling back to depth/auto"
-                );
-                None
-            }
-        };
+        let mode_query: &str = queries.first().map_or("", String::as_str);
+        let mode_route: Option<AgentRoute> = mode_to_route(mode_arg, mode_query);
 
         // Parse the optional `depth` parameter and map it to an AgentRoute override.
         // `mode` takes precedence; depth only matters when mode is absent/auto.
@@ -2828,58 +2806,48 @@ fn truncate_lines_mcp(content: &str, n: usize) -> String {
     }
 }
 
-/// Returns `true` when `query` contains regex metacharacters recognised by the
-/// agent classifier (`is_regex` in `agent_classifier.rs`).  Mirrors the subset
-/// that matters for the `mode=lexical` token-shape check so both stay in sync
-/// without exposing the private `agent_classifier::is_regex` symbol here.
+/// Resolve the stable public `mode` vocabulary to an `AgentRoute` override.
 ///
-/// Checks (ordered cheapest-first):
-///   1. `^`/`$` anchors
-///   2. `\b \B \d \D \s \S \w \W` escape classes
-///   3. Unquoted `|` alternation
-///   4. `[...]` character class
-///   5. `(x|y)` / `(x?)` / `(x*)` / `(x+)` quantifier groups
-fn has_regex_metacharacters(query: &str) -> bool {
-    if query.starts_with('^') || query.ends_with('$') {
-        return true;
-    }
-    let bytes = query.as_bytes();
-    for i in 0..bytes.len().saturating_sub(1) {
-        if bytes[i] == b'\\'
-            && matches!(
-                bytes[i + 1],
-                b'b' | b'B' | b'd' | b'D' | b's' | b'S' | b'w' | b'W'
-            )
-        {
-            return true;
-        }
-    }
-    let trimmed = query.trim();
-    let quote_wrapped = (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('`') && trimmed.ends_with('`'));
-    if !quote_wrapped && query.contains('|') {
-        return true;
-    }
-    if let Some(open) = query.find('[')
-        && query[open..].contains(']')
-    {
-        return true;
-    }
-    if let Some(open) = query.find('(') {
-        let after = &query[open + 1..];
-        if let Some(close) = after.find(')') {
-            let inner = &after[..close];
-            if inner.contains('|')
-                || inner.contains('?')
-                || inner.contains('*')
-                || inner.contains('+')
-            {
-                return true;
+/// Pure (no I/O, no `self`) so the mapping and precedence are unit-testable
+/// without a live index. Returns `None` to mean "no override — let the
+/// keyword classifier (or `depth`/env, per the caller's precedence) decide".
+///
+/// Mapping:
+///   - `auto` / `None` / unknown → `None` (auto-classify; unknown warns)
+///   - `lexical` → `ExactSymbol`, promoted to `Regex` when `query` contains
+///     regex metacharacters (reuses `agent_classifier::is_regex`, the single
+///     source of truth)
+///   - `search` → `Semantic`
+///   - `structural` → `Structural`
+///   - `deep` → `Deep`
+fn mode_to_route(
+    mode: Option<&str>,
+    query: &str,
+) -> Option<semantex_core::search::agent_classifier::AgentRoute> {
+    use semantex_core::search::agent_classifier::{AgentRoute, is_regex};
+    match mode {
+        Some("auto") | None => None, // explicit auto or absent → let depth/env/classifier decide
+        Some("lexical") => {
+            // Exact symbol lookup; promote to Regex if the query contains
+            // regex metacharacters (backslash-class, alternation, bracket
+            // class, anchors, or quantifier group).
+            if is_regex(query) {
+                Some(AgentRoute::Regex)
+            } else {
+                Some(AgentRoute::ExactSymbol)
             }
         }
+        Some("search") => Some(AgentRoute::Semantic),
+        Some("structural") => Some(AgentRoute::Structural),
+        Some("deep") => Some(AgentRoute::Deep),
+        Some(other) => {
+            tracing::warn!(
+                mode = other,
+                "unknown 'mode' value — ignoring, falling back to depth/auto"
+            );
+            None
+        }
     }
-    false
 }
 
 /// Map an optional `response_format` to an effective budget given the base budget.
@@ -2968,7 +2936,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 mod tests {
     use super::{
         DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
-        has_regex_metacharacters,
+        mode_to_route,
     };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
@@ -4188,51 +4156,79 @@ mod tests {
     // mode → route mapping and precedence (unit tests — no index needed)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Helper: call tool_agent with a synthetic (no-index) path so we can
-    /// test the parsing logic up to the point where it tries to open an index
-    /// (which will fail).  We only care about the parse + precedence path,
-    /// and the test inspects the error or the tracing field rather than a
-    /// full search result.  Since we can't easily intercept the route *before*
-    /// the index open, we instead test `has_regex_metacharacters` directly and
-    /// verify the schema shape for mode values.
+    /// Each stable `mode` value maps to the documented `AgentRoute` override.
+    /// `mode_to_route` is pure, so this exercises the full resolution table
+    /// directly — no live index required (closing the gap where route
+    /// dispatch was previously only testable through a built index).
     #[test]
-    fn has_regex_metacharacters_detects_patterns() {
-        assert!(
-            has_regex_metacharacters(r"auth\w+Handler"),
-            "backslash-class"
+    fn mode_to_route_maps_each_stable_value() {
+        use semantex_core::search::agent_classifier::AgentRoute;
+        // search / structural / deep map to fixed routes (query is irrelevant).
+        assert_eq!(
+            mode_to_route(Some("search"), "anything"),
+            Some(AgentRoute::Semantic)
         );
-        assert!(has_regex_metacharacters("foo|bar"), "unquoted pipe");
-        assert!(has_regex_metacharacters(r"\bclass\b"), "word-boundary");
-        assert!(has_regex_metacharacters("[A-Z]+"), "bracket class");
-        assert!(
-            has_regex_metacharacters("(foo|bar)"),
-            "group with alternation"
+        assert_eq!(
+            mode_to_route(Some("structural"), "who calls foo"),
+            Some(AgentRoute::Structural)
         );
-        assert!(has_regex_metacharacters("(foo*)"), "group with star");
-        assert!(has_regex_metacharacters("^start"), "caret anchor");
-        assert!(has_regex_metacharacters("end$"), "dollar anchor");
+        assert_eq!(
+            mode_to_route(Some("deep"), "how does X work"),
+            Some(AgentRoute::Deep)
+        );
     }
 
     #[test]
-    fn has_regex_metacharacters_plain_symbols_are_false() {
-        assert!(!has_regex_metacharacters("AgentRoute"), "camel case symbol");
-        assert!(!has_regex_metacharacters("tool_agent"), "snake_case symbol");
-        assert!(
-            !has_regex_metacharacters("classify_agent_query"),
-            "function name"
+    fn mode_to_route_lexical_plain_symbol_is_exact() {
+        use semantex_core::search::agent_classifier::AgentRoute;
+        assert_eq!(
+            mode_to_route(Some("lexical"), "AgentRoute"),
+            Some(AgentRoute::ExactSymbol),
+            "plain camel-case symbol → ExactSymbol"
         );
-        assert!(
-            !has_regex_metacharacters("\"foo|bar\""),
-            "quote-wrapped pipe"
+        assert_eq!(
+            mode_to_route(Some("lexical"), "tool_agent"),
+            Some(AgentRoute::ExactSymbol),
+            "plain snake_case symbol → ExactSymbol"
         );
     }
 
-    /// Verify mode enum parsing maps each stable value to the expected
-    /// AgentRoute by invoking tool_agent on a non-existent path and checking
-    /// the error (the route is consumed in the AgentRequest before the index
-    /// is opened, so we can't easily intercept it without a live index).
-    /// Instead we validate through the schema values + description; live
-    /// route dispatch is covered by agent_output_has_structured_and_text.
+    #[test]
+    fn mode_to_route_lexical_regex_promotes_to_regex() {
+        use semantex_core::search::agent_classifier::AgentRoute;
+        for pat in [
+            r"auth\w+Handler", // backslash-class
+            "foo|bar",         // unquoted alternation
+            "[A-Z]+",          // bracket class
+            "(foo|bar)",       // quantifier group
+            "^start",          // anchor
+            "end$",            // anchor
+        ] {
+            assert_eq!(
+                mode_to_route(Some("lexical"), pat),
+                Some(AgentRoute::Regex),
+                "regex metacharacters in {pat:?} must promote lexical → Regex"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_to_route_auto_and_none_yield_no_override() {
+        // Both explicit `auto` and an absent `mode` mean "let the classifier
+        // (or depth/env per the caller's precedence) decide" → None.
+        assert_eq!(mode_to_route(Some("auto"), "anything"), None);
+        assert_eq!(mode_to_route(None, "anything"), None);
+    }
+
+    #[test]
+    fn mode_to_route_unknown_value_falls_back_to_none() {
+        // Unknown values warn and fall back to None (auto) rather than error,
+        // so a stray/typo'd mode never breaks the call.
+        assert_eq!(mode_to_route(Some("bogus"), "anything"), None);
+        assert_eq!(mode_to_route(Some(""), "anything"), None);
+    }
+
+    /// `mode` schema shape: 2020-12 dialect + plain string type.
     #[test]
     fn mode_schema_2020_12_dialect() {
         let t = McpServer::all_tools()

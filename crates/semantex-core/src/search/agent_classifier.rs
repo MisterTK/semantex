@@ -150,7 +150,12 @@ fn is_feature_planning_query(lower: &str) -> bool {
 }
 
 /// Returns true if the query looks like a regex pattern.
-fn is_regex(query: &str) -> bool {
+///
+/// Detects: `\b \B \d \D \s \S \w \W` escape classes, unquoted `|` alternation,
+/// `[...]` character classes, `(x|y)`/`(x?)`/`(x*)`/`(x+)` quantifier groups, and
+/// `^`/`$` anchors. Public so the MCP `mode=lexical` token-shape check can reuse
+/// the single source of truth instead of mirroring it.
+pub fn is_regex(query: &str) -> bool {
     // \b \B \d \D \s \S \w \W — backslash and these classes are all ASCII,
     // so byte iteration is safe and avoids allocating a Vec<char>.
     let bytes = query.as_bytes();
