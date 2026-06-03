@@ -39,11 +39,13 @@ alone, so a grep-derived `file:line-line` id would silently fail to match.
 File-granularity gold is reproducible, chunker-version-stable, and unambiguous.
 
 Repo-agnostic: pass --repo and --lang. Only the per-language def/call regexes
-(LANG_PATTERNS) are language-specific; nothing is gin-specific.
+(LANG_PATTERNS: go|python|typescript|dart) are language-specific; nothing is
+repo-specific. A monorepo spec may set a per-item `"lang"` (and a regex may set
+its own `"globs"`) to mix languages under one run — see build_records.
 
 Usage:
-  python3 gen_route_stress.py --repo /path/to/gin --lang go \
-      --curated curated_gin.json --out gin_route_stress.json
+  python3 gen_route_stress.py --repo /path/to/gin --lang go --repo-name gin \
+      --spec spec_gin.json --curated curated_gin.json --out gin_route_stress.json
 """
 from __future__ import annotations
 
@@ -84,7 +86,32 @@ LANG_PATTERNS = {
         "def": lambda sym: rf"^\s*(?:def|class)\s+{re.escape(sym)}\b",
         "is_def_line": lambda sym: re.compile(rf"^\s*(?:def|class)\s+{re.escape(sym)}\b"),
     },
-    # Extend as needed (ts/java/...); the pilot only uses "go".
+    "typescript": {
+        # .ts + .tsx (React). .d.ts declaration files are still source.
+        "globs": ["*.ts", "*.tsx"],
+        # optional `export` / `export default`, then a named definition:
+        # class|interface|function|type|enum|const|let|var X / abstract class X.
+        "def": lambda sym: (
+            rf"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?"
+            rf"(?:class|interface|function|type|enum|const|let|var)\s+{re.escape(sym)}\b"
+        ),
+        "is_def_line": lambda sym: re.compile(
+            rf"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?"
+            rf"(?:class|interface|function|type|enum|const|let|var)\s+{re.escape(sym)}\b"
+        ),
+    },
+    "dart": {
+        "globs": ["*.dart"],
+        # class|abstract class|enum|mixin|extension|typedef X. (Top-level
+        # function defs in Dart are `RetType X(...)` which is hard to anchor
+        # safely; prefer type-like symbols for Dart lexical targets.)
+        "def": lambda sym: (
+            rf"^\s*(?:abstract\s+)?(?:class|enum|mixin|extension|typedef)\s+{re.escape(sym)}\b"
+        ),
+        "is_def_line": lambda sym: re.compile(
+            rf"^\s*(?:abstract\s+)?(?:class|enum|mixin|extension|typedef)\s+{re.escape(sym)}\b"
+        ),
+    },
 }
 
 
@@ -112,13 +139,15 @@ def _walk_files(repo: Path) -> list[str]:
     return files
 
 
-def _rg_files(repo: Path, pattern: str, globs: list[str], *, exclude_tests: bool = False) -> list[str]:
-    """Repo-relative files with >=1 line matching `pattern` (ripgrep -l)."""
+def _rg_files(repo: Path, pattern: str, globs: list[str]) -> list[str]:
+    """Repo-relative files with >=1 line matching `pattern` (ripgrep -l).
+
+    Test files are NOT excluded — see the GLOBAL TEST-INCLUSION POLICY note on
+    derive_structural. A test file that matches/calls is a real match/caller.
+    """
     cmd = ["rg", "-l", "--no-heading", "--sort", "path"]
     for g in globs:
         cmd += ["--glob", g]
-    if exclude_tests:
-        cmd += ["--glob", "!*_test.*", "--glob", "!test_*"]
     cmd += [pattern, str(repo)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode not in (0, 1):  # 1 = no matches, not an error
@@ -130,13 +159,11 @@ def _rg_files(repo: Path, pattern: str, globs: list[str], *, exclude_tests: bool
     return sorted(set(rel))
 
 
-def _rg_hits(repo: Path, pattern: str, globs: list[str], *, exclude_tests: bool = False) -> list[tuple[str, int, str]]:
-    """(relpath, line_no, line_text) for every match of `pattern`."""
+def _rg_hits(repo: Path, pattern: str, globs: list[str]) -> list[tuple[str, int, str]]:
+    """(relpath, line_no, line_text) for every match of `pattern`. No test exclusion."""
     cmd = ["rg", "-n", "--no-heading", "--sort", "path"]
     for g in globs:
         cmd += ["--glob", g]
-    if exclude_tests:
-        cmd += ["--glob", "!*_test.*", "--glob", "!test_*"]
     cmd += [pattern, str(repo)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode not in (0, 1):
@@ -166,9 +193,9 @@ def derive_glob(repo: Path, glob_pattern: str) -> list[str]:
     return sorted(set(matched))
 
 
-def derive_regex(repo: Path, pattern: str, globs: list[str], *, exclude_tests: bool) -> list[str]:
+def derive_regex(repo: Path, pattern: str, globs: list[str]) -> list[str]:
     """Gold = repo-relative files containing >=1 line matching `pattern`."""
-    return _rg_files(repo, pattern, globs, exclude_tests=exclude_tests)
+    return _rg_files(repo, pattern, globs)
 
 
 def derive_lexical(repo: Path, symbol: str, lang: str) -> list[str]:
@@ -177,18 +204,26 @@ def derive_lexical(repo: Path, symbol: str, lang: str) -> list[str]:
     return _rg_files(repo, spec["def"](symbol), spec["globs"])
 
 
-def derive_structural(repo: Path, symbol: str, lang: str, *, exclude_tests: bool) -> list[str]:
+def derive_structural(repo: Path, symbol: str, lang: str) -> list[str]:
     """Gold = file(s) that CALL `symbol` (call sites), excluding its definition.
 
     A call site is a `<symbol>(` occurrence on a line that is NOT a definition
     of `symbol`. We match `\\b<symbol>\\(`, then drop definition lines via the
     language's `is_def_line`. Returns repo-relative call-site files.
+
+    GLOBAL TEST-INCLUSION POLICY: test files are NEVER excluded — a test that
+    calls (or matches) the symbol IS a real caller/match, so completeness wins
+    over an arbitrary test/non-test split. This is a single uniform policy
+    across glob/regex/lexical/structural; there is deliberately no per-target
+    exclude_tests toggle (a silent toggle would make gold inconsistent). If a
+    production-only variant is ever needed, author it as a separate, clearly
+    labelled query — not a hidden flag.
     """
     spec = LANG_PATTERNS[lang]
     call_re = rf"\b{re.escape(symbol)}\("
     is_def = spec["is_def_line"](symbol)
     files = set()
-    for rel, _ln, text in _rg_hits(repo, call_re, spec["globs"], exclude_tests=exclude_tests):
+    for rel, _ln, text in _rg_hits(repo, call_re, spec["globs"]):
         if is_def.search(text):
             continue
         files.add(rel)
@@ -243,33 +278,44 @@ def build_records(repo: Path, repo_name: str, lang: str, spec_path: Path) -> lis
     repo) and emit the derived records. The spec is small, human-authored DATA
     that names the targets; the GOLD for each is derived mechanically here, so
     re-running reproduces it exactly.
+
+    `lang` is the run default. A MONOREPO (multi-language) spec can override the
+    language per item via an item-level `"lang"` (e.g. a Dart regex/lexical
+    target inside a TS-default run), or scope a regex with an explicit
+    item-level `"globs"` list. This keeps one spec file able to mix languages
+    without per-repo hardcoding.
     """
     spec = json.loads(spec_path.read_text())
     records: list[dict] = []
 
-    # glob
+    def _lang(item):
+        il = item.get("lang", lang)
+        if il not in LANG_PATTERNS:
+            raise ValueError(f"{item.get('id')}: unknown lang {il!r}")
+        return il
+
+    # glob (language-independent: filesystem walk)
     for item in spec.get("glob", []):
         gold = derive_glob(repo, item["pattern"])
         records.append(_rec(item["id"], repo_name, item["query"], "glob", gold,
                             granularity="file", note=f"glob={item['pattern']}"))
 
-    # regex
+    # regex (scope = explicit item globs, else the item language's globs)
     for item in spec.get("regex", []):
-        gold = derive_regex(repo, item["pattern"], LANG_PATTERNS[lang]["globs"],
-                            exclude_tests=item.get("exclude_tests", False))
+        globs = item.get("globs") or LANG_PATTERNS[_lang(item)]["globs"]
+        gold = derive_regex(repo, item["pattern"], globs)
         records.append(_rec(item["id"], repo_name, item["query"], "regex", gold,
                             granularity="file", note=f"regex={item['pattern']!r}"))
 
     # lexical / exact-symbol
     for item in spec.get("lexical", []):
-        gold = derive_lexical(repo, item["symbol"], lang)
+        gold = derive_lexical(repo, item["symbol"], _lang(item))
         records.append(_rec(item["id"], repo_name, item["query"], "lexical", gold,
                             granularity="file", note=f"def of {item['symbol']}"))
 
     # structural / callers
     for item in spec.get("structural", []):
-        gold = derive_structural(repo, item["symbol"], lang,
-                                 exclude_tests=item.get("exclude_tests", False))
+        gold = derive_structural(repo, item["symbol"], _lang(item))
         note = f"callers of {item['symbol']}"
         xc = crosscheck_structural_graph(repo, item["symbol"], gold)
         if xc is not None:

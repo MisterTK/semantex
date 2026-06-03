@@ -198,11 +198,17 @@
       "query": "places that call panic(",
       "intended_mechanism": "regex",
       "gold": [
+        "benchmarks_test.go",
+        "binding/json_test.go",
         "context.go",
+        "context_test.go",
+        "debug_test.go",
         "mode.go",
+        "recovery_test.go",
         "render/html.go",
         "render/redirect.go",
         "routergroup.go",
+        "routergroup_test.go",
         "tree.go",
         "utils.go"
       ],
@@ -239,7 +245,8 @@
       "query": "type definitions implementing an interface via methods named ServeHTTP",
       "intended_mechanism": "regex",
       "gold": [
-        "gin.go"
+        "gin.go",
+        "utils_test.go"
       ],
       "match_granularity": "file",
       "source": "derived",

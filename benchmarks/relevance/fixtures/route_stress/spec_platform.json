@@ -1,0 +1,31 @@
+{
+  "_comment": "BOUNDED monorepo generalization slice for platform (TS: apps/api, apps/fhir-sync, apps/ddt; Dart: apps/frontend_flutter). DELIBERATELY SMALL (~3-4 per mechanism, 20 records). Every lexical/structural symbol was grepped repo-wide across BOTH languages first and kept ONLY if it has exactly one def in one file/language (favor-unambiguous-gold, hard). Globs are deep monorepo paths. Per-item \"lang\"/\"globs\" let this ONE spec mix TS and Dart targets under a single generator run (run with --lang typescript as the default; Dart items carry \"lang\": \"dart\"). Structural targets are TS-only on purpose — the generator's Dart is_def_line recognises type defs but NOT method/constructor decls, so a Dart call-derivation would mis-count a signature as a call site (see README 'Symbols rejected on platform'). Gold derived mechanically (reproducible); test files included by global policy. Verified against platform at 2026-06-03.",
+
+  "glob": [
+    {"id": "plat-glob-1", "query": "TypeScript Zod model files under apps/api", "pattern": "apps/api/src/models/*.ts"},
+    {"id": "plat-glob-2", "query": "Flutter generated freezed Dart files", "pattern": "*.freezed.dart"},
+    {"id": "plat-glob-3", "query": "the API v1 route handlers", "pattern": "apps/api/src/routes/v1/*.ts"},
+    {"id": "plat-glob-4", "query": "the per-app Dockerfiles at the repo root", "pattern": "Dockerfile.*"}
+  ],
+
+  "regex": [
+    {"id": "plat-regex-1", "query": "TypeScript Zod object schema declarations", "pattern": "z\\.object\\(", "lang": "typescript"},
+    {"id": "plat-regex-2", "query": "Dart freezed-annotated data classes", "pattern": "@freezed", "lang": "dart"},
+    {"id": "plat-regex-3", "query": "Dart Riverpod ConsumerWidget screens", "pattern": "extends ConsumerWidget", "lang": "dart"},
+    {"id": "plat-regex-4", "query": "TypeScript files with a default export", "pattern": "^export default ", "lang": "typescript"}
+  ],
+
+  "lexical": [
+    {"id": "plat-lex-1", "query": "the DataAvailabilityCache class", "symbol": "DataAvailabilityCache", "lang": "typescript"},
+    {"id": "plat-lex-2", "query": "the FhirPersonaGeneratorService class", "symbol": "FhirPersonaGeneratorService", "lang": "typescript"},
+    {"id": "plat-lex-3", "query": "the PrimaryCareProviderSchema zod schema", "symbol": "PrimaryCareProviderSchema", "lang": "typescript"},
+    {"id": "plat-lex-4", "query": "the AggieChatService Dart class", "symbol": "AggieChatService", "lang": "dart"},
+    {"id": "plat-lex-5", "query": "the ConnectionCard Flutter widget", "symbol": "ConnectionCard", "lang": "dart"}
+  ],
+
+  "structural": [
+    {"id": "plat-struct-1", "query": "what instantiates DataAvailabilityCache", "symbol": "DataAvailabilityCache", "lang": "typescript"},
+    {"id": "plat-struct-2", "query": "where is FhirPersonaGeneratorService constructed", "symbol": "FhirPersonaGeneratorService", "lang": "typescript"},
+    {"id": "plat-struct-3", "query": "what instantiates HealthService", "symbol": "HealthService", "lang": "typescript"}
+  ]
+}

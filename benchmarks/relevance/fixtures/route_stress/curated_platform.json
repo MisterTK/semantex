@@ -1,0 +1,63 @@
+[
+  {
+    "id": "plat-sem-1",
+    "repo": "platform",
+    "query": "how does the API server bootstrap and mount its routes",
+    "intended_mechanism": "semantic",
+    "gold": ["apps/api/src/index.ts"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "getApp() / server bootstrap + route mounting live in apps/api/src/index.ts. Single, unambiguous gold (one app's entry point)."
+  },
+  {
+    "id": "plat-sem-2",
+    "repo": "platform",
+    "query": "how is a synthetic FHIR patient persona generated",
+    "intended_mechanism": "semantic",
+    "gold": ["apps/api/src/services/fhir/fhirPersonaGeneratorService.ts"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "FHIR persona generation logic is contained in this one service file. Distinctive, single gold."
+  },
+  {
+    "id": "plat-sem-3",
+    "repo": "platform",
+    "query": "how does the Flutter app stream chat responses from the assistant",
+    "intended_mechanism": "semantic",
+    "gold": ["apps/frontend_flutter/lib/features/chat/services/chat_service.dart"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "AggieChatService streaming-message orchestration lives here (Dart side). Single gold. Cross-language coverage."
+  },
+
+  {
+    "id": "plat-use-1",
+    "repo": "platform",
+    "query": "how do I add a new versioned REST endpoint to the API",
+    "intended_mechanism": "usage",
+    "gold": ["apps/api/src/routes/v1/health.ts"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "health.ts is a representative, self-contained example of the idiomatic v1 route-handler pattern (OpenAPIHono route definition). One clear exemplar."
+  },
+  {
+    "id": "plat-use-2",
+    "repo": "platform",
+    "query": "how do I call the backend API from the Flutter client",
+    "intended_mechanism": "usage",
+    "gold": ["apps/frontend_flutter/lib/core/api/services/family_api_service.dart"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "family_api_service.dart is a representative idiomatic Dio-based API-client service. One clear cross-language exemplar."
+  },
+  {
+    "id": "plat-use-3",
+    "repo": "platform",
+    "query": "how do I define a TypeScript request/response validation schema",
+    "intended_mechanism": "usage",
+    "gold": ["apps/api/src/models/primaryCareProvider.ts"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "primaryCareProvider.ts is a representative Zod-schema model (Schema + Create/Update + inferred types) — the idiomatic validation-schema pattern. One clear exemplar."
+  }
+]
