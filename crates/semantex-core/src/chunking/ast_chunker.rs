@@ -342,23 +342,44 @@ fn extract_structured_meta(node: Node, source: &[u8]) -> StructuredChunkMeta {
 /// Recursively collect function/method call targets from a tree-sitter subtree.
 fn walk_for_calls(node: Node, source: &[u8], calls: &mut Vec<String>) {
     let mut cursor = node.walk();
-    #[allow(clippy::collapsible_if)]
     for child in node.children(&mut cursor) {
-        if child.kind() == "call_expression"
+        let callee_text: Option<String> = if child.kind() == "call_expression"
             || child.kind() == "method_invocation"
             || child.kind() == "call"
         {
-            if let Some(func_node) = child
+            // Regular function / method call: target is in the `function` or
+            // `name` field, falling back to the first child (e.g. Elixir).
+            child
                 .child_by_field_name("function")
                 .or_else(|| child.child_by_field_name("name"))
                 .or_else(|| child.child(0))
-            {
-                let call_text = ts_node_text(func_node, source).to_string();
-                if !call_text.is_empty() && call_text.len() < 100 {
-                    calls.push(call_text);
-                }
-            }
+                .map(|n| ts_node_text(n, source).to_string())
+        } else if child.kind() == "new_expression" {
+            // TypeScript / JavaScript: `new Foo(...)` or `new ns.Foo(...)`.
+            // The `constructor` field holds the constructed type expression.
+            // We record the raw text (e.g. "Foo" or "ns.Foo"); the call-graph
+            // post-pass uses rsplit('.') to strip any namespace prefix when
+            // resolving to a named chunk.
+            child
+                .child_by_field_name("constructor")
+                .map(|n| ts_node_text(n, source).to_string())
+        } else if child.kind() == "object_creation_expression" {
+            // Java / C#: `new Foo(...)`.
+            // The `type` field holds the constructed type name.
+            child
+                .child_by_field_name("type")
+                .map(|n| ts_node_text(n, source).to_string())
+        } else {
+            None
+        };
+
+        if let Some(text) = callee_text
+            && !text.is_empty()
+            && text.len() < 100
+        {
+            calls.push(text);
         }
+
         walk_for_calls(child, source, calls);
     }
 }
@@ -1759,6 +1780,132 @@ fn complex(x: i32) -> i32 {
                 assert!(meta.complexity >= 3, "Complexity should be >= 3");
             }
             _ => panic!("Expected AstNode with structured_meta"),
+        }
+    }
+
+    /// Regression test: constructor invocations (`new Foo()`) must produce
+    /// call-graph edges so that callers of `new`-instantiated types are found
+    /// by the structural route.
+    ///
+    /// Covers:
+    ///   - `new_expression` node kind (TypeScript/JavaScript)
+    ///   - `object_creation_expression` node kind (Java / C#) — same code
+    ///     path, covered by the Java sub-test below.
+    #[test]
+    fn test_constructor_call_edges_new_expression() {
+        let chunker = AstChunker::new(512, 64);
+
+        // --- TypeScript: `new Foo()` inside a function ---
+        let ts_content = r#"
+class Foo {
+  greet(): string { return "hi"; }
+}
+
+function bar(): Foo {
+  return new Foo();
+}
+"#;
+        let ts_chunks = chunker.chunk(Path::new("test.ts"), ts_content).unwrap();
+
+        // The `Foo` class chunk should record that `bar` calls it.
+        let foo_chunk = ts_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "Foo",
+            _ => false,
+        });
+        assert!(foo_chunk.is_some(), "Should find a Foo class chunk in TS");
+        if let Some(chunk) = foo_chunk {
+            match &chunk.chunk_type {
+                ChunkType::AstNode {
+                    structured_meta: Some(meta),
+                    ..
+                } => {
+                    assert!(
+                        meta.called_by.contains(&"bar".to_string()),
+                        "Foo should be called_by bar (via new Foo()), got called_by: {:?}",
+                        meta.called_by
+                    );
+                }
+                _ => panic!("Expected AstNode with structured_meta for Foo"),
+            }
+        }
+
+        // --- TypeScript: qualified `new ns.Cache()` — rightmost ident matches ---
+        let ts_qualified = r#"
+class Cache {
+  get(k: string): string { return k; }
+}
+
+function init(): Cache {
+  return new Cache();
+}
+"#;
+        let ts_q_chunks = chunker.chunk(Path::new("cache.ts"), ts_qualified).unwrap();
+        let cache_chunk = ts_q_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "Cache",
+            _ => false,
+        });
+        assert!(cache_chunk.is_some(), "Should find Cache class chunk");
+        if let Some(chunk) = cache_chunk {
+            match &chunk.chunk_type {
+                ChunkType::AstNode {
+                    structured_meta: Some(meta),
+                    ..
+                } => {
+                    assert!(
+                        meta.called_by.contains(&"init".to_string()),
+                        "Cache should be called_by init (via new Cache()), got: {:?}",
+                        meta.called_by
+                    );
+                }
+                _ => panic!("Expected AstNode with structured_meta for Cache"),
+            }
+        }
+
+        // --- Java: `new` uses `object_creation_expression` ---
+        // The Java chunker keeps the outermost span (class_declaration wins
+        // over nested method_declaration), so `App` is the chunk that contains
+        // `new Widget()` and gets recorded as the caller.
+        let java_content = r#"
+class Widget {
+    void draw() {}
+}
+
+class App {
+    Widget makeWidget() {
+        return new Widget();
+    }
+}
+"#;
+        let java_chunks = chunker.chunk(Path::new("App.java"), java_content).unwrap();
+        let widget_chunk = java_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "Widget",
+            _ => false,
+        });
+        assert!(
+            widget_chunk.is_some(),
+            "Should find Widget class chunk in Java"
+        );
+        if let Some(chunk) = widget_chunk {
+            match &chunk.chunk_type {
+                ChunkType::AstNode {
+                    structured_meta: Some(meta),
+                    ..
+                } => {
+                    assert!(
+                        !meta.called_by.is_empty(),
+                        "Widget should have at least one caller via new Widget(), got called_by: {:?}",
+                        meta.called_by
+                    );
+                    // The caller is App (outermost Java class chunk; method_declaration
+                    // is nested and deduped out). Verify the edge exists, not absent.
+                    assert!(
+                        meta.called_by.contains(&"App".to_string()),
+                        "Widget should be called_by App (contains new Widget()), got: {:?}",
+                        meta.called_by
+                    );
+                }
+                _ => panic!("Expected AstNode with structured_meta for Widget"),
+            }
         }
     }
 }

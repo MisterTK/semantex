@@ -2,10 +2,15 @@
   "_comment": "BOUNDED monorepo generalization slice for platform (TS: apps/api, apps/fhir-sync, apps/ddt; Dart: apps/frontend_flutter). DELIBERATELY SMALL (~3-4 per mechanism, 20 records). Every lexical/structural symbol was grepped repo-wide across BOTH languages first and kept ONLY if it has exactly one def in one file/language (favor-unambiguous-gold, hard). Globs are deep monorepo paths. Per-item \"lang\"/\"globs\" let this ONE spec mix TS and Dart targets under a single generator run (run with --lang typescript as the default; Dart items carry \"lang\": \"dart\"). Structural targets are TS-only on purpose — the generator's Dart is_def_line recognises type defs but NOT method/constructor decls, so a Dart call-derivation would mis-count a signature as a call site (see README 'Symbols rejected on platform'). Gold derived mechanically (reproducible); test files included by global policy. Verified against platform at 2026-06-03.",
 
   "glob": [
-    {"id": "plat-glob-1", "query": "TypeScript Zod model files under apps/api", "pattern": "apps/api/src/models/*.ts"},
-    {"id": "plat-glob-2", "query": "Flutter generated freezed Dart files", "pattern": "*.freezed.dart"},
-    {"id": "plat-glob-3", "query": "the API v1 route handlers", "pattern": "apps/api/src/routes/v1/*.ts"},
-    {"id": "plat-glob-4", "query": "the per-app Dockerfiles at the repo root", "pattern": "Dockerfile.*"}
+    {"id": "plat-glob-1", "query": "TypeScript Zod model files under apps/api", "pattern": "apps/api/src/models/*.ts", "glob_kind": "nl"},
+    {"id": "plat-glob-2", "query": "Flutter generated freezed Dart files", "pattern": "*.freezed.dart", "glob_kind": "nl"},
+    {"id": "plat-glob-3", "query": "the API v1 route handlers", "pattern": "apps/api/src/routes/v1/*.ts", "glob_kind": "nl"},
+    {"id": "plat-glob-4", "query": "the per-app Dockerfiles at the repo root", "pattern": "Dockerfile.*", "glob_kind": "nl"},
+    {"id": "plat-glob-lit-1", "query": "apps/api/src/controllers/*.ts", "pattern": "apps/api/src/controllers/*.ts", "glob_kind": "literal"},
+    {"id": "plat-glob-lit-2", "query": "apps/api/src/middleware/*.ts", "pattern": "apps/api/src/middleware/*.ts", "glob_kind": "literal"},
+    {"id": "plat-glob-lit-3", "query": ".github/workflows/*.yaml", "pattern": ".github/workflows/*.yaml", "glob_kind": "literal"},
+    {"id": "plat-glob-lit-4", "query": "apps/frontend_flutter/integration_test/*.dart", "pattern": "apps/frontend_flutter/integration_test/*.dart", "glob_kind": "literal"},
+    {"id": "plat-glob-lit-5", "query": "apps/api/src/repos/*.test.ts", "pattern": "apps/api/src/repos/*.test.ts", "glob_kind": "literal"}
   ],
 
   "regex": [

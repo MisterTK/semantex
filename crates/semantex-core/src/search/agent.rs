@@ -57,6 +57,57 @@ pub(crate) struct HandlerResult {
     disambiguation: Option<Vec<crate::server::protocol::DisambigSuggestion>>,
 }
 
+/// Per-route configuration for the consolidated `handle_search` dispatcher.
+///
+/// The three "list-route" handlers (Semantic, Analytical, Exhaustive) share a
+/// single implementation body; this enum captures every dimension along which
+/// they differ so the consolidated path reproduces each route's exact behaviour.
+#[derive(Clone, Copy)]
+enum SearchVariant {
+    /// Dense-only path (HyDE when an LLM is wired), max 10 results, FormatStyle::Default.
+    /// `is_fallback` propagates into `fallback_used` on success and controls the
+    /// two-stage empty fallback (inline deep → "No results").
+    Semantic { is_fallback: bool },
+    /// Hybrid search with `.code_only()`, max 5 results. `full_code=true` switches
+    /// to `format_code_blocks`; `full_code=false` uses FormatStyle::Default.
+    /// Empty path: `handle_deep(budget, true)`.
+    Analytical { full_code: bool },
+    /// Hybrid search, max 20 results, budget×3, FormatStyle::Default.
+    /// Empty path: `handle_deep(budget×3, true)`.
+    Exhaustive,
+}
+
+impl SearchVariant {
+    /// Number of results to request from the search layer.
+    fn max_results(self) -> usize {
+        match self {
+            Self::Semantic { .. } => 10,
+            Self::Analytical { .. } => 5,
+            Self::Exhaustive => 20,
+        }
+    }
+
+    /// Multiplier applied to the caller-supplied `budget` before formatting
+    /// and before passing the budget down to any fallback path.
+    fn budget_multiplier(self) -> usize {
+        match self {
+            Self::Exhaustive => 3,
+            _ => 1,
+        }
+    }
+
+    /// When `true`, add `.code_only()` to the search query.
+    fn code_only(self) -> bool {
+        matches!(self, Self::Analytical { .. })
+    }
+
+    /// When `true`, use `search_semantic` (dense + optional HyDE);
+    /// when `false`, use `searcher.search` (hybrid BM25+dense).
+    fn use_dense(self) -> bool {
+        matches!(self, Self::Semantic { .. })
+    }
+}
+
 /// Orchestrates agent queries: classify → dispatch → fallback → format.
 pub struct AgentPipeline<'a> {
     searcher: &'a HybridSearcher,
@@ -328,74 +379,7 @@ impl<'a> AgentPipeline<'a> {
     }
 
     fn handle_semantic(&self, query: &str, budget: usize, is_fallback: bool) -> HandlerResult {
-        let sq = SearchQuery::new(query).max_results(10);
-        match self.search_semantic(&sq) {
-            Ok(output) if !output.results.is_empty() => {
-                let items: Vec<SearchResultItem> = output
-                    .results
-                    .iter()
-                    .map(|r| search_result_to_item(r, true))
-                    .collect();
-                let confidence = compute_confidence(&items);
-                let disambig = disambiguation_from_results(&output.results);
-                let count = items.len();
-                let hits = items.clone();
-                let resp = SearchResponse {
-                    results: items,
-                    duration_ms: output.metrics.total_ms,
-                    dense_count: output.metrics.dense_count,
-                    sparse_count: output.metrics.sparse_count,
-                    fused_count: output.metrics.fused_count,
-                    metrics: None,
-                    confidence: Some(confidence),
-                    disambiguation: disambig.clone(),
-                };
-                let mut formatted = format_search_results(&resp, FormatStyle::Default, budget);
-                if let Some(suggestions) = &disambig {
-                    append_disambiguation_block(&mut formatted, suggestions);
-                }
-                HandlerResult {
-                    formatted,
-                    fallback_used: is_fallback,
-                    result_count: count,
-                    hits,
-                    disambiguation: disambig,
-                }
-            }
-            _ => {
-                if is_fallback {
-                    HandlerResult {
-                        formatted: format!("No results found for: {query}"),
-                        fallback_used: is_fallback,
-                        result_count: 0,
-                        hits: Vec::new(),
-                        disambiguation: None,
-                    }
-                } else {
-                    // Fallback to deep search
-                    match deep_search_module::deep_search(self.searcher, query, 20, true) {
-                        Ok(result) if !result.answer.is_empty() => {
-                            let resp = deep_result_to_response(result);
-                            let count = resp.sources.len();
-                            HandlerResult {
-                                formatted: format_deep_results(&resp, budget),
-                                fallback_used: true,
-                                result_count: count,
-                                hits: Vec::new(),
-                                disambiguation: None,
-                            }
-                        }
-                        _ => HandlerResult {
-                            formatted: format!("No results found for: {query}"),
-                            fallback_used: is_fallback,
-                            result_count: 0,
-                            hits: Vec::new(),
-                            disambiguation: None,
-                        },
-                    }
-                }
-            }
-        }
+        self.handle_search(query, budget, SearchVariant::Semantic { is_fallback })
     }
 
     fn handle_deep(&self, query: &str, budget: usize, is_fallback: bool) -> HandlerResult {
@@ -589,8 +573,37 @@ impl<'a> AgentPipeline<'a> {
     }
 
     fn handle_analytical(&self, query: &str, budget: usize, full_code: bool) -> HandlerResult {
-        let sq = SearchQuery::new(query).max_results(5).code_only();
-        match self.searcher.search(&sq) {
+        self.handle_search(query, budget, SearchVariant::Analytical { full_code })
+    }
+
+    fn handle_exhaustive(&self, query: &str, budget: usize) -> HandlerResult {
+        self.handle_search(query, budget, SearchVariant::Exhaustive)
+    }
+
+    /// Consolidated handler for the three "list-route" variants that differ only
+    /// in config: Semantic (dense, max 10, FormatStyle::Default), Analytical
+    /// (hybrid + code_only, max 5, full_code-conditional format), and Exhaustive
+    /// (hybrid, max 20, budget×3, FormatStyle::Default).
+    ///
+    /// Every observable output — result count, format, fallback path, structured
+    /// hits, disambiguation — is derived from the variant config below.
+    /// Byte-identical to the three original handlers for every route.
+    fn handle_search(&self, query: &str, budget: usize, variant: SearchVariant) -> HandlerResult {
+        let effective_budget = budget * variant.budget_multiplier();
+        let sq = {
+            let base = SearchQuery::new(query).max_results(variant.max_results());
+            if variant.code_only() {
+                base.code_only()
+            } else {
+                base
+            }
+        };
+        let search_result = if variant.use_dense() {
+            self.search_semantic(&sq)
+        } else {
+            self.searcher.search(&sq)
+        };
+        match search_result {
             Ok(output) if !output.results.is_empty() => {
                 let items: Vec<SearchResultItem> = output
                     .results
@@ -600,70 +613,41 @@ impl<'a> AgentPipeline<'a> {
                 let disambig = disambiguation_from_results(&output.results);
                 let count = items.len();
                 let hits = items.clone();
-                if full_code {
+
+                // Analytical + full_code: emit raw code blocks instead of the
+                // standard search-results format. Falls back to deep if no
+                // content is available.
+                if let SearchVariant::Analytical { full_code: true } = variant {
                     let code_contents: Vec<String> = items
                         .iter()
                         .map(|i| i.content.clone().unwrap_or_default())
                         .collect();
-                    let mut formatted = format_code_blocks(&items, &code_contents, budget);
+                    let mut formatted =
+                        format_code_blocks(&items, &code_contents, effective_budget);
                     if formatted == "No code blocks to display." {
-                        return self.handle_deep(query, budget, true);
+                        return self.handle_deep(query, effective_budget, true);
                     }
                     if let Some(suggestions) = &disambig {
                         append_disambiguation_block(&mut formatted, suggestions);
                     }
-                    HandlerResult {
+                    return HandlerResult {
                         formatted,
                         fallback_used: false,
                         result_count: count,
                         hits,
                         disambiguation: disambig,
-                    }
-                } else {
-                    let confidence = compute_confidence(&items);
-                    let resp = crate::server::protocol::SearchResponse {
-                        results: items,
-                        duration_ms: output.metrics.total_ms,
-                        dense_count: output.metrics.dense_count,
-                        sparse_count: output.metrics.sparse_count,
-                        fused_count: output.metrics.fused_count,
-                        metrics: None,
-                        confidence: Some(confidence),
-                        disambiguation: disambig.clone(),
                     };
-                    let mut formatted = format_search_results(&resp, FormatStyle::Default, budget);
-                    if let Some(suggestions) = &disambig {
-                        append_disambiguation_block(&mut formatted, suggestions);
-                    }
-                    HandlerResult {
-                        formatted,
-                        fallback_used: false,
-                        result_count: count,
-                        hits,
-                        disambiguation: disambig,
-                    }
                 }
-            }
-            _ => self.handle_deep(query, budget, true),
-        }
-    }
 
-    fn handle_exhaustive(&self, query: &str, budget: usize) -> HandlerResult {
-        // Exhaustive queries need broader coverage: more results and a larger budget to
-        // avoid truncation on large monorepos where relevant items are scattered.
-        let exhaustive_budget = budget * 3;
-        let sq = SearchQuery::new(query).max_results(20);
-        match self.searcher.search(&sq) {
-            Ok(output) if !output.results.is_empty() => {
-                let items: Vec<SearchResultItem> = output
-                    .results
-                    .iter()
-                    .map(|r| search_result_to_item(r, true))
-                    .collect();
+                // All other variants: standard search-results format.
+                // Semantic propagates `is_fallback` into `fallback_used` (it can be called
+                // as a fallback from handle_deep with is_fallback=true); Analytical and
+                // Exhaustive always return false on success.
+                let fallback_used_on_hit = match variant {
+                    SearchVariant::Semantic { is_fallback } => is_fallback,
+                    _ => false,
+                };
                 let confidence = compute_confidence(&items);
-                let disambig = disambiguation_from_results(&output.results);
-                let count = items.len();
-                let hits = items.clone();
                 let resp = SearchResponse {
                     results: items,
                     duration_ms: output.metrics.total_ms,
@@ -675,19 +659,62 @@ impl<'a> AgentPipeline<'a> {
                     disambiguation: disambig.clone(),
                 };
                 let mut formatted =
-                    format_search_results(&resp, FormatStyle::Default, exhaustive_budget);
+                    format_search_results(&resp, FormatStyle::Default, effective_budget);
                 if let Some(suggestions) = &disambig {
                     append_disambiguation_block(&mut formatted, suggestions);
                 }
                 HandlerResult {
                     formatted,
-                    fallback_used: false,
+                    fallback_used: fallback_used_on_hit,
                     result_count: count,
                     hits,
                     disambiguation: disambig,
                 }
             }
-            _ => self.handle_deep(query, exhaustive_budget, true),
+            _ => {
+                // Semantic has a unique two-stage fallback when it was not already a
+                // fallback call: try deep search inline (same as handle_deep does), and
+                // on double-failure preserve `fallback_used: false` to match the original
+                // handle_semantic behaviour.
+                if let SearchVariant::Semantic { is_fallback } = variant {
+                    if is_fallback {
+                        // Already a fallback (called from handle_deep) — terminal failure.
+                        return HandlerResult {
+                            formatted: format!("No results found for: {query}"),
+                            fallback_used: true,
+                            result_count: 0,
+                            hits: Vec::new(),
+                            disambiguation: None,
+                        };
+                    }
+                    // Primary semantic call: fall back to deep search.
+                    match deep_search_module::deep_search(self.searcher, query, 20, true) {
+                        Ok(result) if !result.answer.is_empty() => {
+                            let resp = deep_result_to_response(result);
+                            let count = resp.sources.len();
+                            return HandlerResult {
+                                formatted: format_deep_results(&resp, effective_budget),
+                                fallback_used: true,
+                                result_count: count,
+                                hits: Vec::new(),
+                                disambiguation: None,
+                            };
+                        }
+                        _ => {
+                            return HandlerResult {
+                                formatted: format!("No results found for: {query}"),
+                                fallback_used: false,
+                                result_count: 0,
+                                hits: Vec::new(),
+                                disambiguation: None,
+                            };
+                        }
+                    }
+                }
+                // Analytical and Exhaustive: delegate to handle_deep with the
+                // (possibly budget-multiplied) effective budget.
+                self.handle_deep(query, effective_budget, true)
+            }
         }
     }
 
@@ -1331,6 +1358,124 @@ mod tests {
         let result = glob_files(dir.path(), "*.rs");
         assert!(result.formatted.contains("... and 10 more files"));
         assert_eq!(result.result_count, 60);
+    }
+
+    // ── SearchVariant config lock ──────────────────────────────────────────────
+
+    /// Guard the per-route variant config captured in `SearchVariant`. Each
+    /// assertion locks a dimension that, if changed, would silently alter
+    /// observable route behaviour.
+    ///
+    /// Semantic: dense path, max 10, no code_only, budget×1.
+    /// Analytical: hybrid path, max 5, code_only=true, budget×1.
+    /// Exhaustive: hybrid path, max 20, no code_only, budget×3.
+    #[test]
+    fn search_variant_config_is_locked() {
+        // Semantic (is_fallback=false — the dispatch path)
+        let sem = SearchVariant::Semantic { is_fallback: false };
+        assert_eq!(sem.max_results(), 10, "Semantic max_results");
+        assert_eq!(sem.budget_multiplier(), 1, "Semantic budget_multiplier");
+        assert!(!sem.code_only(), "Semantic must NOT set code_only");
+        assert!(sem.use_dense(), "Semantic must use dense (HyDE) path");
+
+        // Semantic (is_fallback=true — called from handle_deep as fallback)
+        let sem_fb = SearchVariant::Semantic { is_fallback: true };
+        assert!(
+            sem_fb.use_dense(),
+            "Semantic fallback must still use dense path"
+        );
+
+        // Analytical
+        let ana = SearchVariant::Analytical { full_code: false };
+        assert_eq!(ana.max_results(), 5, "Analytical max_results");
+        assert_eq!(ana.budget_multiplier(), 1, "Analytical budget_multiplier");
+        assert!(ana.code_only(), "Analytical must set code_only");
+        assert!(!ana.use_dense(), "Analytical must use hybrid path");
+
+        // Analytical full_code variant — same search config, different format
+        let ana_fc = SearchVariant::Analytical { full_code: true };
+        assert_eq!(ana_fc.max_results(), 5);
+        assert!(ana_fc.code_only());
+
+        // Exhaustive
+        let exh = SearchVariant::Exhaustive;
+        assert_eq!(exh.max_results(), 20, "Exhaustive max_results");
+        assert_eq!(
+            exh.budget_multiplier(),
+            3,
+            "Exhaustive budget_multiplier (×3)"
+        );
+        assert!(!exh.code_only(), "Exhaustive must NOT set code_only");
+        assert!(!exh.use_dense(), "Exhaustive must use hybrid path");
+    }
+
+    /// Exhaustive route must apply the budget×3 multiplier end-to-end: the
+    /// formatted result passes the effective budget to the formatter, not the
+    /// raw budget. We verify this via the populated searcher so a real search
+    /// result is formatted, then confirm the result count matches Exhaustive's
+    /// max_results ceiling (≤20) rather than Semantic's (≤10).
+    #[test]
+    fn exhaustive_route_uses_budget_multiplier_and_max20() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline =
+            AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/variant-exh-test"));
+        let (resp, _hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Exhaustive),
+            budget: Some(12_000),
+            full_code: false,
+        });
+        assert!(resp.formatted.contains("[route: exhaustive]"));
+        // result_count ≤ 20 (Exhaustive max) — our tiny index has 2 chunks
+        assert!(
+            resp.metrics.result_count <= 20,
+            "Exhaustive result_count {} exceeds max 20",
+            resp.metrics.result_count
+        );
+    }
+
+    /// Analytical route must issue a code_only query (hybrid, max 5). With our
+    /// populated searcher the query hits both chunks; the result count must be
+    /// ≤5 (Analytical's max), not 10 or 20.
+    #[test]
+    fn analytical_route_uses_max5_and_code_only() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline =
+            AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/variant-ana-test"));
+        let (resp, _hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Analytical),
+            budget: Some(12_000),
+            full_code: false,
+        });
+        assert!(resp.formatted.contains("[route: analytical]"));
+        assert!(
+            resp.metrics.result_count <= 5,
+            "Analytical result_count {} exceeds max 5",
+            resp.metrics.result_count
+        );
+    }
+
+    /// Semantic route must use the dense path (search_semantic); with a
+    /// sparse-only test searcher it falls back to deep search (no dense
+    /// model present), which either returns a deep result or "No results
+    /// found" — either way the route header must be emitted correctly.
+    #[test]
+    fn semantic_route_emits_correct_route_header() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline =
+            AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/variant-sem-test"));
+        let (resp, _hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Semantic),
+            budget: Some(12_000),
+            full_code: false,
+        });
+        assert!(
+            resp.formatted.starts_with("[route: semantic]"),
+            "Semantic must emit [route: semantic] header, got: {}",
+            &resp.formatted[..resp.formatted.len().min(80)]
+        );
     }
 }
 

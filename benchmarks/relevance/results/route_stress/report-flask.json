@@ -1,31 +1,31 @@
 {
   "repo": "flask",
-  "total_queries": 30,
+  "total_queries": 34,
   "synthesis_count": 10,
-  "overall_regret": 0.4147,
-  "overall_router_accuracy": 0.3333,
-  "router_matches_oracle_count": 10,
+  "overall_regret": 0.3859,
+  "overall_router_accuracy": 0.3824,
+  "router_matches_oracle_count": 13,
   "oracle_win_counts": {
-    "file_pattern": 0,
+    "file_pattern": 4,
     "regex": 12,
     "exact_symbol": 13,
     "structural": 21,
     "semantic": 15
   },
   "per_route_mean_ndcg": {
-    "file_pattern": 0.0,
-    "regex": 0.5371,
-    "exact_symbol": 0.5897,
-    "structural": 0.7101,
-    "semantic": 0.6399
+    "file_pattern": 0.1169,
+    "regex": 0.4739,
+    "exact_symbol": 0.5284,
+    "structural": 0.6388,
+    "semantic": 0.5727
   },
   "per_mechanism_route_ndcg": {
     "glob": {
-      "file_pattern": 0.0,
-      "regex": 0.6614,
-      "exact_symbol": 0.3597,
-      "structural": 0.4755,
-      "semantic": 0.4585
+      "file_pattern": 0.4418,
+      "regex": 0.3675,
+      "exact_symbol": 0.2303,
+      "structural": 0.3013,
+      "semantic": 0.2852
     },
     "lexical": {
       "file_pattern": 0.0,
@@ -38,7 +38,7 @@
       "file_pattern": 0.0,
       "regex": 0.4397,
       "exact_symbol": 0.3913,
-      "structural": 0.5162,
+      "structural": 0.5327,
       "semantic": 0.594
     },
     "semantic": {
@@ -64,38 +64,40 @@
     }
   },
   "per_mechanism_regret": {
-    "glob": 0.4093,
+    "glob": 0.2728,
     "lexical": 0.1139,
-    "regex": 0.104,
+    "regex": 0.0854,
     "semantic": 1.0,
-    "structural": 0.0089,
+    "structural": 0.0815,
     "usage": 0.8524
   },
   "per_mechanism_router_accuracy": {
-    "glob": 0.0,
+    "glob": 0.4444,
     "lexical": 0.8,
-    "regex": 0.4,
+    "regex": 0.2,
     "semantic": 0.0,
     "structural": 0.8,
     "usage": 0.0
   },
   "confusion_matrix": {
     "glob": {
-      "file_pattern": 1,
-      "semantic": 4
+      "file_pattern": 5,
+      "exact_symbol": 4
     },
     "lexical": {
-      "semantic": 5
+      "semantic": 2,
+      "exact_symbol": 3
     },
     "regex": {
-      "semantic": 5
+      "semantic": 3,
+      "structural": 1,
+      "exact_symbol": 1
     },
     "semantic": {
       "deep": 5
     },
     "structural": {
-      "structural": 4,
-      "semantic": 1
+      "structural": 5
     },
     "usage": {
       "deep": 5
@@ -157,10 +159,10 @@
         "regex"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.9218,
-      "regret": 0.0782
+      "router_ndcg": 0.7654,
+      "regret": 0.2346
     },
     {
       "query_id": "flask-glob-3",
@@ -187,10 +189,10 @@
         "regex"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.6364,
-      "regret": 0.3636
+      "router_ndcg": 0.4693,
+      "regret": 0.5307
     },
     {
       "query_id": "flask-glob-4",
@@ -217,10 +219,10 @@
         "regex"
       ],
       "oracle_ndcg": 0.6898,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.0851,
-      "regret": 0.6047
+      "router_ndcg": 0.0,
+      "regret": 0.6898
     },
     {
       "query_id": "flask-glob-5",
@@ -245,9 +247,129 @@
       "oracle_route": "file_pattern",
       "oracle_routes_tied": [],
       "oracle_ndcg": 0.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 0.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-glob-lit-1",
+      "query": "src/flask/*.py",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 18,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.09478836436955078,
+        "structural": 0.3340514446642156,
+        "semantic": 0.09478836436955078
+      },
+      "route_recall": {
+        "file_pattern": 0.5555555555555556,
+        "regex": 0.0,
+        "exact_symbol": 0.05555555555555555,
+        "structural": 0.16666666666666666,
+        "semantic": 0.05555555555555555
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-glob-lit-2",
+      "query": "docs/deploying/*.rst",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 11,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.17993148201117176,
+        "structural": 0.0,
+        "semantic": 0.17993148201117176
+      },
+      "route_recall": {
+        "file_pattern": 0.9090909090909091,
+        "regex": 0.0,
+        "exact_symbol": 0.18181818181818182,
+        "structural": 0.0,
+        "semantic": 0.18181818181818182
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-glob-lit-3",
+      "query": "tests/type_check/*.py",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 3,
+      "route_ndcg": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-glob-lit-4",
+      "query": "tests/test_apps/cliapp/*.py",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 5,
+      "route_ndcg": {
+        "file_pattern": 0.975788054854922,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 1.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [
+        "file_pattern"
+      ],
+      "oracle_ndcg": 0.9758,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.9758,
       "regret": 0.0
     },
     {
@@ -322,14 +444,14 @@
         "file_pattern": 0.0,
         "regex": 0.6067408741303463,
         "exact_symbol": 0.27487633291429087,
-        "structural": 0.45321560571317426,
+        "structural": 0.5359616270184943,
         "semantic": 0.27487633291429087
       },
       "route_recall": {
         "file_pattern": 0.0,
         "regex": 0.7142857142857143,
         "exact_symbol": 0.14285714285714285,
-        "structural": 0.42857142857142855,
+        "structural": 0.5714285714285714,
         "semantic": 0.14285714285714285
       },
       "oracle_route": "regex",
@@ -337,10 +459,10 @@
         "regex"
       ],
       "oracle_ndcg": 0.6067,
-      "router_choice": "semantic",
+      "router_choice": "structural",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.2749,
-      "regret": 0.3319
+      "router_ndcg": 0.536,
+      "regret": 0.0708
     },
     {
       "query_id": "flask-regex-4",
@@ -367,10 +489,10 @@
         "semantic"
       ],
       "oracle_ndcg": 0.6372,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.6372,
-      "regret": 0.0
+      "router_ndcg": 0.469,
+      "regret": 0.1682
     },
     {
       "query_id": "flask-regex-5",
@@ -494,7 +616,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -524,7 +646,7 @@
         "structural"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 0.4307,
       "regret": 0.5693
@@ -556,7 +678,7 @@
         "semantic"
       ],
       "oracle_ndcg": 1.0,
-      "router_choice": "semantic",
+      "router_choice": "exact_symbol",
       "router_chose_synthesis": false,
       "router_ndcg": 1.0,
       "regret": 0.0
@@ -647,10 +769,10 @@
         "regex"
       ],
       "oracle_ndcg": 0.798,
-      "router_choice": "semantic",
+      "router_choice": "structural",
       "router_chose_synthesis": false,
-      "router_ndcg": 0.7537,
-      "regret": 0.0443
+      "router_ndcg": 0.3904,
+      "regret": 0.4076
     },
     {
       "query_id": "flask-struct-4",

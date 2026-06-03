@@ -48,6 +48,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=test_*.py"
     },
     {
@@ -62,6 +63,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=src/flask/json/*.py"
     },
     {
@@ -76,6 +78,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=src/flask/sansio/*.py"
     },
     {
@@ -166,6 +169,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=*.rst"
     },
     {
@@ -181,7 +185,93 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=.github/workflows/*.yaml"
+    },
+    {
+      "id": "flask-glob-lit-1",
+      "repo": "flask",
+      "query": "src/flask/*.py",
+      "intended_mechanism": "glob",
+      "gold": [
+        "src/flask/__init__.py",
+        "src/flask/__main__.py",
+        "src/flask/app.py",
+        "src/flask/blueprints.py",
+        "src/flask/cli.py",
+        "src/flask/config.py",
+        "src/flask/ctx.py",
+        "src/flask/debughelpers.py",
+        "src/flask/globals.py",
+        "src/flask/helpers.py",
+        "src/flask/logging.py",
+        "src/flask/sessions.py",
+        "src/flask/signals.py",
+        "src/flask/templating.py",
+        "src/flask/testing.py",
+        "src/flask/typing.py",
+        "src/flask/views.py",
+        "src/flask/wrappers.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=src/flask/*.py"
+    },
+    {
+      "id": "flask-glob-lit-2",
+      "repo": "flask",
+      "query": "docs/deploying/*.rst",
+      "intended_mechanism": "glob",
+      "gold": [
+        "docs/deploying/apache-httpd.rst",
+        "docs/deploying/asgi.rst",
+        "docs/deploying/eventlet.rst",
+        "docs/deploying/gevent.rst",
+        "docs/deploying/gunicorn.rst",
+        "docs/deploying/index.rst",
+        "docs/deploying/mod_wsgi.rst",
+        "docs/deploying/nginx.rst",
+        "docs/deploying/proxy_fix.rst",
+        "docs/deploying/uwsgi.rst",
+        "docs/deploying/waitress.rst"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=docs/deploying/*.rst"
+    },
+    {
+      "id": "flask-glob-lit-3",
+      "repo": "flask",
+      "query": "tests/type_check/*.py",
+      "intended_mechanism": "glob",
+      "gold": [
+        "tests/type_check/typing_app_decorators.py",
+        "tests/type_check/typing_error_handler.py",
+        "tests/type_check/typing_route.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=tests/type_check/*.py"
+    },
+    {
+      "id": "flask-glob-lit-4",
+      "repo": "flask",
+      "query": "tests/test_apps/cliapp/*.py",
+      "intended_mechanism": "glob",
+      "gold": [
+        "tests/test_apps/cliapp/__init__.py",
+        "tests/test_apps/cliapp/app.py",
+        "tests/test_apps/cliapp/factory.py",
+        "tests/test_apps/cliapp/importerrorapp.py",
+        "tests/test_apps/cliapp/multiapp.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=tests/test_apps/cliapp/*.py"
     },
     {
       "id": "flask-regex-1",
