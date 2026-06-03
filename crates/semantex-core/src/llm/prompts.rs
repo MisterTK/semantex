@@ -20,18 +20,16 @@ single best search strategy from the list below and respond with its name in \
 snake_case. Respond with EXACTLY ONE route name, no other text.
 
 Routes:
-  file_pattern       — query is a glob / file-name pattern (e.g. **/*.rs)
-  regex              — query is a regex (contains \\b, \\d, |, [...], anchors)
-  exact_symbol       — query is a single identifier or symbol name (CamelCase, snake_case, dot.path)
-  structural         — callers / callees / imports / type references / call graph
-  deep               — open-ended \"how\" / \"why\" / \"explain\" questions
-  analytical         — comparative or quality analysis (most, least, compare, review)
-  exhaustive         — enumerate all occurrences of something (list all, find all, show every)
-  semantic           — natural-language concept search with no structural intent
-  architecture       — high-level overview: main components, subsystems, god nodes, data flow
-  exhaustive_structural — exhaustive enumeration of config options, env vars, or CLI flags
-  deep_with_examples — deep explanation requested alongside code examples or step-by-step walkthrough
-  feature_planning   — impact analysis for adding a feature (\"if I wanted to add X\", \"what files would change\")
+  file_pattern     — query is a glob / file-name pattern (e.g. **/*.rs)
+  regex            — query is a regex (contains \\b, \\d, |, [...], anchors)
+  exact_symbol     — query is a single identifier or symbol name (CamelCase, snake_case, dot.path)
+  structural       — callers / callees / imports / type references / call graph
+  deep             — open-ended \"how\" / \"why\" / \"explain\" questions
+  analytical       — comparative or quality analysis (most, least, compare, review)
+  exhaustive       — enumerate all occurrences of something (list all, find all, show every, list all config/env/CLI flags)
+  semantic         — natural-language concept search with no structural intent
+  architecture     — high-level overview: main components, subsystems, god nodes, data flow
+  feature_planning — impact analysis for adding a feature (\"if I wanted to add X\", \"what files would change\")
 
 Respond with exactly one route name in snake_case, no other text.";
 
@@ -187,8 +185,6 @@ mod tests {
             AgentRoute::Exhaustive,
             AgentRoute::Semantic,
             AgentRoute::Architecture,
-            AgentRoute::ExhaustiveStructural,
-            AgentRoute::DeepWithExamples,
             AgentRoute::FeaturePlanning,
         ];
         for variant in variants {
@@ -251,22 +247,14 @@ mod tests {
             AgentRoute::FilePattern
         );
 
-        assert_eq!(
-            parse_route_from_llm_output("exhaustive_structural").unwrap(),
-            AgentRoute::ExhaustiveStructural
+        // Removed variants must now parse as Err.
+        assert!(
+            parse_route_from_llm_output("exhaustive_structural").is_err(),
+            "exhaustive_structural is no longer a valid route"
         );
-        assert_eq!(
-            parse_route_from_llm_output("exhaustivestructural").unwrap(),
-            AgentRoute::ExhaustiveStructural
-        );
-
-        assert_eq!(
-            parse_route_from_llm_output("deep_with_examples").unwrap(),
-            AgentRoute::DeepWithExamples
-        );
-        assert_eq!(
-            parse_route_from_llm_output("deepwithexamples").unwrap(),
-            AgentRoute::DeepWithExamples
+        assert!(
+            parse_route_from_llm_output("deep_with_examples").is_err(),
+            "deep_with_examples is no longer a valid route"
         );
 
         assert_eq!(
@@ -385,8 +373,6 @@ mod tests {
                 AgentRoute::Exhaustive => {}
                 AgentRoute::Semantic => {}
                 AgentRoute::Architecture => {}
-                AgentRoute::ExhaustiveStructural => {}
-                AgentRoute::DeepWithExamples => {}
                 AgentRoute::FeaturePlanning => {}
             }
         }
