@@ -26,6 +26,17 @@ stress** and carries a **multi-gold** answer set, so a later harness can ask:
 | `semantic`   | "how does the middleware chain work"   | hand-judged relevant files                   | curated  |
 | `usage`      | "how do I register a route handler"    | hand-judged idiomatic-usage / public-API file| curated  |
 
+### `glob_kind` discriminator (literal vs nl)
+
+`glob`-mechanism records carry a `glob_kind` field to distinguish two subtypes:
+
+| `glob_kind` | example query        | router implication                          |
+|-------------|----------------------|---------------------------------------------|
+| `"nl"`      | "all Go test files (`*_test.go`)" | NL description of a glob; semantic/NL router path |
+| `"literal"` | `*_test.go`          | query IS a glob pattern; fires `file_pattern` route |
+
+**Why this matters:** the `file_pattern` route fires **only** when the query is itself a literal glob pattern (contains `*` or `?` as a wildcard operator). A natural-language description like "all Go test files" will be routed through the semantic/NL path, not `file_pattern` — scoring 0 on a `file_pattern`-route evaluation is expected, not a bug. The NL variants (`glob_kind: "nl"`) legitimately test whether the router handles NL glob descriptions; the literal variants (`glob_kind: "literal"`) test whether `--route file_pattern` returns the right files. Both subtypes share the same `intended_mechanism: "glob"` and identical gold derivation logic. A harness can slice by `glob_kind` to evaluate these two code-paths independently.
+
 ## Gold convention (READ THIS)
 
 **Gold ids are repo-relative file paths; matching is FILE-granularity**
@@ -149,16 +160,16 @@ graph.
 | `curated_<repo>.json`         | **hand-curated** semantic + usage records (committed data, NOT regenerated); each gold file carries a `note` justifying it |
 | `<repo>_route_stress.json`    | the generated corpus for that repo                                   |
 
-Repos in the corpus (this PR):
+Repos in the corpus:
 
-| repo       | lang        | records | per-mechanism                                  |
-|------------|-------------|---------|------------------------------------------------|
-| `gin`      | Go          | 30      | 5 × {glob, regex, lexical, structural, semantic, usage} |
-| `flask`    | Python      | 30      | 5 × each                                       |
-| `platform` | TS + Dart (monorepo slice) | 22 | glob 4, regex 4, lexical 5, structural 3, semantic 3, usage 3 |
+| repo       | lang        | records | glob (nl+literal)                              | other mechanisms             |
+|------------|-------------|---------|------------------------------------------------|------------------------------|
+| `gin`      | Go          | 34      | 9 (5 nl + 4 literal)                           | 5 × {regex, lexical, structural, semantic, usage} |
+| `flask`    | Python      | 34      | 9 (5 nl + 4 literal)                           | 5 × each                     |
+| `platform` | TS + Dart (monorepo slice) | 27 | 9 (4 nl + 5 literal)              | regex 4, lexical 5, structural 3, semantic 3, usage 3 |
 
-Per-mechanism totals across the 3 repos: glob 14, regex 14, lexical 15,
-structural 13, semantic 13, usage 13 (≈13-15 each). **Expandable** — add more
+Per-mechanism totals across the 3 repos: glob 27 (14 nl + 13 literal), regex 14, lexical 15,
+structural 13, semantic 13, usage 13. **Expandable** — add more
 targets to the specs if the harness shows noisy per-mechanism signal.
 
 ## Record schema
@@ -176,9 +187,30 @@ targets to the specs if the harness shows noisy per-mechanism signal.
 }
 ```
 
+Glob records additionally carry `glob_kind`:
+
+```json
+{
+  "id": "gin-glob-lit-1",
+  "repo": "gin",
+  "query": "internal/**/*.go",
+  "intended_mechanism": "glob",
+  "glob_kind": "literal",
+  "gold": ["internal/bytesconv/bytesconv.go", "..."],
+  "match_granularity": "file",
+  "source": "derived",
+  "note": "glob=internal/**/*.go"
+}
+```
+
 - `source: "derived"` — gold is reproduced by re-running the generator.
 - `source: "curated"` — gold is committed data (semantic/usage); edit
   `curated_<repo>.json` by hand, never regenerate it.
+- `glob_kind: "literal"` — query is a literal glob pattern; tests the
+  `file_pattern` router dispatch.
+- `glob_kind: "nl"` — query is a natural-language description of a glob;
+  tests NL routing. `glob_kind` is only present on `intended_mechanism: "glob"`
+  records.
 
 ## Regenerate
 
@@ -223,8 +255,17 @@ the generator is repo-specific beyond the per-language def/call patterns.
 
 ## Status
 
-**Three repos shipped:** gin (Go, 30), flask (Python, 30), platform (TS+Dart
-monorepo slice, 22). The platform slice validates cross-language + monorepo
+**Three repos shipped:** gin (Go, 34), flask (Python, 34), platform (TS+Dart
+monorepo slice, 27). The platform slice validates cross-language + monorepo
 generalization with a small, deliberately-unambiguous target set. The corpus is
 expandable per mechanism once the route-running harness (a later task) shows
 where the per-mechanism signal is noisy.
+
+Literal-glob (`glob_kind: "literal"`) variants were added in a second pass
+(4 gin, 4 flask, 5 platform = 13 new records). These allow the `file_pattern`
+router to be evaluated cleanly: the original NL-glob queries always scored 0 on
+a `file_pattern`-route eval, making the route untestable. Both subtypes are
+retained — NL variants test router NL-handling, literal variants test the
+`file_pattern` dispatch path. Note: `**`-in-middle patterns are avoided where
+Python's `Path.match` does not traverse all depth levels; patterns were chosen
+so the generator's filesystem walk produces a **complete**, reproducible gold set.

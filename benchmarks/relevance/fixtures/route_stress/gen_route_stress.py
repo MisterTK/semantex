@@ -258,7 +258,8 @@ def crosscheck_structural_graph(repo: Path, symbol: str, derived: list[str]) -> 
 # --------------------------------------------------------------------------- #
 # Record assembly
 # --------------------------------------------------------------------------- #
-def _rec(id_, repo_name, query, mechanism, gold, *, granularity="file", source="derived", note=None):
+def _rec(id_, repo_name, query, mechanism, gold, *, granularity="file", source="derived",
+         note=None, glob_kind=None):
     r = {
         "id": id_,
         "repo": repo_name,
@@ -268,6 +269,13 @@ def _rec(id_, repo_name, query, mechanism, gold, *, granularity="file", source="
         "match_granularity": granularity,
         "source": source,
     }
+    # glob_kind: "literal" (query IS a glob pattern, e.g. "*_test.go") or
+    #            "nl" (query DESCRIBES a glob in natural language). Present only
+    #            on glob-mechanism records. Allows a harness to evaluate the
+    #            file_pattern router (which fires only on literal globs) separately
+    #            from NL descriptions of glob queries.
+    if glob_kind is not None:
+        r["glob_kind"] = glob_kind
     if note:
         r["note"] = note
     return r
@@ -295,10 +303,14 @@ def build_records(repo: Path, repo_name: str, lang: str, spec_path: Path) -> lis
         return il
 
     # glob (language-independent: filesystem walk)
+    # Each item may carry a "glob_kind" field: "literal" (query IS a glob pattern
+    # such as "*_test.go") or "nl" (query describes a glob in natural language).
+    # This lets a harness distinguish file_pattern-routable queries from NL ones.
     for item in spec.get("glob", []):
         gold = derive_glob(repo, item["pattern"])
         records.append(_rec(item["id"], repo_name, item["query"], "glob", gold,
-                            granularity="file", note=f"glob={item['pattern']}"))
+                            granularity="file", note=f"glob={item['pattern']}",
+                            glob_kind=item.get("glob_kind")))
 
     # regex (scope = explicit item globs, else the item language's globs)
     for item in spec.get("regex", []):

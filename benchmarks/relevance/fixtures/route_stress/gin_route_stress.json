@@ -61,6 +61,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=*_test.go"
     },
     {
@@ -89,6 +90,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=render/*.go"
     },
     {
@@ -130,6 +132,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=binding/*.go"
     },
     {
@@ -151,6 +154,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=*.md"
     },
     {
@@ -164,7 +168,71 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=ginS/*.go"
+    },
+    {
+      "id": "gin-glob-lit-1",
+      "repo": "gin",
+      "query": "internal/**/*.go",
+      "intended_mechanism": "glob",
+      "gold": [
+        "internal/bytesconv/bytesconv.go",
+        "internal/bytesconv/bytesconv_test.go",
+        "internal/fs/fs.go",
+        "internal/fs/fs_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=internal/**/*.go"
+    },
+    {
+      "id": "gin-glob-lit-2",
+      "repo": "gin",
+      "query": "codec/json/*.go",
+      "intended_mechanism": "glob",
+      "gold": [
+        "codec/json/api.go",
+        "codec/json/go_json.go",
+        "codec/json/json.go",
+        "codec/json/jsoniter.go",
+        "codec/json/sonic.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=codec/json/*.go"
+    },
+    {
+      "id": "gin-glob-lit-3",
+      "repo": "gin",
+      "query": ".github/workflows/*.yml",
+      "intended_mechanism": "glob",
+      "gold": [
+        ".github/workflows/codeql.yml",
+        ".github/workflows/gin.yml",
+        ".github/workflows/goreleaser.yml",
+        ".github/workflows/trivy-scan.yml"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=.github/workflows/*.yml"
+    },
+    {
+      "id": "gin-glob-lit-4",
+      "repo": "gin",
+      "query": ".github/ISSUE_TEMPLATE/*.yaml",
+      "intended_mechanism": "glob",
+      "gold": [
+        ".github/ISSUE_TEMPLATE/bug-report.yaml",
+        ".github/ISSUE_TEMPLATE/feature-request.yaml"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=.github/ISSUE_TEMPLATE/*.yaml"
     },
     {
       "id": "gin-regex-1",

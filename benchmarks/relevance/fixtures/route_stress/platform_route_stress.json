@@ -33,6 +33,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=apps/api/src/models/*.ts"
     },
     {
@@ -59,6 +60,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=*.freezed.dart"
     },
     {
@@ -87,6 +89,7 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=apps/api/src/routes/v1/*.ts"
     },
     {
@@ -103,7 +106,92 @@
       ],
       "match_granularity": "file",
       "source": "derived",
+      "glob_kind": "nl",
       "note": "glob=Dockerfile.*"
+    },
+    {
+      "id": "plat-glob-lit-1",
+      "repo": "platform",
+      "query": "apps/api/src/controllers/*.ts",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/api/src/controllers/connectionController.ts",
+        "apps/api/src/controllers/healthController.ts",
+        "apps/api/src/controllers/internalController.ts",
+        "apps/api/src/controllers/userController.ts",
+        "apps/api/src/controllers/vitalController.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=apps/api/src/controllers/*.ts"
+    },
+    {
+      "id": "plat-glob-lit-2",
+      "repo": "platform",
+      "query": "apps/api/src/middleware/*.ts",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/api/src/middleware/auth.integration.test.ts",
+        "apps/api/src/middleware/auth.test.ts",
+        "apps/api/src/middleware/auth.ts",
+        "apps/api/src/middleware/errorHandler.ts",
+        "apps/api/src/middleware/familyAuth.test.ts",
+        "apps/api/src/middleware/familyAuth.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=apps/api/src/middleware/*.ts"
+    },
+    {
+      "id": "plat-glob-lit-3",
+      "repo": "platform",
+      "query": ".github/workflows/*.yaml",
+      "intended_mechanism": "glob",
+      "gold": [
+        ".github/workflows/deploy-android.yaml",
+        ".github/workflows/deploy-ios.yaml",
+        ".github/workflows/pr-validation.yaml",
+        ".github/workflows/release-please.yaml"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=.github/workflows/*.yaml"
+    },
+    {
+      "id": "plat-glob-lit-4",
+      "repo": "platform",
+      "query": "apps/frontend_flutter/integration_test/*.dart",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/frontend_flutter/integration_test/auth_group_test.dart",
+        "apps/frontend_flutter/integration_test/chat_flow_test.dart",
+        "apps/frontend_flutter/integration_test/dashboard_group_test.dart",
+        "apps/frontend_flutter/integration_test/test_helpers.dart"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=apps/frontend_flutter/integration_test/*.dart"
+    },
+    {
+      "id": "plat-glob-lit-5",
+      "repo": "platform",
+      "query": "apps/api/src/repos/*.test.ts",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/api/src/repos/familyRepository.test.ts",
+        "apps/api/src/repos/fhirPersonaRepository.test.ts",
+        "apps/api/src/repos/fhirRepository.test.ts",
+        "apps/api/src/repos/userProfileRepository.test.ts",
+        "apps/api/src/repos/userRepository.test.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "glob_kind": "literal",
+      "note": "glob=apps/api/src/repos/*.test.ts"
     },
     {
       "id": "plat-regex-1",

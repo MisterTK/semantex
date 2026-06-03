@@ -2,11 +2,15 @@
   "_comment": "Derivation spec for the flask (Python) route-stress slice. NAMES the targets; gen_route_stress.py DERIVES the gold mechanically (reproducible). Test files are included by the global test-inclusion policy. Targets chosen for SINGLE / small enumerable gold (favor-unambiguous-gold). Verified against flask at 2026-06-03.",
 
   "glob": [
-    {"id": "flask-glob-1", "query": "all pytest test modules (test_*.py)", "pattern": "test_*.py"},
-    {"id": "flask-glob-2", "query": "files under the flask.json subpackage", "pattern": "src/flask/json/*.py"},
-    {"id": "flask-glob-3", "query": "files under the flask.sansio subpackage", "pattern": "src/flask/sansio/*.py"},
-    {"id": "flask-glob-4", "query": "reStructuredText files at the repo root", "pattern": "*.rst"},
-    {"id": "flask-glob-5", "query": "GitHub Actions workflow YAML files", "pattern": ".github/workflows/*.yaml"}
+    {"id": "flask-glob-1", "query": "all pytest test modules (test_*.py)", "pattern": "test_*.py", "glob_kind": "nl"},
+    {"id": "flask-glob-2", "query": "files under the flask.json subpackage", "pattern": "src/flask/json/*.py", "glob_kind": "nl"},
+    {"id": "flask-glob-3", "query": "files under the flask.sansio subpackage", "pattern": "src/flask/sansio/*.py", "glob_kind": "nl"},
+    {"id": "flask-glob-4", "query": "reStructuredText files at the repo root", "pattern": "*.rst", "glob_kind": "nl"},
+    {"id": "flask-glob-5", "query": "GitHub Actions workflow YAML files", "pattern": ".github/workflows/*.yaml", "glob_kind": "nl"},
+    {"id": "flask-glob-lit-1", "query": "src/flask/*.py", "pattern": "src/flask/*.py", "glob_kind": "literal"},
+    {"id": "flask-glob-lit-2", "query": "docs/deploying/*.rst", "pattern": "docs/deploying/*.rst", "glob_kind": "literal"},
+    {"id": "flask-glob-lit-3", "query": "tests/type_check/*.py", "pattern": "tests/type_check/*.py", "glob_kind": "literal"},
+    {"id": "flask-glob-lit-4", "query": "tests/test_apps/cliapp/*.py", "pattern": "tests/test_apps/cliapp/*.py", "glob_kind": "literal"}
   ],
 
   "regex": [

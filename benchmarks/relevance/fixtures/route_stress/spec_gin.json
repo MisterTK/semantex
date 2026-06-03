@@ -4,27 +4,56 @@
     {
       "id": "gin-glob-1",
       "query": "all Go test files (*_test.go)",
-      "pattern": "*_test.go"
+      "pattern": "*_test.go",
+      "glob_kind": "nl"
     },
     {
       "id": "gin-glob-2",
       "query": "files under the render/ package",
-      "pattern": "render/*.go"
+      "pattern": "render/*.go",
+      "glob_kind": "nl"
     },
     {
       "id": "gin-glob-3",
       "query": "files under the binding/ package",
-      "pattern": "binding/*.go"
+      "pattern": "binding/*.go",
+      "glob_kind": "nl"
     },
     {
       "id": "gin-glob-4",
       "query": "markdown docs at the repo root",
-      "pattern": "*.md"
+      "pattern": "*.md",
+      "glob_kind": "nl"
     },
     {
       "id": "gin-glob-5",
       "query": "the ginS subpackage Go sources",
-      "pattern": "ginS/*.go"
+      "pattern": "ginS/*.go",
+      "glob_kind": "nl"
+    },
+    {
+      "id": "gin-glob-lit-1",
+      "query": "internal/**/*.go",
+      "pattern": "internal/**/*.go",
+      "glob_kind": "literal"
+    },
+    {
+      "id": "gin-glob-lit-2",
+      "query": "codec/json/*.go",
+      "pattern": "codec/json/*.go",
+      "glob_kind": "literal"
+    },
+    {
+      "id": "gin-glob-lit-3",
+      "query": ".github/workflows/*.yml",
+      "pattern": ".github/workflows/*.yml",
+      "glob_kind": "literal"
+    },
+    {
+      "id": "gin-glob-lit-4",
+      "query": ".github/ISSUE_TEMPLATE/*.yaml",
+      "pattern": ".github/ISSUE_TEMPLATE/*.yaml",
+      "glob_kind": "literal"
     }
   ],
   "regex": [
