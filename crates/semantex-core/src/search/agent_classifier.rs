@@ -149,6 +149,32 @@ fn is_feature_planning_query(lower: &str) -> bool {
     false
 }
 
+/// True when an NL query expresses grep/regex *intent* — i.e. the user wants
+/// lines/text matching a literal pattern, served best by lexical (regex)
+/// retrieval rather than dense semantic search.
+///
+/// The input is expected to be already lowercased. Trigger phrases are kept
+/// tight and universal (generic English; no repo/domain vocabulary). Each one
+/// unambiguously means "find lines/occurrences of a literal string":
+///   - "lines containing …" / "lines with …" / "lines that match …" /
+///     "lines matching …"
+///   - "grep for …"
+///   - "search for the string …"
+///   - "occurrences of …"
+///
+/// Deliberately conservative: ambiguous phrasings (e.g. a bare "search for X",
+/// which often means a semantic search) are LEFT OUT so the guard does not
+/// over-fire and steal genuine Semantic queries.
+fn has_regex_intent(lower: &str) -> bool {
+    lower.contains("lines containing")
+        || lower.contains("lines with ")
+        || lower.contains("lines that match")
+        || lower.contains("lines matching")
+        || lower.contains("grep for ")
+        || lower.contains("search for the string ")
+        || lower.contains("occurrences of ")
+}
+
 /// Returns true if the query looks like a regex pattern.
 ///
 /// Detects: `\b \B \d \D \s \S \w \W` escape classes, unquoted `|` alternation,
@@ -209,14 +235,37 @@ pub fn is_regex(query: &str) -> bool {
     false
 }
 
+/// True when the query is (mostly) a bare glob *pattern* rather than an NL
+/// sentence that merely contains a glob char somewhere.
+///
+/// FilePattern is a path-pattern route: it serves literal globs like
+/// `*_test.go`, `**/*.go`, `binding/*.go`, `src/*.py`. A multi-word natural-
+/// language sentence that happens to embed a `*` mid-phrase (e.g. "functions
+/// that return a *Context") is NOT a glob — routing it to FilePattern was a
+/// measured 0.00-nDCG mis-route. The guard: a bare glob query is a single
+/// whitespace-free token, or a short pattern of at most two tokens (covering
+/// the rare `dir/ *.go`-style spacing). Anything longer is treated as prose
+/// and must fall through to the rest of the cascade.
+///
+/// Domain-neutral: keyed purely on token shape (whitespace + glob chars), no
+/// language/path vocabulary.
+fn is_bare_glob_query(query: &str) -> bool {
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    // A sentence-like query (3+ words) where a `*`/glob-`?` is embedded mid-
+    // phrase is prose, not a pattern. Allow up to two tokens so the rare
+    // spaced pattern still resolves as a glob.
+    tokens.len() <= 2
+}
+
 /// Classify a query into a high-level agent route.
 pub fn classify_agent_query(query: &str) -> AgentRoute {
-    // 1. FilePattern
-    if query.contains('*') || query.contains("**/") {
+    // 1. FilePattern — only for a (mostly) bare glob *pattern*, not an NL
+    // sentence that merely embeds a glob char. See `is_bare_glob_query`.
+    if (query.contains('*') || query.contains("**/")) && is_bare_glob_query(query) {
         return AgentRoute::FilePattern;
     }
     // Check for mid-token `?` (not a trailing natural-language question mark)
-    {
+    if is_bare_glob_query(query) {
         let chars: Vec<char> = query.chars().collect();
         for i in 0..chars.len() {
             if chars[i] == '?' {
@@ -402,6 +451,24 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         if lower.contains(marker) {
             return AgentRoute::Exhaustive;
         }
+    }
+
+    // 7a. Regex-INTENT NL phrasing → Regex.
+    //
+    // A natural-language query that expresses grep/regex *intent* — "lines
+    // containing X", "lines with X", "lines that match X", "grep for X",
+    // "search for the string X", "occurrences of X" — is served far better by
+    // line-oriented lexical (regex) retrieval than by dense semantic search.
+    // The measured mis-routes ("lines containing a TODO or FIXME marker") fell
+    // through to Semantic (nDCG 0.00; oracle Regex 0.31).
+    //
+    // Placed AFTER Deep/Structural/Analytical/Exhaustive so it can only
+    // reclassify a query that those earlier steps did not claim — it mainly
+    // diverts what would otherwise be Semantic. The trigger list is tight and
+    // universal (generic English grep phrasing, no repo terms): each phrase
+    // unambiguously signals "find lines/text matching a literal pattern".
+    if has_regex_intent(&lower) {
+        return AgentRoute::Regex;
     }
 
     // 7b. NL lookup that names a distinctive symbol → lexical family.
@@ -1160,6 +1227,130 @@ mod tests {
             classify_agent_query("error handling patterns"),
             AgentRoute::Semantic
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Fix A — regex-INTENT NL phrasing → Regex
+    // (route-stress eval: gin/flask). "lines containing/with/matching X",
+    // "grep for X", "search for the string X", "occurrences of X" express a
+    // grep/regex intent that line-oriented lexical retrieval serves far better
+    // than dense semantic search. These fire only on queries that would
+    // otherwise fall to Semantic (placed just before step 7b).
+    // ────────────────────────────────────────────────────────────────────
+
+    // ── POSITIVE: regex-intent NL → Regex ───────────────────────────────
+    #[test]
+    fn regex_intent_lines_containing_is_regex() {
+        // Measured mis-route: "lines containing a TODO or FIXME marker" was
+        // Semantic (nDCG 0.00); oracle is Regex (0.31).
+        assert_eq!(
+            classify_agent_query("lines containing a TODO or FIXME marker"),
+            AgentRoute::Regex
+        );
+    }
+    #[test]
+    fn regex_intent_lines_with_is_regex() {
+        assert_eq!(
+            classify_agent_query("lines with a trailing whitespace marker"),
+            AgentRoute::Regex
+        );
+    }
+    #[test]
+    fn regex_intent_lines_that_match_is_regex() {
+        assert_eq!(
+            classify_agent_query("lines that match the deprecated annotation"),
+            AgentRoute::Regex
+        );
+    }
+    #[test]
+    fn regex_intent_grep_for_is_regex() {
+        assert_eq!(
+            classify_agent_query("grep for the panic call"),
+            AgentRoute::Regex
+        );
+    }
+    #[test]
+    fn regex_intent_search_for_the_string_is_regex() {
+        assert_eq!(
+            classify_agent_query("search for the string deadbeef"),
+            AgentRoute::Regex
+        );
+    }
+    #[test]
+    fn regex_intent_occurrences_of_is_regex() {
+        assert_eq!(
+            classify_agent_query("occurrences of the deprecated flag"),
+            AgentRoute::Regex
+        );
+    }
+
+    // ── NEGATIVE: regex-intent guard must not steal earlier-correct routes ─
+    #[test]
+    fn regex_intent_guard_does_not_steal_deep_synthesis() {
+        // "how does X work" must stay Deep even if it mentions lines/matches.
+        assert_eq!(
+            classify_agent_query("how does line matching work in the parser"),
+            AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn regex_intent_guard_does_not_steal_semantic_nl() {
+        // Genuine semantic NL without grep-intent phrasing stays Semantic.
+        assert_eq!(
+            classify_agent_query("error handling patterns"),
+            AgentRoute::Semantic
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Fix B — FilePattern tightened to (mostly) bare-glob queries
+    // (route-stress eval: gin/flask). A multi-word NL sentence that merely
+    // contains a `*` somewhere must NOT route to FilePattern; only a bare
+    // glob-shaped pattern (single whitespace-free token, or a short pattern)
+    // does.
+    // ────────────────────────────────────────────────────────────────────
+
+    // ── POSITIVE: the measured mis-route is no longer FilePattern ────────
+    #[test]
+    fn nl_sentence_with_star_is_not_file_pattern() {
+        // "functions that return a *Context" was FilePattern (nDCG 0.00!) — the
+        // bare `*` made FilePattern misfire. It is a multi-word NL sentence, not
+        // a literal glob. After Fix B it falls through to Semantic (the
+        // `*Context` token is not a metacharacter pattern `is_regex` recognizes,
+        // and the query is genuine NL). Oracle is Regex (0.61); Semantic is a
+        // safe, non-regressing landing — the key win is escaping FilePattern.
+        let route = classify_agent_query("functions that return a *Context");
+        assert_ne!(
+            route,
+            AgentRoute::FilePattern,
+            "NL sentence containing a bare `*` must not route to FilePattern"
+        );
+        assert_eq!(
+            route,
+            AgentRoute::Semantic,
+            "documented landing: Semantic (not regex-shaped, genuine NL)"
+        );
+    }
+
+    // ── NEGATIVE / PRESERVE: bare globs STILL route to FilePattern ───────
+    #[test]
+    fn bare_glob_star_test_go_still_file_pattern() {
+        assert_eq!(classify_agent_query("*_test.go"), AgentRoute::FilePattern);
+    }
+    #[test]
+    fn bare_glob_doublestar_still_file_pattern() {
+        assert_eq!(classify_agent_query("**/*.go"), AgentRoute::FilePattern);
+    }
+    #[test]
+    fn bare_glob_dir_pattern_still_file_pattern() {
+        assert_eq!(
+            classify_agent_query("binding/*.go"),
+            AgentRoute::FilePattern
+        );
+    }
+    #[test]
+    fn bare_glob_src_star_py_still_file_pattern() {
+        assert_eq!(classify_agent_query("src/*.py"), AgentRoute::FilePattern);
     }
 
     // ────────────────────────────────────────────────────────────────────
