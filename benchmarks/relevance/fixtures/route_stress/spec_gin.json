@@ -1,0 +1,35 @@
+{
+  "_comment": "Derivation spec for the gin (Go) route-stress pilot. This file NAMES the targets (globs / regexes / symbols); gen_route_stress.py DERIVES the gold for each mechanically from the repo source, so re-running reproduces the gold exactly. Targets were chosen to have a SINGLE or small, clearly-enumerable gold set (the favor-unambiguous-gold principle). Counts in the README were verified against gin at commit state of 2026-06-03.",
+
+  "glob": [
+    {"id": "gin-glob-1", "query": "all Go test files (*_test.go)", "pattern": "*_test.go"},
+    {"id": "gin-glob-2", "query": "files under the render/ package", "pattern": "render/*.go"},
+    {"id": "gin-glob-3", "query": "files under the binding/ package", "pattern": "binding/*.go"},
+    {"id": "gin-glob-4", "query": "markdown docs at the repo root", "pattern": "*.md"},
+    {"id": "gin-glob-5", "query": "the ginS subpackage Go sources", "pattern": "ginS/*.go"}
+  ],
+
+  "regex": [
+    {"id": "gin-regex-1", "query": "lines containing a TODO or FIXME marker", "pattern": "TODO|FIXME", "exclude_tests": false},
+    {"id": "gin-regex-2", "query": "functions that return a *Context", "pattern": "func .*\\) \\*Context \\{", "exclude_tests": true},
+    {"id": "gin-regex-3", "query": "places that call panic(", "pattern": "panic\\(", "exclude_tests": true},
+    {"id": "gin-regex-4", "query": "Go build-constraint (//go:build) directives", "pattern": "^//go:build", "exclude_tests": false},
+    {"id": "gin-regex-5", "query": "type definitions implementing an interface via methods named ServeHTTP", "pattern": "func .*\\) ServeHTTP\\(", "exclude_tests": true}
+  ],
+
+  "lexical": [
+    {"id": "gin-lex-1", "query": "the RouterGroup struct", "symbol": "RouterGroup"},
+    {"id": "gin-lex-2", "query": "the handleHTTPRequest method", "symbol": "handleHTTPRequest"},
+    {"id": "gin-lex-3", "query": "the ResponseWriter interface", "symbol": "ResponseWriter"},
+    {"id": "gin-lex-4", "query": "the HandlerFunc type", "symbol": "HandlerFunc"},
+    {"id": "gin-lex-5", "query": "the Context struct", "symbol": "Context"}
+  ],
+
+  "structural": [
+    {"id": "gin-struct-1", "query": "what calls handleHTTPRequest", "symbol": "handleHTTPRequest", "exclude_tests": true},
+    {"id": "gin-struct-2", "query": "callers of combineHandlers", "symbol": "combineHandlers", "exclude_tests": false},
+    {"id": "gin-struct-3", "query": "where is allocateContext called", "symbol": "allocateContext", "exclude_tests": false},
+    {"id": "gin-struct-4", "query": "callers of redirectTrailingSlash", "symbol": "redirectTrailingSlash", "exclude_tests": true},
+    {"id": "gin-struct-5", "query": "what calls calculateAbsolutePath", "symbol": "calculateAbsolutePath", "exclude_tests": false}
+  ]
+}

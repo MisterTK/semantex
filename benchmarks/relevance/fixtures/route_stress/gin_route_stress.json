@@ -1,0 +1,494 @@
+{
+  "schema": "route_stress/v1",
+  "repo": "gin",
+  "repo_path_at_gen": "/Users/tk/dev/gin",
+  "match_granularity_default": "file",
+  "mechanisms": [
+    "glob",
+    "regex",
+    "lexical",
+    "structural",
+    "semantic",
+    "usage"
+  ],
+  "records": [
+    {
+      "id": "gin-glob-1",
+      "repo": "gin",
+      "query": "all Go test files (*_test.go)",
+      "intended_mechanism": "glob",
+      "gold": [
+        "auth_test.go",
+        "benchmarks_test.go",
+        "binding/binding_msgpack_test.go",
+        "binding/binding_test.go",
+        "binding/default_validator_benchmark_test.go",
+        "binding/default_validator_test.go",
+        "binding/form_mapping_benchmark_test.go",
+        "binding/form_mapping_test.go",
+        "binding/json_test.go",
+        "binding/msgpack_test.go",
+        "binding/multipart_form_mapping_test.go",
+        "binding/toml_test.go",
+        "binding/validate_test.go",
+        "binding/xml_test.go",
+        "binding/yaml_test.go",
+        "context_file_test.go",
+        "context_test.go",
+        "debug_test.go",
+        "deprecated_test.go",
+        "errors_test.go",
+        "fs_test.go",
+        "ginS/gins_test.go",
+        "gin_integration_test.go",
+        "gin_test.go",
+        "githubapi_test.go",
+        "internal/bytesconv/bytesconv_test.go",
+        "internal/fs/fs_test.go",
+        "logger_test.go",
+        "middleware_test.go",
+        "mode_test.go",
+        "path_test.go",
+        "recovery_test.go",
+        "render/reader_test.go",
+        "render/render_msgpack_test.go",
+        "render/render_test.go",
+        "response_writer_test.go",
+        "routergroup_test.go",
+        "routes_test.go",
+        "tree_test.go",
+        "utils_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=*_test.go"
+    },
+    {
+      "id": "gin-glob-2",
+      "repo": "gin",
+      "query": "files under the render/ package",
+      "intended_mechanism": "glob",
+      "gold": [
+        "render/bson.go",
+        "render/data.go",
+        "render/html.go",
+        "render/json.go",
+        "render/msgpack.go",
+        "render/pdf.go",
+        "render/protobuf.go",
+        "render/reader.go",
+        "render/reader_test.go",
+        "render/redirect.go",
+        "render/render.go",
+        "render/render_msgpack_test.go",
+        "render/render_test.go",
+        "render/text.go",
+        "render/toml.go",
+        "render/xml.go",
+        "render/yaml.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=render/*.go"
+    },
+    {
+      "id": "gin-glob-3",
+      "repo": "gin",
+      "query": "files under the binding/ package",
+      "intended_mechanism": "glob",
+      "gold": [
+        "binding/binding.go",
+        "binding/binding_msgpack_test.go",
+        "binding/binding_nomsgpack.go",
+        "binding/binding_test.go",
+        "binding/bson.go",
+        "binding/default_validator.go",
+        "binding/default_validator_benchmark_test.go",
+        "binding/default_validator_test.go",
+        "binding/form.go",
+        "binding/form_mapping.go",
+        "binding/form_mapping_benchmark_test.go",
+        "binding/form_mapping_test.go",
+        "binding/header.go",
+        "binding/json.go",
+        "binding/json_test.go",
+        "binding/msgpack.go",
+        "binding/msgpack_test.go",
+        "binding/multipart_form_mapping.go",
+        "binding/multipart_form_mapping_test.go",
+        "binding/plain.go",
+        "binding/protobuf.go",
+        "binding/query.go",
+        "binding/toml.go",
+        "binding/toml_test.go",
+        "binding/uri.go",
+        "binding/validate_test.go",
+        "binding/xml.go",
+        "binding/xml_test.go",
+        "binding/yaml.go",
+        "binding/yaml_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=binding/*.go"
+    },
+    {
+      "id": "gin-glob-4",
+      "repo": "gin",
+      "query": "markdown docs at the repo root",
+      "intended_mechanism": "glob",
+      "gold": [
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "AUTHORS.md",
+        "BENCHMARKS.md",
+        "CHANGELOG.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "README.md",
+        "docs/doc.md",
+        "examples/README.md",
+        "ginS/README.md"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=*.md"
+    },
+    {
+      "id": "gin-glob-5",
+      "repo": "gin",
+      "query": "the ginS subpackage Go sources",
+      "intended_mechanism": "glob",
+      "gold": [
+        "ginS/gins.go",
+        "ginS/gins_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=ginS/*.go"
+    },
+    {
+      "id": "gin-regex-1",
+      "repo": "gin",
+      "query": "lines containing a TODO or FIXME marker",
+      "intended_mechanism": "regex",
+      "gold": [
+        "context_test.go",
+        "response_writer_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='TODO|FIXME'"
+    },
+    {
+      "id": "gin-regex-2",
+      "repo": "gin",
+      "query": "functions that return a *Context",
+      "intended_mechanism": "regex",
+      "gold": [
+        "context.go",
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='func .*\\\\) \\\\*Context \\\\{'"
+    },
+    {
+      "id": "gin-regex-3",
+      "repo": "gin",
+      "query": "places that call panic(",
+      "intended_mechanism": "regex",
+      "gold": [
+        "context.go",
+        "mode.go",
+        "render/html.go",
+        "render/redirect.go",
+        "routergroup.go",
+        "tree.go",
+        "utils.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='panic\\\\('"
+    },
+    {
+      "id": "gin-regex-4",
+      "repo": "gin",
+      "query": "Go build-constraint (//go:build) directives",
+      "intended_mechanism": "regex",
+      "gold": [
+        "binding/binding.go",
+        "binding/binding_msgpack_test.go",
+        "binding/binding_nomsgpack.go",
+        "binding/msgpack.go",
+        "binding/msgpack_test.go",
+        "codec/json/go_json.go",
+        "codec/json/json.go",
+        "codec/json/jsoniter.go",
+        "codec/json/sonic.go",
+        "context_appengine.go",
+        "render/msgpack.go",
+        "render/render_msgpack_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='^//go:build'"
+    },
+    {
+      "id": "gin-regex-5",
+      "repo": "gin",
+      "query": "type definitions implementing an interface via methods named ServeHTTP",
+      "intended_mechanism": "regex",
+      "gold": [
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='func .*\\\\) ServeHTTP\\\\('"
+    },
+    {
+      "id": "gin-lex-1",
+      "repo": "gin",
+      "query": "the RouterGroup struct",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "routergroup.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of RouterGroup"
+    },
+    {
+      "id": "gin-lex-2",
+      "repo": "gin",
+      "query": "the handleHTTPRequest method",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of handleHTTPRequest"
+    },
+    {
+      "id": "gin-lex-3",
+      "repo": "gin",
+      "query": "the ResponseWriter interface",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "response_writer.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of ResponseWriter"
+    },
+    {
+      "id": "gin-lex-4",
+      "repo": "gin",
+      "query": "the HandlerFunc type",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of HandlerFunc"
+    },
+    {
+      "id": "gin-lex-5",
+      "repo": "gin",
+      "query": "the Context struct",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "context.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of Context"
+    },
+    {
+      "id": "gin-struct-1",
+      "repo": "gin",
+      "query": "what calls handleHTTPRequest",
+      "intended_mechanism": "structural",
+      "gold": [
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of handleHTTPRequest; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "gin-struct-2",
+      "repo": "gin",
+      "query": "callers of combineHandlers",
+      "intended_mechanism": "structural",
+      "gold": [
+        "gin.go",
+        "routergroup.go",
+        "routergroup_test.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of combineHandlers; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "gin-struct-3",
+      "repo": "gin",
+      "query": "where is allocateContext called",
+      "intended_mechanism": "structural",
+      "gold": [
+        "context_test.go",
+        "gin.go",
+        "test_helpers.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of allocateContext; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "gin-struct-4",
+      "repo": "gin",
+      "query": "callers of redirectTrailingSlash",
+      "intended_mechanism": "structural",
+      "gold": [
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of redirectTrailingSlash; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "gin-struct-5",
+      "repo": "gin",
+      "query": "what calls calculateAbsolutePath",
+      "intended_mechanism": "structural",
+      "gold": [
+        "routergroup.go"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of calculateAbsolutePath; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "gin-sem-1",
+      "repo": "gin",
+      "query": "how does the middleware chain work",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "context.go",
+        "routergroup.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Next()/handlers index advance live in context.go; combineHandlers + Use that build the chain live in routergroup.go. Hand-judged."
+    },
+    {
+      "id": "gin-sem-2",
+      "repo": "gin",
+      "query": "how are panics recovered during request handling",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "recovery.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Recovery middleware that catches panics and writes a 500. Single, unambiguous gold."
+    },
+    {
+      "id": "gin-sem-3",
+      "repo": "gin",
+      "query": "how does request body binding and validation work",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "binding/binding.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Binding interface + Default() content-type dispatch. The concrete binders are siblings; binding.go is the canonical entry point."
+    },
+    {
+      "id": "gin-sem-4",
+      "repo": "gin",
+      "query": "how does the radix tree route matching work",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "tree.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "The httprouter-derived radix tree (addRoute/getValue) lives entirely in tree.go. Single gold."
+    },
+    {
+      "id": "gin-sem-5",
+      "repo": "gin",
+      "query": "how are accumulated request errors collected and reported",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "errors.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Error / errorMsgs type + c.Error() accumulation. context.go holds Error() but the error model is errors.go. Hand-judged primary."
+    },
+    {
+      "id": "gin-use-1",
+      "repo": "gin",
+      "query": "how do I register a route handler for a GET request",
+      "intended_mechanism": "usage",
+      "gold": [
+        "routergroup.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Public verb shortcuts (GET/POST/...) + Handle live in routergroup.go \u2014 the idiomatic registration API."
+    },
+    {
+      "id": "gin-use-2",
+      "repo": "gin",
+      "query": "how do I create a new gin engine / router instance",
+      "intended_mechanism": "usage",
+      "gold": [
+        "gin.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "New() and Default() constructors live in gin.go \u2014 the canonical setup entry points."
+    },
+    {
+      "id": "gin-use-3",
+      "repo": "gin",
+      "query": "how do I return a JSON response from a handler",
+      "intended_mechanism": "usage",
+      "gold": [
+        "context.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "c.JSON()/c.IndentedJSON() \u2014 the user-facing render call \u2014 are methods on Context in context.go. (render/json.go is the impl, not how a user invokes it.)"
+    },
+    {
+      "id": "gin-use-4",
+      "repo": "gin",
+      "query": "how do I attach middleware to a router group",
+      "intended_mechanism": "usage",
+      "gold": [
+        "routergroup.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "RouterGroup.Use(...) is the idiomatic middleware-attach API. Single gold."
+    },
+    {
+      "id": "gin-use-5",
+      "repo": "gin",
+      "query": "how do I switch gin between debug and release mode",
+      "intended_mechanism": "usage",
+      "gold": [
+        "mode.go"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "SetMode / gin.ReleaseMode constants live in mode.go \u2014 the idiomatic mode-switch API."
+    }
+  ]
+}
