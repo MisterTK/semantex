@@ -1,0 +1,11 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+### src/auth.rs:10-14 — AuthMiddleware [struct]
+```rust
+  10 | pub struct AuthMiddleware {
+  11 |     token: String,
+  12 |     ttl: u64,
+  13 | }
+```

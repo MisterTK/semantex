@@ -82,17 +82,37 @@ impl<'a> Handler<'a> {
             Request::MultiSearch(req) => self.handle_multi_search(req),
             Request::DeepSearch(ref req) => self.handle_deep_search(req),
             Request::Agent(ref req) => self.handle_agent(req),
+            Request::AgentHits(ref req) => self.handle_agent_hits(req),
         }
     }
 
     fn handle_agent(&self, req: &AgentRequest) -> Response {
+        Response::Agent(self.build_agent_pipeline().handle(req))
+    }
+
+    /// Run an agent query and return the engine's structured ranked hits
+    /// (the same `Vec<SearchResultItem>` the in-process MCP `structuredContent`
+    /// path consumes) instead of the prose `AgentResponse`. Used by the
+    /// route-stress benchmark harness to score a SPECIFIC retrieval route
+    /// against file-level gold — each hit's `file` is repo-relative.
+    fn handle_agent_hits(&self, req: &AgentRequest) -> Response {
+        let (resp, hits) = self.build_agent_pipeline().handle_with_hits(req);
+        Response::AgentHits(super::protocol::AgentHitsResponse {
+            route: resp.route,
+            hits,
+        })
+    }
+
+    /// Construct the `AgentPipeline`, threading the LLM + runtime when built
+    /// with the `llm` feature. Shared by `handle_agent` / `handle_agent_hits`.
+    fn build_agent_pipeline(&self) -> crate::search::agent::AgentPipeline<'_> {
         use crate::search::agent::AgentPipeline;
         let pipeline = AgentPipeline::new(self.searcher, self.project_root.clone());
         #[cfg(feature = "llm")]
         let pipeline = pipeline
             .with_llm(self.llm.clone())
             .with_runtime(self.runtime.clone());
-        Response::Agent(pipeline.handle(req))
+        pipeline
     }
 
     fn handle_search(&self, req: SearchRequest) -> Response {

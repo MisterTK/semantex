@@ -1,0 +1,775 @@
+{
+  "repo": "platform",
+  "total_queries": 22,
+  "synthesis_count": 6,
+  "overall_regret": 0.1964,
+  "overall_router_accuracy": 0.3182,
+  "router_matches_oracle_count": 7,
+  "oracle_win_counts": {
+    "file_pattern": 0,
+    "regex": 11,
+    "exact_symbol": 9,
+    "structural": 8,
+    "semantic": 9
+  },
+  "per_route_mean_ndcg": {
+    "file_pattern": 0.0,
+    "regex": 0.5177,
+    "exact_symbol": 0.423,
+    "structural": 0.3456,
+    "semantic": 0.4563
+  },
+  "per_mechanism_route_ndcg": {
+    "glob": {
+      "file_pattern": 0.0,
+      "regex": 0.4152,
+      "exact_symbol": 0.104,
+      "structural": 0.1515,
+      "semantic": 0.1799
+    },
+    "lexical": {
+      "file_pattern": 0.0,
+      "regex": 0.9262,
+      "exact_symbol": 0.9262,
+      "structural": 1.0,
+      "semantic": 0.9262
+    },
+    "regex": {
+      "file_pattern": 0.0,
+      "regex": 0.4479,
+      "exact_symbol": 0.2491,
+      "structural": 0.2165,
+      "semantic": 0.3567
+    },
+    "semantic": {
+      "file_pattern": 0.0,
+      "regex": 0.4769,
+      "exact_symbol": 0.5436,
+      "structural": 0.377,
+      "semantic": 0.5436
+    },
+    "structural": {
+      "file_pattern": 0.0,
+      "regex": 0.625,
+      "exact_symbol": 0.5436,
+      "structural": 0.0,
+      "semantic": 0.5436
+    },
+    "usage": {
+      "file_pattern": 0.0,
+      "regex": 0.0,
+      "exact_symbol": 0.0,
+      "structural": 0.0,
+      "semantic": 0.0
+    }
+  },
+  "per_mechanism_regret": {
+    "glob": 0.3173,
+    "lexical": 0.0738,
+    "regex": 0.1099,
+    "semantic": 0.5436,
+    "structural": 0.2044,
+    "usage": 0.0
+  },
+  "per_mechanism_router_accuracy": {
+    "glob": 0.0,
+    "lexical": 0.8,
+    "regex": 0.25,
+    "semantic": 0.0,
+    "structural": 0.6667,
+    "usage": 0.0
+  },
+  "confusion_matrix": {
+    "glob": {
+      "semantic": 4
+    },
+    "lexical": {
+      "semantic": 5
+    },
+    "regex": {
+      "semantic": 4
+    },
+    "semantic": {
+      "deep": 3
+    },
+    "structural": {
+      "semantic": 3
+    },
+    "usage": {
+      "feature_planning": 1,
+      "deep": 2
+    }
+  },
+  "per_query": [
+    {
+      "query_id": "plat-glob-1",
+      "query": "TypeScript Zod model files under apps/api",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 12,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.32776097292662437,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.3333333333333333,
+        "semantic": 0.0
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 0.3278,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0,
+      "regret": 0.3278
+    },
+    {
+      "query_id": "plat-glob-2",
+      "query": "Flutter generated freezed Dart files",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 15,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6410457898283652,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.06943122193677727
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.5333333333333333,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.06666666666666667
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.641,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0694,
+      "regret": 0.5716
+    },
+    {
+      "query_id": "plat-glob-3",
+      "query": "the API v1 route handlers",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 17,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.3589542101716347,
+        "exact_symbol": 0.13886244387355454,
+        "structural": 0.2781981696179509,
+        "semantic": 0.13886244387355454
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.11764705882352941,
+        "exact_symbol": 0.058823529411764705,
+        "structural": 0.17647058823529413,
+        "semantic": 0.058823529411764705
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.359,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.1389,
+      "regret": 0.2201
+    },
+    {
+      "query_id": "plat-glob-4",
+      "query": "the per-app Dockerfiles at the repo root",
+      "repo": "platform",
+      "intended_mechanism": "glob",
+      "gold_count": 5,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6608397947263839,
+        "exact_symbol": 0.27727342735504823,
+        "structural": 0.0,
+        "semantic": 0.5111381318124144
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.8,
+        "exact_symbol": 0.4,
+        "structural": 0.0,
+        "semantic": 0.8
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.6608,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.5111,
+      "regret": 0.1497
+    },
+    {
+      "query_id": "plat-regex-1",
+      "query": "TypeScript Zod object schema declarations",
+      "repo": "platform",
+      "intended_mechanism": "regex",
+      "gold_count": 25,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.07839826897867533,
+        "exact_symbol": 0.13886244387355454,
+        "structural": 0.13886244387355454,
+        "semantic": 0.13886244387355454
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.04,
+        "exact_symbol": 0.04,
+        "structural": 0.04,
+        "semantic": 0.04
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 0.1389,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.1389,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-regex-2",
+      "query": "Dart freezed-annotated data classes",
+      "repo": "platform",
+      "intended_mechanism": "regex",
+      "gold_count": 15,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.4288398090337664,
+        "structural": 0.0,
+        "semantic": 0.7162874455029681
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.6666666666666666,
+        "exact_symbol": 0.26666666666666666,
+        "structural": 0.0,
+        "semantic": 0.5333333333333333
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.7163,
+      "regret": 0.2837
+    },
+    {
+      "query_id": "plat-regex-3",
+      "query": "Dart Riverpod ConsumerWidget screens",
+      "repo": "platform",
+      "intended_mechanism": "regex",
+      "gold_count": 15,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.7133080652109928,
+        "exact_symbol": 0.4288398090337664,
+        "structural": 0.7273298443105218,
+        "semantic": 0.5716349530699036
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.4666666666666667,
+        "exact_symbol": 0.26666666666666666,
+        "structural": 0.4,
+        "semantic": 0.4
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 0.7273,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.5716,
+      "regret": 0.1557
+    },
+    {
+      "query_id": "plat-regex-4",
+      "query": "TypeScript files with a default export",
+      "repo": "platform",
+      "intended_mechanism": "regex",
+      "gold_count": 26,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [],
+      "oracle_ndcg": 0.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-lex-1",
+      "query": "the DataAvailabilityCache class",
+      "repo": "platform",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-lex-2",
+      "query": "the FhirPersonaGeneratorService class",
+      "repo": "platform",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-lex-3",
+      "query": "the PrimaryCareProviderSchema zod schema",
+      "repo": "platform",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.6309297535714575,
+        "structural": 1.0,
+        "semantic": 0.6309297535714575
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "structural"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.6309,
+      "regret": 0.3691
+    },
+    {
+      "query_id": "plat-lex-4",
+      "query": "the AggieChatService Dart class",
+      "repo": "platform",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-lex-5",
+      "query": "the ConnectionCard Flutter widget",
+      "repo": "platform",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-struct-1",
+      "query": "what instantiates DataAvailabilityCache",
+      "repo": "platform",
+      "intended_mechanism": "structural",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 0.6309297535714575,
+        "structural": 0.0,
+        "semantic": 0.6309297535714575
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 0.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "semantic"
+      ],
+      "oracle_ndcg": 0.6309,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.6309,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-struct-2",
+      "query": "where is FhirPersonaGeneratorService constructed",
+      "repo": "platform",
+      "intended_mechanism": "structural",
+      "gold_count": 2,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6131471927654584,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.5,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.6131,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0,
+      "regret": 0.6131
+    },
+    {
+      "query_id": "plat-struct-3",
+      "query": "what instantiates HealthService",
+      "repo": "platform",
+      "intended_mechanism": "structural",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 1.0,
+        "structural": 0.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 0.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-sem-1",
+      "query": "how does the API server bootstrap and mount its routes",
+      "repo": "platform",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [],
+      "oracle_ndcg": 0.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-sem-2",
+      "query": "how is a synthetic FHIR patient persona generated",
+      "repo": "platform",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 0.6309297535714575,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "plat-sem-3",
+      "query": "how does the Flutter app stream chat responses from the assistant",
+      "repo": "platform",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.43067655807339306,
+        "exact_symbol": 0.6309297535714575,
+        "structural": 0.5,
+        "semantic": 0.6309297535714575
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "semantic"
+      ],
+      "oracle_ndcg": 0.6309,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.6309
+    },
+    {
+      "query_id": "plat-use-1",
+      "query": "how do I add a new versioned REST endpoint to the API",
+      "repo": "platform",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [],
+      "oracle_ndcg": 0.0,
+      "router_choice": "feature_planning",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-use-2",
+      "query": "how do I call the backend API from the Flutter client",
+      "repo": "platform",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [],
+      "oracle_ndcg": 0.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "plat-use-3",
+      "query": "how do I define a TypeScript request/response validation schema",
+      "repo": "platform",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [],
+      "oracle_ndcg": 0.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.0
+    }
+  ]
+}

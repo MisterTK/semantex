@@ -1,0 +1,103 @@
+[
+  {
+    "id": "gin-sem-1",
+    "repo": "gin",
+    "query": "how does the middleware chain work",
+    "intended_mechanism": "semantic",
+    "gold": ["context.go", "routergroup.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Next()/handlers index advance live in context.go; combineHandlers + Use that build the chain live in routergroup.go. Hand-judged."
+  },
+  {
+    "id": "gin-sem-2",
+    "repo": "gin",
+    "query": "how are panics recovered during request handling",
+    "intended_mechanism": "semantic",
+    "gold": ["recovery.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Recovery middleware that catches panics and writes a 500. Single, unambiguous gold."
+  },
+  {
+    "id": "gin-sem-3",
+    "repo": "gin",
+    "query": "how does request body binding and validation work",
+    "intended_mechanism": "semantic",
+    "gold": ["binding/binding.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Binding interface + Default() content-type dispatch. The concrete binders are siblings; binding.go is the canonical entry point."
+  },
+  {
+    "id": "gin-sem-4",
+    "repo": "gin",
+    "query": "how does the radix tree route matching work",
+    "intended_mechanism": "semantic",
+    "gold": ["tree.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "The httprouter-derived radix tree (addRoute/getValue) lives entirely in tree.go. Single gold."
+  },
+  {
+    "id": "gin-sem-5",
+    "repo": "gin",
+    "query": "how are accumulated request errors collected and reported",
+    "intended_mechanism": "semantic",
+    "gold": ["errors.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Error / errorMsgs type + c.Error() accumulation. context.go holds Error() but the error model is errors.go. Hand-judged primary."
+  },
+
+  {
+    "id": "gin-use-1",
+    "repo": "gin",
+    "query": "how do I register a route handler for a GET request",
+    "intended_mechanism": "usage",
+    "gold": ["routergroup.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Public verb shortcuts (GET/POST/...) + Handle live in routergroup.go — the idiomatic registration API."
+  },
+  {
+    "id": "gin-use-2",
+    "repo": "gin",
+    "query": "how do I create a new gin engine / router instance",
+    "intended_mechanism": "usage",
+    "gold": ["gin.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "New() and Default() constructors live in gin.go — the canonical setup entry points."
+  },
+  {
+    "id": "gin-use-3",
+    "repo": "gin",
+    "query": "how do I return a JSON response from a handler",
+    "intended_mechanism": "usage",
+    "gold": ["context.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "c.JSON()/c.IndentedJSON() — the user-facing render call — are methods on Context in context.go. (render/json.go is the impl, not how a user invokes it.)"
+  },
+  {
+    "id": "gin-use-4",
+    "repo": "gin",
+    "query": "how do I attach middleware to a router group",
+    "intended_mechanism": "usage",
+    "gold": ["routergroup.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "RouterGroup.Use(...) is the idiomatic middleware-attach API. Single gold."
+  },
+  {
+    "id": "gin-use-5",
+    "repo": "gin",
+    "query": "how do I switch gin between debug and release mode",
+    "intended_mechanism": "usage",
+    "gold": ["mode.go"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "SetMode / gin.ReleaseMode constants live in mode.go — the idiomatic mode-switch API."
+  }
+]

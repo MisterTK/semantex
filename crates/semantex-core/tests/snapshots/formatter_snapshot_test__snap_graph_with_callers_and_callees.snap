@@ -1,0 +1,13 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+Target:
+  src/auth.rs:10-50 AuthMiddleware [struct]
+
+Callers (2):
+  src/middleware.rs:5-20 apply_middleware [fn]
+  src/server.rs:100-115 start_server [fn]
+
+Callees (1):
+  src/token.rs:1-30 validate_token [fn]

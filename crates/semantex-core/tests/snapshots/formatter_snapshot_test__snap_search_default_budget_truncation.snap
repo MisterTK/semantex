@@ -1,0 +1,19 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+src/module0.rs:1-20 Symbol0 [fn] (0.90)
+  fn symbol_0() { /* impl */ }
+
+src/module1.rs:11-30 Symbol1 [fn] (0.85)
+  fn symbol_1() { /* impl */ }
+
+src/module2.rs:21-40 Symbol2 [fn] (0.80)
+  fn symbol_2() { /* impl */ }
+
+src/module3.rs:31-50 Symbol3 [fn] (0.75)
+  fn symbol_3() { /* impl */ }
+
+... and 1 more results
+
+[5 results, 30ms, confidence: high]

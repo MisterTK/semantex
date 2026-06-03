@@ -738,7 +738,10 @@ impl McpServer {
                     "and returns a ready-to-use answer. THE recommended tool for ALL code-search needs — ",
                     "one call in, one complete answer out. Do NOT chain semantex_* calls to assemble an ",
                     "answer; if the result is incomplete, refine the QUESTION and call semantex_agent again. ",
-                    "Accepts a natural-language question, a symbol, a regex, or a glob."
+                    "Accepts a natural-language question, a symbol, a regex, or a glob. ",
+                    "Use 'mode' ONLY when you know the retrieval shape: 'lexical' for exact symbol/regex, ",
+                    "'structural' for callers/callees/imports, 'deep' for multi-source explanation. ",
+                    "Leave 'mode' unset (auto) for everything else — the classifier is usually right."
                 ).into(),
                 input_schema: serde_json::json!({
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -765,10 +768,15 @@ impl McpServer {
                             "type": "integer",
                             "description": "Response size budget in bytes (default: server SEMANTEX_MCP_BUDGET, normally 12000 ≈3K tokens)"
                         },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["auto", "lexical", "search", "structural", "deep"],
+                            "description": "Retrieval strategy. 'auto' (default) = keyword classifier decides; 'lexical' = exact symbol or regex lookup; 'search' = hybrid dense+sparse; 'structural' = callers/callees/imports graph walk; 'deep' = multi-source synthesis. Overrides 'depth'. Leave unset unless you know the shape."
+                        },
                         "depth": {
                             "type": "string",
                             "enum": ["quick", "search", "deep"],
-                            "description": "Search depth. 'quick'=symbol lookup (~50ms), 'search'=hybrid with snippets (~100ms), 'deep'=full implementations with call graphs (~200ms). Omit to auto-detect."
+                            "description": "Search depth. 'quick'=symbol lookup (~50ms), 'search'=hybrid with snippets (~100ms), 'deep'=full implementations with call graphs (~200ms). Omit to auto-detect. Overridden by 'mode' when both are set."
                         },
                         "focus": {
                             "type": "string",
@@ -1196,16 +1204,28 @@ impl McpServer {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(self.mcp_defaults.full_code);
 
+        // Parse the optional `mode` parameter (stable public vocabulary).
+        // Precedence: explicit `mode` arg > `depth` arg > SEMANTEX_MCP_DEPTH env > auto.
+        let mode_arg = args.get("mode").and_then(|v| v.as_str());
+        let mode_query: &str = queries.first().map_or("", String::as_str);
+        let mode_route: Option<AgentRoute> = mode_to_route(mode_arg, mode_query);
+
         // Parse the optional `depth` parameter and map it to an AgentRoute override.
+        // `mode` takes precedence; depth only matters when mode is absent/auto.
         let depth_arg = args
             .get("depth")
             .and_then(|v| v.as_str())
             .or(self.mcp_defaults.depth.as_deref());
-        let depth_route: Option<AgentRoute> = match depth_arg {
-            Some("quick") => Some(AgentRoute::ExactSymbol),
-            Some("search") => Some(AgentRoute::Semantic),
-            Some("deep") => Some(AgentRoute::Deep),
-            _ => None,
+        let depth_route: Option<AgentRoute> = if mode_route.is_some() {
+            // `mode` wins — depth is ignored.
+            mode_route
+        } else {
+            match depth_arg {
+                Some("quick") => Some(AgentRoute::ExactSymbol),
+                Some("search") => Some(AgentRoute::Semantic),
+                Some("deep") => Some(AgentRoute::Deep),
+                _ => None,
+            }
         };
 
         // Parse the optional `focus` parameter.
@@ -1215,6 +1235,7 @@ impl McpServer {
             queries = ?queries,
             path = %path.display(),
             full_code,
+            mode = mode_arg.unwrap_or("auto"),
             ?depth_route,
             focus,
             "MCP agent search"
@@ -2785,6 +2806,50 @@ fn truncate_lines_mcp(content: &str, n: usize) -> String {
     }
 }
 
+/// Resolve the stable public `mode` vocabulary to an `AgentRoute` override.
+///
+/// Pure (no I/O, no `self`) so the mapping and precedence are unit-testable
+/// without a live index. Returns `None` to mean "no override — let the
+/// keyword classifier (or `depth`/env, per the caller's precedence) decide".
+///
+/// Mapping:
+///   - `auto` / `None` / unknown → `None` (auto-classify; unknown warns)
+///   - `lexical` → `ExactSymbol`, promoted to `Regex` when `query` contains
+///     regex metacharacters (reuses `agent_classifier::is_regex`, the single
+///     source of truth)
+///   - `search` → `Semantic`
+///   - `structural` → `Structural`
+///   - `deep` → `Deep`
+fn mode_to_route(
+    mode: Option<&str>,
+    query: &str,
+) -> Option<semantex_core::search::agent_classifier::AgentRoute> {
+    use semantex_core::search::agent_classifier::{AgentRoute, is_regex};
+    match mode {
+        Some("auto") | None => None, // explicit auto or absent → let depth/env/classifier decide
+        Some("lexical") => {
+            // Exact symbol lookup; promote to Regex if the query contains
+            // regex metacharacters (backslash-class, alternation, bracket
+            // class, anchors, or quantifier group).
+            if is_regex(query) {
+                Some(AgentRoute::Regex)
+            } else {
+                Some(AgentRoute::ExactSymbol)
+            }
+        }
+        Some("search") => Some(AgentRoute::Semantic),
+        Some("structural") => Some(AgentRoute::Structural),
+        Some("deep") => Some(AgentRoute::Deep),
+        Some(other) => {
+            tracing::warn!(
+                mode = other,
+                "unknown 'mode' value — ignoring, falling back to depth/auto"
+            );
+            None
+        }
+    }
+}
+
 /// Map an optional `response_format` to an effective budget given the base budget.
 /// `concise` ≈ ⅓ tokens (best-practice "return less by default"); `detailed`/None = base.
 fn budget_for_format(response_format: Option<&str>, base_budget: usize) -> usize {
@@ -2871,6 +2936,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 mod tests {
     use super::{
         DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
+        mode_to_route,
     };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
@@ -4012,6 +4078,7 @@ mod tests {
             "path",
             "full_code",
             "budget",
+            "mode",
             "depth",
             "focus",
             "response_format",
@@ -4021,6 +4088,165 @@ mod tests {
         assert!(
             t.annotations.is_some(),
             "agent must keep read-only annotations"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mode parameter — JSON Schema shape and description copy
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mode_schema_has_correct_enum_values() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let mode = &t.input_schema["properties"]["mode"];
+        let variants = mode["enum"]
+            .as_array()
+            .expect("mode must have an enum array");
+        let names: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
+        for expected in &["auto", "lexical", "search", "structural", "deep"] {
+            assert!(
+                names.contains(expected),
+                "mode enum must contain '{expected}'; got {names:?}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            5,
+            "mode enum must have exactly 5 values; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn mode_description_mentions_auto_default() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let desc = t.input_schema["properties"]["mode"]["description"]
+            .as_str()
+            .expect("mode must have a description");
+        assert!(
+            desc.to_lowercase().contains("auto"),
+            "mode description must mention 'auto': {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("default") || desc.to_lowercase().contains("classifier"),
+            "mode description must explain what auto does: {desc}"
+        );
+    }
+
+    #[test]
+    fn agent_description_mentions_mode_guidance() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        let d = t.description.to_lowercase();
+        assert!(d.contains("mode"), "description must mention 'mode': {d}");
+        assert!(
+            d.contains("auto") || d.contains("classifier"),
+            "description must tell the agent that auto is the default: {d}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mode → route mapping and precedence (unit tests — no index needed)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Each stable `mode` value maps to the documented `AgentRoute` override.
+    /// `mode_to_route` is pure, so this exercises the full resolution table
+    /// directly — no live index required (closing the gap where route
+    /// dispatch was previously only testable through a built index).
+    #[test]
+    fn mode_to_route_maps_each_stable_value() {
+        use semantex_core::search::agent_classifier::AgentRoute;
+        // search / structural / deep map to fixed routes (query is irrelevant).
+        assert_eq!(
+            mode_to_route(Some("search"), "anything"),
+            Some(AgentRoute::Semantic)
+        );
+        assert_eq!(
+            mode_to_route(Some("structural"), "who calls foo"),
+            Some(AgentRoute::Structural)
+        );
+        assert_eq!(
+            mode_to_route(Some("deep"), "how does X work"),
+            Some(AgentRoute::Deep)
+        );
+    }
+
+    #[test]
+    fn mode_to_route_lexical_plain_symbol_is_exact() {
+        use semantex_core::search::agent_classifier::AgentRoute;
+        assert_eq!(
+            mode_to_route(Some("lexical"), "AgentRoute"),
+            Some(AgentRoute::ExactSymbol),
+            "plain camel-case symbol → ExactSymbol"
+        );
+        assert_eq!(
+            mode_to_route(Some("lexical"), "tool_agent"),
+            Some(AgentRoute::ExactSymbol),
+            "plain snake_case symbol → ExactSymbol"
+        );
+    }
+
+    #[test]
+    fn mode_to_route_lexical_regex_promotes_to_regex() {
+        use semantex_core::search::agent_classifier::AgentRoute;
+        for pat in [
+            r"auth\w+Handler", // backslash-class
+            "foo|bar",         // unquoted alternation
+            "[A-Z]+",          // bracket class
+            "(foo|bar)",       // quantifier group
+            "^start",          // anchor
+            "end$",            // anchor
+        ] {
+            assert_eq!(
+                mode_to_route(Some("lexical"), pat),
+                Some(AgentRoute::Regex),
+                "regex metacharacters in {pat:?} must promote lexical → Regex"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_to_route_auto_and_none_yield_no_override() {
+        // Both explicit `auto` and an absent `mode` mean "let the classifier
+        // (or depth/env per the caller's precedence) decide" → None.
+        assert_eq!(mode_to_route(Some("auto"), "anything"), None);
+        assert_eq!(mode_to_route(None, "anything"), None);
+    }
+
+    #[test]
+    fn mode_to_route_unknown_value_falls_back_to_none() {
+        // Unknown values warn and fall back to None (auto) rather than error,
+        // so a stray/typo'd mode never breaks the call.
+        assert_eq!(mode_to_route(Some("bogus"), "anything"), None);
+        assert_eq!(mode_to_route(Some(""), "anything"), None);
+    }
+
+    /// `mode` schema shape: 2020-12 dialect + plain string type.
+    #[test]
+    fn mode_schema_2020_12_dialect() {
+        let t = McpServer::all_tools()
+            .into_iter()
+            .find(|x| x.name == "semantex_agent")
+            .unwrap();
+        assert_eq!(
+            t.input_schema.get("$schema").and_then(|v| v.as_str()),
+            Some("https://json-schema.org/draft/2020-12/schema"),
+            "input_schema must declare 2020-12 dialect"
+        );
+        // mode is a sibling of the existing depth/response_format enums —
+        // both use plain string type.
+        let mode = &t.input_schema["properties"]["mode"];
+        assert_eq!(
+            mode["type"].as_str(),
+            Some("string"),
+            "mode must be type string"
         );
     }
 }

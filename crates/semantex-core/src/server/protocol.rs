@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 /// A JSON message always starts with '{' (0x7b), so 0x00 is unambiguous.
 pub const BINARY_MAGIC: u8 = 0x00;
 
-/// Daemon binary-protocol version (v0.4.1 W-Index #2, bumped in v0.5 W-Delta Item 6).
+/// Daemon binary-protocol version (v0.4.1 W-Index #2, bumped in v0.5 W-Delta Item 6,
+/// bumped again for the v3 route-set simplification).
 ///
 /// Encoded as the second byte of every binary frame, immediately after
 /// `BINARY_MAGIC`. A client and daemon that disagree on this byte refuse to
@@ -26,7 +27,14 @@ pub const BINARY_MAGIC: u8 = 0x00;
 /// `BinaryFrameError::UnsupportedVersion` instead. Users must restart
 /// the daemon after upgrading from a v0.4.x build (same UX as the v0.4
 /// bincode→postcard cutover).
-pub const BINARY_PROTOCOL_VERSION: u8 = 2;
+///
+/// v3: cutover point for the `AgentRoute` route-set simplification (variant
+/// add/remove/reorder). `AgentRoute` is carried in postcard by positional
+/// discriminant; any change to the variant order is a silent wire break for
+/// mixed-version client/daemon pairs. The v3 bump forces a clean
+/// `UnsupportedVersion` error on all such mixed pairs. All daemons must be
+/// restarted on upgrade from a v2 build.
+pub const BINARY_PROTOCOL_VERSION: u8 = 3;
 
 /// Error type returned by binary decode when the framing is malformed.
 ///
@@ -82,6 +90,16 @@ pub enum Request {
     MultiSearch(MultiSearchRequest),
     DeepSearch(DeepSearchRequest),
     Agent(AgentRequest),
+    /// Run a (usually forced-route) agent query and return the structured
+    /// ranked hits the engine already computes — the same `Vec<SearchResultItem>`
+    /// the in-process MCP `structuredContent` path consumes via
+    /// `AgentPipeline::handle_with_hits`. Used by the route-stress benchmark
+    /// harness to score a SPECIFIC retrieval route against file-level gold.
+    ///
+    /// Reuses `AgentRequest` (no new request fields). Appended LAST so the
+    /// postcard discriminants of every existing variant are unchanged — no
+    /// `BINARY_PROTOCOL_VERSION` bump.
+    AgentHits(AgentRequest),
 }
 
 /// Search request parameters
@@ -191,6 +209,10 @@ pub enum Response {
     MultiSearch(MultiSearchResponse),
     DeepSearch(DeepSearchResponse),
     Agent(AgentResponse),
+    /// Structured ranked hits for a forced-route agent query (see
+    /// `Request::AgentHits`). Appended LAST — existing variant discriminants
+    /// are unchanged, so no `BINARY_PROTOCOL_VERSION` bump.
+    AgentHits(AgentHitsResponse),
 }
 
 /// Search results response
@@ -324,6 +346,9 @@ pub enum BinaryRequest {
     MultiSearch(MultiSearchRequest),
     DeepSearch(DeepSearchRequest),
     Agent(AgentRequest),
+    /// Forced-route agent query returning structured ranked hits. Appended
+    /// LAST so existing postcard discriminants are unchanged (no version bump).
+    AgentHits(AgentRequest),
 }
 
 /// Binary response type for postcard.
@@ -337,6 +362,9 @@ pub enum BinaryResponse {
     MultiSearch(MultiSearchResponse),
     DeepSearch(DeepSearchResponse),
     Agent(AgentResponse),
+    /// Structured ranked hits for a forced-route agent query. Appended LAST
+    /// (no version bump).
+    AgentHits(AgentHitsResponse),
 }
 
 impl From<BinaryRequest> for Request {
@@ -349,6 +377,7 @@ impl From<BinaryRequest> for Request {
             BinaryRequest::MultiSearch(m) => Request::MultiSearch(m),
             BinaryRequest::DeepSearch(d) => Request::DeepSearch(d),
             BinaryRequest::Agent(a) => Request::Agent(a),
+            BinaryRequest::AgentHits(a) => Request::AgentHits(a),
         }
     }
 }
@@ -364,6 +393,7 @@ impl From<Response> for BinaryResponse {
             Response::MultiSearch(m) => BinaryResponse::MultiSearch(m),
             Response::DeepSearch(d) => BinaryResponse::DeepSearch(d),
             Response::Agent(a) => BinaryResponse::Agent(a),
+            Response::AgentHits(a) => BinaryResponse::AgentHits(a),
         }
     }
 }
@@ -486,6 +516,24 @@ pub struct AgentResponse {
     pub disambiguation: Option<Vec<DisambigSuggestion>>,
 }
 
+/// Structured ranked hits from a forced-route agent query.
+///
+/// Carries the `Vec<SearchResultItem>` the engine already computes for
+/// item-list routes (`semantic` / `exact_symbol` / `analytical` / `exhaustive`
+/// / `regex`, plus `file_pattern` and `structural` which now populate hits
+/// too) so a benchmark harness can score a SPECIFIC retrieval route. Each
+/// item's `file` is repo-relative — exactly what the file-level gold matcher
+/// consumes. Synthesis routes (`deep` / `architecture` / `feature_planning`)
+/// are prose-only and return an empty `hits` vec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHitsResponse {
+    /// The route that actually ran (the forced route, or the classifier's
+    /// pick when no route was forced).
+    pub route: AgentRoute,
+    /// Ranked hits, best-first. Empty for prose-only synthesis routes.
+    pub hits: Vec<SearchResultItem>,
+}
+
 /// Performance metrics for agent queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMetrics {
@@ -543,6 +591,85 @@ mod agent_protocol_tests {
         let parsed: AgentResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.route, AgentRoute::Semantic);
         assert!(parsed.formatted.contains("[route: semantic]"));
+    }
+
+    /// The `AgentHits` request/response variants (route-stress measurement
+    /// seam) survive a full binary encode/decode roundtrip. `AgentHits` was
+    /// appended LAST to both `BinaryRequest` and `BinaryResponse`, so no
+    /// `BINARY_PROTOCOL_VERSION` bump was required.
+    #[test]
+    fn test_agent_hits_binary_roundtrip() {
+        use crate::search::agent_classifier::AgentRoute;
+        let req = BinaryRequest::AgentHits(AgentRequest {
+            query: "auth".into(),
+            route: Some(AgentRoute::Semantic),
+            budget: None,
+            full_code: false,
+        });
+        let enc = encode_binary_request(&req);
+        let dec = decode_binary_request(&enc[BINARY_FRAME_HEADER_LEN..]).unwrap();
+        match dec {
+            BinaryRequest::AgentHits(r) => {
+                assert_eq!(r.query, "auth");
+                assert_eq!(r.route, Some(AgentRoute::Semantic));
+            }
+            _ => panic!("Wrong request variant"),
+        }
+
+        let resp = BinaryResponse::AgentHits(AgentHitsResponse {
+            route: AgentRoute::Semantic,
+            hits: vec![SearchResultItem {
+                file: "auth/login.rs".into(),
+                start_line: 1,
+                end_line: 3,
+                score: 0.9,
+                source: "Hybrid".into(),
+                chunk_type: "AstNode".into(),
+                name: Some("authenticate".into()),
+                language: Some("rust".into()),
+                content: None,
+                kind: Some("function".into()),
+                summary: None,
+            }],
+        });
+        let enc = encode_binary_response(&resp);
+        let dec = decode_binary_response(&enc[BINARY_FRAME_HEADER_LEN..]).unwrap();
+        match dec {
+            BinaryResponse::AgentHits(r) => {
+                assert_eq!(r.route, AgentRoute::Semantic);
+                assert_eq!(r.hits.len(), 1);
+                assert_eq!(r.hits[0].file, "auth/login.rs");
+            }
+            _ => panic!("Wrong response variant"),
+        }
+    }
+
+    /// Appending the `AgentHits` variant must NOT shift the postcard
+    /// discriminant of any pre-existing variant. We assert a `Health` request
+    /// (the cheapest existing variant) still encodes to the exact byte that
+    /// older builds produced for it — proving the wire is backward-compatible
+    /// and the no-version-bump claim holds.
+    #[test]
+    fn appending_agent_hits_keeps_existing_discriminants() {
+        // BinaryRequest::Health is the 2nd variant (index 1). Postcard encodes
+        // a fieldless enum variant as a single varint discriminant byte.
+        let enc = encode_binary_request(&BinaryRequest::Health);
+        // body = [VERSION][postcard]; postcard payload is just [0x01].
+        let body = &enc[BINARY_FRAME_HEADER_LEN..];
+        assert_eq!(body[0], BINARY_PROTOCOL_VERSION);
+        assert_eq!(body[1], 1, "Health discriminant must stay at index 1");
+        // And the agent variant (index 6) must also be unchanged.
+        let agent = encode_binary_request(&BinaryRequest::Agent(AgentRequest {
+            query: String::new(),
+            route: None,
+            budget: None,
+            full_code: false,
+        }));
+        assert_eq!(
+            agent[BINARY_FRAME_HEADER_LEN + 1],
+            6,
+            "Agent discriminant must stay at index 6"
+        );
     }
 
     #[test]
@@ -627,35 +754,32 @@ mod agent_protocol_tests {
 
     /// v0.5 Item 6 (per W-Delta dispatch + coordinator Option A): a v1
     /// `SearchResponse` payload that lacks the new `disambiguation` field
-    /// must be rejected by the v2 decoder with `UnsupportedVersion`, NOT
-    /// with `Decode(DeserializeUnexpectedEnd)`. The point of bumping
-    /// `BINARY_PROTOCOL_VERSION` from 1 to 2 is that the framing layer
-    /// catches the schema drift cleanly rather than the postcard
-    /// deserializer producing a silent mis-decode or a confusing EOF.
+    /// must be rejected with `UnsupportedVersion`, NOT with
+    /// `Decode(DeserializeUnexpectedEnd)`. The point of bumping
+    /// `BINARY_PROTOCOL_VERSION` is that the framing layer catches schema
+    /// drift cleanly rather than the postcard deserializer producing a
+    /// silent mis-decode or a confusing EOF.
     #[test]
-    fn decode_v1_response_as_v2_rejected_cleanly() {
-        // Build a v1-shaped wire body. We can't construct a v1
-        // `SearchResponse` literal anymore (the struct gained
-        // `disambiguation`), so synthesize the v1 byte sequence by hand
-        // using the postcard wire format. Frame body = [V=1][postcard].
-        //
-        // Easier: serialize a v2-shaped Health response (no payload
-        // change) but with version byte set to 1. The decode path
-        // shouldn't even get to postcard.
+    fn decode_v1_response_as_v3_rejected_cleanly() {
+        // Synthesize a v1-version frame body; the version byte check fires
+        // before postcard ever touches the payload.
         let postcard_payload = postcard::to_stdvec(&BinaryResponse::Health(HealthResponse {
             status: "ok".into(),
             uptime_s: 0,
             searches: 0,
         }))
         .unwrap();
-        let mut v1_body = vec![1u8]; // legacy version byte
+        let mut v1_body = vec![1u8]; // v1 version byte
         v1_body.extend_from_slice(&postcard_payload);
 
-        let err = decode_binary_response(&v1_body).expect_err("must reject v1 frame under v2");
+        let err = decode_binary_response(&v1_body).expect_err("must reject v1 frame under v3");
         match err {
             BinaryFrameError::UnsupportedVersion { expected, got } => {
                 assert_eq!(expected, BINARY_PROTOCOL_VERSION);
-                assert_eq!(expected, 2, "v0.5 Item 6 raised protocol version to 2");
+                assert_eq!(
+                    expected, 3,
+                    "route-set cutover raised protocol version to 3"
+                );
                 assert_eq!(got, 1, "v1 client/daemon payload should be flagged as v1");
             }
             BinaryFrameError::Decode(e) => {
@@ -664,29 +788,29 @@ mod agent_protocol_tests {
         }
     }
 
-    /// Symmetric check on the request side — a v1 request payload from an
-    /// old client should never be mis-decoded by the v2 daemon.
+    /// Symmetric check on the request side — a v2 request payload from an
+    /// old client should never be mis-decoded by the v3 daemon.
     #[test]
-    fn decode_v1_request_as_v2_rejected_cleanly() {
+    fn decode_v2_request_as_v3_rejected_cleanly() {
         let postcard_payload = postcard::to_stdvec(&BinaryRequest::Health).unwrap();
-        let mut v1_body = vec![1u8];
-        v1_body.extend_from_slice(&postcard_payload);
+        let mut v2_body = vec![2u8]; // previous version byte
+        v2_body.extend_from_slice(&postcard_payload);
 
-        let err = decode_binary_request(&v1_body).expect_err("must reject v1 frame under v2");
+        let err = decode_binary_request(&v2_body).expect_err("must reject v2 frame under v3");
         assert!(matches!(
             err,
             BinaryFrameError::UnsupportedVersion {
-                expected: 2,
-                got: 1
+                expected: 3,
+                got: 2
             }
         ));
     }
 
-    /// v0.5 Item 6 protocol bump sanity: the constant is at the post-bump
+    /// Protocol version bump sanity: the constant is at the post-bump
     /// value so a future accidental revert lights this test up.
     #[test]
-    fn protocol_version_is_v2_per_item_6() {
-        assert_eq!(BINARY_PROTOCOL_VERSION, 2);
+    fn protocol_version_is_v3_for_route_set_cutover() {
+        assert_eq!(BINARY_PROTOCOL_VERSION, 3);
     }
 
     /// `DisambigSuggestion` round-trips through JSON and postcard.

@@ -1,0 +1,1036 @@
+{
+  "repo": "flask",
+  "total_queries": 30,
+  "synthesis_count": 10,
+  "overall_regret": 0.4147,
+  "overall_router_accuracy": 0.3333,
+  "router_matches_oracle_count": 10,
+  "oracle_win_counts": {
+    "file_pattern": 0,
+    "regex": 12,
+    "exact_symbol": 13,
+    "structural": 21,
+    "semantic": 15
+  },
+  "per_route_mean_ndcg": {
+    "file_pattern": 0.0,
+    "regex": 0.5371,
+    "exact_symbol": 0.5897,
+    "structural": 0.7101,
+    "semantic": 0.6399
+  },
+  "per_mechanism_route_ndcg": {
+    "glob": {
+      "file_pattern": 0.0,
+      "regex": 0.6614,
+      "exact_symbol": 0.3597,
+      "structural": 0.4755,
+      "semantic": 0.4585
+    },
+    "lexical": {
+      "file_pattern": 0.0,
+      "regex": 0.3291,
+      "exact_symbol": 0.6723,
+      "structural": 0.7861,
+      "semantic": 0.6723
+    },
+    "regex": {
+      "file_pattern": 0.0,
+      "regex": 0.4397,
+      "exact_symbol": 0.3913,
+      "structural": 0.5162,
+      "semantic": 0.594
+    },
+    "semantic": {
+      "file_pattern": 0.0,
+      "regex": 0.6262,
+      "exact_symbol": 1.0,
+      "structural": 1.0,
+      "semantic": 1.0
+    },
+    "structural": {
+      "file_pattern": 0.0,
+      "regex": 0.7166,
+      "exact_symbol": 0.3887,
+      "structural": 0.7564,
+      "semantic": 0.3887
+    },
+    "usage": {
+      "file_pattern": 0.0,
+      "regex": 0.4498,
+      "exact_symbol": 0.7262,
+      "structural": 0.7262,
+      "semantic": 0.7262
+    }
+  },
+  "per_mechanism_regret": {
+    "glob": 0.4093,
+    "lexical": 0.1139,
+    "regex": 0.104,
+    "semantic": 1.0,
+    "structural": 0.0089,
+    "usage": 0.8524
+  },
+  "per_mechanism_router_accuracy": {
+    "glob": 0.0,
+    "lexical": 0.8,
+    "regex": 0.4,
+    "semantic": 0.0,
+    "structural": 0.8,
+    "usage": 0.0
+  },
+  "confusion_matrix": {
+    "glob": {
+      "file_pattern": 1,
+      "semantic": 4
+    },
+    "lexical": {
+      "semantic": 5
+    },
+    "regex": {
+      "semantic": 5
+    },
+    "semantic": {
+      "deep": 5
+    },
+    "structural": {
+      "structural": 4,
+      "semantic": 1
+    },
+    "usage": {
+      "deep": 5
+    }
+  },
+  "per_query": [
+    {
+      "query_id": "flask-glob-1",
+      "query": "all pytest test modules (test_*.py)",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 27,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6172839611614818,
+        "exact_symbol": 0.5637884576902256,
+        "structural": 1.0,
+        "semantic": 0.6489315753318465
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.18518518518518517,
+        "exact_symbol": 0.14814814814814814,
+        "structural": 0.37037037037037035,
+        "semantic": 0.18518518518518517
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "file_pattern",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-glob-2",
+      "query": "files under the flask.json subpackage",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 3,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.7653606369886217,
+        "structural": 0.6978817289434457,
+        "semantic": 0.9217868789962071
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.6666666666666666,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.9218,
+      "regret": 0.0782
+    },
+    {
+      "query_id": "flask-glob-3",
+      "query": "files under the flask.sansio subpackage",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 3,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.46927872602275644,
+        "structural": 0.6797310500037655,
+        "semantic": 0.6364391809889587
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.3333333333333333,
+        "structural": 1.0,
+        "semantic": 0.6666666666666666
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.6364,
+      "regret": 0.3636
+    },
+    {
+      "query_id": "flask-glob-4",
+      "query": "reStructuredText files at the repo root",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 79,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.689828656353462,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.08514311764162098
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0759493670886076,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.012658227848101266
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.6898,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0851,
+      "regret": 0.6047
+    },
+    {
+      "query_id": "flask-glob-5",
+      "query": "GitHub Actions workflow YAML files",
+      "repo": "flask",
+      "intended_mechanism": "glob",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "file_pattern",
+      "oracle_routes_tied": [],
+      "oracle_ndcg": 0.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-regex-1",
+      "query": "modules using a future annotations import",
+      "repo": "flask",
+      "intended_mechanism": "regex",
+      "gold_count": 26,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.6489315753318465,
+        "structural": 0.3589542101716347,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.38461538461538464,
+        "exact_symbol": 0.19230769230769232,
+        "structural": 0.07692307692307693,
+        "semantic": 0.38461538461538464
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-regex-2",
+      "query": "async def coroutine definitions",
+      "repo": "flask",
+      "intended_mechanism": "regex",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.24630238874073,
+        "exact_symbol": 0.0,
+        "structural": 0.24630238874073,
+        "semantic": 0.19519002499605084
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.25,
+        "exact_symbol": 0.0,
+        "structural": 0.25,
+        "semantic": 0.25
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "structural"
+      ],
+      "oracle_ndcg": 0.2463,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.1952,
+      "regret": 0.0511
+    },
+    {
+      "query_id": "flask-regex-3",
+      "query": "places that call abort(",
+      "repo": "flask",
+      "intended_mechanism": "regex",
+      "gold_count": 7,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6067408741303463,
+        "exact_symbol": 0.27487633291429087,
+        "structural": 0.45321560571317426,
+        "semantic": 0.27487633291429087
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.7142857142857143,
+        "exact_symbol": 0.14285714285714285,
+        "structural": 0.42857142857142855,
+        "semantic": 0.14285714285714285
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.6067,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.2749,
+      "regret": 0.3319
+    },
+    {
+      "query_id": "flask-regex-4",
+      "query": "modules guarded by typing.TYPE_CHECKING",
+      "repo": "flask",
+      "intended_mechanism": "regex",
+      "gold_count": 19,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.3452783761086436,
+        "exact_symbol": 0.4690000933206748,
+        "structural": 0.522495596791931,
+        "semantic": 0.6371523797895855
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.21052631578947367,
+        "exact_symbol": 0.15789473684210525,
+        "structural": 0.21052631578947367,
+        "semantic": 0.2631578947368421
+      },
+      "oracle_route": "semantic",
+      "oracle_routes_tied": [
+        "semantic"
+      ],
+      "oracle_ndcg": 0.6372,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.6372,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-regex-5",
+      "query": "type: ignore inline suppressions",
+      "repo": "flask",
+      "intended_mechanism": "regex",
+      "gold_count": 18,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.5637884576902256,
+        "structural": 1.0,
+        "semantic": 0.8630152897016882
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.2222222222222222,
+        "structural": 0.5555555555555556,
+        "semantic": 0.4444444444444444
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.863,
+      "regret": 0.137
+    },
+    {
+      "query_id": "flask-lex-1",
+      "query": "the Request class",
+      "repo": "flask",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.43067655807339306,
+        "structural": 0.43067655807339306,
+        "semantic": 0.43067655807339306
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 0.4307,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.4307,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-lex-2",
+      "query": "the Response class",
+      "repo": "flask",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.5,
+        "exact_symbol": 0.5,
+        "structural": 0.5,
+        "semantic": 0.5
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 0.5,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.5,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-lex-3",
+      "query": "the SessionInterface class",
+      "repo": "flask",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.2890648263178879,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-lex-4",
+      "query": "the AppContext class",
+      "repo": "flask",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.5,
+        "exact_symbol": 0.43067655807339306,
+        "structural": 1.0,
+        "semantic": 0.43067655807339306
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.4307,
+      "regret": 0.5693
+    },
+    {
+      "query_id": "flask-lex-5",
+      "query": "the JSONProvider class",
+      "repo": "flask",
+      "intended_mechanism": "lexical",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.3562071871080222,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-struct-1",
+      "query": "what calls get_flashed_messages",
+      "repo": "flask",
+      "intended_mechanism": "structural",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 0.0,
+        "structural": 0.6309297535714575,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.0,
+        "structural": 1.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "structural"
+      ],
+      "oracle_ndcg": 0.6309,
+      "router_choice": "structural",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.6309,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-struct-2",
+      "query": "callers of stream_with_context",
+      "repo": "flask",
+      "intended_mechanism": "structural",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.7606395682357036,
+        "exact_symbol": 0.6366824387328317,
+        "structural": 1.0,
+        "semantic": 0.6366824387328317
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.5,
+        "structural": 1.0,
+        "semantic": 0.5
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "structural",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-struct-3",
+      "query": "where is send_from_directory called",
+      "repo": "flask",
+      "intended_mechanism": "structural",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.7979719524871096,
+        "exact_symbol": 0.75369761125927,
+        "structural": 0.3903800499921017,
+        "semantic": 0.75369761125927
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.75,
+        "structural": 0.25,
+        "semantic": 0.75
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.798,
+      "router_choice": "semantic",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.7537,
+      "regret": 0.0443
+    },
+    {
+      "query_id": "flask-struct-4",
+      "query": "what calls flash",
+      "repo": "flask",
+      "intended_mechanism": "structural",
+      "gold_count": 4,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.44229834886928765,
+        "exact_symbol": 0.0,
+        "structural": 0.7606395682357036,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.75,
+        "exact_symbol": 0.0,
+        "structural": 1.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 0.7606,
+      "router_choice": "structural",
+      "router_chose_synthesis": false,
+      "router_ndcg": 0.7606,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-struct-5",
+      "query": "callers of make_response",
+      "repo": "flask",
+      "intended_mechanism": "structural",
+      "gold_count": 5,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.951231200062686,
+        "exact_symbol": 0.5531464700081437,
+        "structural": 1.0,
+        "semantic": 0.5531464700081437
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.4,
+        "structural": 1.0,
+        "semantic": 0.4
+      },
+      "oracle_route": "structural",
+      "oracle_routes_tied": [
+        "structural"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "structural",
+      "router_chose_synthesis": false,
+      "router_ndcg": 1.0,
+      "regret": 0.0
+    },
+    {
+      "query_id": "flask-sem-1",
+      "query": "how does the application and request context stack work",
+      "repo": "flask",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-sem-2",
+      "query": "how are signed-cookie sessions serialized and loaded",
+      "repo": "flask",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-sem-3",
+      "query": "how does blueprint registration defer route setup",
+      "repo": "flask",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex",
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-sem-4",
+      "query": "how does flask render a Jinja template",
+      "repo": "flask",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-sem-5",
+      "query": "how does the CLI discover and load the application factory",
+      "repo": "flask",
+      "intended_mechanism": "semantic",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.5,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-use-1",
+      "query": "how do I create a Flask application instance",
+      "repo": "flask",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.3562071871080222,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-use-2",
+      "query": "how do I register a URL route with a view function",
+      "repo": "flask",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 0.6309297535714575,
+        "structural": 0.6309297535714575,
+        "semantic": 0.6309297535714575
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 0.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 0.6309,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.6309
+    },
+    {
+      "query_id": "flask-use-3",
+      "query": "how do I return a JSON response from a view",
+      "repo": "flask",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 0.0,
+        "structural": 0.0,
+        "semantic": 0.0
+      },
+      "oracle_route": "regex",
+      "oracle_routes_tied": [
+        "regex"
+      ],
+      "oracle_ndcg": 0.6309,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 0.6309
+    },
+    {
+      "query_id": "flask-use-4",
+      "query": "how do I read configuration from environment variables or a file",
+      "repo": "flask",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    },
+    {
+      "query_id": "flask-use-5",
+      "query": "how do I send a file download response",
+      "repo": "flask",
+      "intended_mechanism": "usage",
+      "gold_count": 1,
+      "route_ndcg": {
+        "file_pattern": 0.0,
+        "regex": 0.6309297535714575,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "route_recall": {
+        "file_pattern": 0.0,
+        "regex": 1.0,
+        "exact_symbol": 1.0,
+        "structural": 1.0,
+        "semantic": 1.0
+      },
+      "oracle_route": "exact_symbol",
+      "oracle_routes_tied": [
+        "exact_symbol",
+        "structural",
+        "semantic"
+      ],
+      "oracle_ndcg": 1.0,
+      "router_choice": "deep",
+      "router_chose_synthesis": true,
+      "router_ndcg": 0.0,
+      "regret": 1.0
+    }
+  ]
+}

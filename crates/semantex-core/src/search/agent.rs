@@ -200,10 +200,6 @@ impl<'a> AgentPipeline<'a> {
             AgentRoute::Exhaustive => self.handle_exhaustive(&request.query, budget),
             AgentRoute::Semantic => self.handle_semantic(&request.query, budget, false),
             AgentRoute::Architecture => self.handle_architecture(&request.query, budget),
-            AgentRoute::ExhaustiveStructural => {
-                self.handle_exhaustive_structural(&request.query, budget)
-            }
-            AgentRoute::DeepWithExamples => self.handle_deep_with_examples(&request.query, budget),
             AgentRoute::FeaturePlanning => self.handle_feature_planning(&request.query, budget),
         };
         let search_ms = search_start.elapsed().as_millis() as u64;
@@ -561,11 +557,29 @@ impl<'a> AgentPipeline<'a> {
                     formatted.push_str(s);
                     formatted.push('\n');
                 }
+                // Structured hits: flatten the graph-walk sections into one
+                // ranked, file-bearing list (target → callers → callees →
+                // type_refs → hierarchy). Each item already carries a
+                // repo-relative `file` (via `chunk_to_item`), so a route-stress
+                // harness scoring the structural/`usage` mechanism against
+                // file-level gold gets the SAME files the formatter rendered.
+                // When a section was collapsed to a summary (Item 7) its `Vec`
+                // is empty, so those items don't appear here — matching the
+                // formatted output.
+                let hits: Vec<SearchResultItem> = resp
+                    .target
+                    .iter()
+                    .chain(resp.callers.iter())
+                    .chain(resp.callees.iter())
+                    .chain(resp.type_refs.iter())
+                    .chain(resp.hierarchy.iter())
+                    .cloned()
+                    .collect();
                 return HandlerResult {
                     formatted,
                     fallback_used: false,
                     result_count: total,
-                    hits: Vec::new(),
+                    hits,
                     disambiguation: None,
                 };
             }
@@ -846,160 +860,6 @@ impl<'a> AgentPipeline<'a> {
         }
     }
 
-    /// Phase 4 — Exhaustive enumeration with structural enrichment. The
-    /// agent classifier routes here when the query asks to *list all*
-    /// configuration / options / flags / env vars. Combines a wider search
-    /// (more candidates, larger budget) with structural callers/imports
-    /// information so the agent gets definitions AND usages in one response.
-    ///
-    /// v0.3.1 Item 1: `max_results` is now derived from `budget_for_chunk_count`
-    /// (was hardcoded 30, which over-fetched on small repos and triggered
-    /// follow-up exploration — see spec §4 Item 1, platform Q4 +29%).
-    fn handle_exhaustive_structural(&self, query: &str, budget: usize) -> HandlerResult {
-        // Use the existing exhaustive path's wider search settings; the
-        // formatter is what makes the difference. Inject a structural hint
-        // by widening max_results and enriching the budget so callers can
-        // be listed alongside definitions.
-        let exhaustive_budget = budget * 4;
-        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
-        let arch_budget = budget_for_chunk_count(chunk_count as usize);
-        let sq = SearchQuery::new(query).max_results(arch_budget.exhaustive_max);
-        match self.searcher.search(&sq) {
-            Ok(output) if !output.results.is_empty() => {
-                let items: Vec<SearchResultItem> = output
-                    .results
-                    .iter()
-                    .map(|r| search_result_to_item(r, true))
-                    .collect();
-                let confidence = compute_confidence(&items);
-                let disambig = disambiguation_from_results(&output.results);
-                let count = items.len();
-                let hits = items.clone();
-                let resp = SearchResponse {
-                    results: items,
-                    duration_ms: output.metrics.total_ms,
-                    dense_count: output.metrics.dense_count,
-                    sparse_count: output.metrics.sparse_count,
-                    fused_count: output.metrics.fused_count,
-                    metrics: None,
-                    confidence: Some(confidence),
-                    disambiguation: disambig.clone(),
-                };
-                let mut formatted =
-                    format_search_results(&resp, FormatStyle::Default, exhaustive_budget);
-                if let Some(suggestions) = &disambig {
-                    append_disambiguation_block(&mut formatted, suggestions);
-                }
-                HandlerResult {
-                    formatted,
-                    fallback_used: false,
-                    result_count: count,
-                    hits,
-                    disambiguation: disambig,
-                }
-            }
-            _ => self.handle_exhaustive(query, budget),
-        }
-    }
-
-    /// Phase 4 — Deep search enriched with pattern-catalog exemplars. The
-    /// classifier routes here for "explain the most complex algorithm" /
-    /// "deep dive into X with examples" queries. If the deep response
-    /// mentions a known pattern name (e.g. `rust.tokio_spawn`), the
-    /// pattern's exemplars are pulled inline so the agent sees concrete
-    /// code without a follow-up call.
-    ///
-    /// v0.3.1 Item 3 (spec §4): pattern × example expansion is now capped
-    /// adaptively by `ArchBudget.deep_examples_max`:
-    ///   - small repo (chunks ≤ 2000): 1 pattern × 2 examples = 2 hits
-    ///   - medium (≤ 10000):           2 patterns × 3 examples = 6 hits
-    ///   - large:                       3 patterns × 3 examples = 9 hits
-    ///
-    /// Also: if the upstream deep result has < 5 sources, the enrichment
-    /// pass is skipped entirely — the answer is already focused and the
-    /// extra exemplars would just bloat tokens (motivates flask Q3 +54%).
-    fn handle_deep_with_examples(&self, query: &str, budget: usize) -> HandlerResult {
-        let deep_result = self.handle_deep(query, budget, false);
-        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
-        let arch_budget = budget_for_chunk_count(chunk_count as usize);
-        let limits = deep_examples_limits(arch_budget.deep_examples_max);
-
-        // Item 3: short-circuit when the deep response is already focused.
-        if !should_enrich_with_examples(deep_result.result_count, &limits) {
-            return deep_result;
-        }
-
-        // Scan deep output for pattern-name mentions (e.g. `rust.X`, `ts.X`)
-        // and pull `limits.examples_per_pattern` exemplars per matched
-        // pattern from the catalog, capped at `limits.max_patterns`.
-        let db_path = self.project_root.join(".semantex").join("chunks.db");
-        let mut found_patterns: Vec<String> = Vec::new();
-        for cap in regex::Regex::new(r"\b(?:rust|ts|py|go|java)\.[a-z_]+\b")
-            .ok()
-            .map(|re| {
-                re.find_iter(&deep_result.formatted)
-                    .map(|m| m.as_str().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-        {
-            if !found_patterns.contains(&cap) {
-                found_patterns.push(cap);
-            }
-            if found_patterns.len() >= limits.max_patterns {
-                break;
-            }
-        }
-        if found_patterns.is_empty() {
-            return deep_result;
-        }
-        let mut enriched = deep_result.formatted.clone();
-        enriched.push_str("\n\n## Pattern catalog exemplars\n\n");
-        let mut added = 0usize;
-        for pat in &found_patterns {
-            let examples = crate::index::architecture::query_pattern_matches(
-                &db_path,
-                pat,
-                None,
-                limits.examples_per_pattern,
-            )
-            .unwrap_or_default();
-            if examples.is_empty() {
-                continue;
-            }
-            let _ = std::fmt::Write::write_fmt(
-                &mut enriched,
-                format_args!("### `{}` ({} matches)\n\n", pat, examples.len()),
-            );
-            for (chunk_id, _name, lang) in &examples {
-                if let Ok(chunk) = self.searcher.with_store(|s| s.get_chunk(*chunk_id)) {
-                    let _ = std::fmt::Write::write_fmt(
-                        &mut enriched,
-                        format_args!(
-                            "- `{}:{}-{}` ({})\n",
-                            chunk.file_path.display(),
-                            chunk.start_line,
-                            chunk.end_line,
-                            lang
-                        ),
-                    );
-                    added += 1;
-                }
-            }
-            enriched.push('\n');
-        }
-        if added == 0 {
-            return deep_result;
-        }
-        HandlerResult {
-            formatted: enriched,
-            fallback_used: false,
-            result_count: deep_result.result_count + added,
-            hits: Vec::new(),
-            disambiguation: None,
-        }
-    }
-
     /// v0.6 Item 10 — Feature-planning route. The classifier sends
     /// "if I wanted to add X, what files would change?" questions here.
     /// We build a 3-step plan (Architecture → ConventionLookup →
@@ -1134,60 +994,6 @@ pub(crate) fn disambiguation_from_results(
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Adaptive pattern × example caps for `handle_deep_with_examples`.
-///
-/// Derived from `ArchBudget.deep_examples_max` via `deep_examples_limits`.
-/// Per spec §4 Item 3:
-///   - small repo (deep_examples_max = 1): 1 pattern × 2 examples = 2 hits
-///   - medium (= 3):                       2 patterns × 3 examples = 6 hits
-///   - large (= 5):                        3 patterns × 3 examples = 9 hits
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DeepExamplesLimits {
-    pub max_patterns: usize,
-    pub examples_per_pattern: usize,
-}
-
-/// Map `ArchBudget.deep_examples_max` to the pattern × example grid used by
-/// `handle_deep_with_examples`. Pure function so it's trivially unit-testable.
-pub(crate) fn deep_examples_limits(deep_examples_max: usize) -> DeepExamplesLimits {
-    // The grid is intentionally non-linear: small repos get *both* fewer
-    // patterns and fewer examples per pattern, since the answer is usually
-    // narrow already; large repos keep the original 3×3 ceiling.
-    match deep_examples_max {
-        0 => DeepExamplesLimits {
-            max_patterns: 0,
-            examples_per_pattern: 0,
-        },
-        1 => DeepExamplesLimits {
-            max_patterns: 1,
-            examples_per_pattern: 2,
-        },
-        2..=4 => DeepExamplesLimits {
-            max_patterns: 2,
-            examples_per_pattern: 3,
-        },
-        _ => DeepExamplesLimits {
-            max_patterns: 3,
-            examples_per_pattern: 3,
-        },
-    }
-}
-
-/// Decide whether `handle_deep_with_examples` should run pattern enrichment.
-///
-/// Per spec §4 Item 3: if the upstream deep result has fewer than 5 sources,
-/// the answer is already focused and we skip enrichment entirely. Also skip
-/// if the budget reduces to zero hits.
-pub(crate) fn should_enrich_with_examples(
-    deep_result_count: usize,
-    limits: &DeepExamplesLimits,
-) -> bool {
-    if deep_result_count < 5 {
-        return false;
-    }
-    limits.max_patterns > 0 && limits.examples_per_pattern > 0
-}
-
 /// Perform a filesystem glob walk and return matching file paths.
 /// Extracted as a standalone fn to enable unit testing without constructing AgentPipeline.
 pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
@@ -1246,6 +1052,29 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
 
     files.sort();
     let total = files.len();
+    // Structured hits: one file-level item per match (repo-relative `file`),
+    // capped to match the formatted listing so a route-stress harness can
+    // score the file_pattern route against file-level gold. file_pattern is a
+    // pure filesystem glob, so there is no chunk/line/score — items carry the
+    // repo-relative path with a synthetic "File" chunk_type and rank-implied
+    // ordering (files are already sorted; first-listed = rank 1).
+    let hits: Vec<crate::server::protocol::SearchResultItem> = files
+        .iter()
+        .take(50)
+        .map(|f| crate::server::protocol::SearchResultItem {
+            file: f.clone(),
+            start_line: 0,
+            end_line: 0,
+            score: 0.0,
+            source: "FilePattern".to_string(),
+            chunk_type: "File".to_string(),
+            name: None,
+            language: None,
+            content: None,
+            kind: None,
+            summary: None,
+        })
+        .collect();
     let mut lines: Vec<String> = files.into_iter().take(50).collect();
     if total > 50 {
         lines.push(format!("... and {} more files", total - 50));
@@ -1255,7 +1084,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
         formatted: lines.join("\n"),
         fallback_used: false,
         result_count: total,
-        hits: Vec::new(),
+        hits,
         disambiguation: None,
     }
 }
@@ -1370,6 +1199,42 @@ mod tests {
         assert!(hits.iter().all(|h| !h.file.is_empty()));
     }
 
+    /// Route-stress seam (daemon path): the `Request::AgentHits` handler must
+    /// return a `Response::AgentHits` carrying the forced route plus the
+    /// engine's structured ranked hits. This is the exact path the benchmark
+    /// harness drives via `daemon_agent_hits_binary` / `agent --json-hits`.
+    #[test]
+    fn handle_agent_hits_returns_structured_hits_response() {
+        use crate::server::handler::Handler;
+        use crate::server::protocol::{Request, Response};
+        use std::sync::atomic::AtomicU64;
+
+        let (_dir, searcher) = build_populated_searcher();
+        let count = AtomicU64::new(0);
+        let handler = Handler::new(
+            &searcher,
+            &count,
+            std::path::PathBuf::from("/tmp/agent-hits-handler"),
+        );
+
+        let resp = handler.handle(
+            Request::AgentHits(AgentRequest {
+                query: "authentication".into(),
+                route: Some(AgentRoute::Semantic),
+                budget: Some(12_000),
+                full_code: false,
+            }),
+            std::time::Instant::now(),
+        );
+
+        let Response::AgentHits(ah) = resp else {
+            panic!("expected Response::AgentHits");
+        };
+        assert_eq!(ah.route, AgentRoute::Semantic);
+        assert!(!ah.hits.is_empty(), "forced semantic route must yield hits");
+        assert!(ah.hits.iter().all(|h| !h.file.is_empty()));
+    }
+
     /// `handle` (the wire path) must produce the SAME `AgentResponse` shape as
     /// `handle_with_hits(...).0` — both delegate to `handle_inner`, so the
     /// daemon's postcard `AgentResponse` is unaffected by the hits surfacing.
@@ -1421,6 +1286,29 @@ mod tests {
         assert_eq!(result.result_count, 2);
     }
 
+    /// Route-stress seam: the `file_pattern` (glob) route must surface
+    /// structured, repo-relative hits — not just a formatted listing — so the
+    /// harness can score the glob mechanism against file-level gold.
+    #[test]
+    fn file_pattern_route_surfaces_repo_relative_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("foo.rs"), "").unwrap();
+        std::fs::write(dir.path().join("sub/bar.rs"), "").unwrap();
+        std::fs::write(dir.path().join("baz.py"), "").unwrap();
+
+        let result = glob_files(dir.path(), "**/*.rs");
+        let files: Vec<&str> = result.hits.iter().map(|h| h.file.as_str()).collect();
+        assert!(files.contains(&"foo.rs"), "files: {files:?}");
+        // Repo-relative, not absolute — exactly what the gold matcher expects.
+        assert!(files.contains(&"sub/bar.rs"), "files: {files:?}");
+        assert!(!files.iter().any(|f| f.contains("baz.py")));
+        assert!(
+            result.hits.iter().all(|h| !h.file.starts_with('/')),
+            "hits must be repo-relative, got {files:?}"
+        );
+    }
+
     #[test]
     fn test_handle_file_pattern_excludes_git() {
         let dir = tempfile::tempdir().unwrap();
@@ -1443,63 +1331,6 @@ mod tests {
         let result = glob_files(dir.path(), "*.rs");
         assert!(result.formatted.contains("... and 10 more files"));
         assert_eq!(result.result_count, 60);
-    }
-
-    // --- v0.3.1 Item 3 helpers ---------------------------------------------
-
-    #[test]
-    fn deep_examples_limits_small_repo() {
-        // small tier deep_examples_max = 1 → 1 pattern × 2 examples
-        let l = deep_examples_limits(1);
-        assert_eq!(l.max_patterns, 1);
-        assert_eq!(l.examples_per_pattern, 2);
-    }
-
-    #[test]
-    fn deep_examples_limits_medium_repo() {
-        // medium tier deep_examples_max = 3 → 2 patterns × 3 examples
-        let l = deep_examples_limits(3);
-        assert_eq!(l.max_patterns, 2);
-        assert_eq!(l.examples_per_pattern, 3);
-    }
-
-    #[test]
-    fn deep_examples_limits_large_repo() {
-        // large tier deep_examples_max = 5 → 3 patterns × 3 examples
-        let l = deep_examples_limits(5);
-        assert_eq!(l.max_patterns, 3);
-        assert_eq!(l.examples_per_pattern, 3);
-    }
-
-    #[test]
-    fn deep_examples_limits_zero_yields_zero() {
-        // Edge case: explicit zero budget should disable enrichment entirely.
-        let l = deep_examples_limits(0);
-        assert_eq!(l.max_patterns, 0);
-        assert_eq!(l.examples_per_pattern, 0);
-    }
-
-    #[test]
-    fn should_enrich_skips_when_few_sources() {
-        // Spec §4 Item 3: result_count < 5 → skip enrichment regardless of budget.
-        let l = deep_examples_limits(5); // generous large-repo budget
-        assert!(!should_enrich_with_examples(0, &l));
-        assert!(!should_enrich_with_examples(3, &l));
-        assert!(!should_enrich_with_examples(4, &l));
-    }
-
-    #[test]
-    fn should_enrich_runs_with_enough_sources() {
-        let l = deep_examples_limits(3);
-        assert!(should_enrich_with_examples(5, &l));
-        assert!(should_enrich_with_examples(20, &l));
-    }
-
-    #[test]
-    fn should_enrich_skips_when_budget_zero() {
-        // Even with plenty of sources, a zero budget disables enrichment.
-        let l = deep_examples_limits(0);
-        assert!(!should_enrich_with_examples(50, &l));
     }
 }
 

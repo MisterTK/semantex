@@ -1,0 +1,35 @@
+{
+  "_comment": "Derivation spec for the flask (Python) route-stress slice. NAMES the targets; gen_route_stress.py DERIVES the gold mechanically (reproducible). Test files are included by the global test-inclusion policy. Targets chosen for SINGLE / small enumerable gold (favor-unambiguous-gold). Verified against flask at 2026-06-03.",
+
+  "glob": [
+    {"id": "flask-glob-1", "query": "all pytest test modules (test_*.py)", "pattern": "test_*.py"},
+    {"id": "flask-glob-2", "query": "files under the flask.json subpackage", "pattern": "src/flask/json/*.py"},
+    {"id": "flask-glob-3", "query": "files under the flask.sansio subpackage", "pattern": "src/flask/sansio/*.py"},
+    {"id": "flask-glob-4", "query": "reStructuredText files at the repo root", "pattern": "*.rst"},
+    {"id": "flask-glob-5", "query": "GitHub Actions workflow YAML files", "pattern": ".github/workflows/*.yaml"}
+  ],
+
+  "regex": [
+    {"id": "flask-regex-1", "query": "modules using a future annotations import", "pattern": "^from __future__ import annotations"},
+    {"id": "flask-regex-2", "query": "async def coroutine definitions", "pattern": "^\\s*async def "},
+    {"id": "flask-regex-3", "query": "places that call abort(", "pattern": "\\babort\\("},
+    {"id": "flask-regex-4", "query": "modules guarded by typing.TYPE_CHECKING", "pattern": "TYPE_CHECKING"},
+    {"id": "flask-regex-5", "query": "type: ignore inline suppressions", "pattern": "type: ignore"}
+  ],
+
+  "lexical": [
+    {"id": "flask-lex-1", "query": "the Request class", "symbol": "Request"},
+    {"id": "flask-lex-2", "query": "the Response class", "symbol": "Response"},
+    {"id": "flask-lex-3", "query": "the SessionInterface class", "symbol": "SessionInterface"},
+    {"id": "flask-lex-4", "query": "the AppContext class", "symbol": "AppContext"},
+    {"id": "flask-lex-5", "query": "the JSONProvider class", "symbol": "JSONProvider"}
+  ],
+
+  "structural": [
+    {"id": "flask-struct-1", "query": "what calls get_flashed_messages", "symbol": "get_flashed_messages"},
+    {"id": "flask-struct-2", "query": "callers of stream_with_context", "symbol": "stream_with_context"},
+    {"id": "flask-struct-3", "query": "where is send_from_directory called", "symbol": "send_from_directory"},
+    {"id": "flask-struct-4", "query": "what calls flash", "symbol": "flash"},
+    {"id": "flask-struct-5", "query": "callers of make_response", "symbol": "make_response"}
+  ]
+}

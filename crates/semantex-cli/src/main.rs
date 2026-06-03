@@ -314,7 +314,7 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
 
-        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern, architecture, exhaustive_structural, deep_with_examples, feature_planning
+        /// Override query classification: semantic, deep, exact_symbol, structural, regex, analytical, exhaustive, file_pattern, architecture, feature_planning
         #[arg(long)]
         route: Option<String>,
 
@@ -329,6 +329,14 @@ enum Commands {
         /// Output raw JSON instead of formatted text
         #[arg(long)]
         json: bool,
+
+        /// Output the structured ranked hits (a JSON array of
+        /// SearchResultItem, same shape as `search --json`) instead of the
+        /// prose answer. Combine with `--route <name>` to measure a SPECIFIC
+        /// retrieval route — each hit's `file` is repo-relative. Synthesis
+        /// routes (deep / architecture / feature_planning) emit `[]`.
+        #[arg(long, conflicts_with = "json")]
+        json_hits: bool,
     },
     /// Show LLM backend status and run a 1-token health-check classify call.
     ///
@@ -983,6 +991,7 @@ fn main() -> Result<()> {
             full,
             budget,
             json,
+            json_hits,
         }) => {
             use semantex_core::search::agent_classifier::AgentRoute;
             use semantex_core::server::protocol::AgentRequest;
@@ -1001,8 +1010,7 @@ fn main() -> Result<()> {
                         anyhow::anyhow!(
                             "Unknown route: {other}. Valid: file_pattern (files), regex, \
                              exact_symbol (exact), structural, deep, analytical, exhaustive, \
-                             semantic (search), architecture, exhaustive_structural, \
-                             deep_with_examples, feature_planning"
+                             semantic (search), architecture, feature_planning"
                         )
                     })?,
                 }),
@@ -1020,6 +1028,18 @@ fn main() -> Result<()> {
                 budget,
                 full_code: full,
             };
+
+            if json_hits {
+                // Forced-route measurement seam: return the engine's structured
+                // ranked hits (Vec<SearchResultItem>) as a JSON array in the
+                // SAME shape as `search --json`, so the relevance harness's
+                // file-level matcher consumes it unchanged. Each `file` is
+                // repo-relative.
+                let response = semantex_core::server::daemon_agent_hits_binary(port, request)
+                    .context("Failed to send agent-hits request to daemon")?;
+                println!("{}", serde_json::to_string_pretty(&response.hits)?);
+                return Ok(());
+            }
 
             let response = semantex_core::server::daemon_agent_binary(port, request)
                 .context("Failed to send agent request to daemon")?;

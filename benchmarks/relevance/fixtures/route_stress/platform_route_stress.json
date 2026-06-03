@@ -1,0 +1,403 @@
+{
+  "schema": "route_stress/v1",
+  "repo": "platform",
+  "repo_path_at_gen": "/Users/tk/dev/platform",
+  "match_granularity_default": "file",
+  "mechanisms": [
+    "glob",
+    "regex",
+    "lexical",
+    "structural",
+    "semantic",
+    "usage"
+  ],
+  "records": [
+    {
+      "id": "plat-glob-1",
+      "repo": "platform",
+      "query": "TypeScript Zod model files under apps/api",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/api/src/models/address.ts",
+        "apps/api/src/models/consents.ts",
+        "apps/api/src/models/document.ts",
+        "apps/api/src/models/family.ts",
+        "apps/api/src/models/fhir.ts",
+        "apps/api/src/models/goal.ts",
+        "apps/api/src/models/health.ts",
+        "apps/api/src/models/healthInsurance.ts",
+        "apps/api/src/models/primaryCareProvider.ts",
+        "apps/api/src/models/user.ts",
+        "apps/api/src/models/vital.ts",
+        "apps/api/src/models/wearablePersona.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=apps/api/src/models/*.ts"
+    },
+    {
+      "id": "plat-glob-2",
+      "repo": "platform",
+      "query": "Flutter generated freezed Dart files",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/frontend_flutter/lib/features/connections/data/dto/connection_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/family/data/dto/family_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/family/domain/models/family_member.freezed.dart",
+        "apps/frontend_flutter/lib/features/health/data/dto/health_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/health/domain/models/health_query.freezed.dart",
+        "apps/frontend_flutter/lib/features/records/data/dto/document_processing_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/address_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/consent_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/health_insurance_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/primary_care_provider_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/user_dto.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/address.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/health_insurance.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/primary_care_provider.freezed.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/user.freezed.dart"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=*.freezed.dart"
+    },
+    {
+      "id": "plat-glob-3",
+      "repo": "platform",
+      "query": "the API v1 route handlers",
+      "intended_mechanism": "glob",
+      "gold": [
+        "apps/api/src/routes/v1/callbacks.ts",
+        "apps/api/src/routes/v1/connections.integration.test.ts",
+        "apps/api/src/routes/v1/connections.test.ts",
+        "apps/api/src/routes/v1/connections.ts",
+        "apps/api/src/routes/v1/consents.ts",
+        "apps/api/src/routes/v1/documents.test.ts",
+        "apps/api/src/routes/v1/documents.ts",
+        "apps/api/src/routes/v1/family.ts",
+        "apps/api/src/routes/v1/fhir.test.ts",
+        "apps/api/src/routes/v1/fhir.ts",
+        "apps/api/src/routes/v1/health.test.ts",
+        "apps/api/src/routes/v1/health.ts",
+        "apps/api/src/routes/v1/index.ts",
+        "apps/api/src/routes/v1/internal.ts",
+        "apps/api/src/routes/v1/profile.ts",
+        "apps/api/src/routes/v1/public.ts",
+        "apps/api/src/routes/v1/users.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=apps/api/src/routes/v1/*.ts"
+    },
+    {
+      "id": "plat-glob-4",
+      "repo": "platform",
+      "query": "the per-app Dockerfiles at the repo root",
+      "intended_mechanism": "glob",
+      "gold": [
+        "Dockerfile.adk",
+        "Dockerfile.api",
+        "Dockerfile.ddt",
+        "Dockerfile.fhir-sync",
+        "Dockerfile.medparse"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=Dockerfile.*"
+    },
+    {
+      "id": "plat-regex-1",
+      "repo": "platform",
+      "query": "TypeScript Zod object schema declarations",
+      "intended_mechanism": "regex",
+      "gold": [
+        "apps/api/src/config/index.ts",
+        "apps/api/src/controllers/connectionController.ts",
+        "apps/api/src/models/address.ts",
+        "apps/api/src/models/consents.ts",
+        "apps/api/src/models/document.ts",
+        "apps/api/src/models/family.ts",
+        "apps/api/src/models/fhir.ts",
+        "apps/api/src/models/goal.ts",
+        "apps/api/src/models/health.ts",
+        "apps/api/src/models/healthInsurance.ts",
+        "apps/api/src/models/primaryCareProvider.ts",
+        "apps/api/src/models/user.ts",
+        "apps/api/src/models/vital.ts",
+        "apps/api/src/models/wearablePersona.ts",
+        "apps/api/src/poc/fasten/fastenConfig.ts",
+        "apps/api/src/routes/v1/connections.ts",
+        "apps/api/src/routes/v1/health.ts",
+        "apps/api/src/routes/v1/internal.ts",
+        "apps/api/src/routes/v1/users.ts",
+        "apps/api/src/schemas/healthQuerySchemas.ts",
+        "apps/api/src/services/fhir/fhirPersonaGeneratorService.ts",
+        "apps/api/src/utils/apiResponses.ts",
+        "apps/fhir-sync/src/config/index.ts",
+        "apps/fhir-sync/src/models/connection.ts",
+        "apps/fhir-sync/src/models/fhir.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='z\\\\.object\\\\('"
+    },
+    {
+      "id": "plat-regex-2",
+      "repo": "platform",
+      "query": "Dart freezed-annotated data classes",
+      "intended_mechanism": "regex",
+      "gold": [
+        "apps/frontend_flutter/lib/features/connections/data/dto/connection_dto.dart",
+        "apps/frontend_flutter/lib/features/family/data/dto/family_dto.dart",
+        "apps/frontend_flutter/lib/features/family/domain/models/family_member.dart",
+        "apps/frontend_flutter/lib/features/health/data/dto/health_dto.dart",
+        "apps/frontend_flutter/lib/features/health/domain/models/health_query.dart",
+        "apps/frontend_flutter/lib/features/records/data/dto/document_processing_dto.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/address_dto.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/consent_dto.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/health_insurance_dto.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/primary_care_provider_dto.dart",
+        "apps/frontend_flutter/lib/features/user/data/dto/user_dto.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/address.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/health_insurance.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/primary_care_provider.dart",
+        "apps/frontend_flutter/lib/features/user/domain/entities/user.dart"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='@freezed'"
+    },
+    {
+      "id": "plat-regex-3",
+      "repo": "platform",
+      "query": "Dart Riverpod ConsumerWidget screens",
+      "intended_mechanism": "regex",
+      "gold": [
+        "apps/frontend_flutter/lib/features/family/presentation/screens/family_member_detail_screen.dart",
+        "apps/frontend_flutter/lib/features/family/presentation/screens/family_members_screen.dart",
+        "apps/frontend_flutter/lib/features/family/presentation/widgets/profile_switcher.dart",
+        "apps/frontend_flutter/lib/features/health/presentation/screens/activity_detail_page.dart",
+        "apps/frontend_flutter/lib/features/health/presentation/widgets/dashboard/motion_section.dart",
+        "apps/frontend_flutter/lib/features/health/presentation/widgets/dashboard/recovery_section.dart",
+        "apps/frontend_flutter/lib/features/health/presentation/widgets/dashboard/vitals_section.dart",
+        "apps/frontend_flutter/lib/features/health/presentation/widgets/health_charts_grid.dart",
+        "apps/frontend_flutter/lib/features/records/presentation/screens/document_detail_screen.dart",
+        "apps/frontend_flutter/lib/features/records/presentation/screens/document_history_screen.dart",
+        "apps/frontend_flutter/lib/features/records/presentation/screens/records_screen.dart",
+        "apps/frontend_flutter/lib/features/settings/presentation/screens/settings_screen.dart",
+        "apps/frontend_flutter/lib/features/user/presentation/screens/about_screen.dart",
+        "apps/frontend_flutter/lib/main.dart",
+        "apps/frontend_flutter/lib/ui/main_navigation.dart"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='extends ConsumerWidget'"
+    },
+    {
+      "id": "plat-regex-4",
+      "repo": "platform",
+      "query": "TypeScript files with a default export",
+      "intended_mechanism": "regex",
+      "gold": [
+        "apps/api/src/lib/firebaseClient.ts",
+        "apps/api/src/lib/logger.ts",
+        "apps/api/src/poc/fasten/fastenRoutes.ts",
+        "apps/api/src/routes/v1/callbacks.ts",
+        "apps/api/src/routes/v1/connections.ts",
+        "apps/api/src/routes/v1/consents.ts",
+        "apps/api/src/routes/v1/documents.ts",
+        "apps/api/src/routes/v1/family.ts",
+        "apps/api/src/routes/v1/fhir.ts",
+        "apps/api/src/routes/v1/health.ts",
+        "apps/api/src/routes/v1/index.ts",
+        "apps/api/src/routes/v1/internal.ts",
+        "apps/api/src/routes/v1/profile.ts",
+        "apps/api/src/routes/v1/public.ts",
+        "apps/api/src/routes/v1/users.ts",
+        "apps/api/vitest.config.ts",
+        "apps/ddt/src/logger.ts",
+        "apps/ddt/src/server.ts",
+        "apps/ddt/src/webhook/handler.ts",
+        "apps/fhir-sync/src/routes/v1/index.ts",
+        "apps/fhir-sync/src/routes/v1/jobs.ts",
+        "apps/fhir-sync/src/routes/v1/sync.ts",
+        "apps/fhir-sync/vitest.config.ts",
+        "apps/marketing/app/layout.tsx",
+        "apps/marketing/app/page.tsx",
+        "apps/marketing/next.config.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='^export default '"
+    },
+    {
+      "id": "plat-lex-1",
+      "repo": "platform",
+      "query": "the DataAvailabilityCache class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "apps/api/src/repos/metadata/DataAvailabilityCache.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of DataAvailabilityCache"
+    },
+    {
+      "id": "plat-lex-2",
+      "repo": "platform",
+      "query": "the FhirPersonaGeneratorService class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "apps/api/src/services/fhir/fhirPersonaGeneratorService.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of FhirPersonaGeneratorService"
+    },
+    {
+      "id": "plat-lex-3",
+      "repo": "platform",
+      "query": "the PrimaryCareProviderSchema zod schema",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "apps/api/src/models/primaryCareProvider.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of PrimaryCareProviderSchema"
+    },
+    {
+      "id": "plat-lex-4",
+      "repo": "platform",
+      "query": "the AggieChatService Dart class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "apps/frontend_flutter/lib/features/chat/services/chat_service.dart"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of AggieChatService"
+    },
+    {
+      "id": "plat-lex-5",
+      "repo": "platform",
+      "query": "the ConnectionCard Flutter widget",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "apps/frontend_flutter/lib/features/connections/presentation/widgets/connection_card.dart"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of ConnectionCard"
+    },
+    {
+      "id": "plat-struct-1",
+      "repo": "platform",
+      "query": "what instantiates DataAvailabilityCache",
+      "intended_mechanism": "structural",
+      "gold": [
+        "apps/api/src/repos/healthRepositoryBQ.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of DataAvailabilityCache; graph-crosscheck agrees=False"
+    },
+    {
+      "id": "plat-struct-2",
+      "repo": "platform",
+      "query": "where is FhirPersonaGeneratorService constructed",
+      "intended_mechanism": "structural",
+      "gold": [
+        "apps/api/src/routes/v1/internal.ts",
+        "apps/api/src/services/fhir/fhirPersonaGeneratorService.test.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of FhirPersonaGeneratorService; graph-crosscheck agrees=False"
+    },
+    {
+      "id": "plat-struct-3",
+      "repo": "platform",
+      "query": "what instantiates HealthService",
+      "intended_mechanism": "structural",
+      "gold": [
+        "apps/api/src/routes/v1/health.ts"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of HealthService; graph-crosscheck agrees=False"
+    },
+    {
+      "id": "plat-sem-1",
+      "repo": "platform",
+      "query": "how does the API server bootstrap and mount its routes",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "apps/api/src/index.ts"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "getApp() / server bootstrap + route mounting live in apps/api/src/index.ts. Single, unambiguous gold (one app's entry point)."
+    },
+    {
+      "id": "plat-sem-2",
+      "repo": "platform",
+      "query": "how is a synthetic FHIR patient persona generated",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "apps/api/src/services/fhir/fhirPersonaGeneratorService.ts"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "FHIR persona generation logic is contained in this one service file. Distinctive, single gold."
+    },
+    {
+      "id": "plat-sem-3",
+      "repo": "platform",
+      "query": "how does the Flutter app stream chat responses from the assistant",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "apps/frontend_flutter/lib/features/chat/services/chat_service.dart"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "AggieChatService streaming-message orchestration lives here (Dart side). Single gold. Cross-language coverage."
+    },
+    {
+      "id": "plat-use-1",
+      "repo": "platform",
+      "query": "how do I add a new versioned REST endpoint to the API",
+      "intended_mechanism": "usage",
+      "gold": [
+        "apps/api/src/routes/v1/health.ts"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "health.ts is a representative, self-contained example of the idiomatic v1 route-handler pattern (OpenAPIHono route definition). One clear exemplar."
+    },
+    {
+      "id": "plat-use-2",
+      "repo": "platform",
+      "query": "how do I call the backend API from the Flutter client",
+      "intended_mechanism": "usage",
+      "gold": [
+        "apps/frontend_flutter/lib/core/api/services/family_api_service.dart"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "family_api_service.dart is a representative idiomatic Dio-based API-client service. One clear cross-language exemplar."
+    },
+    {
+      "id": "plat-use-3",
+      "repo": "platform",
+      "query": "how do I define a TypeScript request/response validation schema",
+      "intended_mechanism": "usage",
+      "gold": [
+        "apps/api/src/models/primaryCareProvider.ts"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "primaryCareProvider.ts is a representative Zod-schema model (Schema + Create/Update + inferred types) \u2014 the idiomatic validation-schema pattern. One clear exemplar."
+    }
+  ]
+}

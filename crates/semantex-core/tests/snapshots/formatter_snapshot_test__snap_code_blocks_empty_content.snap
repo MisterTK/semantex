@@ -1,0 +1,5 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+No code blocks to display.

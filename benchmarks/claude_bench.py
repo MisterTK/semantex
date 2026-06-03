@@ -136,6 +136,16 @@ SX_CONFIG_ARMS: dict[str, dict[str, str]] = {
     "sx-budget-high":  {"SEMANTEX_EMBEDDER": "lateon-colbert", "SEMANTEX_MCP_BUDGET": "24000"},
     "sx-full-code":    {"SEMANTEX_EMBEDDER": "lateon-colbert", "SEMANTEX_MCP_FULL_CODE": "1"},
     "sx-depth-deep":   {"SEMANTEX_EMBEDDER": "lateon-colbert", "SEMANTEX_MCP_DEPTH": "deep"},
+    # Clean-sweep candidate: depth=deep completes the answer in fewer turns (pays back
+    # the consult round by eliminating follow-up exploration), budget=6000 trims the
+    # deep payload to push CCB below builtin. Aim: beat builtin on ALL of quality/CCB/
+    # latency/turns. Bare (no steer).
+    "sx-deep-lean":    {"SEMANTEX_EMBEDDER": "lateon-colbert",
+                        "SEMANTEX_MCP_DEPTH": "deep", "SEMANTEX_MCP_BUDGET": "6000"},
+    # Labeled adoption-gap DIAGNOSTIC: identical env to sx-lateon, but gets the
+    # SEMANTEX_MD steer (see nudge_for_arm). steered-minus-bare delta = the adoption
+    # gap (how much value low discoverability costs). NEVER a shipped/headline number.
+    "sx-lateon-steered": {"SEMANTEX_EMBEDDER": "lateon-colbert"},
 }
 
 # Embedder -> the dense_backend name it builds (must match .semantex/meta.json).
@@ -154,8 +164,11 @@ def all_arm_names() -> list[str]:
 
 def nudge_for_arm(arm: str) -> str | None:
     """Repo CLAUDE.md nudge for an arm. BARE-MCP: config-arms get NONE — the tool
-    descriptions carry their own weight. Only legacy `semantex`/`graphify` keep one."""
-    return {"semantex": SEMANTEX_MD, "graphify": GRAPHIFY_MD}.get(arm)
+    descriptions carry their own weight. Exceptions: legacy `semantex`/`graphify`,
+    and the `sx-lateon-steered` adoption-gap DIAGNOSTIC (steered-minus-bare delta;
+    never a headline)."""
+    return {"semantex": SEMANTEX_MD, "graphify": GRAPHIFY_MD,
+            "sx-lateon-steered": SEMANTEX_MD}.get(arm)
 
 
 def eprint(*a, **k):
@@ -412,6 +425,21 @@ def parse_claude_stream(raw: str) -> dict:
 # ── runner ──────────────────────────────────────────────────────────────
 
 
+def _spawn_claude(cmd, **kw):
+    """subprocess.run for the claude CLI, retrying on transient FileNotFoundError —
+    the claude-code CLI can auto-update mid-run and momentarily swap its binary symlink,
+    which otherwise crashes the whole sweep/judge. Re-raises after 3 tries; other
+    exceptions (e.g. TimeoutExpired) propagate to the caller."""
+    for attempt in range(3):
+        try:
+            return subprocess.run(cmd, **kw)
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+            eprint(" claude binary missing — retrying in 30s")
+            time.sleep(30)
+
+
 def run_claude(prompt: str, repo: str, arm: str, api_key: str, timeout: int = 600) -> str:
     cdir = arm_config_dir(arm)
     mcp_path = cdir / "mcp.json"
@@ -441,16 +469,28 @@ def run_claude(prompt: str, repo: str, arm: str, api_key: str, timeout: int = 60
     env = {**os.environ,
            "ANTHROPIC_API_KEY": api_key,
            "CLAUDE_CONFIG_DIR": str(cdir)}
+    r = None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo,
-                           timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        eprint(f" TIMEOUT({timeout}s)")
-        return ""
+        for attempt in range(3):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo,
+                                   timeout=timeout, env=env)
+                break
+            except subprocess.TimeoutExpired:
+                eprint(f" TIMEOUT({timeout}s)")
+                return ""
+            except FileNotFoundError:
+                # claude binary transiently missing (e.g. claude-code CLI auto-update
+                # mid-run swaps the symlink). Don't let it nuke the whole sweep — wait + retry.
+                if attempt == 2:
+                    eprint(f" claude binary missing ({CLAUDE_BIN}) after 3 tries — skipping cell")
+                    return ""
+                eprint(" claude binary missing — retrying in 30s")
+                time.sleep(30)
     finally:
         if injected and md_path.exists():
             md_path.unlink()
-    if r.returncode != 0 and not r.stdout:
+    if r is None or (r.returncode != 0 and not r.stdout):
         eprint(f" ERR rc={r.returncode} {r.stderr[:160]}")
         return ""
     return r.stdout
@@ -502,10 +542,16 @@ def cmd_run(args):
         for q in QUESTIONS:
             for arm in arms:
                 for rep in range(1, args.reps + 1):
+                    raw_path = out / "raw" / f"{rn}_{q['id']}_{arm}_r{rep}.json"
+                    if getattr(args, "resume", False) and raw_path.exists():
+                        # Completing a crashed run: keep the existing cell (no API $),
+                        # load it so the final all_results.json is whole.
+                        results.append(json.loads(raw_path.read_text()))
+                        eprint(f"    [{arm:>8}] {q['id']} r{rep}… skip (resume)")
+                        continue
                     res = run_single(q, repo, arm, rep, api_key)
                     results.append(res)
-                    (out / "raw" / f"{rn}_{q['id']}_{arm}_r{rep}.json").write_text(
-                        json.dumps(res, indent=2))
+                    raw_path.write_text(json.dumps(res, indent=2))
                     time.sleep(1)
     (out / "all_results.json").write_text(json.dumps(results, indent=2))
     eprint(f"\n  saved: {out/'all_results.json'}")
@@ -552,29 +598,35 @@ def cmd_judge(args):
     env = {**os.environ, "ANTHROPIC_API_KEY": api_key,
            "CLAUDE_CONFIG_DIR": str(arm_config_dir("builtin"))}
     for r in results:
+        if r.get("quality") is not None:
+            continue  # resume: already scored (survives a mid-judge crash)
         if r.get("error") or not r.get("answer"):
             continue
         prompt = JUDGE_PROMPT.format(question=qmap.get(r["question_id"], ""),
                                      answer=r["answer"][:6000])
-        # Tool-blind, MCP-free, project-free judge call.
-        proc = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
-             "--model", args.judge_model, "--strict-mcp-config",
-             "--mcp-config", json.dumps({"mcpServers": {}}),
-             "--disallowedTools", *JUDGE_BLOCK_TOOLS],
-            capture_output=True, text=True, env=env, cwd=str(neutral_cwd), timeout=180)
+        # Tool-blind, MCP-free, project-free judge call (retry on transient missing binary).
         score, reason = None, ""
         try:
+            proc = _spawn_claude(
+                [CLAUDE_BIN, "-p", prompt, "--output-format", "json",
+                 "--model", args.judge_model, "--strict-mcp-config",
+                 "--mcp-config", json.dumps({"mcpServers": {}}),
+                 "--disallowedTools", *JUDGE_BLOCK_TOOLS],
+                capture_output=True, text=True, env=env, cwd=str(neutral_cwd), timeout=180)
             res = json.loads(proc.stdout)
             txt = res.get("result", "") if isinstance(res, dict) else ""
             j = json.loads(txt[txt.find("{"): txt.rfind("}") + 1])
             score, reason = j.get("score"), j.get("reason", "")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            reason = f"judge-spawn-failed: {e}"  # leave unscored; --input again resumes it
         except Exception as e:  # noqa: BLE001
             reason = f"judge-parse-failed: {e}"
         r["quality"] = score
         r["quality_reason"] = reason
         eprint(f"  {Path(r['repo']).name} {r['question_id']} {r['arm']} r{r.get('rep')}: "
                f"quality={score}")
+        # Incremental write so a crash mid-judge preserves scored work (resume-safe).
+        (inp / "all_results.json").write_text(json.dumps(results, indent=2))
     (inp / "all_results.json").write_text(json.dumps(results, indent=2))
     eprint("  judge scores merged into all_results.json")
 
@@ -681,6 +733,9 @@ if __name__ == "__main__":
     rp.add_argument("--arms", nargs="+", default=list(ARMS), choices=all_arm_names(),
                     help="which arms to run (default: all 3). e.g. --arms semantex to "
                          "measure only semantex against a prior run's stored baseline.")
+    rp.add_argument("--resume", action="store_true",
+                    help="skip (repo,q,arm,rep) cells whose raw file already exists and "
+                         "load them into the final all_results.json — completes a crashed run.")
 
     jp = sub.add_parser("judge", help="blind-grade answer quality (COSTS API tokens)")
     jp.add_argument("--input", required=True)

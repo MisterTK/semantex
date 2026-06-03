@@ -79,7 +79,8 @@ pub struct ArchOverview {
 /// import it from here (or vice versa). Values must stay in sync.
 pub const ARCH_TINY_REPO_THRESHOLD: u64 = 500;
 
-/// Adaptive output budget for arch / exhaustive / deep-with-examples handlers.
+/// Adaptive output budget for the architecture handler (and, historically,
+/// the exhaustive-structural / deep-with-examples handlers removed in v3).
 ///
 /// Sizes are derived from index chunk count by `budget_for_chunk_count`. The
 /// goal is to stop emitting verbose multi-section responses on small repos
@@ -92,7 +93,11 @@ pub struct ArchBudget {
     pub god_nodes: usize,
     pub communities: usize,
     pub boundaries: usize,
+    // retained: no live reader after v3 route removal (deep_examples_limits,
+    // the sole consumer, was deleted with the DeepWithExamples handler).
     pub deep_examples_max: usize,
+    // retained: no live reader after v3 route removal (handle_exhaustive_structural,
+    // the sole consumer, was deleted with the ExhaustiveStructural handler).
     pub exhaustive_max: usize,
 }
 
@@ -619,9 +624,9 @@ mod tests {
 
     #[test]
     fn exhaustive_max_replaces_hardcoded_30() {
-        // Spec §4 Item 1: handle_exhaustive_structural previously used
-        // `max_results(30)` regardless of repo size. The adaptive budget
-        // must replace that with the per-tier exhaustive_max.
+        // The per-tier exhaustive_max stays distinct from the legacy hardcoded
+        // 30. (Its sole live reader was removed with the ExhaustiveStructural
+        // handler in v3; the field is retained — see ArchBudget.)
         assert_eq!(budget_for_chunk_count(1_000).exhaustive_max, 12);
         assert_eq!(budget_for_chunk_count(5_000).exhaustive_max, 25);
         assert_eq!(budget_for_chunk_count(15_000).exhaustive_max, 40);

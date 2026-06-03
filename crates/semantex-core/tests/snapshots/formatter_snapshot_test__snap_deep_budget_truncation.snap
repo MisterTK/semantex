@@ -1,0 +1,8 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+The system uses a complex algorithm a complex algorithm a complex algorithm a complex algorithm a complex algorithm a complex algorithm a complex algorithm a complex algorithm a complex algorithm a co
+
+[answer truncated]
+[searched: 50 chunks, read: 10, 100ms]

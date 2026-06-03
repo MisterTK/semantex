@@ -1,0 +1,103 @@
+[
+  {
+    "id": "flask-sem-1",
+    "repo": "flask",
+    "query": "how does the application and request context stack work",
+    "intended_mechanism": "semantic",
+    "gold": ["src/flask/ctx.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "AppContext / RequestContext push()/pop() and the context-local stacks live in ctx.py. Single, unambiguous gold."
+  },
+  {
+    "id": "flask-sem-2",
+    "repo": "flask",
+    "query": "how are signed-cookie sessions serialized and loaded",
+    "intended_mechanism": "semantic",
+    "gold": ["src/flask/sessions.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "SessionInterface / SecureCookieSessionInterface open_session/save_session live in sessions.py. Single gold."
+  },
+  {
+    "id": "flask-sem-3",
+    "repo": "flask",
+    "query": "how does blueprint registration defer route setup",
+    "intended_mechanism": "semantic",
+    "gold": ["src/flask/sansio/blueprints.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Blueprint.register + deferred BlueprintSetupState recording live in sansio/blueprints.py (the sans-io core). Hand-judged primary."
+  },
+  {
+    "id": "flask-sem-4",
+    "repo": "flask",
+    "query": "how does flask render a Jinja template",
+    "intended_mechanism": "semantic",
+    "gold": ["src/flask/templating.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "render_template / Environment wiring live entirely in templating.py. Single gold."
+  },
+  {
+    "id": "flask-sem-5",
+    "repo": "flask",
+    "query": "how does the CLI discover and load the application factory",
+    "intended_mechanism": "semantic",
+    "gold": ["src/flask/cli.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "ScriptInfo.load_app + factory discovery (find_app_by_string etc.) live in cli.py. Single gold."
+  },
+
+  {
+    "id": "flask-use-1",
+    "repo": "flask",
+    "query": "how do I create a Flask application instance",
+    "intended_mechanism": "usage",
+    "gold": ["src/flask/app.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "The concrete Flask app class (app = Flask(__name__)) is defined in app.py — the canonical setup entry point."
+  },
+  {
+    "id": "flask-use-2",
+    "repo": "flask",
+    "query": "how do I register a URL route with a view function",
+    "intended_mechanism": "usage",
+    "gold": ["src/flask/sansio/scaffold.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "The @route decorator (Scaffold.route -> add_url_rule) — the idiomatic registration API — lives in sansio/scaffold.py."
+  },
+  {
+    "id": "flask-use-3",
+    "repo": "flask",
+    "query": "how do I return a JSON response from a view",
+    "intended_mechanism": "usage",
+    "gold": ["src/flask/json/__init__.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "jsonify() — the user-facing JSON response helper — is exposed from flask.json (__init__.py)."
+  },
+  {
+    "id": "flask-use-4",
+    "repo": "flask",
+    "query": "how do I read configuration from environment variables or a file",
+    "intended_mechanism": "usage",
+    "gold": ["src/flask/config.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "Config.from_envvar / from_pyfile / from_object — the idiomatic config-loading API — live in config.py. Single gold."
+  },
+  {
+    "id": "flask-use-5",
+    "repo": "flask",
+    "query": "how do I send a file download response",
+    "intended_mechanism": "usage",
+    "gold": ["src/flask/helpers.py"],
+    "match_granularity": "file",
+    "source": "curated",
+    "note": "send_file / send_from_directory — the idiomatic file-response helpers — live in helpers.py."
+  }
+]

@@ -28,12 +28,29 @@ fn has_caps_prefix_symbol(s: &str) -> bool {
 
 /// High-level query intent for agent routing.
 ///
-/// **Phase 4 additions** (`Architecture`, `ExhaustiveStructural`,
-/// `DeepWithExamples`): replace the M1-M6 visible MCP tools that the
-/// v0.3-visible release exposed and that regressed CCB by +20%. The agent
-/// pipeline now routes architecture/exhaustive/deep-pattern queries
-/// internally to the same logic those tools used, without inviting agents
-/// to chain multiple structural tools additively.
+/// **Phase 4 additions** (`Architecture`): replaces the M1-M6 visible MCP
+/// tools that the v0.3-visible release exposed and that regressed CCB by
+/// +20%. The agent pipeline now routes architecture queries internally to
+/// the same logic those tools used, without inviting agents to chain
+/// multiple structural tools additively.
+///
+/// # Wire-format invariant — append-only variants
+///
+/// `AgentRoute` is serialized by postcard (a non-self-describing binary
+/// format) using **positional discriminants**: the first variant is `0`,
+/// the second is `1`, and so on. Reordering or removing a variant silently
+/// changes the meaning of every discriminant that follows it on the wire.
+///
+/// **Rules:**
+/// - New routes **must be appended at the end** of this enum.
+/// - Removing or reordering a variant **requires a `BINARY_PROTOCOL_VERSION`
+///   bump** in `crates/semantex-core/src/server/protocol.rs` so that
+///   mixed-version client/daemon pairs fail fast with `UnsupportedVersion`
+///   instead of silently mis-decoding.
+/// - `v3` is the first version where the route set changes (`ExhaustiveStructural`
+///   and `DeepWithExamples` removed); all daemons must be restarted on
+///   upgrade from a v2 build. Mixed-version client/daemon pairs will
+///   mis-decode `AgentRoute` silently if this discipline is not followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRoute {
@@ -49,14 +66,6 @@ pub enum AgentRoute {
     /// Returns a compact ArchOverview (PageRank god nodes + communities +
     /// cross-directory boundaries) in one call.
     Architecture,
-    /// "List all configuration options" / "every CLI flag" / "enumerate X".
-    /// Wide-net search with structural enumeration of callers/imports for
-    /// each candidate, in one response.
-    ExhaustiveStructural,
-    /// "Explain the most complex algorithm" / "deep dive into X with examples".
-    /// Deep search enriched with pattern-catalog exemplars for any pattern
-    /// names matched in the result set.
-    DeepWithExamples,
     /// "If I wanted to add X, what files would change?" — v0.6 Item 10.
     /// Routes to the multi-step internal planner which decomposes the
     /// question into Architecture → ConventionLookup → ImpactedFiles
@@ -79,8 +88,6 @@ impl std::str::FromStr for AgentRoute {
             "exhaustive" => Ok(Self::Exhaustive),
             "semantic" => Ok(Self::Semantic),
             "architecture" => Ok(Self::Architecture),
-            "exhaustivestructural" | "exhaustive_structural" => Ok(Self::ExhaustiveStructural),
-            "deepwithexamples" | "deep_with_examples" => Ok(Self::DeepWithExamples),
             "featureplanning" | "feature_planning" => Ok(Self::FeaturePlanning),
             other => anyhow::bail!("unknown AgentRoute: {other:?}"),
         }
@@ -99,8 +106,6 @@ impl std::fmt::Display for AgentRoute {
             Self::Exhaustive => write!(f, "exhaustive"),
             Self::Semantic => write!(f, "semantic"),
             Self::Architecture => write!(f, "architecture"),
-            Self::ExhaustiveStructural => write!(f, "exhaustive_structural"),
-            Self::DeepWithExamples => write!(f, "deep_with_examples"),
             Self::FeaturePlanning => write!(f, "feature_planning"),
         }
     }
@@ -145,7 +150,12 @@ fn is_feature_planning_query(lower: &str) -> bool {
 }
 
 /// Returns true if the query looks like a regex pattern.
-fn is_regex(query: &str) -> bool {
+///
+/// Detects: `\b \B \d \D \s \S \w \W` escape classes, unquoted `|` alternation,
+/// `[...]` character classes, `(x|y)`/`(x?)`/`(x*)`/`(x+)` quantifier groups, and
+/// `^`/`$` anchors. Public so the MCP `mode=lexical` token-shape check can reuse
+/// the single source of truth instead of mirroring it.
+pub fn is_regex(query: &str) -> bool {
     // \b \B \d \D \s \S \w \W — backslash and these classes are all ASCII,
     // so byte iteration is safe and avoids allocating a Vec<char>.
     let bytes = query.as_bytes();
@@ -321,32 +331,6 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
-    // 4b. DeepWithExamples — Phase 4. Checked BEFORE the Deep prefix scan
-    // so "explain the most complex algorithm" doesn't fall through to plain
-    // Deep. Routes to deep search enriched with pattern-catalog exemplars
-    // for any pattern names matched in the result set, so the agent gets
-    // concrete code alongside prose without a follow-up turn.
-    let deep_with_examples_markers = [
-        "explain the most complex",
-        "most complex algorithm",
-        "key algorithm",
-        "main algorithm",
-        "data transformation",
-        "core algorithm",
-        "step by step",
-        "step-by-step",
-        "deep dive",
-        "show me how",
-        "show me the pattern",
-        "with examples",
-        "give examples of",
-    ];
-    for marker in &deep_with_examples_markers {
-        if lower.contains(marker) {
-            return AgentRoute::DeepWithExamples;
-        }
-    }
-
     // 5. Deep — prefix matching
     let deep_prefixes = [
         "how ",
@@ -363,7 +347,12 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         }
     }
 
-    // 6. Analytical — keyword matching
+    // 6. Analytical — keyword matching.
+    // NOTE (post-DWE-removal): prefix-less "most complex …" phrasings (e.g.
+    // "the most complex algorithm in this repo", with no leading "explain"/
+    // "how") used to route to DeepWithExamples. They now divert here via the
+    // "most " + "complex" keywords → Analytical. Deep-prefixed variants
+    // ("explain the most complex …") still hit the Deep prefix scan above.
     let analytical_keywords = [
         "most ",
         "least ",
@@ -393,6 +382,9 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
     }
 
     // 7. Exhaustive — "list all X", "find all Y", "enumerate Z"
+    // Former ExhaustiveStructural phrases (config/env/cli/flag/option) are
+    // now folded here: they route to plain Exhaustive (budget×3, max 20
+    // results) instead of the former ×4 + adaptive exhaustive_max.
     let exhaustive_markers = [
         "list all",
         "list every",
@@ -406,35 +398,10 @@ pub fn classify_agent_query(query: &str) -> AgentRoute {
         "enumerate every",
         "enumerate ",
     ];
-    let mut is_exhaustive = false;
     for marker in &exhaustive_markers {
         if lower.contains(marker) {
-            is_exhaustive = true;
-            break;
+            return AgentRoute::Exhaustive;
         }
-    }
-    if is_exhaustive {
-        // 7b. ExhaustiveStructural — Phase 4. When an exhaustive query also
-        // mentions config/env/cli/flag/option, route to the richer structural
-        // enumeration that includes definitions + usages in one pass.
-        let structural_exhaustive_markers = [
-            "config",
-            "env var",
-            "environment variable",
-            "cli flag",
-            "command line",
-            "option",
-            "setting",
-            "every flag",
-            "every option",
-            "every config",
-        ];
-        for kw in &structural_exhaustive_markers {
-            if lower.contains(kw) {
-                return AgentRoute::ExhaustiveStructural;
-            }
-        }
-        return AgentRoute::Exhaustive;
     }
 
     // 8. Semantic — default
@@ -644,13 +611,11 @@ mod tests {
 
     #[test]
     fn test_exhaustive_list_all() {
-        // Phase 4: "list all" + "configuration options" / "environment variables"
-        // is now ExhaustiveStructural — the richer route that enumerates
-        // definitions + usages in one response. The plain Exhaustive route is
-        // for queries that don't name a configuration/CLI surface.
+        // Former ExhaustiveStructural phrase: "list all" + config/env vocab now
+        // routes to plain Exhaustive (budget×3, max 20 results).
         assert_eq!(
             classify_agent_query("List all configuration options and environment variables"),
-            AgentRoute::ExhaustiveStructural
+            AgentRoute::Exhaustive
         );
     }
     #[test]
@@ -662,10 +627,11 @@ mod tests {
     }
     #[test]
     fn test_exhaustive_enumerate_cli() {
-        // Phase 4: "enumerate" + "CLI flags" routes to ExhaustiveStructural.
+        // Former ExhaustiveStructural phrase: "enumerate" + "CLI flags" now routes
+        // to plain Exhaustive (folded in via enumerate_ marker + no sub-route).
         assert_eq!(
             classify_agent_query("enumerate the CLI flags this project supports"),
-            AgentRoute::ExhaustiveStructural
+            AgentRoute::Exhaustive
         );
     }
     #[test]
@@ -684,7 +650,8 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Phase 4 — Architecture / ExhaustiveStructural / DeepWithExamples
+    // Phase 4 — Architecture (ExhaustiveStructural + DeepWithExamples
+    // removed in v3; their former trigger phrases now route below)
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -714,42 +681,104 @@ mod tests {
             AgentRoute::Architecture
         );
     }
+
+    // ── Former ExhaustiveStructural phrases → now Exhaustive ─────────────
     #[test]
-    fn test_exhaustive_structural_config() {
-        // Q4-class question; explicit config/env routing.
+    fn former_exhaustive_structural_config_now_exhaustive() {
+        // Q4-class question; config/env vocab no longer triggers a separate
+        // route — folds into plain Exhaustive (budget×3, max 20 results).
         assert_eq!(
             classify_agent_query(
                 "list all configuration options, environment variables, \
                  and CLI flags this project supports"
             ),
-            AgentRoute::ExhaustiveStructural
+            AgentRoute::Exhaustive
+        );
+    }
+    #[test]
+    fn former_exhaustive_structural_list_options_now_exhaustive() {
+        assert_eq!(
+            classify_agent_query("list all options"),
+            AgentRoute::Exhaustive
         );
     }
     #[test]
     fn test_exhaustive_plain_still_exhaustive() {
-        // No config/CLI hint → stays as plain Exhaustive.
+        // No config/CLI hint → plain Exhaustive (unchanged).
         assert_eq!(
             classify_agent_query("list all middleware registered in the app"),
             AgentRoute::Exhaustive
         );
     }
+
+    // ── Former DeepWithExamples phrases → natural-cascade fall-through ────
     #[test]
-    fn test_deep_with_examples_most_complex() {
-        // Q3-class question. Phase 4 routes to deep+exemplars so the agent
-        // gets curated code blocks without a follow-up turn.
+    fn former_dwe_explain_most_complex_now_deep() {
+        // "explain " prefix → Deep (deep prefix scan, step 5).
+        // DELTA: plain Deep synthesis, no pattern-catalog appendix.
         assert_eq!(
             classify_agent_query(
                 "explain the most complex algorithm or data transformation in \
                  this codebase step by step"
             ),
-            AgentRoute::DeepWithExamples
+            AgentRoute::Deep
         );
     }
     #[test]
-    fn test_deep_with_examples_show_me_how() {
+    fn former_dwe_show_me_how_now_semantic() {
+        // "show me how …" → no deep prefix, no analytical keyword, no exhaustive
+        // marker → Semantic (default).
         assert_eq!(
             classify_agent_query("show me how the retry backoff is implemented"),
-            AgentRoute::DeepWithExamples
+            AgentRoute::Semantic
+        );
+    }
+    #[test]
+    fn former_dwe_deep_dive_now_semantic() {
+        // "deep dive into X" → no prefix match, no analytical keyword →
+        // falls to Semantic.
+        assert_eq!(
+            classify_agent_query("deep dive into the connection pooling logic"),
+            AgentRoute::Semantic
+        );
+    }
+    #[test]
+    fn former_dwe_step_by_step_now_semantic() {
+        // "walk me through X step by step" → "walk me through " is a deep
+        // prefix, so this routes to Deep.
+        assert_eq!(
+            classify_agent_query("walk me through the auth flow step by step"),
+            AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn former_dwe_how_prefix_still_deep() {
+        // "how " prefix queries that previously hit DeepWithExamples via
+        // "step by step" or "with examples" markers now go to Deep directly
+        // via the prefix scan (the prefix scan fires first).
+        assert_eq!(
+            classify_agent_query("how does the retry mechanism work step by step"),
+            AgentRoute::Deep
+        );
+    }
+    #[test]
+    fn former_dwe_bare_most_complex_now_analytical() {
+        // Surprising re-route: a prefix-less "most complex …" phrase (no leading
+        // "explain"/"how") used to hit DeepWithExamples via the "most complex
+        // algorithm" marker. With DWE gone it now matches "most " AND "complex"
+        // in the analytical keyword table → Analytical (not Deep/Semantic).
+        assert_eq!(
+            classify_agent_query("the most complex algorithm in this repo"),
+            AgentRoute::Analytical
+        );
+    }
+    #[test]
+    fn former_dwe_give_examples_now_semantic() {
+        // "give examples of X" → no prefix, no analytical keyword, no exhaustive
+        // marker → Semantic (default). Previously hit DWE via "give examples of".
+        assert_eq!(
+            classify_agent_query("give examples of the retry backoff usage"),
+            AgentRoute::Semantic
         );
     }
 
@@ -827,7 +856,6 @@ mod tests {
     //   - Not Architecture (no architecture keyword matches).
     //   - Not Structural (none of: callers/callees/who calls/used by/uses/
     //     depends on/references/imports/etc. appear in the query).
-    //   - Not DeepWithExamples (no marker matches).
     //   - Deep prefix `"how "` matches → AgentRoute::Deep.
     //
     // Conclusion (§4.2 branch (a)): The classifier ALREADY routes platform
@@ -925,8 +953,6 @@ mod tests {
             AgentRoute::Exhaustive,
             AgentRoute::Semantic,
             AgentRoute::Architecture,
-            AgentRoute::ExhaustiveStructural,
-            AgentRoute::DeepWithExamples,
             AgentRoute::FeaturePlanning,
         ];
         for route in routes {
@@ -957,20 +983,21 @@ mod tests {
             AgentRoute::ExactSymbol
         );
         assert_eq!(
-            "ExhaustiveStructural".parse::<AgentRoute>().unwrap(),
-            AgentRoute::ExhaustiveStructural
-        );
-        assert_eq!(
-            "DeepWithExamples".parse::<AgentRoute>().unwrap(),
-            AgentRoute::DeepWithExamples
-        );
-        assert_eq!(
             "FeaturePlanning".parse::<AgentRoute>().unwrap(),
             AgentRoute::FeaturePlanning
         );
         assert_eq!(
             "FilePattern".parse::<AgentRoute>().unwrap(),
             AgentRoute::FilePattern
+        );
+        // Removed variants must now parse as Err (not silently map to something).
+        assert!(
+            "ExhaustiveStructural".parse::<AgentRoute>().is_err(),
+            "ExhaustiveStructural is no longer a valid route"
+        );
+        assert!(
+            "DeepWithExamples".parse::<AgentRoute>().is_err(),
+            "DeepWithExamples is no longer a valid route"
         );
     }
 }

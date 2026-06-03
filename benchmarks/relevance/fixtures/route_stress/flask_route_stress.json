@@ -1,0 +1,569 @@
+{
+  "schema": "route_stress/v1",
+  "repo": "flask",
+  "repo_path_at_gen": "/Users/tk/dev/flask",
+  "match_granularity_default": "file",
+  "mechanisms": [
+    "glob",
+    "regex",
+    "lexical",
+    "structural",
+    "semantic",
+    "usage"
+  ],
+  "records": [
+    {
+      "id": "flask-glob-1",
+      "repo": "flask",
+      "query": "all pytest test modules (test_*.py)",
+      "intended_mechanism": "glob",
+      "gold": [
+        "examples/javascript/tests/test_js_example.py",
+        "examples/tutorial/tests/test_auth.py",
+        "examples/tutorial/tests/test_blog.py",
+        "examples/tutorial/tests/test_db.py",
+        "examples/tutorial/tests/test_factory.py",
+        "tests/test_appctx.py",
+        "tests/test_async.py",
+        "tests/test_basic.py",
+        "tests/test_blueprints.py",
+        "tests/test_cli.py",
+        "tests/test_config.py",
+        "tests/test_converters.py",
+        "tests/test_helpers.py",
+        "tests/test_instance_config.py",
+        "tests/test_json.py",
+        "tests/test_json_tag.py",
+        "tests/test_logging.py",
+        "tests/test_regression.py",
+        "tests/test_reqctx.py",
+        "tests/test_request.py",
+        "tests/test_session_interface.py",
+        "tests/test_signals.py",
+        "tests/test_subclassing.py",
+        "tests/test_templating.py",
+        "tests/test_testing.py",
+        "tests/test_user_error_handler.py",
+        "tests/test_views.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=test_*.py"
+    },
+    {
+      "id": "flask-glob-2",
+      "repo": "flask",
+      "query": "files under the flask.json subpackage",
+      "intended_mechanism": "glob",
+      "gold": [
+        "src/flask/json/__init__.py",
+        "src/flask/json/provider.py",
+        "src/flask/json/tag.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=src/flask/json/*.py"
+    },
+    {
+      "id": "flask-glob-3",
+      "repo": "flask",
+      "query": "files under the flask.sansio subpackage",
+      "intended_mechanism": "glob",
+      "gold": [
+        "src/flask/sansio/app.py",
+        "src/flask/sansio/blueprints.py",
+        "src/flask/sansio/scaffold.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=src/flask/sansio/*.py"
+    },
+    {
+      "id": "flask-glob-4",
+      "repo": "flask",
+      "query": "reStructuredText files at the repo root",
+      "intended_mechanism": "glob",
+      "gold": [
+        "CHANGES.rst",
+        "docs/api.rst",
+        "docs/appcontext.rst",
+        "docs/async-await.rst",
+        "docs/blueprints.rst",
+        "docs/changes.rst",
+        "docs/cli.rst",
+        "docs/config.rst",
+        "docs/contributing.rst",
+        "docs/debugging.rst",
+        "docs/deploying/apache-httpd.rst",
+        "docs/deploying/asgi.rst",
+        "docs/deploying/eventlet.rst",
+        "docs/deploying/gevent.rst",
+        "docs/deploying/gunicorn.rst",
+        "docs/deploying/index.rst",
+        "docs/deploying/mod_wsgi.rst",
+        "docs/deploying/nginx.rst",
+        "docs/deploying/proxy_fix.rst",
+        "docs/deploying/uwsgi.rst",
+        "docs/deploying/waitress.rst",
+        "docs/design.rst",
+        "docs/errorhandling.rst",
+        "docs/extensiondev.rst",
+        "docs/extensions.rst",
+        "docs/gevent.rst",
+        "docs/index.rst",
+        "docs/installation.rst",
+        "docs/license.rst",
+        "docs/lifecycle.rst",
+        "docs/logging.rst",
+        "docs/patterns/appdispatch.rst",
+        "docs/patterns/appfactories.rst",
+        "docs/patterns/caching.rst",
+        "docs/patterns/celery.rst",
+        "docs/patterns/deferredcallbacks.rst",
+        "docs/patterns/favicon.rst",
+        "docs/patterns/fileuploads.rst",
+        "docs/patterns/flashing.rst",
+        "docs/patterns/index.rst",
+        "docs/patterns/javascript.rst",
+        "docs/patterns/jquery.rst",
+        "docs/patterns/lazyloading.rst",
+        "docs/patterns/methodoverrides.rst",
+        "docs/patterns/mongoengine.rst",
+        "docs/patterns/packages.rst",
+        "docs/patterns/requestchecksum.rst",
+        "docs/patterns/singlepageapplications.rst",
+        "docs/patterns/sqlalchemy.rst",
+        "docs/patterns/sqlite3.rst",
+        "docs/patterns/streaming.rst",
+        "docs/patterns/subclassing.rst",
+        "docs/patterns/templateinheritance.rst",
+        "docs/patterns/urlprocessors.rst",
+        "docs/patterns/viewdecorators.rst",
+        "docs/patterns/wtforms.rst",
+        "docs/quickstart.rst",
+        "docs/reqcontext.rst",
+        "docs/server.rst",
+        "docs/shell.rst",
+        "docs/signals.rst",
+        "docs/templating.rst",
+        "docs/testing.rst",
+        "docs/tutorial/blog.rst",
+        "docs/tutorial/database.rst",
+        "docs/tutorial/deploy.rst",
+        "docs/tutorial/factory.rst",
+        "docs/tutorial/index.rst",
+        "docs/tutorial/install.rst",
+        "docs/tutorial/layout.rst",
+        "docs/tutorial/next.rst",
+        "docs/tutorial/static.rst",
+        "docs/tutorial/templates.rst",
+        "docs/tutorial/tests.rst",
+        "docs/tutorial/views.rst",
+        "docs/views.rst",
+        "docs/web-security.rst",
+        "examples/javascript/README.rst",
+        "examples/tutorial/README.rst"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=*.rst"
+    },
+    {
+      "id": "flask-glob-5",
+      "repo": "flask",
+      "query": "GitHub Actions workflow YAML files",
+      "intended_mechanism": "glob",
+      "gold": [
+        ".github/workflows/lock.yaml",
+        ".github/workflows/pre-commit.yaml",
+        ".github/workflows/publish.yaml",
+        ".github/workflows/tests.yaml"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "glob=.github/workflows/*.yaml"
+    },
+    {
+      "id": "flask-regex-1",
+      "repo": "flask",
+      "query": "modules using a future annotations import",
+      "intended_mechanism": "regex",
+      "gold": [
+        "src/flask/app.py",
+        "src/flask/blueprints.py",
+        "src/flask/cli.py",
+        "src/flask/config.py",
+        "src/flask/ctx.py",
+        "src/flask/debughelpers.py",
+        "src/flask/globals.py",
+        "src/flask/helpers.py",
+        "src/flask/json/__init__.py",
+        "src/flask/json/provider.py",
+        "src/flask/json/tag.py",
+        "src/flask/logging.py",
+        "src/flask/sansio/app.py",
+        "src/flask/sansio/blueprints.py",
+        "src/flask/sansio/scaffold.py",
+        "src/flask/sessions.py",
+        "src/flask/signals.py",
+        "src/flask/templating.py",
+        "src/flask/testing.py",
+        "src/flask/typing.py",
+        "src/flask/views.py",
+        "src/flask/wrappers.py",
+        "tests/test_request.py",
+        "tests/type_check/typing_app_decorators.py",
+        "tests/type_check/typing_error_handler.py",
+        "tests/type_check/typing_route.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='^from __future__ import annotations'"
+    },
+    {
+      "id": "flask-regex-2",
+      "repo": "flask",
+      "query": "async def coroutine definitions",
+      "intended_mechanism": "regex",
+      "gold": [
+        "tests/test_async.py",
+        "tests/test_helpers.py",
+        "tests/type_check/typing_app_decorators.py",
+        "tests/type_check/typing_route.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='^\\\\s*async def '"
+    },
+    {
+      "id": "flask-regex-3",
+      "repo": "flask",
+      "query": "places that call abort(",
+      "intended_mechanism": "regex",
+      "gold": [
+        "examples/tutorial/flaskr/blog.py",
+        "src/flask/helpers.py",
+        "tests/test_basic.py",
+        "tests/test_blueprints.py",
+        "tests/test_helpers.py",
+        "tests/test_regression.py",
+        "tests/test_user_error_handler.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='\\\\babort\\\\('"
+    },
+    {
+      "id": "flask-regex-4",
+      "repo": "flask",
+      "query": "modules guarded by typing.TYPE_CHECKING",
+      "intended_mechanism": "regex",
+      "gold": [
+        "src/flask/app.py",
+        "src/flask/blueprints.py",
+        "src/flask/cli.py",
+        "src/flask/config.py",
+        "src/flask/ctx.py",
+        "src/flask/debughelpers.py",
+        "src/flask/globals.py",
+        "src/flask/helpers.py",
+        "src/flask/json/__init__.py",
+        "src/flask/json/provider.py",
+        "src/flask/logging.py",
+        "src/flask/sansio/app.py",
+        "src/flask/sansio/blueprints.py",
+        "src/flask/sansio/scaffold.py",
+        "src/flask/sessions.py",
+        "src/flask/templating.py",
+        "src/flask/testing.py",
+        "src/flask/typing.py",
+        "src/flask/wrappers.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='TYPE_CHECKING'"
+    },
+    {
+      "id": "flask-regex-5",
+      "repo": "flask",
+      "query": "type: ignore inline suppressions",
+      "intended_mechanism": "regex",
+      "gold": [
+        "src/flask/app.py",
+        "src/flask/blueprints.py",
+        "src/flask/cli.py",
+        "src/flask/config.py",
+        "src/flask/ctx.py",
+        "src/flask/debughelpers.py",
+        "src/flask/globals.py",
+        "src/flask/helpers.py",
+        "src/flask/json/__init__.py",
+        "src/flask/json/provider.py",
+        "src/flask/logging.py",
+        "src/flask/sansio/app.py",
+        "src/flask/sansio/blueprints.py",
+        "src/flask/sansio/scaffold.py",
+        "src/flask/sessions.py",
+        "src/flask/testing.py",
+        "src/flask/views.py",
+        "src/flask/wrappers.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "regex='type: ignore'"
+    },
+    {
+      "id": "flask-lex-1",
+      "repo": "flask",
+      "query": "the Request class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "src/flask/wrappers.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of Request"
+    },
+    {
+      "id": "flask-lex-2",
+      "repo": "flask",
+      "query": "the Response class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "src/flask/wrappers.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of Response"
+    },
+    {
+      "id": "flask-lex-3",
+      "repo": "flask",
+      "query": "the SessionInterface class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "src/flask/sessions.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of SessionInterface"
+    },
+    {
+      "id": "flask-lex-4",
+      "repo": "flask",
+      "query": "the AppContext class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "src/flask/ctx.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of AppContext"
+    },
+    {
+      "id": "flask-lex-5",
+      "repo": "flask",
+      "query": "the JSONProvider class",
+      "intended_mechanism": "lexical",
+      "gold": [
+        "src/flask/json/provider.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "def of JSONProvider"
+    },
+    {
+      "id": "flask-struct-1",
+      "repo": "flask",
+      "query": "what calls get_flashed_messages",
+      "intended_mechanism": "structural",
+      "gold": [
+        "tests/test_basic.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of get_flashed_messages; graph-crosscheck agrees=None"
+    },
+    {
+      "id": "flask-struct-2",
+      "repo": "flask",
+      "query": "callers of stream_with_context",
+      "intended_mechanism": "structural",
+      "gold": [
+        "src/flask/helpers.py",
+        "src/flask/templating.py",
+        "tests/test_helpers.py",
+        "tests/test_testing.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of stream_with_context; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "flask-struct-3",
+      "repo": "flask",
+      "query": "where is send_from_directory called",
+      "intended_mechanism": "structural",
+      "gold": [
+        "src/flask/app.py",
+        "src/flask/blueprints.py",
+        "src/flask/helpers.py",
+        "tests/test_helpers.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of send_from_directory; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "flask-struct-4",
+      "repo": "flask",
+      "query": "what calls flash",
+      "intended_mechanism": "structural",
+      "gold": [
+        "examples/tutorial/flaskr/auth.py",
+        "examples/tutorial/flaskr/blog.py",
+        "tests/test_basic.py",
+        "tests/test_signals.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of flash; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "flask-struct-5",
+      "repo": "flask",
+      "query": "callers of make_response",
+      "intended_mechanism": "structural",
+      "gold": [
+        "src/flask/app.py",
+        "src/flask/helpers.py",
+        "tests/test_basic.py",
+        "tests/test_helpers.py",
+        "tests/test_views.py"
+      ],
+      "match_granularity": "file",
+      "source": "derived",
+      "note": "callers of make_response; graph-crosscheck agrees=True"
+    },
+    {
+      "id": "flask-sem-1",
+      "repo": "flask",
+      "query": "how does the application and request context stack work",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "src/flask/ctx.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "AppContext / RequestContext push()/pop() and the context-local stacks live in ctx.py. Single, unambiguous gold."
+    },
+    {
+      "id": "flask-sem-2",
+      "repo": "flask",
+      "query": "how are signed-cookie sessions serialized and loaded",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "src/flask/sessions.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "SessionInterface / SecureCookieSessionInterface open_session/save_session live in sessions.py. Single gold."
+    },
+    {
+      "id": "flask-sem-3",
+      "repo": "flask",
+      "query": "how does blueprint registration defer route setup",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "src/flask/sansio/blueprints.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Blueprint.register + deferred BlueprintSetupState recording live in sansio/blueprints.py (the sans-io core). Hand-judged primary."
+    },
+    {
+      "id": "flask-sem-4",
+      "repo": "flask",
+      "query": "how does flask render a Jinja template",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "src/flask/templating.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "render_template / Environment wiring live entirely in templating.py. Single gold."
+    },
+    {
+      "id": "flask-sem-5",
+      "repo": "flask",
+      "query": "how does the CLI discover and load the application factory",
+      "intended_mechanism": "semantic",
+      "gold": [
+        "src/flask/cli.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "ScriptInfo.load_app + factory discovery (find_app_by_string etc.) live in cli.py. Single gold."
+    },
+    {
+      "id": "flask-use-1",
+      "repo": "flask",
+      "query": "how do I create a Flask application instance",
+      "intended_mechanism": "usage",
+      "gold": [
+        "src/flask/app.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "The concrete Flask app class (app = Flask(__name__)) is defined in app.py \u2014 the canonical setup entry point."
+    },
+    {
+      "id": "flask-use-2",
+      "repo": "flask",
+      "query": "how do I register a URL route with a view function",
+      "intended_mechanism": "usage",
+      "gold": [
+        "src/flask/sansio/scaffold.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "The @route decorator (Scaffold.route -> add_url_rule) \u2014 the idiomatic registration API \u2014 lives in sansio/scaffold.py."
+    },
+    {
+      "id": "flask-use-3",
+      "repo": "flask",
+      "query": "how do I return a JSON response from a view",
+      "intended_mechanism": "usage",
+      "gold": [
+        "src/flask/json/__init__.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "jsonify() \u2014 the user-facing JSON response helper \u2014 is exposed from flask.json (__init__.py)."
+    },
+    {
+      "id": "flask-use-4",
+      "repo": "flask",
+      "query": "how do I read configuration from environment variables or a file",
+      "intended_mechanism": "usage",
+      "gold": [
+        "src/flask/config.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "Config.from_envvar / from_pyfile / from_object \u2014 the idiomatic config-loading API \u2014 live in config.py. Single gold."
+    },
+    {
+      "id": "flask-use-5",
+      "repo": "flask",
+      "query": "how do I send a file download response",
+      "intended_mechanism": "usage",
+      "gold": [
+        "src/flask/helpers.py"
+      ],
+      "match_granularity": "file",
+      "source": "curated",
+      "note": "send_file / send_from_directory \u2014 the idiomatic file-response helpers \u2014 live in helpers.py."
+    }
+  ]
+}

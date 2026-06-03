@@ -1,0 +1,8 @@
+---
+source: crates/semantex-core/tests/formatter_snapshot_test.rs
+expression: out
+---
+src/auth.rs:42: fn authenticate(token: &str) -> bool {
+src/session.rs:17: pub fn session_start() {
+
+[2 matches, 5ms]

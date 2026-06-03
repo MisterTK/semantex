@@ -170,6 +170,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+# Snapshot testing for the Phase-0 formatter regression net.
+# Dev-only: zero impact on the default (non-LLM) production build.
+insta = "1"
 
 [[bench]]
 name = "simd_bench"
