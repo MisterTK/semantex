@@ -1,7 +1,7 @@
 //! Claude Code hook commands — full lifecycle.
 //!
 //! SessionStart   → detect index, pre-warm daemon, output context
-//! PreToolUse     → Grep|Glob nudge or deny, Bash search nudge or deny (--deny flag)
+//! PreToolUse     → Grep|Glob nudge or deny, Bash search nudge or deny, Read nudge or deny (--deny flag)
 //! SubagentStart  → inject semantex context into Explore/general-purpose agents
 //! SessionEnd     → stop daemon
 //!
@@ -14,6 +14,16 @@ use semantex_core::index::registry;
 use semantex_core::index::state::{self, IndexState};
 use std::path::PathBuf;
 use std::process::Stdio;
+
+/// Read-hook nudge text — points the agent at the `semantex_agent` MCP tool and
+/// keeps the duplicate-re-read framing. Extracted as a const so tests can assert
+/// it references `semantex_agent` without touching control flow.
+const READ_HOOK_NUDGE: &str = concat!(
+    "Use the `semantex_agent` tool (semantic code search) instead of Read for exploring code — ",
+    "one call returns a complete answer with file:line + code; it covers regex and file-glob too. ",
+    "You may already have this file's content from a prior `semantex_agent` result; ",
+    "re-reading is duplicate work.",
+);
 
 /// Check if a semantex index directory (`.semantex/meta.json`) exists for the current
 /// directory or any parent. Returns the `.semantex` directory path if found.
@@ -100,10 +110,10 @@ pub fn cmd_session_hook() -> Result<()> {
 
     let additional_context = format!(
         "semantex semantic code search is available (index: {}).\n\
-         - `semantex --deep \"question\"` — one call, complete answer. Use for how/why/connect questions. Trust the answer, skip follow-up Reads.\n\
-         - `semantex --refs \"query\"` — compact refs for simple lookups (find definition, list references).\n\
-         - `semantex --grep \"literal\"` — exact match.\n\
-         Fallback: Grep for regex patterns, Glob for file names.",
+         Use the `semantex_agent` tool (semantic code search) instead of Grep/Glob/Read — one call \
+         returns a complete answer with file:line + code; it covers regex and file-glob too. \
+         Trust the result and skip follow-up Reads.\n\
+         Fallback: Grep/Glob only if the `semantex_agent` tool is unavailable.",
         index_dir.display()
     );
 
@@ -131,10 +141,9 @@ pub fn cmd_grep_hook(deny: bool) -> Result<()> {
     }
 
     let nudge = concat!(
-        "STOP: Use semantex via Bash instead of Grep/Glob — semantex finds code by meaning.\n",
-        "- Complex questions (how/why/explain): `semantex --deep \"question\"` — one call replaces 5-10 grep+read iterations. Use the answer directly.\n",
-        "- Find references: `semantex --refs \"query\"` or `semantex --refs -e \"pattern\" \"query\"`\n",
-        "- Exact string: `semantex --grep \"literal\"`",
+        "Use the `semantex_agent` tool (semantic code search) instead of Grep/Glob — ",
+        "one call returns a complete answer with file:line + code; it covers regex and ",
+        "file-glob too. Use the result directly instead of running follow-up searches.",
     );
 
     let output = if deny {
@@ -178,13 +187,11 @@ pub fn cmd_subagent_hook() -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": "SubagentStart",
             "additionalContext": concat!(
-                "IMPORTANT: semantex (semantic code search) is available. Use it via Bash instead of Grep/Glob.\n\n",
-                "Start with semantex for EVERY code search:\n",
-                "- How/why/explain questions → `semantex --deep \"question\"` — one call, complete answer. Use it directly, no follow-up Reads.\n",
-                "- Find/where/what questions → `semantex --refs \"query\"`\n",
-                "- Exact string → `semantex --grep \"literal\"`\n",
-                "- Regex + semantic → `semantex --refs -e \"regex\" \"query\"`\n\n",
-                "Fall back to Grep ONLY for regex patterns, Glob ONLY for file name patterns.",
+                "IMPORTANT: the `semantex_agent` tool (semantic code search) is available. ",
+                "Use it instead of Grep/Glob/Read for EVERY code search — one call returns a ",
+                "complete answer with file:line + code, and it covers regex and file-glob too. ",
+                "Use the result directly, no follow-up Reads.\n\n",
+                "Fall back to Grep/Glob only if the `semantex_agent` tool is unavailable.",
             ),
         }
     });
@@ -226,8 +233,9 @@ pub fn cmd_bash_hook(deny: bool) -> Result<()> {
     }
 
     let nudge = concat!(
-        "Use `semantex --refs \"query\"` or `semantex --grep \"literal\"` instead of grep/rg/find. ",
-        "Use `semantex --deep \"question\"` for complex questions.",
+        "Use the `semantex_agent` tool (semantic code search) instead of grep/rg/find — ",
+        "one call returns a complete answer with file:line + code; it covers regex and ",
+        "file-glob too. Use the result directly instead of running follow-up searches.",
     );
 
     let output = if deny {
@@ -298,6 +306,147 @@ fn is_search_command(cmd: &str) -> bool {
     ) || (first_token == "git" && cmd.contains("grep"))
 }
 
+/// Decide whether reading `file_path` is worth a soft semantex nudge.
+///
+/// Mirrors graphify's path-awareness: nudge for a source/doc file the agent is
+/// exploring, but stay silent (return `false`) on semantex's own output, VCS /
+/// dependency / build dirs, lock files, and binary/data/media files — anything
+/// where a "use semantex instead" nudge would be noise or risk a loop.
+fn should_nudge_read_path(file_path: &str) -> bool {
+    // Lock files — match by exact name (case-sensitive, as these are well-known).
+    const LOCK_FILES: [&str; 10] = [
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "uv.lock",
+        "poetry.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "flake.lock",
+    ];
+    // Binary / data / media extensions — case-insensitive. The compound suffix
+    // `*.min.js` is handled separately below.
+    const BINARY_EXTS: &[&str] = &[
+        "lock", "bin", "wasm", "so", "dylib", "a", "o", "exe", "dll", "png", "jpg", "jpeg", "gif",
+        "svg", "ico", "webp", "pdf", "zip", "tar", "gz", "tgz", "bz2", "7z", "woff", "woff2",
+        "ttf", "eot", "otf", "mp4", "mp3", "mov", "wav", "db", "sqlite", "sqlite3", "parquet",
+        "pyc", "class", "jar", "map",
+    ];
+
+    // Normalize separators so the checks below are OS-agnostic.
+    let path = file_path.replace('\\', "/");
+
+    // semantex's own output — never nudge (avoid loops / re-reads of our results).
+    if path.contains("/.semantex/") || path.starts_with(".semantex/") {
+        return false;
+    }
+
+    // VCS / dependency / build directories — not source the agent is exploring.
+    for marker in ["/.git/", "/node_modules/", "/target/", "/dist/", "/build/"] {
+        if path.contains(marker) {
+            return false;
+        }
+    }
+    // Also catch these as a leading path component (no leading slash).
+    for prefix in [".git/", "node_modules/", "target/", "dist/", "build/"] {
+        if path.starts_with(prefix) {
+            return false;
+        }
+    }
+
+    // File name (last path component).
+    let name = path.rsplit('/').next().unwrap_or(&path);
+
+    if LOCK_FILES.contains(&name) {
+        return false;
+    }
+
+    let name_lower = name.to_ascii_lowercase();
+    // Compound suffix: `*.min.js` is a built/minified artifact.
+    if name_lower.ends_with(".min.js") {
+        return false;
+    }
+    if let Some((_, ext)) = name_lower.rsplit_once('.')
+        && BINARY_EXTS.contains(&ext)
+    {
+        return false;
+    }
+
+    // Otherwise: a source/doc file worth nudging.
+    true
+}
+
+/// PreToolUse Read hook — called via `semantex --read-hook [--deny]`.
+///
+/// Catches the measured failure mode (the substitution probe): the agent doing
+/// DUPLICATE re-`Read`s of files semantex already returned. Graphify parity —
+/// it hooks the native Read tool the Bash hook can't see.
+///
+/// Default (no --deny): soft nudge via additionalContext — the Read still runs.
+/// With --deny: hard block via permissionDecision.
+///
+/// Fails open everywhere: no index, unparseable stdin, missing `file_path`, or a
+/// path not worth nudging → `{}` (silent pass-through).
+pub fn cmd_read_hook(deny: bool) -> Result<()> {
+    if find_index_dir().is_none() {
+        println!("{{}}");
+        return Ok(());
+    }
+
+    // Read tool_input from stdin.
+    let mut input = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
+        // Fail open on a stdin read error.
+        println!("{{}}");
+        return Ok(());
+    }
+
+    // Parse JSON + extract tool_input.file_path. Any failure → fail open.
+    let file_path = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|v| {
+            v.get("tool_input")
+                .and_then(|ti| ti.get("file_path"))
+                .and_then(|p| p.as_str())
+                .map(str::to_owned)
+        });
+
+    let Some(file_path) = file_path else {
+        println!("{{}}");
+        return Ok(());
+    };
+
+    if !should_nudge_read_path(&file_path) {
+        println!("{{}}");
+        return Ok(());
+    }
+
+    let nudge = READ_HOOK_NUDGE;
+
+    let output = if deny {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": nudge,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": nudge,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": nudge,
+            }
+        })
+    };
+
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
 /// SessionEnd hook — called via `semantex --session-end-hook`.
 ///
 /// Stops the daemon if one is running. No JSON output needed
@@ -320,4 +469,60 @@ pub fn cmd_session_end_hook() -> Result<()> {
         .status(); // wait for completion (fast — socket send)
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_nudge_read_path_true_for_source() {
+        for p in [
+            "src/main.rs",
+            "crates/x/lib.py",
+            "README.md",
+            "docs/design.md",
+            "a/b/Component.tsx",
+        ] {
+            assert!(should_nudge_read_path(p), "expected nudge for {p}");
+        }
+    }
+
+    #[test]
+    fn should_nudge_read_path_false_for_own_output_and_vcs() {
+        for p in [
+            ".semantex/meta.json",
+            "proj/.semantex/chunks.db",
+            ".git/config",
+            "node_modules/x/y.js",
+            "target/debug/foo",
+        ] {
+            assert!(!should_nudge_read_path(p), "expected silent for {p}");
+        }
+    }
+
+    #[test]
+    fn read_hook_nudge_points_at_semantex_agent_tool() {
+        assert!(
+            READ_HOOK_NUDGE.contains("semantex_agent"),
+            "read-hook nudge must point at the semantex_agent MCP tool"
+        );
+        // Keeps the duplicate-re-read framing.
+        assert!(READ_HOOK_NUDGE.contains("duplicate work"));
+    }
+
+    #[test]
+    fn should_nudge_read_path_false_for_lock_and_binary() {
+        for p in [
+            "Cargo.lock",
+            "package-lock.json",
+            "go.sum",
+            "assets/logo.png",
+            "data.bin",
+            "x.wasm",
+            "f.min.js",
+        ] {
+            assert!(!should_nudge_read_path(p), "expected silent for {p}");
+        }
+    }
 }

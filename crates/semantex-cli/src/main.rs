@@ -157,6 +157,10 @@ struct Cli {
     #[arg(long, hide = true)]
     bash_hook: bool,
 
+    /// Internal: Claude Code PreToolUse hook for Read interception
+    #[arg(long, hide = true)]
+    read_hook: bool,
+
     /// Hard-deny mode for hooks: block the tool call instead of just nudging.
     /// Use with --grep-hook or --bash-hook.
     #[arg(long, hide = true)]
@@ -790,6 +794,9 @@ fn main() -> Result<()> {
     }
     if cli.bash_hook {
         return commands::hooks::cmd_bash_hook(cli.deny);
+    }
+    if cli.read_hook {
+        return commands::hooks::cmd_read_hook(cli.deny);
     }
     if cli.uninstall_claude_code {
         return commands::install::uninstall_claude_code();

@@ -74,6 +74,101 @@ fn prompt_scope() -> Result<InstallScope> {
     }
 }
 
+/// The three semantex MCP search tools the agent calls — pre-approved so a fresh
+/// session never gets a per-tool permission prompt for them.
+const SEMANTEX_MCP_TOOLS: [&str; 3] = [
+    "mcp__semantex__semantex_agent",
+    "mcp__semantex__semantex_search",
+    "mcp__semantex__semantex_deep",
+];
+
+/// Build the semantex MCP server config object (matches `plugin/.mcp.json`):
+/// `{"type": "stdio", "command": <binary>, "args": ["mcp"]}`.
+fn semantex_mcp_server(binary: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "stdio",
+        "command": binary,
+        "args": ["mcp"],
+    })
+}
+
+/// Ensure `root["mcpServers"]["semantex"]` is the semantex stdio server config,
+/// creating the `mcpServers` object if absent. Preserves every other key and
+/// every other server. Idempotent.
+fn merge_mcp_server(root: &mut serde_json::Value, binary: &str) {
+    // If root isn't an object (e.g. a fresh `{}` or a corrupted scalar we chose to
+    // proceed on), coerce it to an empty object so we never panic.
+    if !root.is_object() {
+        *root = serde_json::json!({});
+    }
+    let obj = root.as_object_mut().expect("root coerced to object");
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    servers
+        .as_object_mut()
+        .expect("mcpServers coerced to object")
+        .insert("semantex".to_string(), semantex_mcp_server(binary));
+}
+
+/// Ensure `"semantex"` appears in `settings["enabledMcpjsonServers"]` (the exact
+/// Claude Code field that pre-approves a project `.mcp.json` server). Creates the
+/// array if absent; never duplicates; preserves existing entries.
+fn ensure_enabled_mcp(settings: &mut serde_json::Value) {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let obj = settings
+        .as_object_mut()
+        .expect("settings coerced to object");
+    let list = obj
+        .entry("enabledMcpjsonServers")
+        .or_insert_with(|| serde_json::json!([]));
+    if !list.is_array() {
+        *list = serde_json::json!([]);
+    }
+    let arr = list.as_array_mut().expect("enabledMcpjsonServers is array");
+    if !arr.iter().any(|v| v.as_str() == Some("semantex")) {
+        arr.push(serde_json::json!("semantex"));
+    }
+}
+
+/// Ensure the three `mcp__semantex__*` tool entries appear in
+/// `settings["permissions"]["allow"]`, creating the nested `permissions` object
+/// and `allow` array if absent. Never duplicates; preserves existing allow
+/// entries.
+fn ensure_tool_permissions(settings: &mut serde_json::Value) {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let obj = settings
+        .as_object_mut()
+        .expect("settings coerced to object");
+    let perms = obj
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}));
+    if !perms.is_object() {
+        *perms = serde_json::json!({});
+    }
+    let allow = perms
+        .as_object_mut()
+        .expect("permissions coerced to object")
+        .entry("allow")
+        .or_insert_with(|| serde_json::json!([]));
+    if !allow.is_array() {
+        *allow = serde_json::json!([]);
+    }
+    let arr = allow.as_array_mut().expect("allow is array");
+    for tool in SEMANTEX_MCP_TOOLS {
+        if !arr.iter().any(|v| v.as_str() == Some(tool)) {
+            arr.push(serde_json::json!(tool));
+        }
+    }
+}
+
 /// Resolve the settings file path and base claude dir for the given scope.
 /// Returns (claude_dir, settings_path).
 fn scope_paths(scope: &InstallScope) -> Result<(PathBuf, PathBuf)> {
@@ -96,6 +191,170 @@ fn scope_paths(scope: &InstallScope) -> Result<(PathBuf, PathBuf)> {
             Ok((claude_dir, settings))
         }
     }
+}
+
+/// Path to the user's `~/.claude.json` (Claude Code's global config — holds
+/// user/global `mcpServers` and per-project local `mcpServers`).
+fn claude_json_path() -> PathBuf {
+    dirs_home().join(".claude.json")
+}
+
+/// Read + parse `~/.claude.json`.
+///
+/// - Missing file → `Ok(Some(default))` (we create it fresh).
+/// - Present + valid JSON → `Ok(Some(value))`.
+/// - Present + UNPARSEABLE → `Ok(None)` — the caller MUST skip the write and warn;
+///   we never clobber a file we couldn't parse (it's the user's most important
+///   Claude file).
+fn read_claude_json() -> Result<Option<serde_json::Value>> {
+    let path = claude_json_path();
+    if !path.exists() {
+        return Ok(Some(serde_json::json!({})));
+    }
+    let content = std::fs::read_to_string(&path)?;
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Atomically write `value` to `~/.claude.json`, backing up any existing file to
+/// `~/.claude.json.semantex-bak` first. Write goes to a temp file in the same dir
+/// then `rename`s into place (atomic on the same filesystem) so a crash mid-write
+/// can never leave a truncated config.
+fn write_claude_json_atomic(value: &serde_json::Value) -> Result<()> {
+    let path = claude_json_path();
+
+    // Back up an existing file before we touch it.
+    if path.exists() {
+        let backup = dirs_home().join(".claude.json.semantex-bak");
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("backing up {} before write", path.display()))?;
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("json.semantex-tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)
+        .with_context(|| format!("writing temp file {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("atomically renaming into {}", path.display()))?;
+    Ok(())
+}
+
+/// Print the "could not parse ~/.claude.json — skipping" warning + the manual
+/// recovery command, so the user can register the server by hand.
+fn warn_unparseable_claude_json(binary: &str) {
+    let path = claude_json_path();
+    eprintln!(
+        "  {} {} is not valid JSON — leaving it untouched (never clobbering it).",
+        "warning:".yellow().bold(),
+        path.display()
+    );
+    eprintln!(
+        "           Register the server manually with: claude mcp add semantex -- {binary} mcp"
+    );
+}
+
+/// FIX #1 — register + pre-approve the semantex MCP server for the given scope.
+///
+/// Robustness contract for `~/.claude.json` (User/Local scopes): parse-or-skip
+/// (never clobber on a parse error), back up to `.semantex-bak`, atomic rename.
+fn register_mcp_server(
+    scope: &InstallScope,
+    binary: &str,
+    settings: &mut serde_json::Value,
+    settings_path: &Path,
+) -> Result<()> {
+    match scope {
+        InstallScope::Project => {
+            // Project servers live in a repo-root `.mcp.json`. repo_root is the dir
+            // CONTAINING `.claude` — i.e. settings_path's grandparent.
+            let repo_root = settings_path
+                .parent() // .claude
+                .and_then(|p| p.parent()) // repo root
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            let mcp_path = repo_root.join(".mcp.json");
+
+            let mut mcp_json: serde_json::Value = if mcp_path.exists() {
+                let content = std::fs::read_to_string(&mcp_path)?;
+                serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+            } else {
+                serde_json::json!({})
+            };
+            merge_mcp_server(&mut mcp_json, binary);
+            std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp_json)?)?;
+
+            // Pre-approve the project .mcp.json server + the tool calls in settings.json.
+            ensure_enabled_mcp(settings);
+            ensure_tool_permissions(settings);
+
+            eprintln!(
+                "  {} MCP server → {}",
+                "✓".green().bold(),
+                mcp_path.display()
+            );
+        }
+        InstallScope::Local => {
+            // Local servers live under ~/.claude.json projects["<abs repo>"].mcpServers.
+            let repo_root = std::env::current_dir()?;
+            let repo_key = repo_root.to_string_lossy().to_string();
+
+            match read_claude_json()? {
+                Some(mut root) => {
+                    if !root.is_object() {
+                        root = serde_json::json!({});
+                    }
+                    let projects = root
+                        .as_object_mut()
+                        .expect("root is object")
+                        .entry("projects")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if !projects.is_object() {
+                        *projects = serde_json::json!({});
+                    }
+                    let project_entry = projects
+                        .as_object_mut()
+                        .expect("projects is object")
+                        .entry(repo_key)
+                        .or_insert_with(|| serde_json::json!({}));
+                    // Reuse merge_mcp_server on the per-project sub-object.
+                    merge_mcp_server(project_entry, binary);
+                    write_claude_json_atomic(&root)?;
+
+                    // Local project servers in ~/.claude.json are auto-loaded — no
+                    // enabledMcpjsonServers needed. Just pre-approve the tool calls.
+                    ensure_tool_permissions(settings);
+
+                    eprintln!(
+                        "  {} MCP server → {}",
+                        "✓".green().bold(),
+                        claude_json_path().display()
+                    );
+                }
+                None => warn_unparseable_claude_json(binary),
+            }
+        }
+        InstallScope::User => {
+            // User/global servers live in ~/.claude.json TOP-LEVEL mcpServers
+            // (auto-approved — no enabledMcpjsonServers needed).
+            match read_claude_json()? {
+                Some(mut root) => {
+                    merge_mcp_server(&mut root, binary);
+                    write_claude_json_atomic(&root)?;
+                    // Pre-approve the tool calls in ~/.claude/settings.json.
+                    ensure_tool_permissions(settings);
+                    eprintln!(
+                        "  {} MCP server → {}",
+                        "✓".green().bold(),
+                        claude_json_path().display()
+                    );
+                }
+                None => warn_unparseable_claude_json(binary),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Install semantex hooks + skill into Claude Code.
@@ -126,7 +385,8 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
 
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
 
-    // PreToolUse hooks — nudge Grep/Glob and Bash search commands toward semantex
+    // PreToolUse hooks — nudge Grep/Glob, Bash search commands, and native Read
+    // (the Bash hook can't see a file read through the native Read tool) toward semantex
     hooks_obj.insert(
         "PreToolUse".to_string(),
         serde_json::json!([
@@ -143,6 +403,14 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
                 "hooks": [{
                     "type": "command",
                     "command": format!("{binary} --bash-hook"),
+                    "timeout": 5,
+                }]
+            },
+            {
+                "matcher": "Read",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{binary} --read-hook"),
                     "timeout": 5,
                 }]
             }
@@ -196,6 +464,12 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
             }]
         }]),
     );
+
+    // --- 1b. FIX #1: register + pre-approve the semantex MCP server ---
+    // This mutates `settings` (adds enabledMcpjsonServers / permissions.allow) and
+    // writes the MCP server config to its scope-appropriate location, so it must run
+    // BEFORE we persist settings.json below.
+    register_mcp_server(&scope, binary, &mut settings, &settings_path)?;
 
     std::fs::create_dir_all(settings_path.parent().expect("settings path has parent"))?;
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
@@ -370,4 +644,135 @@ pub fn uninstall_all() -> Result<()> {
     uninstall_claude_code()?;
     eprintln!("Removed all semantex hook registrations.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_mcp_server_adds_preserving_other_servers() {
+        // Pre-existing config with an unrelated server and an unrelated top-level key.
+        let mut root = json!({
+            "mcpServers": {
+                "other": { "type": "stdio", "command": "other-bin", "args": [] }
+            },
+            "someTopLevelKey": 42
+        });
+
+        merge_mcp_server(&mut root, "semantex");
+
+        let servers = root.get("mcpServers").and_then(|v| v.as_object()).unwrap();
+        // semantex added with the expected shape.
+        assert_eq!(
+            servers.get("semantex").unwrap(),
+            &json!({ "type": "stdio", "command": "semantex", "args": ["mcp"] })
+        );
+        // The other server is preserved untouched.
+        assert_eq!(
+            servers.get("other").unwrap(),
+            &json!({ "type": "stdio", "command": "other-bin", "args": [] })
+        );
+        // Unrelated top-level key preserved.
+        assert_eq!(root.get("someTopLevelKey").unwrap(), &json!(42));
+    }
+
+    #[test]
+    fn merge_mcp_server_creates_servers_object_when_absent() {
+        let mut root = json!({ "projects": {} });
+        merge_mcp_server(&mut root, "/abs/semantex");
+        assert_eq!(
+            root["mcpServers"]["semantex"],
+            json!({ "type": "stdio", "command": "/abs/semantex", "args": ["mcp"] })
+        );
+        // Untouched sibling preserved.
+        assert_eq!(root["projects"], json!({}));
+    }
+
+    #[test]
+    fn merge_mcp_server_is_idempotent() {
+        let mut root = json!({});
+        merge_mcp_server(&mut root, "semantex");
+        let after_first = root.clone();
+        merge_mcp_server(&mut root, "semantex");
+        // Re-running produces no change (single semantex entry, identical value).
+        assert_eq!(root, after_first);
+        assert_eq!(root["mcpServers"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ensure_enabled_mcp_adds_when_absent() {
+        let mut settings = json!({});
+        ensure_enabled_mcp(&mut settings);
+        assert_eq!(settings["enabledMcpjsonServers"], json!(["semantex"]));
+    }
+
+    #[test]
+    fn ensure_enabled_mcp_no_dup_and_preserves_existing() {
+        let mut settings = json!({ "enabledMcpjsonServers": ["existing-server"] });
+        ensure_enabled_mcp(&mut settings);
+        // existing-server preserved, semantex appended once.
+        assert_eq!(
+            settings["enabledMcpjsonServers"],
+            json!(["existing-server", "semantex"])
+        );
+        // Idempotent: re-running does not duplicate.
+        ensure_enabled_mcp(&mut settings);
+        assert_eq!(
+            settings["enabledMcpjsonServers"],
+            json!(["existing-server", "semantex"])
+        );
+    }
+
+    #[test]
+    fn ensure_tool_permissions_creates_allow_with_three_tools() {
+        let mut settings = json!({});
+        ensure_tool_permissions(&mut settings);
+        let allow = settings["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 3);
+        for tool in SEMANTEX_MCP_TOOLS {
+            assert!(
+                allow.iter().any(|v| v.as_str() == Some(tool)),
+                "missing {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_tool_permissions_merges_into_existing_allow_without_loss_or_dup() {
+        let mut settings = json!({
+            "permissions": {
+                "allow": ["Bash(ls:*)", "mcp__semantex__semantex_agent"],
+                "deny": ["Bash(rm:*)"]
+            }
+        });
+        ensure_tool_permissions(&mut settings);
+        let allow = settings["permissions"]["allow"].as_array().unwrap();
+        // Existing non-semantex entry preserved.
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(ls:*)")));
+        // The pre-existing semantex_agent entry is not duplicated.
+        assert_eq!(
+            allow
+                .iter()
+                .filter(|v| v.as_str() == Some("mcp__semantex__semantex_agent"))
+                .count(),
+            1
+        );
+        // All three tools now present.
+        for tool in SEMANTEX_MCP_TOOLS {
+            assert!(
+                allow.iter().any(|v| v.as_str() == Some(tool)),
+                "missing {tool}"
+            );
+        }
+        // Total = 1 existing (Bash) + 3 semantex (one was already there) = 4.
+        assert_eq!(allow.len(), 4);
+        // Sibling `deny` key untouched.
+        assert_eq!(settings["permissions"]["deny"], json!(["Bash(rm:*)"]));
+        // Idempotent.
+        let snapshot = settings.clone();
+        ensure_tool_permissions(&mut settings);
+        assert_eq!(settings, snapshot);
+    }
 }
