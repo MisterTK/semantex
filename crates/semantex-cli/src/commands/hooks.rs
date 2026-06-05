@@ -15,6 +15,16 @@ use semantex_core::index::state::{self, IndexState};
 use std::path::PathBuf;
 use std::process::Stdio;
 
+/// Read-hook nudge text — points the agent at the `semantex_agent` MCP tool and
+/// keeps the duplicate-re-read framing. Extracted as a const so tests can assert
+/// it references `semantex_agent` without touching control flow.
+const READ_HOOK_NUDGE: &str = concat!(
+    "Use the `semantex_agent` tool (semantic code search) instead of Read for exploring code — ",
+    "one call returns a complete answer with file:line + code; it covers regex and file-glob too. ",
+    "You may already have this file's content from a prior `semantex_agent` result; ",
+    "re-reading is duplicate work.",
+);
+
 /// Check if a semantex index directory (`.semantex/meta.json`) exists for the current
 /// directory or any parent. Returns the `.semantex` directory path if found.
 fn find_index_dir() -> Option<PathBuf> {
@@ -100,10 +110,10 @@ pub fn cmd_session_hook() -> Result<()> {
 
     let additional_context = format!(
         "semantex semantic code search is available (index: {}).\n\
-         - `semantex --deep \"question\"` — one call, complete answer. Use for how/why/connect questions. Trust the answer, skip follow-up Reads.\n\
-         - `semantex --refs \"query\"` — compact refs for simple lookups (find definition, list references).\n\
-         - `semantex --grep \"literal\"` — exact match.\n\
-         Fallback: Grep for regex patterns, Glob for file names.",
+         Use the `semantex_agent` tool (semantic code search) instead of Grep/Glob/Read — one call \
+         returns a complete answer with file:line + code; it covers regex and file-glob too. \
+         Trust the result and skip follow-up Reads.\n\
+         Fallback: Grep/Glob only if the `semantex_agent` tool is unavailable.",
         index_dir.display()
     );
 
@@ -131,10 +141,9 @@ pub fn cmd_grep_hook(deny: bool) -> Result<()> {
     }
 
     let nudge = concat!(
-        "STOP: Use semantex via Bash instead of Grep/Glob — semantex finds code by meaning.\n",
-        "- Complex questions (how/why/explain): `semantex --deep \"question\"` — one call replaces 5-10 grep+read iterations. Use the answer directly.\n",
-        "- Find references: `semantex --refs \"query\"` or `semantex --refs -e \"pattern\" \"query\"`\n",
-        "- Exact string: `semantex --grep \"literal\"`",
+        "Use the `semantex_agent` tool (semantic code search) instead of Grep/Glob — ",
+        "one call returns a complete answer with file:line + code; it covers regex and ",
+        "file-glob too. Use the result directly instead of running follow-up searches.",
     );
 
     let output = if deny {
@@ -178,13 +187,11 @@ pub fn cmd_subagent_hook() -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": "SubagentStart",
             "additionalContext": concat!(
-                "IMPORTANT: semantex (semantic code search) is available. Use it via Bash instead of Grep/Glob.\n\n",
-                "Start with semantex for EVERY code search:\n",
-                "- How/why/explain questions → `semantex --deep \"question\"` — one call, complete answer. Use it directly, no follow-up Reads.\n",
-                "- Find/where/what questions → `semantex --refs \"query\"`\n",
-                "- Exact string → `semantex --grep \"literal\"`\n",
-                "- Regex + semantic → `semantex --refs -e \"regex\" \"query\"`\n\n",
-                "Fall back to Grep ONLY for regex patterns, Glob ONLY for file name patterns.",
+                "IMPORTANT: the `semantex_agent` tool (semantic code search) is available. ",
+                "Use it instead of Grep/Glob/Read for EVERY code search — one call returns a ",
+                "complete answer with file:line + code, and it covers regex and file-glob too. ",
+                "Use the result directly, no follow-up Reads.\n\n",
+                "Fall back to Grep/Glob only if the `semantex_agent` tool is unavailable.",
             ),
         }
     });
@@ -226,8 +233,9 @@ pub fn cmd_bash_hook(deny: bool) -> Result<()> {
     }
 
     let nudge = concat!(
-        "Use `semantex --refs \"query\"` or `semantex --grep \"literal\"` instead of grep/rg/find. ",
-        "Use `semantex --deep \"question\"` for complex questions.",
+        "Use the `semantex_agent` tool (semantic code search) instead of grep/rg/find — ",
+        "one call returns a complete answer with file:line + code; it covers regex and ",
+        "file-glob too. Use the result directly instead of running follow-up searches.",
     );
 
     let output = if deny {
@@ -415,13 +423,7 @@ pub fn cmd_read_hook(deny: bool) -> Result<()> {
         return Ok(());
     }
 
-    let nudge = concat!(
-        "semantex semantic code search is available for this project. ",
-        "If you're reading this file to explore or understand code, prefer semantex — ",
-        "you may already have its relevant content from a prior `semantex --deep`/`semantex_agent` result. ",
-        "For a question: `semantex --deep \"question\"` (one call, complete answer). ",
-        "For a definition or references: `semantex --refs \"query\"`.",
-    );
+    let nudge = READ_HOOK_NUDGE;
 
     let output = if deny {
         serde_json::json!({
@@ -497,6 +499,16 @@ mod tests {
         ] {
             assert!(!should_nudge_read_path(p), "expected silent for {p}");
         }
+    }
+
+    #[test]
+    fn read_hook_nudge_points_at_semantex_agent_tool() {
+        assert!(
+            READ_HOOK_NUDGE.contains("semantex_agent"),
+            "read-hook nudge must point at the semantex_agent MCP tool"
+        );
+        // Keeps the duplicate-re-read framing.
+        assert!(READ_HOOK_NUDGE.contains("duplicate work"));
     }
 
     #[test]
