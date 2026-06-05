@@ -39,6 +39,14 @@ fn llm_classify_timeout() -> std::time::Duration {
 /// (god_nodes section only, no communities, no boundaries). Per spec §4 Item 4.
 const ARCH_TINY_REPO_THRESHOLD: u64 = 500;
 
+/// Minimum corpus size (chunk count) at or above which the enumeration fan-out
+/// bypasses adaptive sizing for its facet searches (full breadth). Below this,
+/// facet searches keep normal adaptive sizing so small repos stay focused and
+/// don't surface low-signal files (CHANGELOG, CODE_OF_CONDUCT, …). Measured
+/// separator: gin 2230 / flask 1616 (small) vs platform 7809 / CopilotKit 21705
+/// (large). Overridable via `SEMANTEX_FANOUT_BREADTH_MIN_CHUNKS`.
+const FANOUT_BREADTH_MIN_CHUNKS: u64 = 5000;
+
 /// Result from an individual handler method.
 pub(crate) struct HandlerResult {
     formatted: String,
@@ -577,7 +585,89 @@ impl<'a> AgentPipeline<'a> {
     }
 
     fn handle_exhaustive(&self, query: &str, budget: usize) -> HandlerResult {
-        self.handle_search(query, budget, SearchVariant::Exhaustive)
+        // OFF by default: byte-identical to the original exhaustive handler.
+        if !exhaustive_fanout_enabled() {
+            return self.handle_search(query, budget, SearchVariant::Exhaustive);
+        }
+        self.handle_exhaustive_fanout(query, budget)
+    }
+
+    /// Enumeration fan-out for the exhaustive route (gated behind
+    /// `SEMANTEX_EXHAUSTIVE_FANOUT`). Decomposes an enumeration query into
+    /// per-item facets, runs a hybrid search per facet, then unions + dedups +
+    /// diversifies the hits so the answer covers the whole repo instead of
+    /// clustering on one subsystem. Falls back to the plain exhaustive search
+    /// when there is nothing to fan out (single facet) or the fan-out yields
+    /// no hits.
+    fn handle_exhaustive_fanout(&self, query: &str, budget: usize) -> HandlerResult {
+        let facets = enumeration_facets(query);
+        // Nothing to fan out — single concept (or no enumeration marker).
+        if facets.len() <= 1 {
+            return self.handle_search(query, budget, SearchVariant::Exhaustive);
+        }
+
+        // Corpus-size gate for the breadth bypass (mirrors the
+        // `handle_architecture` chunk_count precedent). LARGE corpora: bypass
+        // adaptive sizing so facet queries ("environment variables") — which
+        // don't read as exhaustive — aren't clipped, giving full repo coverage.
+        // SMALL corpora: keep normal adaptive sizing so the route stays focused
+        // and doesn't surface low-signal files (CHANGELOG, CODE_OF_CONDUCT, …).
+        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
+        let full_breadth = fanout_full_breadth(chunk_count, fanout_breadth_threshold());
+
+        // Run one hybrid search per facet (match Exhaustive: max 20, no
+        // code_only). Skip facets whose search errors — never abort the route.
+        let mut all_facet_results: Vec<Vec<crate::types::SearchResult>> = Vec::new();
+        for facet in &facets {
+            let base = SearchQuery::new(facet).max_results(20);
+            let sq = if full_breadth {
+                base.disable_adaptive()
+            } else {
+                base
+            };
+            if let Ok(output) = self.searcher.search(&sq) {
+                all_facet_results.push(output.results);
+            }
+        }
+
+        let merged = union_diversify(all_facet_results, 3, 40);
+        // No coverage from the fan-out — fall back to the plain exhaustive path.
+        if merged.is_empty() {
+            return self.handle_search(query, budget, SearchVariant::Exhaustive);
+        }
+
+        // Success path: mirror `handle_search`'s standard search-results format,
+        // with metrics zeroed (fused_count reflects the diversified union).
+        let effective_budget = budget * SearchVariant::Exhaustive.budget_multiplier();
+        let items: Vec<SearchResultItem> = merged
+            .iter()
+            .map(|r| search_result_to_item(r, true))
+            .collect();
+        let disambig = disambiguation_from_results(&merged);
+        let confidence = compute_confidence(&items);
+        let count = items.len();
+        let hits = items.clone();
+        let resp = SearchResponse {
+            results: items,
+            duration_ms: 0,
+            dense_count: 0,
+            sparse_count: 0,
+            fused_count: merged.len(),
+            metrics: None,
+            confidence: Some(confidence),
+            disambiguation: disambig.clone(),
+        };
+        let mut formatted = format_search_results(&resp, FormatStyle::Default, effective_budget);
+        if let Some(suggestions) = &disambig {
+            append_disambiguation_block(&mut formatted, suggestions);
+        }
+        HandlerResult {
+            formatted,
+            fallback_used: false,
+            result_count: count,
+            hits,
+            disambiguation: disambig,
+        }
     }
 
     /// Consolidated handler for the three "list-route" variants that differ only
@@ -1116,6 +1206,281 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
     }
 }
 
+/// Syntactically decompose an enumeration question ("list all X, Y, and Z")
+/// into per-item facets so the caller can fan out narrow searches that won't
+/// cluster on a single subsystem. Pure string surgery — no semantics, no
+/// model. The full original `query` is always included as the final facet so
+/// the holistic view (and single-concept enumerations) stay covered.
+///
+/// Returns content fragments first, then the original query. If nothing
+/// survives decomposition, returns just `[query]`.
+// Consumed by the enumeration fan-out in `handle_exhaustive`.
+fn enumeration_facets(query: &str) -> Vec<String> {
+    // Sentinel substituted for every multi-char split delimiter, so we can
+    // split once without re-splitting on bare "," inside the multi-char forms.
+    const SENTINEL: &str = "\u{0}";
+    /// Universal stopwords — a fragment composed entirely of these (after
+    /// stripping non-alphanumerics) carries no retrieval signal and is dropped.
+    const STOP: &[&str] = &[
+        "the",
+        "a",
+        "an",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "they",
+        "them",
+        "their",
+        "there",
+        "where",
+        "when",
+        "what",
+        "which",
+        "who",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "does",
+        "do",
+        "did",
+        "done",
+        "project",
+        "repo",
+        "repository",
+        "codebase",
+        "supports",
+        "supported",
+        "support",
+        "defined",
+        "define",
+        "defines",
+        "exist",
+        "exists",
+        "existing",
+        "used",
+        "use",
+        "uses",
+        "using",
+        "in",
+        "on",
+        "of",
+        "for",
+        "to",
+        "and",
+        "or",
+        "all",
+        "every",
+        "any",
+        "each",
+        "with",
+        "that's",
+        "here",
+    ];
+
+    // 1. Strip a leading enumeration marker. ALL detection + slicing happens on
+    //    the lowercased copy `lower`, so every byte offset indexes the SAME
+    //    string it was computed from — `to_lowercase()` is not byte-length-
+    //    preserving (e.g. `İ` U+0130 grows 2→3 bytes), so slicing `query` with a
+    //    `lower` offset would land mid-codepoint and panic. Content facets are
+    //    therefore lowercased; that is fine (facets are case-insensitive search
+    //    queries). The original-case query is re-appended verbatim in step 5.
+    //    Use the marker that appears earliest in the string.
+    const MARKERS: &[&str] = &[
+        "list all",
+        "list every",
+        "find all",
+        "find every",
+        "show all",
+        "show every",
+        "what are all",
+        "where are all",
+        "enumerate all",
+        "enumerate every",
+        "enumerate ",
+    ];
+    let lower = query.to_lowercase();
+    let mut best: Option<(usize, usize)> = None; // (start, marker_len)
+    for m in MARKERS {
+        if let Some(pos) = lower.find(m) {
+            match best {
+                Some((bp, _)) if pos >= bp => {}
+                _ => best = Some((pos, m.len())),
+            }
+        }
+    }
+    let remainder: &str = match best {
+        Some((pos, len)) => &lower[pos + len..],
+        None => &lower,
+    };
+
+    // 2. Split the remainder into fragments on commas / semicolons / standalone
+    //    " and " / " or ". Replace the multi-char (and comma+and) delimiters
+    //    with a sentinel first so "android"/"category" are never split.
+    let mut work = remainder.to_string();
+    for delim in [", and ", ", or ", " and ", " or ", "; ", ", ", ";", ","] {
+        work = work.replace(delim, SENTINEL);
+    }
+
+    let mut fragments: Vec<String> = Vec::new();
+    for raw in work.split(SENTINEL) {
+        // Normalize: strip a leading "and "/"or " left over from edge splits.
+        // `frag` is a slice of `lower` (already lowercased), so we strip the
+        // lowercase prefixes directly off it — no cross-string byte offsets,
+        // hence no char-boundary panic.
+        let mut frag = raw.trim();
+        if let Some(rest) = frag.strip_prefix("and ") {
+            frag = rest;
+        } else if let Some(rest) = frag.strip_prefix("or ") {
+            frag = rest;
+        }
+        // 3. Trim whitespace + trailing '.'.
+        let frag = frag.trim().trim_end_matches('.').trim();
+        if frag.len() < 3 {
+            continue;
+        }
+        // Drop if every word (lowercased, alnum-only) is a stopword.
+        let all_stop = frag.split_whitespace().all(|w| {
+            let cleaned: String = w
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            cleaned.is_empty() || STOP.contains(&cleaned.as_str())
+        });
+        if all_stop {
+            continue;
+        }
+        fragments.push(frag.to_string());
+    }
+
+    // 4. Lowercase-dedup (preserve first-seen original case); cap at 6.
+    let mut facets: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for frag in fragments {
+        let key = frag.to_lowercase();
+        if seen.insert(key) {
+            facets.push(frag);
+            if facets.len() == 6 {
+                break;
+            }
+        }
+    }
+
+    // 5. Always include the full original query, unless already present.
+    let query_lower = query.to_lowercase();
+    if !facets.iter().any(|f| f.to_lowercase() == query_lower) {
+        facets.push(query.to_string());
+    }
+
+    // 6. If the only facet is the original query, return just that.
+    if facets.len() == 1 {
+        return vec![query.to_string()];
+    }
+    facets
+}
+
+/// Union + dedup + diversify the per-facet result lists from the enumeration
+/// fan-out into a single ranked Vec.
+///
+/// Pure (no I/O, no model): given the per-facet hit lists, it (1) flattens and
+/// dedups by `(file_path, start_line)` — the same identity `search_result_to_item`
+/// keys each item on — keeping the higher `.score` on a collision; (2) sorts by
+/// score descending (tie-break by file then start_line for determinism); then
+/// (3) greedily admits results while that file's running count is `< per_file_cap`,
+/// stopping at `total_cap`. The per-file cap spreads coverage across files so an
+/// enumeration question covers the whole repo instead of clustering on one
+/// subsystem.
+fn union_diversify(
+    result_lists: Vec<Vec<crate::types::SearchResult>>,
+    per_file_cap: usize,
+    total_cap: usize,
+) -> Vec<crate::types::SearchResult> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // 1. Flatten + dedup by (file, start_line), keeping the higher score.
+    let mut best: HashMap<(PathBuf, u32), crate::types::SearchResult> = HashMap::new();
+    for list in result_lists {
+        for r in list {
+            let key = (r.chunk.file_path.clone(), r.chunk.start_line);
+            match best.get(&key) {
+                Some(existing) if existing.score >= r.score => {}
+                _ => {
+                    best.insert(key, r);
+                }
+            }
+        }
+    }
+
+    // 2. Sort by score desc; deterministic tie-break by (file, start_line).
+    let mut deduped: Vec<crate::types::SearchResult> = best.into_values().collect();
+    deduped.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.file_path.cmp(&b.chunk.file_path))
+            .then_with(|| a.chunk.start_line.cmp(&b.chunk.start_line))
+    });
+
+    // 3. Greedily admit while per-file count < cap, until total_cap.
+    let mut per_file: HashMap<PathBuf, usize> = HashMap::new();
+    let mut admitted: Vec<crate::types::SearchResult> =
+        Vec::with_capacity(total_cap.min(deduped.len()));
+    for r in deduped {
+        if admitted.len() >= total_cap {
+            break;
+        }
+        let count = per_file.entry(r.chunk.file_path.clone()).or_insert(0);
+        if *count >= per_file_cap {
+            continue;
+        }
+        *count += 1;
+        admitted.push(r);
+    }
+    admitted
+}
+
+/// Pure parser for the `SEMANTEX_EXHAUSTIVE_FANOUT` flag, factored out so the
+/// default-ON contract is unit-testable without touching process env. ON by
+/// default (the corpus gate in `handle_exhaustive_fanout` makes it safe); only
+/// an explicit `"0"` or (case-insensitively) `"false"` disables it.
+fn fanout_flag_from(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        None => true,
+    }
+}
+
+/// Whether the exhaustive-route facet fan-out is enabled. Gated behind
+/// `SEMANTEX_EXHAUSTIVE_FANOUT`; ON by default. Disable with
+/// `SEMANTEX_EXHAUSTIVE_FANOUT=0`.
+fn exhaustive_fanout_enabled() -> bool {
+    fanout_flag_from(std::env::var("SEMANTEX_EXHAUSTIVE_FANOUT").ok().as_deref())
+}
+
+/// Pure corpus-size gate for the fan-out's breadth bypass: a facet search
+/// disables adaptive sizing (keeps full breadth) only when the corpus is large
+/// enough that an enumeration genuinely spans many files. Small corpora keep
+/// normal adaptive sizing so they stay focused.
+fn fanout_full_breadth(chunk_count: u64, threshold: u64) -> bool {
+    chunk_count >= threshold
+}
+
+/// Resolve the breadth threshold: `SEMANTEX_FANOUT_BREADTH_MIN_CHUNKS` if it
+/// parses as a `u64`, else the built-in `FANOUT_BREADTH_MIN_CHUNKS`.
+fn fanout_breadth_threshold() -> u64 {
+    std::env::var("SEMANTEX_FANOUT_BREADTH_MIN_CHUNKS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(FANOUT_BREADTH_MIN_CHUNKS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1224,6 +1589,37 @@ mod tests {
             "Semantic route must surface structured hits"
         );
         assert!(hits.iter().all(|h| !h.file.is_empty()));
+    }
+
+    /// Integration: a query with `.disable_adaptive()` returns at least as many
+    /// results as the same query without it, driven through the real
+    /// `HybridSearcher.search()` adaptive stage. Skipping the adaptive pipeline
+    /// can only widen (never narrow) the result set — the fan-out relies on this
+    /// to keep full breadth. Best-effort: the fixture is small (2 chunks), so
+    /// this guards the wiring and the monotonic-breadth contract rather than a
+    /// large clip.
+    #[test]
+    fn disable_adaptive_returns_at_least_as_many_results() {
+        let (_dir, searcher) = build_populated_searcher();
+
+        let base = searcher
+            .search(&SearchQuery::new("authentication").max_results(20))
+            .expect("base search");
+        let wide = searcher
+            .search(
+                &SearchQuery::new("authentication")
+                    .max_results(20)
+                    .disable_adaptive(),
+            )
+            .expect("disable_adaptive search");
+
+        assert!(
+            wide.results.len() >= base.results.len(),
+            "disable_adaptive must not return fewer results than adaptive \
+             (wide={}, base={})",
+            wide.results.len(),
+            base.results.len()
+        );
     }
 
     /// Route-stress seam (daemon path): the `Request::AgentHits` handler must
@@ -1476,6 +1872,248 @@ mod tests {
             "Semantic must emit [route: semantic] header, got: {}",
             &resp.formatted[..resp.formatted.len().min(80)]
         );
+    }
+
+    // --- enumeration_facets: syntactic decomposition of "list all X, Y, Z" --
+
+    #[test]
+    fn enumeration_facets_splits_multi_item() {
+        let q = "List all configuration options, environment variables, and CLI flags this project supports and where they are defined.";
+        let facets = enumeration_facets(q);
+        assert!(
+            facets
+                .iter()
+                .any(|f| f.to_lowercase().contains("configuration options")),
+            "missing 'configuration options' facet: {facets:?}"
+        );
+        assert!(
+            facets
+                .iter()
+                .any(|f| f.to_lowercase().contains("environment variables")),
+            "missing 'environment variables' facet: {facets:?}"
+        );
+        assert!(
+            facets
+                .iter()
+                .any(|f| f.to_lowercase().contains("cli flags")),
+            "missing 'cli flags' facet: {facets:?}"
+        );
+        assert!(
+            facets.iter().any(|f| f == q),
+            "missing exact original query facet: {facets:?}"
+        );
+    }
+
+    #[test]
+    fn enumeration_facets_drops_stopword_fragments() {
+        let q = "List all configuration options, environment variables, and CLI flags this project supports and where they are defined.";
+        let facets = enumeration_facets(q);
+        assert!(
+            !facets
+                .iter()
+                .any(|f| f.trim().to_lowercase() == "where they are defined"),
+            "all-stopword fragment was not dropped: {facets:?}"
+        );
+    }
+
+    #[test]
+    fn enumeration_facets_single_concept_passthrough() {
+        let q = "list all environment variables";
+        let facets = enumeration_facets(q);
+        assert!(facets.len() <= 2, "too many facets: {facets:?}");
+        assert!(
+            facets
+                .iter()
+                .all(|f| f.to_lowercase().contains("environment variables")),
+            "junk fragment present: {facets:?}"
+        );
+    }
+
+    #[test]
+    fn enumeration_facets_caps() {
+        let q = "find all a1, b2, c3, d4, e5, f6, g7, h8";
+        let facets = enumeration_facets(q);
+        assert!(facets.len() <= 7, "facets not capped: {facets:?}");
+    }
+
+    #[test]
+    fn enumeration_facets_no_marker_returns_query() {
+        let q = "how does auth work";
+        let facets = enumeration_facets(q);
+        assert_eq!(facets, vec!["how does auth work".to_string()]);
+    }
+
+    #[test]
+    fn enumeration_facets_unicode_no_panic() {
+        // Regression: byte offsets were computed on `query.to_lowercase()` but
+        // used to slice `query`. `to_lowercase()` is NOT byte-length-preserving
+        // (e.g. `İ` U+0130 grows 2→3 bytes), so the offsets drifted onto a
+        // non-char-boundary and the slice panicked. Default-on fan-out + an
+        // inline daemon agent path means that panic crashed the whole daemon.
+        // Must not panic, and must return a non-empty Vec.
+        let f1 = enumeration_facets("İlist allé, foo");
+        assert!(!f1.is_empty(), "unicode marker query produced empty facets");
+
+        let f2 = enumeration_facets("list all café options, naïve config");
+        assert!(
+            !f2.is_empty(),
+            "unicode multi-item query produced empty facets"
+        );
+    }
+
+    // --- exhaustive fan-out: union_diversify + gate -----------------------
+
+    /// Minimal `SearchResult` builder for fan-out union/diversify tests.
+    /// Identity is keyed on `(file_path, start_line)` — the SAME pair that
+    /// `search_result_to_item` reads — so dedup tests exercise the real key.
+    fn mk_result(file: &str, line: u32, score: f32) -> crate::types::SearchResult {
+        crate::types::SearchResult {
+            chunk: Chunk {
+                id: 0,
+                file_path: std::path::PathBuf::from(file),
+                start_line: line,
+                end_line: line + 10,
+                content: format!("// {file}:{line}"),
+                chunk_type: ChunkType::AstNode {
+                    name: format!("sym_{line}"),
+                    kind: AstNodeKind::Function,
+                    language: "rust".into(),
+                    structured_meta: None,
+                },
+            },
+            score,
+            source: crate::types::SearchSource::Hybrid,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
+            confidence: crate::types::Confidence::Inferred,
+            confidence_score: 0.5,
+        }
+    }
+
+    #[test]
+    fn union_diversify_dedups_by_file_line_keeping_higher_score() {
+        // Same (file, line) appears in two lists at different scores: keep the
+        // higher score; output sorted by score descending.
+        let list_a = vec![mk_result("a.rs", 10, 0.50), mk_result("b.rs", 20, 0.90)];
+        let list_b = vec![mk_result("a.rs", 10, 0.80), mk_result("c.rs", 30, 0.70)];
+        let merged = union_diversify(vec![list_a, list_b], 3, 40);
+
+        // Dedup: (a.rs,10) appears once, with the HIGHER score 0.80.
+        let a10: Vec<&crate::types::SearchResult> = merged
+            .iter()
+            .filter(|r| {
+                r.chunk.file_path == std::path::Path::new("a.rs") && r.chunk.start_line == 10
+            })
+            .collect();
+        assert_eq!(
+            a10.len(),
+            1,
+            "duplicate (file,line) not deduped: {merged:?}"
+        );
+        assert!(
+            (a10[0].score - 0.80).abs() < 1e-6,
+            "dedup must keep higher score, got {}",
+            a10[0].score
+        );
+
+        // Three distinct keys survive.
+        assert_eq!(merged.len(), 3, "expected 3 unique results: {merged:?}");
+
+        // Sorted by score descending: 0.90 (b), 0.80 (a), 0.70 (c).
+        let scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
+        assert!(
+            scores.windows(2).all(|w| w[0] >= w[1]),
+            "results not sorted by score desc: {scores:?}"
+        );
+        assert!((scores[0] - 0.90).abs() < 1e-6);
+        assert!((scores[1] - 0.80).abs() < 1e-6);
+        assert!((scores[2] - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn union_diversify_caps_per_file() {
+        // Six results, all from the SAME file but distinct lines: no more than
+        // per_file_cap (= 2) may survive for that file.
+        let list = vec![
+            mk_result("same.rs", 1, 0.99),
+            mk_result("same.rs", 2, 0.98),
+            mk_result("same.rs", 3, 0.97),
+            mk_result("same.rs", 4, 0.96),
+            mk_result("same.rs", 5, 0.95),
+            mk_result("same.rs", 6, 0.94),
+        ];
+        let merged = union_diversify(vec![list], 2, 40);
+        let from_same = merged
+            .iter()
+            .filter(|r| r.chunk.file_path == std::path::Path::new("same.rs"))
+            .count();
+        assert_eq!(from_same, 2, "per_file_cap not enforced: {merged:?}");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn union_diversify_caps_total() {
+        // 30 results across 30 distinct files: total_cap (= 5) bounds output.
+        let list: Vec<crate::types::SearchResult> = (0..30)
+            .map(|i| mk_result(&format!("f{i}.rs"), 1, 1.0 - (i as f32) * 0.01))
+            .collect();
+        let merged = union_diversify(vec![list], 3, 5);
+        assert!(
+            merged.len() <= 5,
+            "total_cap not enforced: {} > 5",
+            merged.len()
+        );
+        assert_eq!(merged.len(), 5);
+    }
+
+    #[test]
+    fn fanout_full_breadth_gates_on_corpus_size() {
+        // Small corpora (gin 2230, flask 1616) keep normal adaptive sizing →
+        // false; large corpora (platform 7809, CopilotKit 21705) get full
+        // breadth → true. Boundary is inclusive (>= threshold).
+        assert!(
+            !fanout_full_breadth(2230, 5000),
+            "gin (2230) is small → no breadth bypass"
+        );
+        assert!(
+            !fanout_full_breadth(1616, 5000),
+            "flask (1616) is small → no breadth bypass"
+        );
+        assert!(
+            fanout_full_breadth(7809, 5000),
+            "platform (7809) is large → full breadth"
+        );
+        assert!(
+            fanout_full_breadth(21705, 5000),
+            "CopilotKit (21705) is large → full breadth"
+        );
+        // Boundary: exactly at threshold counts as large (>=).
+        assert!(
+            fanout_full_breadth(5000, 5000),
+            "exactly at threshold (>=) → full breadth"
+        );
+        assert!(
+            !fanout_full_breadth(4999, 5000),
+            "just below threshold → no breadth bypass"
+        );
+    }
+
+    #[test]
+    fn exhaustive_fanout_enabled_by_default() {
+        // The corpus gate makes fan-out safe, so the shipped default is now ON.
+        // Only an explicit "0"/"false" (case-insensitive) disables it.
+        assert!(
+            fanout_flag_from(None),
+            "unset must be ON (shipped default is now on)"
+        );
+        assert!(fanout_flag_from(Some("")), "empty must be ON (default)");
+        assert!(fanout_flag_from(Some("1")), "\"1\" must be ON");
+        assert!(fanout_flag_from(Some("true")), "\"true\" must be ON");
+        // Explicit opt-out.
+        assert!(!fanout_flag_from(Some("0")), "\"0\" must be OFF");
+        assert!(!fanout_flag_from(Some("false")), "\"false\" must be OFF");
+        assert!(!fanout_flag_from(Some("FALSE")), "\"FALSE\" must be OFF");
     }
 }
 

@@ -91,6 +91,10 @@ pub struct SearchQuery {
     pub grep_mode: bool,
     /// Optional regex pattern for hybrid regex+semantic mode (-e flag).
     pub regex_pattern: Option<String>,
+    /// Skip adaptive result sizing for this query (keep full breadth).
+    /// Used by the enumeration fan-out where clipping defeats the purpose.
+    /// Defaults to `false` — normal queries get adaptive sizing as before.
+    pub disable_adaptive: bool,
 }
 
 impl SearchQuery {
@@ -104,11 +108,19 @@ impl SearchQuery {
             file_filter: None,
             grep_mode: false,
             regex_pattern: None,
+            disable_adaptive: false,
         }
     }
 
     pub fn max_results(mut self, n: usize) -> Self {
         self.max_results = n;
+        self
+    }
+
+    /// Skip adaptive result sizing for this query (keep full breadth).
+    /// Used by the enumeration fan-out where clipping defeats the purpose.
+    pub fn disable_adaptive(mut self) -> Self {
+        self.disable_adaptive = true;
         self
     }
 
@@ -169,4 +181,29 @@ impl SearchQuery {
 /// Trait for search backends
 pub trait Searcher: Send + Sync {
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>>;
+}
+
+#[cfg(test)]
+mod query_builder_tests {
+    use super::SearchQuery;
+
+    #[test]
+    fn disable_adaptive_defaults_to_false() {
+        // The normal `new()` path keeps adaptive sizing on — the default must
+        // not change behaviour for any existing query.
+        let q = SearchQuery::new("x");
+        assert!(
+            !q.disable_adaptive,
+            "disable_adaptive must default to false"
+        );
+    }
+
+    #[test]
+    fn disable_adaptive_builder_sets_flag() {
+        let q = SearchQuery::new("x").disable_adaptive();
+        assert!(
+            q.disable_adaptive,
+            "disable_adaptive() builder must set the flag true"
+        );
+    }
 }
