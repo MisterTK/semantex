@@ -213,3 +213,68 @@ def test_pareto_table_includes_tool_usage():
     assert t["sx-lateon"]["sx_tool_calls"] == 2
     assert t["sx-lateon"]["native_tool_calls"] == 6
     assert t["builtin"]["sx_tool_calls"] == 0
+
+
+# ── contamination-free harness: neutralize repo CLAUDE.md ──────────────────
+
+
+def test_neutralize_relocates_and_restores(tmp_path):
+    # On enter, an existing CLAUDE.md is relocated to <name>.semantexbench-bak so the
+    # repo's own project instructions can't route the agent to absent tools during the
+    # benchmark. On exit, the original is restored byte-for-byte and no bak lingers.
+    md = tmp_path / "CLAUDE.md"
+    md.write_text("ORIG")
+    bak = tmp_path / "CLAUDE.md.semantexbench-bak"
+    with cb.neutralize_repo_instructions(str(tmp_path)):
+        assert not md.exists()                   # neutralized: original is gone
+        assert bak.exists() and bak.read_text() == "ORIG"   # safely stashed
+    assert md.exists() and md.read_text() == "ORIG"          # restored
+    assert not bak.exists()                                   # no leftover bak
+
+
+def test_neutralize_restores_on_exception(tmp_path):
+    # The restore lives in a `finally`, so a raise / KeyboardInterrupt inside the body
+    # never strands the user's CLAUDE.md as a .semantexbench-bak.
+    md = tmp_path / "CLAUDE.md"
+    md.write_text("ORIG")
+    try:
+        with cb.neutralize_repo_instructions(str(tmp_path)):
+            assert not md.exists()
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert md.exists() and md.read_text() == "ORIG"           # restored despite raise
+    assert not (tmp_path / "CLAUDE.md.semantexbench-bak").exists()
+
+
+def test_neutralize_steered_injection_wins_then_original_restored(tmp_path):
+    # The steered arm injects its own CLAUDE.md (only when none exists) WHILE neutralized.
+    # On exit the original bak must overwrite that injected nudge — the user's real file
+    # always wins (os.replace is atomic + overwrites).
+    md = tmp_path / "CLAUDE.md"
+    md.write_text("ORIG")
+    with cb.neutralize_repo_instructions(str(tmp_path)):
+        assert not md.exists()
+        md.write_text("NUDGE")                   # simulate the steered arm's injection
+    assert md.read_text() == "ORIG"              # original restored, nudge overwritten
+    assert not (tmp_path / "CLAUDE.md.semantexbench-bak").exists()
+
+
+def test_restore_leftover_baks_self_heals(tmp_path):
+    # A crashed prior run can leave a <name>.semantexbench-bak with NO CLAUDE.md. The
+    # module-level self-heal (called at the very start of cmd_run) restores it.
+    bak = tmp_path / "CLAUDE.md.semantexbench-bak"
+    bak.write_text("ORIG")
+    cb.restore_leftover_instruction_baks([str(tmp_path)])
+    md = tmp_path / "CLAUDE.md"
+    assert md.exists() and md.read_text() == "ORIG"
+    assert not bak.exists()
+
+
+def test_neutralize_noop_when_absent(tmp_path):
+    # A repo with no CLAUDE.md: clean no-op — no bak created, no error, nothing left behind.
+    with cb.neutralize_repo_instructions(str(tmp_path)):
+        assert not (tmp_path / "CLAUDE.md").exists()
+        assert not (tmp_path / "CLAUDE.md.semantexbench-bak").exists()
+    assert not (tmp_path / "CLAUDE.md").exists()
+    assert not (tmp_path / "CLAUDE.md.semantexbench-bak").exists()
