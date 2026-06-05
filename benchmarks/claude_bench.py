@@ -57,6 +57,7 @@ ANTHROPIC_API_KEY is required (sourced from semantex/.env or the environment).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -537,6 +538,62 @@ def run_single(question: dict, repo: str, arm: str, rep: int, api_key: str) -> d
     return m
 
 
+# ── contamination-free harness: neutralize repo CLAUDE.md ─────────────────
+#
+# Large repos (platform, CopilotKit) ship their own CLAUDE.md that routes the
+# agent to tools absent from the hermetic benchmark ("run /context_gather first",
+# "prefer Serena over grep", "use the Nx MCP server first"). Left in place those
+# instructions make EVERY arm flail on missing tools and actively suppress the
+# builtin arm ("prefer Serena over grep") — so the benchmark measures tool-
+# confusion, not retrieval. We temporarily relocate each repo's project
+# instructions for the run and ALWAYS restore them (these are the user's working
+# repos — restoration must be bulletproof: `finally` + self-heal + os.replace).
+
+# Files whose project instructions we neutralize, and the recognizable bak suffix.
+_INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md")
+_BAK_SUFFIX = ".semantexbench-bak"
+
+
+def restore_leftover_instruction_baks(repos) -> None:
+    """Self-heal: for each repo, restore any leftover `<name>.semantexbench-bak`
+    (from a crashed prior run) back to `<name>`. Idempotent — safe to call at the
+    very start of `cmd_run` before any cell runs. NEVER deletes user content; uses
+    atomic `os.replace`, which overwrites any benchmark-injected file so the
+    original always wins."""
+    for repo in repos:
+        root = Path(repo)
+        for name in _INSTRUCTION_FILES:
+            bak = root / (name + _BAK_SUFFIX)
+            if bak.exists():
+                os.replace(bak, root / name)
+
+
+@contextlib.contextmanager
+def neutralize_repo_instructions(repo):
+    """Context manager that neutralizes a repo's project instructions for the run.
+
+    ENTER: for each `CLAUDE.md` / `CLAUDE.local.md` that exists, relocate it to
+    `<name>.semantexbench-bak`. FIRST self-heal any pre-existing bak (from a crashed
+    run) so we never double-bak or lose the real file.
+
+    EXIT (in a `finally`, so it restores even on raise / KeyboardInterrupt): for
+    each `<name>.semantexbench-bak` restore it back to `<name>` via atomic
+    `os.replace`, which OVERWRITES any benchmark-injected CLAUDE.md the run created
+    (the steered arm injects one) — the user's original always wins. No leftover bak."""
+    root = Path(repo)
+    # Self-heal any leftover bak first, then relocate the live instruction file.
+    restore_leftover_instruction_baks([repo])
+    for name in _INSTRUCTION_FILES:
+        orig = root / name
+        if orig.exists():
+            os.replace(orig, root / (name + _BAK_SUFFIX))
+    try:
+        yield
+    finally:
+        # Restore even if the body raised. os.replace overwrites any injected file.
+        restore_leftover_instruction_baks([repo])
+
+
 def cmd_run(args):
     global _MODEL
     _MODEL = args.model
@@ -545,6 +602,9 @@ def cmd_run(args):
         eprint("ERROR: ANTHROPIC_API_KEY not set (env or semantex/.env). Aborting.")
         sys.exit(1)
     arms = getattr(args, "arms", list(ARMS))
+    # Self-heal any leftover .semantexbench-bak from a crashed prior run, up front,
+    # before any cell runs (idempotent — a clean run finds nothing to restore).
+    restore_leftover_instruction_baks(args.repos)
     out = Path(args.output)
     (out / "raw").mkdir(parents=True, exist_ok=True)
     results = []
@@ -552,23 +612,31 @@ def cmd_run(args):
     eprint(f"  Claude head-to-head: {' vs '.join(arms)}  (model={args.model})")
     eprint(f"  repos={len(args.repos)} questions={len(QUESTIONS)} reps={args.reps}")
     eprint("=" * 64)
+    neutralize = getattr(args, "neutralize_claude_md", False)
     for repo in args.repos:
         rn = Path(repo).name
         eprint(f"\n  repo: {rn}")
-        for q in QUESTIONS:
-            for arm in arms:
-                for rep in range(1, args.reps + 1):
-                    raw_path = out / "raw" / f"{rn}_{q['id']}_{arm}_r{rep}.json"
-                    if getattr(args, "resume", False) and raw_path.exists():
-                        # Completing a crashed run: keep the existing cell (no API $),
-                        # load it so the final all_results.json is whole.
-                        results.append(json.loads(raw_path.read_text()))
-                        eprint(f"    [{arm:>8}] {q['id']} r{rep}… skip (resume)")
-                        continue
-                    res = run_single(q, repo, arm, rep, api_key)
-                    results.append(res)
-                    raw_path.write_text(json.dumps(res, indent=2))
-                    time.sleep(1)
+        # When --neutralize-claude-md is set, run ALL arms/reps/questions for THIS
+        # repo with its project CLAUDE.md relocated (restored before the next repo),
+        # so no arm flails on absent tools the repo's instructions route to. Flag off
+        # -> nullcontext -> behavior byte-identical to before.
+        repo_ctx = (neutralize_repo_instructions(repo) if neutralize
+                    else contextlib.nullcontext())
+        with repo_ctx:
+            for q in QUESTIONS:
+                for arm in arms:
+                    for rep in range(1, args.reps + 1):
+                        raw_path = out / "raw" / f"{rn}_{q['id']}_{arm}_r{rep}.json"
+                        if getattr(args, "resume", False) and raw_path.exists():
+                            # Completing a crashed run: keep the existing cell (no API $),
+                            # load it so the final all_results.json is whole.
+                            results.append(json.loads(raw_path.read_text()))
+                            eprint(f"    [{arm:>8}] {q['id']} r{rep}… skip (resume)")
+                            continue
+                        res = run_single(q, repo, arm, rep, api_key)
+                        results.append(res)
+                        raw_path.write_text(json.dumps(res, indent=2))
+                        time.sleep(1)
     (out / "all_results.json").write_text(json.dumps(results, indent=2))
     eprint(f"\n  saved: {out/'all_results.json'}")
     eprint("  next: `judge` then `report`")
@@ -752,6 +820,11 @@ if __name__ == "__main__":
     rp.add_argument("--resume", action="store_true",
                     help="skip (repo,q,arm,rep) cells whose raw file already exists and "
                          "load them into the final all_results.json — completes a crashed run.")
+    rp.add_argument("--neutralize-claude-md", action="store_true",
+                    help="temporarily relocate each repo's own CLAUDE.md / CLAUDE.local.md "
+                         "for the run so its project instructions can't route arms to tools "
+                         "absent from the hermetic benchmark (contamination-free). ALWAYS "
+                         "restored (finally + self-heal + atomic os.replace).")
 
     jp = sub.add_parser("judge", help="blind-grade answer quality (COSTS API tokens)")
     jp.add_argument("--input", required=True)

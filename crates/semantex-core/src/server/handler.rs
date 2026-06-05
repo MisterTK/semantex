@@ -14,6 +14,20 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Test-only sentinel query that forces the connection handler to panic.
+///
+/// Used by `daemon_survives_handler_panic` (see `server/tests.rs`) to prove
+/// that a panic while serving ONE connection is caught + isolated by the accept
+/// loop's `catch_unwind` wrap and does NOT kill the daemon for everyone else.
+///
+/// This injection is GUARDED so it can never fire in a normal release build or
+/// a normal query:
+///   - The trigger only exists under `#[cfg(any(test, debug_assertions))]`, so a
+///     release build (where `debug_assertions` is off) never compiles it.
+///   - Even in a debug build it requires the query to be EXACTLY this improbable
+///     sentinel string, so no real-world query can hit it.
+pub(crate) const TEST_PANIC_SENTINEL: &str = "__SEMANTEX_TEST_PANIC__";
+
 /// Handles incoming requests using a HybridSearcher
 pub struct Handler<'a> {
     searcher: &'a HybridSearcher,
@@ -116,6 +130,19 @@ impl<'a> Handler<'a> {
     }
 
     fn handle_search(&self, req: SearchRequest) -> Response {
+        // Test-only panic injection (see `TEST_PANIC_SENTINEL`). Compiled out of
+        // release builds via `debug_assertions`; even in debug it only fires for
+        // an exact improbable sentinel query, never a real one. This exists so
+        // `daemon_survives_handler_panic` can deterministically force a
+        // per-connection panic without depending on a real bug.
+        #[cfg(any(test, debug_assertions))]
+        // Deliberate explicit panic (not an assertion) — keep the if/panic form
+        // so the intent and message are obvious; clippy would rewrite to assert!.
+        #[allow(clippy::manual_assert)]
+        if req.query == TEST_PANIC_SENTINEL {
+            panic!("injected test panic");
+        }
+
         let start = Instant::now();
 
         let mut query = SearchQuery::new(&req.query).max_results(req.max_results);

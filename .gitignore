@@ -70,3 +70,8 @@ settings.local.json
 .gemini/
 .cursor/
 **/.remember/
+
+# Exception: clean-harness large-repo validation summary
+!/results/cbench-clean-largerepo/
+/results/cbench-clean-largerepo/*
+!/results/cbench-clean-largerepo/report.md

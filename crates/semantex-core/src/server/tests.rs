@@ -991,6 +991,141 @@ mod tests {
         assert!(item.summary.is_none(), "TextWindow should have no summary");
     }
 
+    // --- daemon panic-isolation integration test ---
+
+    /// End-to-end proof that a panic while handling ONE connection is caught and
+    /// isolated by the accept loop, so the daemon keeps serving every other
+    /// caller instead of dying and taking the in-RAM model down with it.
+    ///
+    /// Flow:
+    ///   1. Spawn a real `Listener` (sparse-only, empty index) on a background
+    ///      thread, exactly as the daemon does.
+    ///   2. Send a Search whose query is `TEST_PANIC_SENTINEL` — the handler
+    ///      panics. The CLIENT sees an error (connection dropped mid-response).
+    ///   3. Send a NORMAL Health request and assert it SUCCEEDS. This is the
+    ///      load-bearing assertion: pre-fix the accept-loop thread is dead and
+    ///      this would time out / refuse; post-fix the daemon is alive.
+    #[test]
+    fn daemon_survives_handler_panic() {
+        use crate::config::SemantexConfig;
+        use crate::index::storage::ChunkStore;
+        use crate::search::hybrid::HybridSearcher;
+        use crate::server::listener::Listener;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        // 1. Build a minimal sparse-only searcher over an empty index, mirroring
+        //    handler.rs::build_empty_searcher (the established test harness).
+        let dir = TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        {
+            let _store =
+                ChunkStore::open(&semantex_dir.join("chunks.db")).expect("create empty store");
+        }
+        let config = SemantexConfig::default();
+        let searcher =
+            HybridSearcher::open_sparse_only(&semantex_dir, &config).expect("open searcher");
+
+        let port_file = semantex_dir.join("semantex.port");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let listener = Listener::bind(
+            &port_file,
+            searcher,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            shutdown.clone(),
+        )
+        .expect("bind listener");
+        let port = listener.port();
+
+        // 2. Run the accept loop on a background thread (as the daemon does).
+        let server_thread = std::thread::spawn(move || {
+            let _ = listener.run();
+        });
+
+        // 3. Fire the panic-inducing request. The handler panics; the client's
+        //    read fails because the connection drops mid-response. We only
+        //    require that the panic-isolation logic does NOT propagate — i.e.
+        //    the loop survives.
+        let panic_req = BinaryRequest::Search(SearchRequest {
+            query: super::super::handler::TEST_PANIC_SENTINEL.to_string(),
+            max_results: 5,
+            use_dense: false,
+            use_sparse: true,
+            use_rerank: false,
+            include_types: vec![],
+            exclude_types: vec![],
+            code_only: false,
+            include_content: false,
+            snippet: false,
+            grep_mode: false,
+            regex_pattern: None,
+            auto_peek_top: false,
+        });
+        let panic_result = send_binary_for_test(port, &panic_req, 3);
+        assert!(
+            panic_result.is_err(),
+            "panic-sentinel request should fail at the client (connection dropped); got {panic_result:?}"
+        );
+
+        // 4. LOAD-BEARING: a normal request must still succeed, proving the
+        //    accept loop survived the panic and the daemon keeps serving.
+        let health_req = BinaryRequest::Health;
+        let health_result = send_binary_for_test(port, &health_req, 5);
+        assert!(
+            health_result.is_ok(),
+            "daemon must keep serving after an isolated handler panic; \
+             health request failed: {health_result:?} — the accept loop likely died"
+        );
+        match health_result.unwrap() {
+            BinaryResponse::Health(h) => assert_eq!(h.status, "ok"),
+            other => panic!("expected Health response, got {other:?}"),
+        }
+
+        // Clean shutdown of the background daemon thread.
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = send_binary_for_test(port, &BinaryRequest::Shutdown, 2);
+        let _ = server_thread.join();
+    }
+
+    /// Minimal binary-protocol client for the integration test: connect, send a
+    /// framed request, read the framed response. Mirrors
+    /// `server::mod::send_binary_request` but lives here to keep the test
+    /// self-contained.
+    fn send_binary_for_test(
+        port: u16,
+        req: &BinaryRequest,
+        read_timeout_s: u64,
+    ) -> anyhow::Result<BinaryResponse> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let frame = encode_binary_request(req);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+        stream.set_read_timeout(Some(Duration::from_secs(read_timeout_s)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+        stream.write_all(&frame)?;
+        stream.flush()?;
+
+        let mut magic = [0u8; 1];
+        stream.read_exact(&mut magic)?;
+        if magic[0] != BINARY_MAGIC {
+            anyhow::bail!("expected binary response, got 0x{:02x}", magic[0]);
+        }
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body)?;
+        decode_binary_response(&body).map_err(|e| anyhow::anyhow!("decode failed: {e}"))
+    }
+
     #[test]
     fn test_chunk_to_item_minimal_astnode_no_meta() {
         use crate::types::{AstNodeKind, Chunk, ChunkType};
