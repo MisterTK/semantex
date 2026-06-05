@@ -242,8 +242,41 @@ impl Listener {
                     }
                     last_activity = Instant::now();
                     loop_count = 0; // reset so we don't exit right after heavy search
-                    if let Err(e) = self.handle_connection(stream) {
-                        tracing::warn!("Connection error: {}", e);
+
+                    // Isolate per-connection failures. The accept loop is the
+                    // single thread serving ALL concurrent callers and holding
+                    // the in-RAM model. semantex runs across tens of thousands
+                    // of diverse repos, so a panic somewhere in the agent/search
+                    // pipeline on one weird input WILL happen eventually. Without
+                    // this guard the panic would unwind past the `Result` check
+                    // below and kill the loop, taking the whole daemon — and every
+                    // other caller — down. `catch_unwind` (under `panic = "unwind"`,
+                    // see Cargo.toml) converts that panic into a caught error so we
+                    // log it and keep serving. The daemon state we touch after a
+                    // caught panic (a read-mostly searcher + an atomic counter) is
+                    // safe to reuse, so `AssertUnwindSafe` is the correct + standard
+                    // wrapper here — same as the per-file `catch_unwind` sites in
+                    // the chunking/PDF path.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.handle_connection(stream)
+                    })) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!("Connection error: {}", e);
+                        }
+                        Err(panic_payload) => {
+                            let msg = panic_payload
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "<non-string panic>".to_string());
+                            tracing::error!(
+                                "Connection handler PANICKED (isolated; daemon continues): {}",
+                                msg
+                            );
+                            // Fall through to the next loop iteration — do NOT
+                            // break or propagate. The accept loop keeps serving.
+                        }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
