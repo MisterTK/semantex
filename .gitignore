@@ -46,6 +46,10 @@ CLAUDE.md
 !/benchmarks/tests/
 # Exception: substitution-vs-recall probe (committed source — see results/probe-substitution/).
 !/benchmarks/probe_substitution.py
+# Exception: three-way (semantex/graphify/serena) equal-adoption harness (committed source;
+# its results/three-way/ raw output stays ignored).
+!/benchmarks/three_way.py
+!/benchmarks/three_way_nudge.py
 /benches
 /bench_results
 /scripts
