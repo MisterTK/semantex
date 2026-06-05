@@ -39,6 +39,14 @@ fn llm_classify_timeout() -> std::time::Duration {
 /// (god_nodes section only, no communities, no boundaries). Per spec §4 Item 4.
 const ARCH_TINY_REPO_THRESHOLD: u64 = 500;
 
+/// Minimum corpus size (chunk count) at or above which the enumeration fan-out
+/// bypasses adaptive sizing for its facet searches (full breadth). Below this,
+/// facet searches keep normal adaptive sizing so small repos stay focused and
+/// don't surface low-signal files (CHANGELOG, CODE_OF_CONDUCT, …). Measured
+/// separator: gin 2230 / flask 1616 (small) vs platform 7809 / CopilotKit 21705
+/// (large). Overridable via `SEMANTEX_FANOUT_BREADTH_MIN_CHUNKS`.
+const FANOUT_BREADTH_MIN_CHUNKS: u64 = 5000;
+
 /// Result from an individual handler method.
 pub(crate) struct HandlerResult {
     formatted: String,
@@ -598,14 +606,25 @@ impl<'a> AgentPipeline<'a> {
             return self.handle_search(query, budget, SearchVariant::Exhaustive);
         }
 
+        // Corpus-size gate for the breadth bypass (mirrors the
+        // `handle_architecture` chunk_count precedent). LARGE corpora: bypass
+        // adaptive sizing so facet queries ("environment variables") — which
+        // don't read as exhaustive — aren't clipped, giving full repo coverage.
+        // SMALL corpora: keep normal adaptive sizing so the route stays focused
+        // and doesn't surface low-signal files (CHANGELOG, CODE_OF_CONDUCT, …).
+        let chunk_count = self.searcher.with_store(|s| s.chunk_count().unwrap_or(0));
+        let full_breadth = fanout_full_breadth(chunk_count, fanout_breadth_threshold());
+
         // Run one hybrid search per facet (match Exhaustive: max 20, no
         // code_only). Skip facets whose search errors — never abort the route.
-        // `disable_adaptive`: facet queries ("environment variables") don't read
-        // as exhaustive, so without the bypass the adaptive pipeline would clip
-        // them — defeating the breadth purpose of the fan-out.
         let mut all_facet_results: Vec<Vec<crate::types::SearchResult>> = Vec::new();
         for facet in &facets {
-            let sq = SearchQuery::new(facet).max_results(20).disable_adaptive();
+            let base = SearchQuery::new(facet).max_results(20);
+            let sq = if full_breadth {
+                base.disable_adaptive()
+            } else {
+                base
+            };
             if let Ok(output) = self.searcher.search(&sq) {
                 all_facet_results.push(output.results);
             }
@@ -1421,17 +1440,38 @@ fn union_diversify(
 }
 
 /// Pure parser for the `SEMANTEX_EXHAUSTIVE_FANOUT` flag, factored out so the
-/// OFF-by-default contract is unit-testable without touching process env.
-/// ON iff the value is `"1"` or (case-insensitively) `"true"`.
+/// default-ON contract is unit-testable without touching process env. ON by
+/// default (the corpus gate in `handle_exhaustive_fanout` makes it safe); only
+/// an explicit `"0"` or (case-insensitively) `"false"` disables it.
 fn fanout_flag_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    match value {
+        Some(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        None => true,
+    }
 }
 
 /// Whether the exhaustive-route facet fan-out is enabled. Gated behind
-/// `SEMANTEX_EXHAUSTIVE_FANOUT`; OFF by default (the shipped default keeps the
-/// exhaustive route byte-identical to before).
+/// `SEMANTEX_EXHAUSTIVE_FANOUT`; ON by default. Disable with
+/// `SEMANTEX_EXHAUSTIVE_FANOUT=0`.
 fn exhaustive_fanout_enabled() -> bool {
     fanout_flag_from(std::env::var("SEMANTEX_EXHAUSTIVE_FANOUT").ok().as_deref())
+}
+
+/// Pure corpus-size gate for the fan-out's breadth bypass: a facet search
+/// disables adaptive sizing (keeps full breadth) only when the corpus is large
+/// enough that an enumeration genuinely spans many files. Small corpora keep
+/// normal adaptive sizing so they stay focused.
+fn fanout_full_breadth(chunk_count: u64, threshold: u64) -> bool {
+    chunk_count >= threshold
+}
+
+/// Resolve the breadth threshold: `SEMANTEX_FANOUT_BREADTH_MIN_CHUNKS` if it
+/// parses as a `u64`, else the built-in `FANOUT_BREADTH_MIN_CHUNKS`.
+fn fanout_breadth_threshold() -> u64 {
+    std::env::var("SEMANTEX_FANOUT_BREADTH_MIN_CHUNKS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(FANOUT_BREADTH_MIN_CHUNKS)
 }
 
 #[cfg(test)]
@@ -2003,20 +2043,52 @@ mod tests {
     }
 
     #[test]
-    fn exhaustive_fanout_disabled_by_default() {
-        // The shipped default MUST be OFF. The parser is pure given an
-        // explicit value, so assert the OFF/unset cases deterministically.
+    fn fanout_full_breadth_gates_on_corpus_size() {
+        // Small corpora (gin 2230, flask 1616) keep normal adaptive sizing →
+        // false; large corpora (platform 7809, CopilotKit 21705) get full
+        // breadth → true. Boundary is inclusive (>= threshold).
         assert!(
-            !fanout_flag_from(None),
-            "unset must be OFF (shipped default)"
+            !fanout_full_breadth(2230, 5000),
+            "gin (2230) is small → no breadth bypass"
         );
-        assert!(!fanout_flag_from(Some("0")), "\"0\" must be OFF");
-        assert!(!fanout_flag_from(Some("false")), "\"false\" must be OFF");
-        assert!(!fanout_flag_from(Some("")), "empty must be OFF");
-        // ON cases (documents the enabling contract).
+        assert!(
+            !fanout_full_breadth(1616, 5000),
+            "flask (1616) is small → no breadth bypass"
+        );
+        assert!(
+            fanout_full_breadth(7809, 5000),
+            "platform (7809) is large → full breadth"
+        );
+        assert!(
+            fanout_full_breadth(21705, 5000),
+            "CopilotKit (21705) is large → full breadth"
+        );
+        // Boundary: exactly at threshold counts as large (>=).
+        assert!(
+            fanout_full_breadth(5000, 5000),
+            "exactly at threshold (>=) → full breadth"
+        );
+        assert!(
+            !fanout_full_breadth(4999, 5000),
+            "just below threshold → no breadth bypass"
+        );
+    }
+
+    #[test]
+    fn exhaustive_fanout_enabled_by_default() {
+        // The corpus gate makes fan-out safe, so the shipped default is now ON.
+        // Only an explicit "0"/"false" (case-insensitive) disables it.
+        assert!(
+            fanout_flag_from(None),
+            "unset must be ON (shipped default is now on)"
+        );
+        assert!(fanout_flag_from(Some("")), "empty must be ON (default)");
         assert!(fanout_flag_from(Some("1")), "\"1\" must be ON");
         assert!(fanout_flag_from(Some("true")), "\"true\" must be ON");
-        assert!(fanout_flag_from(Some("TRUE")), "\"TRUE\" must be ON");
+        // Explicit opt-out.
+        assert!(!fanout_flag_from(Some("0")), "\"0\" must be OFF");
+        assert!(!fanout_flag_from(Some("false")), "\"false\" must be OFF");
+        assert!(!fanout_flag_from(Some("FALSE")), "\"FALSE\" must be OFF");
     }
 }
 
