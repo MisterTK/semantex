@@ -79,3 +79,8 @@ settings.local.json
 !/results/cbench-clean-largerepo/
 /results/cbench-clean-largerepo/*
 !/results/cbench-clean-largerepo/report.md
+
+# Exception: three-way comparison summary
+!/results/three-way/
+/results/three-way/*
+!/results/three-way/report.md
