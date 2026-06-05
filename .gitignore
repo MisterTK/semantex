@@ -44,10 +44,20 @@ CLAUDE.md
 # Exception: agent CCB benchmark + unit tests are committed source.
 !/benchmarks/claude_bench.py
 !/benchmarks/tests/
+# Exception: substitution-vs-recall probe (committed source — see results/probe-substitution/).
+!/benchmarks/probe_substitution.py
 /benches
 /bench_results
 /scripts
-/results
+# /results CONTENTS are ignored (use /results/* so the dir stays walkable for the
+# negations below) EXCEPT the committed substitution-vs-recall probe analysis.
+/results/*
+!/results/probe-substitution/
+/results/probe-substitution/*
+!/results/probe-substitution/report.md
+!/results/probe-substitution/parsed.json
+!/results/probe-substitution/raw/
+!/results/probe-substitution/raw_steered/
 
 # Test output
 crates/semantex-core/tests/TEST_RESULTS.md
