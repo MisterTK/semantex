@@ -1,7 +1,7 @@
 use super::agent_classifier::{AgentRoute, classify_agent_query, extract_symbol};
 use super::agent_formatter::{
-    DEFAULT_BUDGET, FormatStyle, append_disambiguation_block, format_code_blocks,
-    format_deep_results, format_graph_results, format_search_results,
+    DEFAULT_BUDGET, FormatStyle, append_disambiguation_block, format_deep_results,
+    format_default_full, format_graph_results, format_search_results,
 };
 use crate::index::architecture::budget_for_chunk_count;
 use crate::search::SearchQuery;
@@ -68,10 +68,11 @@ enum SearchVariant {
     /// `is_fallback` propagates into `fallback_used` on success and controls the
     /// two-stage empty fallback (inline deep → "No results").
     Semantic { is_fallback: bool },
-    /// Hybrid search with `.code_only()`, max 5 results. `full_code=true` switches
-    /// to `format_code_blocks`; `full_code=false` uses FormatStyle::Default.
-    /// Empty path: `handle_deep(budget, true)`.
-    Analytical { full_code: bool },
+    /// Hybrid search with `.code_only()`, max 5 results. Under `full_code` (passed
+    /// to `handle_search`) renders via `format_default_full`; otherwise
+    /// FormatStyle::Default. Unique empty-with-bodies guard: when `full_code` is
+    /// true and no hit carries content, falls back to `handle_deep(budget, true)`.
+    Analytical,
     /// Hybrid search, max 20 results, budget×3, FormatStyle::Default.
     /// Empty path: `handle_deep(budget×3, true)`.
     Exhaustive,
@@ -242,14 +243,20 @@ impl<'a> AgentPipeline<'a> {
         let result = match route {
             AgentRoute::FilePattern => self.handle_file_pattern(&request.query),
             AgentRoute::Regex => self.handle_regex(&request.query, budget),
-            AgentRoute::ExactSymbol => self.handle_exact_symbol(&request.query, budget),
+            AgentRoute::ExactSymbol => {
+                self.handle_exact_symbol(&request.query, budget, request.full_code)
+            }
             AgentRoute::Structural => self.handle_structural(&request.query, budget),
             AgentRoute::Deep => self.handle_deep(&request.query, budget, false),
             AgentRoute::Analytical => {
                 self.handle_analytical(&request.query, budget, request.full_code)
             }
-            AgentRoute::Exhaustive => self.handle_exhaustive(&request.query, budget),
-            AgentRoute::Semantic => self.handle_semantic(&request.query, budget, false),
+            AgentRoute::Exhaustive => {
+                self.handle_exhaustive(&request.query, budget, request.full_code)
+            }
+            AgentRoute::Semantic => {
+                self.handle_semantic(&request.query, budget, false, request.full_code)
+            }
             AgentRoute::Architecture => self.handle_architecture(&request.query, budget),
             AgentRoute::FeaturePlanning => self.handle_feature_planning(&request.query, budget),
         };
@@ -378,8 +385,19 @@ impl<'a> AgentPipeline<'a> {
         classify_agent_query(query)
     }
 
-    fn handle_semantic(&self, query: &str, budget: usize, is_fallback: bool) -> HandlerResult {
-        self.handle_search(query, budget, SearchVariant::Semantic { is_fallback })
+    fn handle_semantic(
+        &self,
+        query: &str,
+        budget: usize,
+        is_fallback: bool,
+        full_code: bool,
+    ) -> HandlerResult {
+        self.handle_search(
+            query,
+            budget,
+            SearchVariant::Semantic { is_fallback },
+            full_code,
+        )
     }
 
     fn handle_deep(&self, query: &str, budget: usize, is_fallback: bool) -> HandlerResult {
@@ -405,13 +423,15 @@ impl<'a> AgentPipeline<'a> {
                         disambiguation: None,
                     }
                 } else {
-                    self.handle_semantic(query, budget, true)
+                    // Deep → semantic fallback is a synthesis path; full bodies
+                    // are not threaded here (preserves the legacy preview path).
+                    self.handle_semantic(query, budget, true, false)
                 }
             }
         }
     }
 
-    fn handle_exact_symbol(&self, query: &str, budget: usize) -> HandlerResult {
+    fn handle_exact_symbol(&self, query: &str, budget: usize, full_code: bool) -> HandlerResult {
         let symbol = query.trim_matches(|c| c == '`' || c == '"' || c == '\'');
         let sq = SearchQuery::new(symbol).max_results(5);
         if let Ok(output) = self.searcher.search(&sq)
@@ -436,7 +456,11 @@ impl<'a> AgentPipeline<'a> {
                 confidence: Some(confidence),
                 disambiguation: disambig.clone(),
             };
-            let mut formatted = format_search_results(&resp, FormatStyle::Default, budget);
+            let mut formatted = if full_code {
+                format_default_full(&resp, budget)
+            } else {
+                format_search_results(&resp, FormatStyle::Default, budget)
+            };
             if let Some(suggestions) = &disambig {
                 append_disambiguation_block(&mut formatted, suggestions);
             }
@@ -469,8 +493,13 @@ impl<'a> AgentPipeline<'a> {
                     confidence: Some("medium".into()),
                     disambiguation: None,
                 };
+                let formatted = if full_code {
+                    format_default_full(&resp, budget)
+                } else {
+                    format_search_results(&resp, FormatStyle::Default, budget)
+                };
                 HandlerResult {
-                    formatted: format_search_results(&resp, FormatStyle::Default, budget),
+                    formatted,
                     fallback_used: true,
                     result_count: count,
                     hits,
@@ -573,11 +602,11 @@ impl<'a> AgentPipeline<'a> {
     }
 
     fn handle_analytical(&self, query: &str, budget: usize, full_code: bool) -> HandlerResult {
-        self.handle_search(query, budget, SearchVariant::Analytical { full_code })
+        self.handle_search(query, budget, SearchVariant::Analytical, full_code)
     }
 
-    fn handle_exhaustive(&self, query: &str, budget: usize) -> HandlerResult {
-        self.handle_search(query, budget, SearchVariant::Exhaustive)
+    fn handle_exhaustive(&self, query: &str, budget: usize, full_code: bool) -> HandlerResult {
+        self.handle_search(query, budget, SearchVariant::Exhaustive, full_code)
     }
 
     /// Consolidated handler for the three "list-route" variants that differ only
@@ -588,7 +617,13 @@ impl<'a> AgentPipeline<'a> {
     /// Every observable output — result count, format, fallback path, structured
     /// hits, disambiguation — is derived from the variant config below.
     /// Byte-identical to the three original handlers for every route.
-    fn handle_search(&self, query: &str, budget: usize, variant: SearchVariant) -> HandlerResult {
+    fn handle_search(
+        &self,
+        query: &str,
+        budget: usize,
+        variant: SearchVariant,
+        full_code: bool,
+    ) -> HandlerResult {
         let effective_budget = budget * variant.budget_multiplier();
         let sq = {
             let base = SearchQuery::new(query).max_results(variant.max_results());
@@ -614,32 +649,19 @@ impl<'a> AgentPipeline<'a> {
                 let count = items.len();
                 let hits = items.clone();
 
-                // Analytical + full_code: emit raw code blocks instead of the
-                // standard search-results format. Falls back to deep if no
-                // content is available.
-                if let SearchVariant::Analytical { full_code: true } = variant {
-                    let code_contents: Vec<String> = items
+                // Analytical full-body guard (preserved from the old
+                // `format_code_blocks` path): when full bodies are requested but
+                // NO item carries usable content, fall back to deep synthesis.
+                // Only Analytical had this guard; Semantic/Exhaustive never did.
+                if full_code
+                    && matches!(variant, SearchVariant::Analytical)
+                    && items
                         .iter()
-                        .map(|i| i.content.clone().unwrap_or_default())
-                        .collect();
-                    let mut formatted =
-                        format_code_blocks(&items, &code_contents, effective_budget);
-                    if formatted == "No code blocks to display." {
-                        return self.handle_deep(query, effective_budget, true);
-                    }
-                    if let Some(suggestions) = &disambig {
-                        append_disambiguation_block(&mut formatted, suggestions);
-                    }
-                    return HandlerResult {
-                        formatted,
-                        fallback_used: false,
-                        result_count: count,
-                        hits,
-                        disambiguation: disambig,
-                    };
+                        .all(|i| i.content.as_deref().is_none_or(str::is_empty))
+                {
+                    return self.handle_deep(query, effective_budget, true);
                 }
 
-                // All other variants: standard search-results format.
                 // Semantic propagates `is_fallback` into `fallback_used` (it can be called
                 // as a fallback from handle_deep with is_fallback=true); Analytical and
                 // Exhaustive always return false on success.
@@ -658,8 +680,14 @@ impl<'a> AgentPipeline<'a> {
                     confidence: Some(confidence),
                     disambiguation: disambig.clone(),
                 };
-                let mut formatted =
-                    format_search_results(&resp, FormatStyle::Default, effective_budget);
+                // full_code=true → render each hit's COMPLETE body inline with an
+                // honest completeness marker; full_code=false → the legacy
+                // 200-char preview path (the byte-identical A/B baseline).
+                let mut formatted = if full_code {
+                    format_default_full(&resp, effective_budget)
+                } else {
+                    format_search_results(&resp, FormatStyle::Default, effective_budget)
+                };
                 if let Some(suggestions) = &disambig {
                     append_disambiguation_block(&mut formatted, suggestions);
                 }
@@ -1385,17 +1413,13 @@ mod tests {
             "Semantic fallback must still use dense path"
         );
 
-        // Analytical
-        let ana = SearchVariant::Analytical { full_code: false };
+        // Analytical (full_code is now a handle_search parameter, not a
+        // variant field — the search config is identical regardless of it).
+        let ana = SearchVariant::Analytical;
         assert_eq!(ana.max_results(), 5, "Analytical max_results");
         assert_eq!(ana.budget_multiplier(), 1, "Analytical budget_multiplier");
         assert!(ana.code_only(), "Analytical must set code_only");
         assert!(!ana.use_dense(), "Analytical must use hybrid path");
-
-        // Analytical full_code variant — same search config, different format
-        let ana_fc = SearchVariant::Analytical { full_code: true };
-        assert_eq!(ana_fc.max_results(), 5);
-        assert!(ana_fc.code_only());
 
         // Exhaustive
         let exh = SearchVariant::Exhaustive;
@@ -1475,6 +1499,62 @@ mod tests {
             resp.formatted.starts_with("[route: semantic]"),
             "Semantic must emit [route: semantic] header, got: {}",
             &resp.formatted[..resp.formatted.len().min(80)]
+        );
+    }
+
+    /// Trust full-body wiring: an item-list route (Analytical — the route that
+    /// reliably surfaces content-bearing hits on the sparse-only test searcher)
+    /// run with `full_code=true` must render at least one fenced code body AND
+    /// the honest completeness marker (`[COMPLETE:` when every hit fit, or the
+    /// "top K of N" partial marker). This guards that the item-list handlers
+    /// route through `format_default_full` rather than the 200-char preview path.
+    #[test]
+    fn test_handle_search_full_code_emits_full_body_marker() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline =
+            AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/full-code-on-test"));
+        let (resp, _hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Analytical),
+            budget: Some(12_000),
+            full_code: true,
+        });
+        assert!(
+            resp.formatted.contains("```"),
+            "full_code=true must emit a fenced code body, got: {}",
+            resp.formatted
+        );
+        assert!(
+            resp.formatted.contains("[COMPLETE:") || resp.formatted.contains("top "),
+            "full_code=true must emit an honest completeness marker, got: {}",
+            resp.formatted
+        );
+    }
+
+    /// A/B baseline guard: the SAME query/route with `full_code=false` must NOT
+    /// emit a fenced body or the `[COMPLETE:` marker — it stays on the legacy
+    /// 200-char preview path (`format_search_results(Default)`). This protects
+    /// the byte-identical baseline the full-body A/B is measured against.
+    #[test]
+    fn test_handle_search_full_code_false_unchanged() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline =
+            AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/full-code-off-test"));
+        let (resp, _hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "authentication".into(),
+            route: Some(AgentRoute::Analytical),
+            budget: Some(12_000),
+            full_code: false,
+        });
+        assert!(
+            !resp.formatted.contains("[COMPLETE:"),
+            "full_code=false must NOT emit the [COMPLETE:] marker, got: {}",
+            resp.formatted
+        );
+        assert!(
+            !resp.formatted.contains("```"),
+            "full_code=false must stay on the 200-char preview path (no fenced body), got: {}",
+            resp.formatted
         );
     }
 }

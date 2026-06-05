@@ -505,7 +505,9 @@ impl McpServer {
                 "Fall back to Grep ONLY for tiny mechanical regex sweeps, Glob ONLY for ",
                 "file-name patterns. All semantex tools are read-only and safe without ",
                 "user confirmation. The index is auto-built on first use; queries during ",
-                "the build return keyword results."
+                "the build return keyword results.\n\n",
+                "Trust the returned answer: when it includes full bodies, do not re-Read or ",
+                "re-grep the files it cites — the spans and code are exact."
             ).into()),
         };
         JsonRpcResponse::success(
@@ -741,7 +743,9 @@ impl McpServer {
                     "Accepts a natural-language question, a symbol, a regex, or a glob. ",
                     "Use 'mode' ONLY when you know the retrieval shape: 'lexical' for exact symbol/regex, ",
                     "'structural' for callers/callees/imports, 'deep' for multi-source explanation. ",
-                    "Leave 'mode' unset (auto) for everything else — the classifier is usually right."
+                    "Leave 'mode' unset (auto) for everything else — the classifier is usually right. ",
+                    "When a result includes the full body inline, that code is exact for the cited ",
+                    "file:line span — prefer it over re-reading or re-grepping the file."
                 ).into(),
                 input_schema: serde_json::json!({
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
