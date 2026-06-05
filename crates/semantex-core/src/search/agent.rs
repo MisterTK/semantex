@@ -1116,6 +1116,128 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
     }
 }
 
+/// Syntactically decompose an enumeration question ("list all X, Y, and Z")
+/// into per-item facets so the caller can fan out narrow searches that won't
+/// cluster on a single subsystem. Pure string surgery — no semantics, no
+/// model. The full original `query` is always included as the final facet so
+/// the holistic view (and single-concept enumerations) stay covered.
+///
+/// Returns content fragments first, then the original query. If nothing
+/// survives decomposition, returns just `[query]`.
+// Consumed by the enumeration fan-out in `handle_exhaustive` (follow-up task);
+// only the unit tests exercise it today, so suppress the unused warning until
+// the call site lands.
+#[allow(dead_code)]
+fn enumeration_facets(query: &str) -> Vec<String> {
+    // Sentinel substituted for every multi-char split delimiter, so we can
+    // split once without re-splitting on bare "," inside the multi-char forms.
+    const SENTINEL: &str = "\u{0}";
+    /// Universal stopwords — a fragment composed entirely of these (after
+    /// stripping non-alphanumerics) carries no retrieval signal and is dropped.
+    const STOP: &[&str] = &[
+        "the", "a", "an", "this", "that", "these", "those", "it", "its", "they", "them", "their",
+        "there", "where", "when", "what", "which", "who", "is", "are", "was", "were", "be", "been",
+        "does", "do", "did", "done", "project", "repo", "repository", "codebase", "supports",
+        "supported", "support", "defined", "define", "defines", "exist", "exists", "existing",
+        "used", "use", "uses", "using", "in", "on", "of", "for", "to", "and", "or", "all", "every",
+        "any", "each", "with", "that's", "here",
+    ];
+
+    // 1. Strip a leading enumeration marker. Match case-insensitively on a
+    //    lowercased copy, but slice the ORIGINAL so case is preserved. Use the
+    //    marker that appears earliest in the string.
+    const MARKERS: &[&str] = &[
+        "list all",
+        "list every",
+        "find all",
+        "find every",
+        "show all",
+        "show every",
+        "what are all",
+        "where are all",
+        "enumerate all",
+        "enumerate every",
+        "enumerate ",
+    ];
+    let lower = query.to_lowercase();
+    let mut best: Option<(usize, usize)> = None; // (start, marker_len)
+    for m in MARKERS {
+        if let Some(pos) = lower.find(m) {
+            match best {
+                Some((bp, _)) if pos >= bp => {}
+                _ => best = Some((pos, m.len())),
+            }
+        }
+    }
+    let remainder: &str = match best {
+        Some((pos, len)) => &query[pos + len..],
+        None => query,
+    };
+
+    // 2. Split the remainder into fragments on commas / semicolons / standalone
+    //    " and " / " or ". Replace the multi-char (and comma+and) delimiters
+    //    with a sentinel first so "android"/"category" are never split.
+    let mut work = remainder.to_string();
+    for delim in [", and ", ", or ", " and ", " or ", "; ", ", ", ";", ","] {
+        work = work.replace(delim, SENTINEL);
+    }
+
+    let mut fragments: Vec<String> = Vec::new();
+    for raw in work.split(SENTINEL) {
+        // Normalize: strip a leading "and "/"or " left over from edge splits.
+        let mut frag = raw.trim();
+        let frag_lower = frag.to_lowercase();
+        if let Some(rest) = frag_lower.strip_prefix("and ") {
+            frag = &frag[frag.len() - rest.len()..];
+        } else if let Some(rest) = frag_lower.strip_prefix("or ") {
+            frag = &frag[frag.len() - rest.len()..];
+        }
+        // 3. Trim whitespace + trailing '.'.
+        let frag = frag.trim().trim_end_matches('.').trim();
+        if frag.len() < 3 {
+            continue;
+        }
+        // Drop if every word (lowercased, alnum-only) is a stopword.
+        let all_stop = frag.split_whitespace().all(|w| {
+            let cleaned: String = w
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect();
+            cleaned.is_empty() || STOP.contains(&cleaned.as_str())
+        });
+        if all_stop {
+            continue;
+        }
+        fragments.push(frag.to_string());
+    }
+
+    // 4. Lowercase-dedup (preserve first-seen original case); cap at 6.
+    let mut facets: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for frag in fragments {
+        let key = frag.to_lowercase();
+        if seen.insert(key) {
+            facets.push(frag);
+            if facets.len() == 6 {
+                break;
+            }
+        }
+    }
+
+    // 5. Always include the full original query, unless already present.
+    let query_lower = query.to_lowercase();
+    if !facets.iter().any(|f| f.to_lowercase() == query_lower) {
+        facets.push(query.to_string());
+    }
+
+    // 6. If the only facet is the original query, return just that.
+    if facets.len() == 1 {
+        return vec![query.to_string()];
+    }
+    facets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,6 +1598,73 @@ mod tests {
             "Semantic must emit [route: semantic] header, got: {}",
             &resp.formatted[..resp.formatted.len().min(80)]
         );
+    }
+
+    // --- enumeration_facets: syntactic decomposition of "list all X, Y, Z" --
+
+    #[test]
+    fn enumeration_facets_splits_multi_item() {
+        let q = "List all configuration options, environment variables, and CLI flags this project supports and where they are defined.";
+        let facets = enumeration_facets(q);
+        assert!(
+            facets
+                .iter()
+                .any(|f| f.to_lowercase().contains("configuration options")),
+            "missing 'configuration options' facet: {facets:?}"
+        );
+        assert!(
+            facets
+                .iter()
+                .any(|f| f.to_lowercase().contains("environment variables")),
+            "missing 'environment variables' facet: {facets:?}"
+        );
+        assert!(
+            facets.iter().any(|f| f.to_lowercase().contains("cli flags")),
+            "missing 'cli flags' facet: {facets:?}"
+        );
+        assert!(
+            facets.iter().any(|f| f == q),
+            "missing exact original query facet: {facets:?}"
+        );
+    }
+
+    #[test]
+    fn enumeration_facets_drops_stopword_fragments() {
+        let q = "List all configuration options, environment variables, and CLI flags this project supports and where they are defined.";
+        let facets = enumeration_facets(q);
+        assert!(
+            !facets
+                .iter()
+                .any(|f| f.trim().to_lowercase() == "where they are defined"),
+            "all-stopword fragment was not dropped: {facets:?}"
+        );
+    }
+
+    #[test]
+    fn enumeration_facets_single_concept_passthrough() {
+        let q = "list all environment variables";
+        let facets = enumeration_facets(q);
+        assert!(facets.len() <= 2, "too many facets: {facets:?}");
+        assert!(
+            facets
+                .iter()
+                .all(|f| f.to_lowercase().contains("environment variables")),
+            "junk fragment present: {facets:?}"
+        );
+    }
+
+    #[test]
+    fn enumeration_facets_caps() {
+        let q = "find all a1, b2, c3, d4, e5, f6, g7, h8";
+        let facets = enumeration_facets(q);
+        assert!(facets.len() <= 7, "facets not capped: {facets:?}");
+    }
+
+    #[test]
+    fn enumeration_facets_no_marker_returns_query() {
+        let q = "how does auth work";
+        let facets = enumeration_facets(q);
+        assert_eq!(facets, vec!["how does auth work".to_string()]);
     }
 }
 
