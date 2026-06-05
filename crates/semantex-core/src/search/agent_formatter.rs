@@ -137,6 +137,136 @@ fn format_default(response: &SearchResponse, budget: usize) -> String {
     output
 }
 
+/// Truncate `text` to at most 200 chars, newlines→spaces, on a valid char
+/// boundary — the preview-line convention shared with `format_default`.
+fn preview_200(text: &str) -> String {
+    let normalized = text.replace('\n', " ");
+    if normalized.len() > 200 {
+        let end = (0..=200.min(normalized.len()))
+            .rev()
+            .find(|&i| normalized.is_char_boundary(i))
+            .unwrap_or(0);
+        normalized[..end].to_string()
+    } else {
+        normalized
+    }
+}
+
+/// Budget-aware full-body formatter for `semantex_agent`.
+///
+/// Renders each result's COMPLETE body inline (within `budget`) as a
+/// line-numbered fenced block — the calling LLM should not need to re-open
+/// the file — and appends an HONEST completeness marker gated on what was
+/// actually rendered (never over-claims "complete" over a clipped body).
+///
+/// Parallel to `format_default` (which it does NOT modify): that one ships a
+/// 200-char preview per hit; this one ships the full body and only falls back
+/// to a preview line once the byte budget is spent.
+pub fn format_default_full(response: &SearchResponse, budget: usize) -> String {
+    if response.results.is_empty() {
+        return "No results.".to_string();
+    }
+
+    let total_count = response.results.len();
+    let mut parts: Vec<String> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut full_bodied = 0usize;
+    let mut files: Vec<&str> = Vec::new();
+    let mut preview_mode = false;
+
+    for item in &response.results {
+        // Body = content, falling back to summary; treat empty as absent.
+        let body = item
+            .content
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| item.summary.as_deref().filter(|s| !s.is_empty()));
+
+        // Items with no body render as a preview line (a bare ref).
+        if body.is_none() {
+            parts.push(format_ref(item));
+            continue;
+        }
+        let body = body.unwrap();
+
+        if !preview_mode {
+            // Build the full fenced block.
+            let lang = item.language.as_deref().unwrap_or("");
+            let mut block = String::new();
+            let _ = write!(
+                block,
+                "### {}:{}-{}",
+                item.file, item.start_line, item.end_line
+            );
+            if let Some(name) = &item.name {
+                let _ = write!(block, " — {name}");
+            }
+            if let Some(kind) = &item.kind {
+                let _ = write!(block, " [{kind}]");
+            }
+            block.push('\n');
+            let _ = writeln!(block, "```{lang}");
+            for (line_num, line) in (item.start_line..).zip(body.lines()) {
+                let _ = writeln!(block, "{line_num:4} | {line}");
+            }
+            block.push_str("```\n");
+
+            let block_len = block.len();
+
+            // Always render the first body-bearing item's full block, even if
+            // it alone exceeds the budget. After that, switch to preview mode
+            // once the budget would be exceeded.
+            if full_bodied == 0 || total_bytes + block_len <= budget {
+                total_bytes += block_len;
+                full_bodied += 1;
+                if !files.contains(&item.file.as_str()) {
+                    files.push(item.file.as_str());
+                }
+                parts.push(block);
+                continue;
+            }
+            // Over budget: fall through to preview for this and the rest.
+            preview_mode = true;
+        }
+
+        // Preview line: ref + (up to 200 chars of the body, newlines→spaces).
+        let mut line = format_ref(item);
+        line.push_str("  ");
+        line.push_str(&preview_200(body));
+        parts.push(line);
+    }
+
+    let confidence = response.confidence.as_deref().unwrap_or("unknown");
+    let mut output = parts.join("\n");
+    let _ = write!(
+        output,
+        "\n\n[{} results, {}ms, confidence: {}]",
+        total_count, response.duration_ms, confidence
+    );
+
+    // Honest completeness marker, gated on what was actually rendered.
+    let k = full_bodied;
+    let n = total_count;
+    let m = files.len();
+    if k == n && k > 0 {
+        let _ = write!(
+            output,
+            "\n[COMPLETE: full bodies for all {n} results across {m} files are included above; \
+             file:line spans are exact — re-reading these files is redundant.]"
+        );
+    } else if k > 0 && k < n {
+        let remaining = n - k;
+        let _ = write!(
+            output,
+            "\n[full bodies for the top {k} of {n} results are included above (spans exact); \
+             the remaining {remaining} are previews — open those files for full code.]"
+        );
+    }
+    // k == 0 → footer only, no marker.
+
+    output
+}
+
 /// Format deep search results.
 pub fn format_deep_results(response: &DeepSearchResponse, budget: usize) -> String {
     if response.answer.is_empty() && response.sources.is_empty() {
@@ -662,5 +792,197 @@ mod tests {
         );
         assert!(out.contains("matches 1 distinct concepts"), "out: {out}");
         assert!(out.contains("- \"only\" (p.rs:1)"), "out: {out}");
+    }
+
+    // --- full-body formatter (trust the complete body) ------------------
+
+    /// Build a result item with an explicit multi-line body.
+    fn make_result_body(
+        file: &str,
+        start: u32,
+        end: u32,
+        name: Option<&str>,
+        kind: Option<&str>,
+        score: f32,
+        content: &str,
+    ) -> SearchResultItem {
+        SearchResultItem {
+            file: file.into(),
+            start_line: start,
+            end_line: end,
+            score,
+            source: "Dense".into(),
+            chunk_type: "AstNode".into(),
+            name: name.map(Into::into),
+            language: Some("rust".into()),
+            content: Some(content.into()),
+            kind: kind.map(Into::into),
+            summary: None,
+        }
+    }
+
+    /// Both bodies render in full (token past char 200 is present) and the
+    /// COMPLETE marker is emitted when every result got a full body.
+    #[test]
+    fn test_format_default_full_emits_full_body_and_complete_marker() {
+        // A body whose unique token only appears well past char 200, so its
+        // presence in the output proves nothing was truncated.
+        let body = |unique: &str| {
+            let mut s = String::new();
+            for i in 0..30 {
+                s.push_str(&format!("    let padding_line_{i} = {i};\n"));
+            }
+            s.push_str(&format!("    let {unique} = 1;\n"));
+            s
+        };
+        let b1 = body("UNIQUE_TOKEN_ALPHA");
+        let b2 = body("UNIQUE_TOKEN_BETA");
+        assert!(b1.len() > 200 && b2.len() > 200);
+
+        let resp = SearchResponse {
+            results: vec![
+                make_result_body("src/a.rs", 1, 31, Some("a"), Some("fn"), 0.9, &b1),
+                make_result_body("src/b.rs", 1, 31, Some("b"), Some("fn"), 0.8, &b2),
+            ],
+            duration_ms: 12,
+            dense_count: 2,
+            sparse_count: 0,
+            fused_count: 2,
+            metrics: None,
+            confidence: Some("high".into()),
+            disambiguation: None,
+        };
+
+        let out = format_default_full(&resp, DEFAULT_BUDGET);
+        // (a) tokens that only appear past char 200 of each body are present.
+        assert!(out.contains("UNIQUE_TOKEN_ALPHA"), "out: {out}");
+        assert!(out.contains("UNIQUE_TOKEN_BETA"), "out: {out}");
+        // (b) fenced code block present.
+        assert!(out.contains("```"), "out: {out}");
+        // (c) honest COMPLETE marker for all 2 results.
+        assert!(
+            out.contains("[COMPLETE: full bodies for all 2 results"),
+            "out: {out}"
+        );
+    }
+
+    /// When the budget clips most results, only the first renders full and
+    /// the marker honestly says "top 1 of 3" — never the COMPLETE claim.
+    #[test]
+    fn test_format_default_full_partial_marker_when_budget_clips() {
+        let big = "x".repeat(3000);
+        let resp = SearchResponse {
+            results: vec![
+                make_result_body("src/a.rs", 1, 50, Some("a"), Some("fn"), 0.9, &big),
+                make_result_body("src/b.rs", 1, 50, Some("b"), Some("fn"), 0.8, &big),
+                make_result_body("src/c.rs", 60, 99, Some("c"), Some("fn"), 0.7, &big),
+            ],
+            duration_ms: 5,
+            dense_count: 3,
+            sparse_count: 0,
+            fused_count: 3,
+            metrics: None,
+            confidence: Some("medium".into()),
+            disambiguation: None,
+        };
+
+        let out = format_default_full(&resp, 1500);
+        assert!(
+            out.contains("[full bodies for the top 1 of 3"),
+            "out: {out}"
+        );
+        assert!(
+            !out.contains("COMPLETE: full bodies for all"),
+            "out: {out}"
+        );
+        // Item 3 is still cited as a ref/preview (its file:line present) but
+        // NOT as a fenced full block (no `### src/c.rs` header).
+        assert!(out.contains("src/c.rs:60-99"), "out: {out}");
+        assert!(!out.contains("### src/c.rs"), "out: {out}");
+    }
+
+    /// The marker must NEVER over-claim COMPLETE when K < N.
+    #[test]
+    fn test_format_default_full_marker_never_overclaims() {
+        let big = "x".repeat(3000);
+        let resp = SearchResponse {
+            results: vec![
+                make_result_body("src/a.rs", 1, 50, Some("a"), Some("fn"), 0.9, &big),
+                make_result_body("src/b.rs", 1, 50, Some("b"), Some("fn"), 0.8, &big),
+                make_result_body("src/c.rs", 60, 99, Some("c"), Some("fn"), 0.7, &big),
+            ],
+            duration_ms: 5,
+            dense_count: 3,
+            sparse_count: 0,
+            fused_count: 3,
+            metrics: None,
+            confidence: Some("medium".into()),
+            disambiguation: None,
+        };
+        let out = format_default_full(&resp, 1500);
+        assert!(
+            !out.contains("COMPLETE: full bodies for all"),
+            "out: {out}"
+        );
+    }
+
+    /// A bodyless item (no content AND no summary) must count toward N but
+    /// NOT toward K — so the marker stays the honest partial form, never the
+    /// COMPLETE over-claim. Guards the load-bearing honesty property against
+    /// a refactor that lets bodyless items silently inflate K.
+    #[test]
+    fn test_format_default_full_bodyless_item_does_not_overclaim() {
+        let body = {
+            let mut s = String::new();
+            for i in 0..10 {
+                s.push_str(&format!("    let line_{i} = {i};\n"));
+            }
+            s
+        };
+        let mut bodyless =
+            make_result_body("src/empty.rs", 7, 9, Some("e"), Some("fn"), 0.5, "");
+        bodyless.content = None;
+        bodyless.summary = None;
+
+        let resp = SearchResponse {
+            results: vec![
+                make_result_body("src/a.rs", 1, 11, Some("a"), Some("fn"), 0.9, &body),
+                bodyless,
+            ],
+            duration_ms: 4,
+            dense_count: 2,
+            sparse_count: 0,
+            fused_count: 2,
+            metrics: None,
+            confidence: Some("medium".into()),
+            disambiguation: None,
+        };
+
+        let out = format_default_full(&resp, DEFAULT_BUDGET);
+        // (a) never over-claims COMPLETE when a result has no full body.
+        assert!(
+            !out.contains("COMPLETE: full bodies for all"),
+            "out: {out}"
+        );
+        // (b) honest partial marker: 1 full body of 2 total results.
+        assert!(out.contains("top 1 of 2"), "out: {out}");
+        // (c) the bodyless item is still cited via its ref line.
+        assert!(out.contains("src/empty.rs:7-9"), "out: {out}");
+    }
+
+    /// Empty results → "No results." sentinel.
+    #[test]
+    fn test_format_default_full_empty_is_no_results() {
+        let resp = SearchResponse {
+            results: vec![],
+            duration_ms: 1,
+            dense_count: 0,
+            sparse_count: 0,
+            fused_count: 0,
+            metrics: None,
+            confidence: Some("none".into()),
+            disambiguation: None,
+        };
+        assert_eq!(format_default_full(&resp, DEFAULT_BUDGET), "No results.");
     }
 }
