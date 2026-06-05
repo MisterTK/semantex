@@ -1283,9 +1283,14 @@ fn enumeration_facets(query: &str) -> Vec<String> {
         "here",
     ];
 
-    // 1. Strip a leading enumeration marker. Match case-insensitively on a
-    //    lowercased copy, but slice the ORIGINAL so case is preserved. Use the
-    //    marker that appears earliest in the string.
+    // 1. Strip a leading enumeration marker. ALL detection + slicing happens on
+    //    the lowercased copy `lower`, so every byte offset indexes the SAME
+    //    string it was computed from — `to_lowercase()` is not byte-length-
+    //    preserving (e.g. `İ` U+0130 grows 2→3 bytes), so slicing `query` with a
+    //    `lower` offset would land mid-codepoint and panic. Content facets are
+    //    therefore lowercased; that is fine (facets are case-insensitive search
+    //    queries). The original-case query is re-appended verbatim in step 5.
+    //    Use the marker that appears earliest in the string.
     const MARKERS: &[&str] = &[
         "list all",
         "list every",
@@ -1310,8 +1315,8 @@ fn enumeration_facets(query: &str) -> Vec<String> {
         }
     }
     let remainder: &str = match best {
-        Some((pos, len)) => &query[pos + len..],
-        None => query,
+        Some((pos, len)) => &lower[pos + len..],
+        None => &lower,
     };
 
     // 2. Split the remainder into fragments on commas / semicolons / standalone
@@ -1325,12 +1330,14 @@ fn enumeration_facets(query: &str) -> Vec<String> {
     let mut fragments: Vec<String> = Vec::new();
     for raw in work.split(SENTINEL) {
         // Normalize: strip a leading "and "/"or " left over from edge splits.
+        // `frag` is a slice of `lower` (already lowercased), so we strip the
+        // lowercase prefixes directly off it — no cross-string byte offsets,
+        // hence no char-boundary panic.
         let mut frag = raw.trim();
-        let frag_lower = frag.to_lowercase();
-        if let Some(rest) = frag_lower.strip_prefix("and ") {
-            frag = &frag[frag.len() - rest.len()..];
-        } else if let Some(rest) = frag_lower.strip_prefix("or ") {
-            frag = &frag[frag.len() - rest.len()..];
+        if let Some(rest) = frag.strip_prefix("and ") {
+            frag = rest;
+        } else if let Some(rest) = frag.strip_prefix("or ") {
+            frag = rest;
         }
         // 3. Trim whitespace + trailing '.'.
         let frag = frag.trim().trim_end_matches('.').trim();
@@ -1936,6 +1943,24 @@ mod tests {
         assert_eq!(facets, vec!["how does auth work".to_string()]);
     }
 
+    #[test]
+    fn enumeration_facets_unicode_no_panic() {
+        // Regression: byte offsets were computed on `query.to_lowercase()` but
+        // used to slice `query`. `to_lowercase()` is NOT byte-length-preserving
+        // (e.g. `İ` U+0130 grows 2→3 bytes), so the offsets drifted onto a
+        // non-char-boundary and the slice panicked. Default-on fan-out + an
+        // inline daemon agent path means that panic crashed the whole daemon.
+        // Must not panic, and must return a non-empty Vec.
+        let f1 = enumeration_facets("İlist allé, foo");
+        assert!(!f1.is_empty(), "unicode marker query produced empty facets");
+
+        let f2 = enumeration_facets("list all café options, naïve config");
+        assert!(
+            !f2.is_empty(),
+            "unicode multi-item query produced empty facets"
+        );
+    }
+
     // --- exhaustive fan-out: union_diversify + gate -----------------------
 
     /// Minimal `SearchResult` builder for fan-out union/diversify tests.
@@ -1978,7 +2003,7 @@ mod tests {
         let a10: Vec<&crate::types::SearchResult> = merged
             .iter()
             .filter(|r| {
-                r.chunk.file_path == std::path::PathBuf::from("a.rs") && r.chunk.start_line == 10
+                r.chunk.file_path == std::path::Path::new("a.rs") && r.chunk.start_line == 10
             })
             .collect();
         assert_eq!(
@@ -2021,7 +2046,7 @@ mod tests {
         let merged = union_diversify(vec![list], 2, 40);
         let from_same = merged
             .iter()
-            .filter(|r| r.chunk.file_path == std::path::PathBuf::from("same.rs"))
+            .filter(|r| r.chunk.file_path == std::path::Path::new("same.rs"))
             .count();
         assert_eq!(from_same, 2, "per_file_cap not enforced: {merged:?}");
         assert_eq!(merged.len(), 2);
