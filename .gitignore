@@ -46,6 +46,8 @@ CLAUDE.md
 !/benchmarks/tests/
 # Exception: substitution-vs-recall probe (committed source — see results/probe-substitution/).
 !/benchmarks/probe_substitution.py
+# Exception: full-body trust-bundle A/B (committed source — see results/probe-fullbody-ab/).
+!/benchmarks/probe_fullbody_ab.py
 /benches
 /bench_results
 /scripts
@@ -58,6 +60,10 @@ CLAUDE.md
 !/results/probe-substitution/parsed.json
 !/results/probe-substitution/raw/
 !/results/probe-substitution/raw_steered/
+# Exception: full-body trust-bundle A/B summary (raw transcripts stay ignored — large).
+!/results/probe-fullbody-ab/
+/results/probe-fullbody-ab/*
+!/results/probe-fullbody-ab/report.md
 
 # Test output
 crates/semantex-core/tests/TEST_RESULTS.md
