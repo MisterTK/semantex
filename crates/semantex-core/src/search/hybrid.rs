@@ -1250,24 +1250,31 @@ impl HybridSearcher {
 
         // Stage 4: Adaptive result sizing, confidence threshold, and deduplication.
         // Exhaustive mode: widen range, skip dedup, lower threshold.
-        let mut adaptive_config = self.config.adaptive_config();
-        if is_exhaustive_query(&effective_text) {
-            adaptive_config.exhaustive = true;
-        }
-        let pre_adaptive_count = results.len();
-        adaptive::apply_adaptive_pipeline(
-            &mut results,
-            query_type,
-            query.max_results,
-            &adaptive_config,
-        );
-        if results.len() != pre_adaptive_count {
-            tracing::debug!(
-                pre_adaptive = pre_adaptive_count,
-                post_adaptive = results.len(),
-                ?query_type,
-                "Adaptive sizing applied"
+        // Per-query bypass (`disable_adaptive`): skip the pipeline entirely so the
+        // caller keeps full breadth — same effect as `SEMANTEX_ADAPTIVE_SIZING=0`
+        // for this one query. Used by the enumeration fan-out, whose narrow facet
+        // queries ("environment variables") don't read as exhaustive but must not
+        // be clipped on a breadth task.
+        if !query.disable_adaptive {
+            let mut adaptive_config = self.config.adaptive_config();
+            if is_exhaustive_query(&effective_text) {
+                adaptive_config.exhaustive = true;
+            }
+            let pre_adaptive_count = results.len();
+            adaptive::apply_adaptive_pipeline(
+                &mut results,
+                query_type,
+                query.max_results,
+                &adaptive_config,
             );
+            if results.len() != pre_adaptive_count {
+                tracing::debug!(
+                    pre_adaptive = pre_adaptive_count,
+                    post_adaptive = results.len(),
+                    ?query_type,
+                    "Adaptive sizing applied"
+                );
+            }
         }
 
         let fused_count = fused.len();

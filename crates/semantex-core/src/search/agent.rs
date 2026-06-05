@@ -600,9 +600,12 @@ impl<'a> AgentPipeline<'a> {
 
         // Run one hybrid search per facet (match Exhaustive: max 20, no
         // code_only). Skip facets whose search errors — never abort the route.
+        // `disable_adaptive`: facet queries ("environment variables") don't read
+        // as exhaustive, so without the bypass the adaptive pipeline would clip
+        // them — defeating the breadth purpose of the fan-out.
         let mut all_facet_results: Vec<Vec<crate::types::SearchResult>> = Vec::new();
         for facet in &facets {
-            let sq = SearchQuery::new(facet).max_results(20);
+            let sq = SearchQuery::new(facet).max_results(20).disable_adaptive();
             if let Ok(output) = self.searcher.search(&sq) {
                 all_facet_results.push(output.results);
             }
@@ -1539,6 +1542,37 @@ mod tests {
             "Semantic route must surface structured hits"
         );
         assert!(hits.iter().all(|h| !h.file.is_empty()));
+    }
+
+    /// Integration: a query with `.disable_adaptive()` returns at least as many
+    /// results as the same query without it, driven through the real
+    /// `HybridSearcher.search()` adaptive stage. Skipping the adaptive pipeline
+    /// can only widen (never narrow) the result set — the fan-out relies on this
+    /// to keep full breadth. Best-effort: the fixture is small (2 chunks), so
+    /// this guards the wiring and the monotonic-breadth contract rather than a
+    /// large clip.
+    #[test]
+    fn disable_adaptive_returns_at_least_as_many_results() {
+        let (_dir, searcher) = build_populated_searcher();
+
+        let base = searcher
+            .search(&SearchQuery::new("authentication").max_results(20))
+            .expect("base search");
+        let wide = searcher
+            .search(
+                &SearchQuery::new("authentication")
+                    .max_results(20)
+                    .disable_adaptive(),
+            )
+            .expect("disable_adaptive search");
+
+        assert!(
+            wide.results.len() >= base.results.len(),
+            "disable_adaptive must not return fewer results than adaptive \
+             (wide={}, base={})",
+            wide.results.len(),
+            base.results.len()
+        );
     }
 
     /// Route-stress seam (daemon path): the `Request::AgentHits` handler must
