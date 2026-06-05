@@ -577,7 +577,75 @@ impl<'a> AgentPipeline<'a> {
     }
 
     fn handle_exhaustive(&self, query: &str, budget: usize) -> HandlerResult {
-        self.handle_search(query, budget, SearchVariant::Exhaustive)
+        // OFF by default: byte-identical to the original exhaustive handler.
+        if !exhaustive_fanout_enabled() {
+            return self.handle_search(query, budget, SearchVariant::Exhaustive);
+        }
+        self.handle_exhaustive_fanout(query, budget)
+    }
+
+    /// Enumeration fan-out for the exhaustive route (gated behind
+    /// `SEMANTEX_EXHAUSTIVE_FANOUT`). Decomposes an enumeration query into
+    /// per-item facets, runs a hybrid search per facet, then unions + dedups +
+    /// diversifies the hits so the answer covers the whole repo instead of
+    /// clustering on one subsystem. Falls back to the plain exhaustive search
+    /// when there is nothing to fan out (single facet) or the fan-out yields
+    /// no hits.
+    fn handle_exhaustive_fanout(&self, query: &str, budget: usize) -> HandlerResult {
+        let facets = enumeration_facets(query);
+        // Nothing to fan out — single concept (or no enumeration marker).
+        if facets.len() <= 1 {
+            return self.handle_search(query, budget, SearchVariant::Exhaustive);
+        }
+
+        // Run one hybrid search per facet (match Exhaustive: max 20, no
+        // code_only). Skip facets whose search errors — never abort the route.
+        let mut all_facet_results: Vec<Vec<crate::types::SearchResult>> = Vec::new();
+        for facet in &facets {
+            let sq = SearchQuery::new(facet).max_results(20);
+            if let Ok(output) = self.searcher.search(&sq) {
+                all_facet_results.push(output.results);
+            }
+        }
+
+        let merged = union_diversify(all_facet_results, 3, 40);
+        // No coverage from the fan-out — fall back to the plain exhaustive path.
+        if merged.is_empty() {
+            return self.handle_search(query, budget, SearchVariant::Exhaustive);
+        }
+
+        // Success path: mirror `handle_search`'s standard search-results format,
+        // with metrics zeroed (fused_count reflects the diversified union).
+        let effective_budget = budget * SearchVariant::Exhaustive.budget_multiplier();
+        let items: Vec<SearchResultItem> = merged
+            .iter()
+            .map(|r| search_result_to_item(r, true))
+            .collect();
+        let disambig = disambiguation_from_results(&merged);
+        let confidence = compute_confidence(&items);
+        let count = items.len();
+        let hits = items.clone();
+        let resp = SearchResponse {
+            results: items,
+            duration_ms: 0,
+            dense_count: 0,
+            sparse_count: 0,
+            fused_count: merged.len(),
+            metrics: None,
+            confidence: Some(confidence),
+            disambiguation: disambig.clone(),
+        };
+        let mut formatted = format_search_results(&resp, FormatStyle::Default, effective_budget);
+        if let Some(suggestions) = &disambig {
+            append_disambiguation_block(&mut formatted, suggestions);
+        }
+        HandlerResult {
+            formatted,
+            fallback_used: false,
+            result_count: count,
+            hits,
+            disambiguation: disambig,
+        }
     }
 
     /// Consolidated handler for the three "list-route" variants that differ only
@@ -1124,10 +1192,7 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
 ///
 /// Returns content fragments first, then the original query. If nothing
 /// survives decomposition, returns just `[query]`.
-// Consumed by the enumeration fan-out in `handle_exhaustive` (follow-up task);
-// only the unit tests exercise it today, so suppress the unused warning until
-// the call site lands.
-#[allow(dead_code)]
+// Consumed by the enumeration fan-out in `handle_exhaustive`.
 fn enumeration_facets(query: &str) -> Vec<String> {
     // Sentinel substituted for every multi-char split delimiter, so we can
     // split once without re-splitting on bare "," inside the multi-char forms.
@@ -1135,12 +1200,65 @@ fn enumeration_facets(query: &str) -> Vec<String> {
     /// Universal stopwords — a fragment composed entirely of these (after
     /// stripping non-alphanumerics) carries no retrieval signal and is dropped.
     const STOP: &[&str] = &[
-        "the", "a", "an", "this", "that", "these", "those", "it", "its", "they", "them", "their",
-        "there", "where", "when", "what", "which", "who", "is", "are", "was", "were", "be", "been",
-        "does", "do", "did", "done", "project", "repo", "repository", "codebase", "supports",
-        "supported", "support", "defined", "define", "defines", "exist", "exists", "existing",
-        "used", "use", "uses", "using", "in", "on", "of", "for", "to", "and", "or", "all", "every",
-        "any", "each", "with", "that's", "here",
+        "the",
+        "a",
+        "an",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "they",
+        "them",
+        "their",
+        "there",
+        "where",
+        "when",
+        "what",
+        "which",
+        "who",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "does",
+        "do",
+        "did",
+        "done",
+        "project",
+        "repo",
+        "repository",
+        "codebase",
+        "supports",
+        "supported",
+        "support",
+        "defined",
+        "define",
+        "defines",
+        "exist",
+        "exists",
+        "existing",
+        "used",
+        "use",
+        "uses",
+        "using",
+        "in",
+        "on",
+        "of",
+        "for",
+        "to",
+        "and",
+        "or",
+        "all",
+        "every",
+        "any",
+        "each",
+        "with",
+        "that's",
+        "here",
     ];
 
     // 1. Strip a leading enumeration marker. Match case-insensitively on a
@@ -1236,6 +1354,81 @@ fn enumeration_facets(query: &str) -> Vec<String> {
         return vec![query.to_string()];
     }
     facets
+}
+
+/// Union + dedup + diversify the per-facet result lists from the enumeration
+/// fan-out into a single ranked Vec.
+///
+/// Pure (no I/O, no model): given the per-facet hit lists, it (1) flattens and
+/// dedups by `(file_path, start_line)` — the same identity `search_result_to_item`
+/// keys each item on — keeping the higher `.score` on a collision; (2) sorts by
+/// score descending (tie-break by file then start_line for determinism); then
+/// (3) greedily admits results while that file's running count is `< per_file_cap`,
+/// stopping at `total_cap`. The per-file cap spreads coverage across files so an
+/// enumeration question covers the whole repo instead of clustering on one
+/// subsystem.
+fn union_diversify(
+    result_lists: Vec<Vec<crate::types::SearchResult>>,
+    per_file_cap: usize,
+    total_cap: usize,
+) -> Vec<crate::types::SearchResult> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // 1. Flatten + dedup by (file, start_line), keeping the higher score.
+    let mut best: HashMap<(PathBuf, u32), crate::types::SearchResult> = HashMap::new();
+    for list in result_lists {
+        for r in list {
+            let key = (r.chunk.file_path.clone(), r.chunk.start_line);
+            match best.get(&key) {
+                Some(existing) if existing.score >= r.score => {}
+                _ => {
+                    best.insert(key, r);
+                }
+            }
+        }
+    }
+
+    // 2. Sort by score desc; deterministic tie-break by (file, start_line).
+    let mut deduped: Vec<crate::types::SearchResult> = best.into_values().collect();
+    deduped.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk.file_path.cmp(&b.chunk.file_path))
+            .then_with(|| a.chunk.start_line.cmp(&b.chunk.start_line))
+    });
+
+    // 3. Greedily admit while per-file count < cap, until total_cap.
+    let mut per_file: HashMap<PathBuf, usize> = HashMap::new();
+    let mut admitted: Vec<crate::types::SearchResult> =
+        Vec::with_capacity(total_cap.min(deduped.len()));
+    for r in deduped {
+        if admitted.len() >= total_cap {
+            break;
+        }
+        let count = per_file.entry(r.chunk.file_path.clone()).or_insert(0);
+        if *count >= per_file_cap {
+            continue;
+        }
+        *count += 1;
+        admitted.push(r);
+    }
+    admitted
+}
+
+/// Pure parser for the `SEMANTEX_EXHAUSTIVE_FANOUT` flag, factored out so the
+/// OFF-by-default contract is unit-testable without touching process env.
+/// ON iff the value is `"1"` or (case-insensitively) `"true"`.
+fn fanout_flag_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Whether the exhaustive-route facet fan-out is enabled. Gated behind
+/// `SEMANTEX_EXHAUSTIVE_FANOUT`; OFF by default (the shipped default keeps the
+/// exhaustive route byte-identical to before).
+fn exhaustive_fanout_enabled() -> bool {
+    fanout_flag_from(std::env::var("SEMANTEX_EXHAUSTIVE_FANOUT").ok().as_deref())
 }
 
 #[cfg(test)]
@@ -1619,7 +1812,9 @@ mod tests {
             "missing 'environment variables' facet: {facets:?}"
         );
         assert!(
-            facets.iter().any(|f| f.to_lowercase().contains("cli flags")),
+            facets
+                .iter()
+                .any(|f| f.to_lowercase().contains("cli flags")),
             "missing 'cli flags' facet: {facets:?}"
         );
         assert!(
@@ -1665,6 +1860,129 @@ mod tests {
         let q = "how does auth work";
         let facets = enumeration_facets(q);
         assert_eq!(facets, vec!["how does auth work".to_string()]);
+    }
+
+    // --- exhaustive fan-out: union_diversify + gate -----------------------
+
+    /// Minimal `SearchResult` builder for fan-out union/diversify tests.
+    /// Identity is keyed on `(file_path, start_line)` — the SAME pair that
+    /// `search_result_to_item` reads — so dedup tests exercise the real key.
+    fn mk_result(file: &str, line: u32, score: f32) -> crate::types::SearchResult {
+        crate::types::SearchResult {
+            chunk: Chunk {
+                id: 0,
+                file_path: std::path::PathBuf::from(file),
+                start_line: line,
+                end_line: line + 10,
+                content: format!("// {file}:{line}"),
+                chunk_type: ChunkType::AstNode {
+                    name: format!("sym_{line}"),
+                    kind: AstNodeKind::Function,
+                    language: "rust".into(),
+                    structured_meta: None,
+                },
+            },
+            score,
+            source: crate::types::SearchSource::Hybrid,
+            score_dense: 0.0,
+            score_sparse: 0.0,
+            score_exact: 0.0,
+            confidence: crate::types::Confidence::Inferred,
+            confidence_score: 0.5,
+        }
+    }
+
+    #[test]
+    fn union_diversify_dedups_by_file_line_keeping_higher_score() {
+        // Same (file, line) appears in two lists at different scores: keep the
+        // higher score; output sorted by score descending.
+        let list_a = vec![mk_result("a.rs", 10, 0.50), mk_result("b.rs", 20, 0.90)];
+        let list_b = vec![mk_result("a.rs", 10, 0.80), mk_result("c.rs", 30, 0.70)];
+        let merged = union_diversify(vec![list_a, list_b], 3, 40);
+
+        // Dedup: (a.rs,10) appears once, with the HIGHER score 0.80.
+        let a10: Vec<&crate::types::SearchResult> = merged
+            .iter()
+            .filter(|r| {
+                r.chunk.file_path == std::path::PathBuf::from("a.rs") && r.chunk.start_line == 10
+            })
+            .collect();
+        assert_eq!(
+            a10.len(),
+            1,
+            "duplicate (file,line) not deduped: {merged:?}"
+        );
+        assert!(
+            (a10[0].score - 0.80).abs() < 1e-6,
+            "dedup must keep higher score, got {}",
+            a10[0].score
+        );
+
+        // Three distinct keys survive.
+        assert_eq!(merged.len(), 3, "expected 3 unique results: {merged:?}");
+
+        // Sorted by score descending: 0.90 (b), 0.80 (a), 0.70 (c).
+        let scores: Vec<f32> = merged.iter().map(|r| r.score).collect();
+        assert!(
+            scores.windows(2).all(|w| w[0] >= w[1]),
+            "results not sorted by score desc: {scores:?}"
+        );
+        assert!((scores[0] - 0.90).abs() < 1e-6);
+        assert!((scores[1] - 0.80).abs() < 1e-6);
+        assert!((scores[2] - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn union_diversify_caps_per_file() {
+        // Six results, all from the SAME file but distinct lines: no more than
+        // per_file_cap (= 2) may survive for that file.
+        let list = vec![
+            mk_result("same.rs", 1, 0.99),
+            mk_result("same.rs", 2, 0.98),
+            mk_result("same.rs", 3, 0.97),
+            mk_result("same.rs", 4, 0.96),
+            mk_result("same.rs", 5, 0.95),
+            mk_result("same.rs", 6, 0.94),
+        ];
+        let merged = union_diversify(vec![list], 2, 40);
+        let from_same = merged
+            .iter()
+            .filter(|r| r.chunk.file_path == std::path::PathBuf::from("same.rs"))
+            .count();
+        assert_eq!(from_same, 2, "per_file_cap not enforced: {merged:?}");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn union_diversify_caps_total() {
+        // 30 results across 30 distinct files: total_cap (= 5) bounds output.
+        let list: Vec<crate::types::SearchResult> = (0..30)
+            .map(|i| mk_result(&format!("f{i}.rs"), 1, 1.0 - (i as f32) * 0.01))
+            .collect();
+        let merged = union_diversify(vec![list], 3, 5);
+        assert!(
+            merged.len() <= 5,
+            "total_cap not enforced: {} > 5",
+            merged.len()
+        );
+        assert_eq!(merged.len(), 5);
+    }
+
+    #[test]
+    fn exhaustive_fanout_disabled_by_default() {
+        // The shipped default MUST be OFF. The parser is pure given an
+        // explicit value, so assert the OFF/unset cases deterministically.
+        assert!(
+            !fanout_flag_from(None),
+            "unset must be OFF (shipped default)"
+        );
+        assert!(!fanout_flag_from(Some("0")), "\"0\" must be OFF");
+        assert!(!fanout_flag_from(Some("false")), "\"false\" must be OFF");
+        assert!(!fanout_flag_from(Some("")), "empty must be OFF");
+        // ON cases (documents the enabling contract).
+        assert!(fanout_flag_from(Some("1")), "\"1\" must be ON");
+        assert!(fanout_flag_from(Some("true")), "\"true\" must be ON");
+        assert!(fanout_flag_from(Some("TRUE")), "\"TRUE\" must be ON");
     }
 }
 
