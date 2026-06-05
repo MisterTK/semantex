@@ -440,6 +440,27 @@ def _spawn_claude(cmd, **kw):
             time.sleep(30)
 
 
+def claude_tool_flags(arm: str) -> list:
+    """Tool-permission flags for `claude -p`.
+
+    MCP tools are NOT auto-approved in non-interactive (`-p`) mode — without an
+    explicit `--allowedTools` the semantex MCP server is silently DENIED and the
+    agent falls back to native search. A stale per-project grant persisted in the
+    reused CLAUDE_CONFIG_DIR can mask this, so a fresh config dir / new repo would
+    flip sx arms to native-fallback non-deterministically (the substitution-probe
+    harness bug, 2026-06-04). Built-in read tools are auto-approved, so only the
+    MCP glob needs an explicit grant. `Skill` stays disallowed for sx/builtin so no
+    skill contamination leaks in; graphify keeps Skill (its skill lives in the
+    hermetic config dir)."""
+    if arm == "builtin":
+        # Native search only: MCP explicitly denied.
+        return ["--disallowedTools", "Skill", "mcp__semantex__*"]
+    if is_semantex_arm(arm):
+        # Deterministically grant the MCP server; block Skill.
+        return ["--allowedTools", "mcp__semantex__*", "--disallowedTools", "Skill"]
+    return []  # graphify: Skill allowed.
+
+
 def run_claude(prompt: str, repo: str, arm: str, api_key: str, timeout: int = 600) -> str:
     cdir = arm_config_dir(arm)
     mcp_path = cdir / "mcp.json"
@@ -459,12 +480,7 @@ def run_claude(prompt: str, repo: str, arm: str, api_key: str, timeout: int = 60
         "--model", args_model(),
         "--strict-mcp-config", "--mcp-config", str(mcp_path),
     ]
-    if arm == "builtin":
-        # No skills, no MCP — native search only.
-        cmd += ["--disallowedTools", "Skill", "mcp__semantex__*"]
-    elif is_semantex_arm(arm):
-        cmd += ["--disallowedTools", "Skill"]  # MCP only, no skill contamination
-    # graphify: allow Skill (its skill lives in this hermetic config dir).
+    cmd += claude_tool_flags(arm)
 
     env = {**os.environ,
            "ANTHROPIC_API_KEY": api_key,

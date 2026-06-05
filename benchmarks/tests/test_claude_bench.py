@@ -160,6 +160,27 @@ def test_assert_ready_false_without_meta(tmp_path):
     assert cb._assert_ready(str(tmp_path), "lateon-colbert") is False
 
 
+def test_claude_tool_flags_grants_mcp_for_sx_arms():
+    # MCP tools are DENIED in `claude -p` (non-interactive) unless explicitly
+    # granted with --allowedTools. Without it the semantex server is silently
+    # denied and the agent falls back to native search — a stale persisted
+    # per-project grant can mask this, making sweeps non-deterministic (the
+    # substitution-probe harness bug, 2026-06-04). Every sx arm MUST grant the
+    # MCP glob; Skill stays disallowed so no skill contamination leaks in.
+    for arm in ("sx-lateon", "sx-coderank", "semantex", "sx-lateon-steered"):
+        f = cb.claude_tool_flags(arm)
+        assert "--allowedTools" in f, arm
+        assert "mcp__semantex__*" in f[f.index("--allowedTools") + 1], arm
+        assert "--disallowedTools" in f and "Skill" in f, arm
+
+
+def test_claude_tool_flags_builtin_blocks_mcp_and_skill():
+    # builtin = native search only: MCP explicitly denied, never granted.
+    f = cb.claude_tool_flags("builtin")
+    assert "--allowedTools" not in f
+    assert f == ["--disallowedTools", "Skill", "mcp__semantex__*"]
+
+
 def test_parse_stream_records_tool_names():
     import json
     # minimal claude stream-json: two assistant turns w/ tool_use blocks + a result.
