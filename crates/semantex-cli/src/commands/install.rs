@@ -126,7 +126,8 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
 
     let hooks_obj = hooks.as_object_mut().context("hooks is not an object")?;
 
-    // PreToolUse hooks — nudge Grep/Glob and Bash search commands toward semantex
+    // PreToolUse hooks — nudge Grep/Glob, Bash search commands, and native Read
+    // (the Bash hook can't see a file read through the native Read tool) toward semantex
     hooks_obj.insert(
         "PreToolUse".to_string(),
         serde_json::json!([
@@ -143,6 +144,14 @@ pub fn install_claude_code(scope: Option<InstallScope>) -> Result<()> {
                 "hooks": [{
                     "type": "command",
                     "command": format!("{binary} --bash-hook"),
+                    "timeout": 5,
+                }]
+            },
+            {
+                "matcher": "Read",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{binary} --read-hook"),
                     "timeout": 5,
                 }]
             }
