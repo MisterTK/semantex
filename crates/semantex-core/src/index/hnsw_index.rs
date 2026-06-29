@@ -894,7 +894,7 @@ mod tests {
     /// with `EMBEDDING_DIM`-length vectors, and `embed_doc_vectors` round-trips
     /// the stored ids. `#[ignore]` — needs the CodeRankEmbed model download.
     #[test]
-    #[ignore]
+    #[ignore = "needs the CodeRankEmbed model download"]
     fn vector_accessor_methods_return_some_on_built_index() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("dense");

@@ -524,123 +524,6 @@ where
     false
 }
 
-#[cfg(test)]
-mod arg_peek_tests {
-    use super::{
-        command_wants_onnxruntime, memory_constrained_from_args,
-        wants_background_priority_from_args,
-    };
-
-    #[test]
-    fn background_priority_only_for_pure_index_paths() {
-        // index/watch are pure background indexing — safe to nice the process.
-        assert!(wants_background_priority_from_args(["index", "."]));
-        assert!(wants_background_priority_from_args(["watch", "/p"]));
-        // mcp/serve answer queries — must NOT be niced.
-        assert!(!wants_background_priority_from_args(["mcp"]));
-        assert!(!wants_background_priority_from_args(["serve"]));
-        // unrelated subcommands stay normal priority.
-        assert!(!wants_background_priority_from_args(["search", "foo"]));
-    }
-
-    #[test]
-    fn detects_mcp_subcommand_plain() {
-        assert!(memory_constrained_from_args(["mcp"]));
-    }
-
-    #[test]
-    fn detects_index_subcommand() {
-        // Indexing is the most memory-heavy operation — must lower ORT threads.
-        assert!(memory_constrained_from_args(["index", "."]));
-    }
-
-    #[test]
-    fn detects_watch_subcommand() {
-        assert!(memory_constrained_from_args(["watch", "/some/path"]));
-    }
-
-    #[test]
-    fn detects_serve_subcommand() {
-        assert!(memory_constrained_from_args(["serve"]));
-    }
-
-    #[test]
-    fn detects_mcp_subcommand_with_flags() {
-        assert!(memory_constrained_from_args([
-            "mcp", "--http", "--port", "5050"
-        ]));
-    }
-
-    #[test]
-    fn detects_mcp_with_global_flag_before() {
-        // global flags (start with `-`) are skipped to find the subcommand
-        assert!(memory_constrained_from_args(["-v", "mcp"]));
-    }
-
-    #[test]
-    fn rejects_status_and_other_lightweight_subcommands() {
-        // status/health/validate are cheap reads — keep the higher thread default.
-        assert!(!memory_constrained_from_args(["status"]));
-        assert!(!memory_constrained_from_args(["validate"]));
-        assert!(!memory_constrained_from_args(["download-models"]));
-    }
-
-    #[test]
-    fn rejects_no_subcommand() {
-        assert!(!memory_constrained_from_args(Vec::<&str>::new()));
-        // Search-mode invocation: positional query, not a memory-constrained mode.
-        assert!(!memory_constrained_from_args(["how does auth work"]));
-    }
-
-    #[test]
-    fn stops_at_double_dash() {
-        // Anything after `--` is a positional arg to the previous command —
-        // not a subcommand.
-        assert!(!memory_constrained_from_args(["--", "mcp"]));
-    }
-
-    #[test]
-    fn handles_mcp_after_pure_flags() {
-        // Pure flags (no flag-takes-value form) before the subcommand work.
-        assert!(memory_constrained_from_args(["--json", "mcp", "--http"]));
-    }
-
-    #[test]
-    fn known_limitation_flag_with_value_misclassifies() {
-        // Documented limitation: a flag that takes a value followed by an
-        // arg looks indistinguishable from "subcommand here". Acceptable
-        // because the worst outcome is SEMANTEX_ORT_THREADS=4 instead of 1.
-        assert!(!memory_constrained_from_args(["--max-count", "5", "mcp"]));
-    }
-
-    #[test]
-    fn ort_provision_for_search_and_heavy_subcommands() {
-        // Default search (positional query) loads ONNX Runtime in-process.
-        assert!(command_wants_onnxruntime(["how does auth work"]));
-        assert!(command_wants_onnxruntime(["index", "."]));
-        assert!(command_wants_onnxruntime(["watch", "/p"]));
-        assert!(command_wants_onnxruntime(["serve"]));
-        assert!(command_wants_onnxruntime(["mcp", "--http"]));
-        assert!(command_wants_onnxruntime(["-v", "mcp"]));
-        // A positional query after `--` is still a search.
-        assert!(command_wants_onnxruntime(["--", "status"]));
-    }
-
-    #[test]
-    fn ort_no_provision_for_lightweight_subcommands() {
-        // These never load ONNX Runtime in-process, so don't trigger a download.
-        assert!(!command_wants_onnxruntime(["status"]));
-        assert!(!command_wants_onnxruntime(["stop"]));
-        assert!(!command_wants_onnxruntime(["validate"]));
-        assert!(!command_wants_onnxruntime(["download-models"])); // provisions itself
-        assert!(!command_wants_onnxruntime(["install-claude-code"]));
-        assert!(!command_wants_onnxruntime(["connect"]));
-        // Bare invocation / pure flags (help/version): no download.
-        assert!(!command_wants_onnxruntime(Vec::<&str>::new()));
-        assert!(!command_wants_onnxruntime(["--version"]));
-    }
-}
-
 fn main() -> Result<()> {
     // ── HARDEST POSSIBLE FAILSAFE: memory caps installed at process start ──
     //
@@ -1099,5 +982,122 @@ fn main() -> Result<()> {
                 commands::search::run(&search_opts, &config)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod arg_peek_tests {
+    use super::{
+        command_wants_onnxruntime, memory_constrained_from_args,
+        wants_background_priority_from_args,
+    };
+
+    #[test]
+    fn background_priority_only_for_pure_index_paths() {
+        // index/watch are pure background indexing — safe to nice the process.
+        assert!(wants_background_priority_from_args(["index", "."]));
+        assert!(wants_background_priority_from_args(["watch", "/p"]));
+        // mcp/serve answer queries — must NOT be niced.
+        assert!(!wants_background_priority_from_args(["mcp"]));
+        assert!(!wants_background_priority_from_args(["serve"]));
+        // unrelated subcommands stay normal priority.
+        assert!(!wants_background_priority_from_args(["search", "foo"]));
+    }
+
+    #[test]
+    fn detects_mcp_subcommand_plain() {
+        assert!(memory_constrained_from_args(["mcp"]));
+    }
+
+    #[test]
+    fn detects_index_subcommand() {
+        // Indexing is the most memory-heavy operation — must lower ORT threads.
+        assert!(memory_constrained_from_args(["index", "."]));
+    }
+
+    #[test]
+    fn detects_watch_subcommand() {
+        assert!(memory_constrained_from_args(["watch", "/some/path"]));
+    }
+
+    #[test]
+    fn detects_serve_subcommand() {
+        assert!(memory_constrained_from_args(["serve"]));
+    }
+
+    #[test]
+    fn detects_mcp_subcommand_with_flags() {
+        assert!(memory_constrained_from_args([
+            "mcp", "--http", "--port", "5050"
+        ]));
+    }
+
+    #[test]
+    fn detects_mcp_with_global_flag_before() {
+        // global flags (start with `-`) are skipped to find the subcommand
+        assert!(memory_constrained_from_args(["-v", "mcp"]));
+    }
+
+    #[test]
+    fn rejects_status_and_other_lightweight_subcommands() {
+        // status/health/validate are cheap reads — keep the higher thread default.
+        assert!(!memory_constrained_from_args(["status"]));
+        assert!(!memory_constrained_from_args(["validate"]));
+        assert!(!memory_constrained_from_args(["download-models"]));
+    }
+
+    #[test]
+    fn rejects_no_subcommand() {
+        assert!(!memory_constrained_from_args(Vec::<&str>::new()));
+        // Search-mode invocation: positional query, not a memory-constrained mode.
+        assert!(!memory_constrained_from_args(["how does auth work"]));
+    }
+
+    #[test]
+    fn stops_at_double_dash() {
+        // Anything after `--` is a positional arg to the previous command —
+        // not a subcommand.
+        assert!(!memory_constrained_from_args(["--", "mcp"]));
+    }
+
+    #[test]
+    fn handles_mcp_after_pure_flags() {
+        // Pure flags (no flag-takes-value form) before the subcommand work.
+        assert!(memory_constrained_from_args(["--json", "mcp", "--http"]));
+    }
+
+    #[test]
+    fn known_limitation_flag_with_value_misclassifies() {
+        // Documented limitation: a flag that takes a value followed by an
+        // arg looks indistinguishable from "subcommand here". Acceptable
+        // because the worst outcome is SEMANTEX_ORT_THREADS=4 instead of 1.
+        assert!(!memory_constrained_from_args(["--max-count", "5", "mcp"]));
+    }
+
+    #[test]
+    fn ort_provision_for_search_and_heavy_subcommands() {
+        // Default search (positional query) loads ONNX Runtime in-process.
+        assert!(command_wants_onnxruntime(["how does auth work"]));
+        assert!(command_wants_onnxruntime(["index", "."]));
+        assert!(command_wants_onnxruntime(["watch", "/p"]));
+        assert!(command_wants_onnxruntime(["serve"]));
+        assert!(command_wants_onnxruntime(["mcp", "--http"]));
+        assert!(command_wants_onnxruntime(["-v", "mcp"]));
+        // A positional query after `--` is still a search.
+        assert!(command_wants_onnxruntime(["--", "status"]));
+    }
+
+    #[test]
+    fn ort_no_provision_for_lightweight_subcommands() {
+        // These never load ONNX Runtime in-process, so don't trigger a download.
+        assert!(!command_wants_onnxruntime(["status"]));
+        assert!(!command_wants_onnxruntime(["stop"]));
+        assert!(!command_wants_onnxruntime(["validate"]));
+        assert!(!command_wants_onnxruntime(["download-models"])); // provisions itself
+        assert!(!command_wants_onnxruntime(["install-claude-code"]));
+        assert!(!command_wants_onnxruntime(["connect"]));
+        // Bare invocation / pure flags (help/version): no download.
+        assert!(!command_wants_onnxruntime(Vec::<&str>::new()));
+        assert!(!command_wants_onnxruntime(["--version"]));
     }
 }

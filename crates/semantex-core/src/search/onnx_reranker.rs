@@ -511,7 +511,7 @@ mod tests {
             )
             .expect("construct with tokenizer present");
             let docs = ["a", "b", "c"];
-            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let docs_ref: Vec<&str> = docs.to_vec();
             let out = r.rerank("q", &docs_ref, 2).expect("identity rerank");
             assert_eq!(out, vec![(0, 0.0_f32), (1, 0.0_f32)]);
         });
@@ -523,9 +523,9 @@ mod tests {
     /// blow past bge's 512 positional range / Qwen3's CPU O(seq^2) budget.
     #[test]
     fn encode_pair_truncates_to_max_context() {
+        const MAX: usize = 8;
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("tokenizer.json"), MINIMAL_TOKENIZER_JSON).unwrap();
-        const MAX: usize = 8;
         let r = OnnxReranker::new(
             tmp.path(),
             "model.onnx",
@@ -570,7 +570,7 @@ mod tests {
     ///   SEMANTEX_RERANKER=on cargo test -p semantex-core \
     ///     -- --ignored onnx_reranker::tests::onnx_classifier_ranks_on_topic
     #[test]
-    #[ignore]
+    #[ignore = "requires downloading the bge ONNX reranker model"]
     fn onnx_classifier_ranks_on_topic() {
         use crate::config::SemantexConfig;
         use crate::search::fastembed_reranker::ENV_ENABLE;
@@ -583,7 +583,9 @@ mod tests {
             unsafe { std::env::set_var("SEMANTEX_RERANKER_MODEL", "bge-onnx") };
             let spec = match select_reranker_choice_from_env() {
                 RerankerChoice::Onnx(s) => s,
-                other => panic!("expected ONNX choice for bge-onnx, got {other:?}"),
+                other @ RerankerChoice::Fastembed(_) => {
+                    panic!("expected ONNX choice for bge-onnx, got {other:?}")
+                }
             };
             let config = SemantexConfig::default();
             let dir = ensure_reranker_model(&config.models_dir(), &spec.files)
@@ -602,7 +604,7 @@ mod tests {
                 "Pizza is a popular Italian dish.",
                 "fn binary_search(a: &[i32], t: i32) -> Option<usize> { /* ... */ }",
             ];
-            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let docs_ref: Vec<&str> = docs.to_vec();
             let out = r
                 .rerank("how does binary search work", &docs_ref, 2)
                 .expect("rerank");
@@ -618,7 +620,7 @@ mod tests {
     ///   SEMANTEX_RERANKER=on cargo test -p semantex-core \
     ///     -- --ignored onnx_reranker::tests::onnx_qwen3_yesno_ranks_on_topic
     #[test]
-    #[ignore]
+    #[ignore = "requires downloading the ~1.1 GB qwen3 ONNX reranker model"]
     fn onnx_qwen3_yesno_ranks_on_topic() {
         use crate::config::SemantexConfig;
         use crate::search::fastembed_reranker::ENV_ENABLE;
@@ -630,7 +632,9 @@ mod tests {
             unsafe { std::env::set_var("SEMANTEX_RERANKER_MODEL", "qwen3") };
             let spec = match select_reranker_choice_from_env() {
                 RerankerChoice::Onnx(s) => s,
-                other => panic!("expected ONNX choice for qwen3, got {other:?}"),
+                other @ RerankerChoice::Fastembed(_) => {
+                    panic!("expected ONNX choice for qwen3, got {other:?}")
+                }
             };
             // The resolved strategy must be the verified yes/no template.
             assert!(
@@ -653,7 +657,7 @@ mod tests {
                 "Pizza is a popular Italian dish.",
                 "fn binary_search(a: &[i32], t: i32) -> Option<usize> { /* ... */ }",
             ];
-            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let docs_ref: Vec<&str> = docs.to_vec();
             let out = r
                 .rerank("how does binary search work", &docs_ref, 2)
                 .expect("rerank (fp16 extraction must succeed)");

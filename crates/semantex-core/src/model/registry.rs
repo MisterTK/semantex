@@ -235,8 +235,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut cfg = SemantexConfig::default();
-        cfg.embedder = "some-multivec".to_string();
+        let cfg = SemantexConfig {
+            embedder: "some-multivec".to_string(),
+            ..Default::default()
+        };
         let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
         assert_eq!(
             reg.embedder_backend_kind().unwrap(),
@@ -248,8 +250,10 @@ mod tests {
     #[test]
     fn coderank_selection_routes_to_hnsw() {
         // The single-vector embedder routes to the coderank-hnsw backend.
-        let mut cfg = SemantexConfig::default();
-        cfg.embedder = "coderank-137m".to_string();
+        let cfg = SemantexConfig {
+            embedder: "coderank-137m".to_string(),
+            ..Default::default()
+        };
         let reg = ModelRegistry::from_config(&cfg, None).unwrap();
         assert_eq!(reg.active_embedder().unwrap().id, "coderank-137m");
         assert_eq!(
@@ -262,8 +266,10 @@ mod tests {
     fn resolve_dense_backend_canonical_embedder_path() {
         // SEMANTEX_EMBEDDER=coderank-137m (canonical) with the default dense_backend
         // alias must route to coderank-hnsw via capabilities.
-        let mut cfg = SemantexConfig::default();
-        cfg.embedder = "coderank-137m".to_string();
+        let cfg = SemantexConfig {
+            embedder: "coderank-137m".to_string(),
+            ..Default::default()
+        };
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::CoderankHnsw
@@ -273,8 +279,10 @@ mod tests {
     #[test]
     fn resolve_dense_backend_alias_parses_known_backend() {
         // A SEMANTEX_DENSE_BACKEND alias that names a known backend wins directly.
-        let mut cfg = SemantexConfig::default();
-        cfg.dense_backend = "coderank-hnsw".to_string();
+        let cfg = SemantexConfig {
+            dense_backend: "coderank-hnsw".to_string(),
+            ..Default::default()
+        };
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::CoderankHnsw
@@ -288,9 +296,11 @@ mod tests {
         // config degrades gracefully. (A KNOWN alias like "colbert-plaid" parses
         // and wins directly — covered separately.) Embedder pinned explicitly so
         // the fall-through target is deterministic regardless of the shipped default.
-        let mut cfg = SemantexConfig::default();
-        cfg.embedder = "coderank-137m".to_string();
-        cfg.dense_backend = "totally-made-up".to_string();
+        let cfg = SemantexConfig {
+            embedder: "coderank-137m".to_string(),
+            dense_backend: "totally-made-up".to_string(),
+            ..Default::default()
+        };
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::CoderankHnsw
@@ -301,8 +311,10 @@ mod tests {
     fn resolve_dense_backend_colbert_plaid_alias_parses() {
         // The known colbert-plaid backend alias parses and wins directly (the
         // deprecated SEMANTEX_DENSE_BACKEND path), independent of the embedder.
-        let mut cfg = SemantexConfig::default();
-        cfg.dense_backend = "colbert-plaid".to_string();
+        let cfg = SemantexConfig {
+            dense_backend: "colbert-plaid".to_string(),
+            ..Default::default()
+        };
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::ColbertPlaid
@@ -316,9 +328,15 @@ mod tests {
         // embedder's multi_vector capability. This is the exact path the indexer +
         // searcher use; a non-empty alias default would shadow it (regression guard
         // for the e2e "lateon-colbert silently built coderank-hnsw" bug).
-        let mut cfg = SemantexConfig::default();
-        assert_eq!(cfg.dense_backend, "", "precondition: alias defaults empty");
-        cfg.embedder = "lateon-colbert".to_string();
+        assert_eq!(
+            SemantexConfig::default().dense_backend,
+            "",
+            "precondition: alias defaults empty"
+        );
+        let cfg = SemantexConfig {
+            embedder: "lateon-colbert".to_string(),
+            ..Default::default()
+        };
         assert_eq!(
             ModelRegistry::resolve_dense_backend(&cfg, None).unwrap(),
             DenseBackendKind::ColbertPlaid
@@ -353,8 +371,10 @@ mod tests {
 
     #[test]
     fn unknown_active_id_errors_naming_the_id_and_role() {
-        let mut cfg = SemantexConfig::default();
-        cfg.embedder = "does-not-exist".to_string();
+        let cfg = SemantexConfig {
+            embedder: "does-not-exist".to_string(),
+            ..Default::default()
+        };
         let reg = ModelRegistry::from_config(&cfg, None).unwrap();
         let err = reg.active_embedder().expect_err("unknown id must error");
         let msg = err.to_string();
@@ -375,8 +395,10 @@ mod tests {
     #[cfg(feature = "llm")]
     #[test]
     fn llm_builtin_resolves_when_feature_on_and_selected() {
-        let mut cfg = SemantexConfig::default();
-        cfg.llm_model = "ollama-default".to_string();
+        let cfg = SemantexConfig {
+            llm_model: "ollama-default".to_string(),
+            ..Default::default()
+        };
         let reg = ModelRegistry::from_config(&cfg, None).unwrap();
         let spec = reg.active_llm().unwrap().expect("llm spec should resolve");
         assert_eq!(spec.id, "ollama-default");

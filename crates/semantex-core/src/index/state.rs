@@ -245,10 +245,7 @@ mod tests {
     fn test_pre_v0_3_schema_v7_is_stale() {
         // Sanity: this test only makes sense as long as the current schema
         // is past v7. If we ever roll back, the test should be updated.
-        assert!(
-            IndexMeta::CURRENT_SCHEMA_VERSION > 7,
-            "current schema version regressed; revisit pre-v0.3 stale test"
-        );
+        const { assert!(IndexMeta::CURRENT_SCHEMA_VERSION > 7) };
 
         let tmp = TempDir::new().unwrap();
         let semantex_dir = tmp.path().join(".semantex");

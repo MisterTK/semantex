@@ -1,6 +1,6 @@
 //! Smoke test proving `tokenizers` is a usable direct dependency of
 //! semantex-core (it is otherwise pulled transitively via fastembed). The ONNX
-//! reranker (search/onnx_reranker.rs) needs `Tokenizer::from_file`.
+//! reranker (`search/onnx_reranker.rs`) needs `Tokenizer::from_file`.
 
 #[test]
 fn tokenizer_type_is_importable() {

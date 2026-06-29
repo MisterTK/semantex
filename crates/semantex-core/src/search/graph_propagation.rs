@@ -509,7 +509,9 @@ mod tests {
 
     #[test]
     fn test_module_decay_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("SEMANTEX_GRAPH_MODULE_DECAY", "0.10") };
         let config = GraphPropagationConfig::localization_mode(10).with_env_overrides();
         unsafe { std::env::remove_var("SEMANTEX_GRAPH_MODULE_DECAY") };
@@ -525,7 +527,9 @@ mod tests {
     #[test]
     fn test_hops_env_one_forces_transitive_off() {
         // SAFETY: env-mutating tests are serialized by ENV_LOCK; restored at end.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("SEMANTEX_GRAPH_HOPS", "1") };
         let config = GraphPropagationConfig::architectural_mode(10).with_env_overrides();
         unsafe { std::env::remove_var("SEMANTEX_GRAPH_HOPS") };
@@ -534,7 +538,9 @@ mod tests {
 
     #[test]
     fn test_hops_env_two_forces_transitive_on() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("SEMANTEX_GRAPH_HOPS", "2") };
         // Start from a 1-hop preset; hops=2 must turn transitive ON.
         let config =
@@ -545,7 +551,9 @@ mod tests {
 
     #[test]
     fn test_disable_env_sets_disabled() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("SEMANTEX_GRAPH_DISABLE", "1") };
         let config =
             GraphPropagationConfig::for_query_type(&QueryType::Semantic, 10).with_env_overrides();

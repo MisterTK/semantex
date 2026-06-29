@@ -286,6 +286,8 @@ pub(crate) mod test_support {
     }
 
     /// Record a module-level import edge (importer imports imported).
+    // `importer` / `imported` are the domain terms for the two edge endpoints.
+    #[allow(clippy::similar_names)]
     pub fn add_module_edge(store: &ChunkStore, importer: &str, imported: &str) {
         store
             .insert_module_edge(importer, imported, "import")
@@ -344,8 +346,10 @@ mod tests {
         for c in store.get_chunks(&[1]).unwrap() {
             chunk_map.insert(c.id, c);
         }
-        let mut config = GraphPropagationConfig::localization_mode(10);
-        config.disabled = true;
+        let config = GraphPropagationConfig {
+            disabled: true,
+            ..GraphPropagationConfig::localization_mode(10)
+        };
         let new_ids = run_graph_stage(&mut fused, &mut chunk_map, &store, &config, 10).unwrap();
         assert!(new_ids.is_empty());
         assert_eq!(fused.len(), 1);

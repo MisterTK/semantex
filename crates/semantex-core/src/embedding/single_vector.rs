@@ -406,6 +406,6 @@ mod tests {
     #[test]
     fn embedding_dim_is_recorded_constant() {
         assert_eq!(SingleVectorEmbedder::embedding_dim(), EMBEDDING_DIM);
-        assert!(EMBEDDING_DIM > 0);
+        const { assert!(EMBEDDING_DIM > 0) };
     }
 }

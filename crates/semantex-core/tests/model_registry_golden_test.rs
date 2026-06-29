@@ -19,8 +19,10 @@ use std::fs;
 #[test]
 fn registry_resolved_backend_equals_direct_for_coderank() {
     // coderank-137m (single-vector) → coderank-hnsw, both ways.
-    let mut cfg = SemantexConfig::default();
-    cfg.embedder = "coderank-137m".to_string();
+    let cfg = SemantexConfig {
+        embedder: "coderank-137m".to_string(),
+        ..SemantexConfig::default()
+    };
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
     let resolved = reg.embedder_backend_kind().unwrap();
     // Direct construction: a single-vector capability maps to coderank-hnsw.
@@ -41,8 +43,10 @@ fn registry_resolved_backend_equals_direct_for_coderank() {
 /// capability-driven (not id-branching).
 #[test]
 fn single_vector_routes_to_hnsw_backendkind() {
-    let mut cfg = SemantexConfig::default();
-    cfg.embedder = "coderank-137m".to_string();
+    let cfg = SemantexConfig {
+        embedder: "coderank-137m".to_string(),
+        ..SemantexConfig::default()
+    };
     let reg = ModelRegistry::from_config(&cfg, None).unwrap();
     // Capability negotiation picks the coderank-hnsw BackendKind from the spec.
     assert_eq!(
@@ -87,8 +91,10 @@ fn user_manifest_second_model_loads_and_routes() {
     )
     .unwrap();
 
-    let mut cfg = SemantexConfig::default();
-    cfg.embedder = "my-sv-variant".to_string();
+    let cfg = SemantexConfig {
+        embedder: "my-sv-variant".to_string(),
+        ..SemantexConfig::default()
+    };
     let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
 
     // It resolves…
@@ -136,8 +142,10 @@ fn user_manifest_multi_vector_model_routes_to_colbert_plaid() {
     )
     .unwrap();
 
-    let mut cfg = SemantexConfig::default();
-    cfg.embedder = "my-multivec-variant".to_string();
+    let cfg = SemantexConfig {
+        embedder: "my-multivec-variant".to_string(),
+        ..SemantexConfig::default()
+    };
     let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
     // Loads as a spec…
     assert_eq!(reg.active_embedder().unwrap().id, "my-multivec-variant");
@@ -181,8 +189,10 @@ fn user_manifest_single_vector_model_capability_routes() {
     )
     .unwrap();
 
-    let mut cfg = SemantexConfig::default();
-    cfg.embedder = "gte-modernbert-hnsw".to_string();
+    let cfg = SemantexConfig {
+        embedder: "gte-modernbert-hnsw".to_string(),
+        ..SemantexConfig::default()
+    };
     let reg = ModelRegistry::from_config(&cfg, Some(&project)).unwrap();
 
     let spec = reg.active_embedder().unwrap();
@@ -258,7 +268,7 @@ fn mismatched_index_errors_cleanly() {
 }
 
 /// Write a tiny synthetic repo so a real index can be built without network
-/// (the default embedder path needs the CodeRankEmbed model; gate the
+/// (the default embedder path needs the `CodeRankEmbed` model; gate the
 /// model-dependent assertion with `#[ignore]`). Inspects meta.json shape only.
 fn write_tiny_repo(dir: &std::path::Path) {
     fs::create_dir_all(dir).unwrap();

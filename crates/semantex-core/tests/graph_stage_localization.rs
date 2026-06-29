@@ -11,7 +11,7 @@ use semantex_core::search::graph_stage::run_graph_stage;
 use semantex_core::types::{Chunk, ScoredChunkId};
 
 /// Locate this repo's index db. The semantex workspace index lives at
-/// `<repo>/.semantex/chunks.db`. CARGO_MANIFEST_DIR = crates/semantex-core; the
+/// `<repo>/.semantex/chunks.db`. `CARGO_MANIFEST_DIR` = crates/semantex-core; the
 /// workspace root is two levels up.
 fn open_repo_store() -> Option<ChunkStore> {
     let db = Path::new(env!("CARGO_MANIFEST_DIR"))

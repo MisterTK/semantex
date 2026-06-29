@@ -312,27 +312,23 @@ mod tests {
         // Stemmer ON: query 'retries' conflates with 'retry' -> both docs hit.
         assert!(
             ids_on.contains(&1) && ids_on.contains(&2),
-            "stemmer on: expected 'retries' query to match docs 1 (retry) and 2 (retries), got {:?}",
-            ids_on
+            "stemmer on: expected 'retries' query to match docs 1 (retry) and 2 (retries), got {ids_on:?}"
         );
 
         // Stemmer OFF: query 'retries' must NOT match doc 1 ('retry' literal).
         assert!(
             !ids_off.contains(&1),
-            "stemmer off: 'retries' must NOT conflate with 'retry' (doc 1), got {:?}",
-            ids_off
+            "stemmer off: 'retries' must NOT conflate with 'retry' (doc 1), got {ids_off:?}"
         );
         assert!(
             ids_off.contains(&2),
-            "stemmer off: 'retries' must still match its own literal in doc 2, got {:?}",
-            ids_off
+            "stemmer off: 'retries' must still match its own literal in doc 2, got {ids_off:?}"
         );
 
         // The two result sets MUST differ — this is the core acceptance signal.
         assert_ne!(
             ids_on, ids_off,
-            "stemmer flag must produce different result sets (on={:?}, off={:?})",
-            ids_on, ids_off
+            "stemmer flag must produce different result sets (on={ids_on:?}, off={ids_off:?})"
         );
     }
 
@@ -382,9 +378,8 @@ mod tests {
         // 3. Re-open with the OPPOSITE flag — must fail. `SparseIndex` does
         // not implement `Debug`, so we can't use `expect_err`; pattern-match
         // on the Result instead.
-        let err = match SparseIndex::open(&sparse_dir, false) {
-            Err(e) => e,
-            Ok(_) => panic!("opening with mismatched stemmer flag must fail"),
+        let Err(err) = SparseIndex::open(&sparse_dir, false) else {
+            panic!("opening with mismatched stemmer flag must fail");
         };
         let msg = err.to_string();
         assert!(
@@ -451,13 +446,11 @@ mod tests {
 
         assert!(
             hits_retry.contains(&1),
-            "'retry' must match doc 1 (literal 'retry'), got {:?}",
-            hits_retry
+            "'retry' must match doc 1 (literal 'retry'), got {hits_retry:?}"
         );
         assert!(
             !hits_retry.contains(&2),
-            "stemmer off: 'retry' must NOT match doc 2 ('retries'), got {:?}",
-            hits_retry
+            "stemmer off: 'retry' must NOT match doc 2 ('retries'), got {hits_retry:?}"
         );
     }
 }

@@ -1500,9 +1500,9 @@ mod tests {
             channels_hit: 3,
             channels_fired: 3,
         };
-        let _next_close = 0.999_f32;
+        let next_close = 0.999_f32;
         assert_eq!(
-            extracted.confidence(Some(_next_close)),
+            extracted.confidence(Some(next_close)),
             Confidence::Extracted
         );
     }

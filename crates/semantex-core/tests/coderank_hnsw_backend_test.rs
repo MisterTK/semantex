@@ -1,9 +1,9 @@
 //! S2 acceptance gate: the `coderank-hnsw` dense backend indexes a synthetic
-//! repo, searches end-to-end via HybridSearcher, and returns deterministic,
+//! repo, searches end-to-end via `HybridSearcher`, and returns deterministic,
 //! relevant dense results. Repo-agnostic (tempdir + inline sources). `#[ignore]`
-//! because it downloads + runs the CodeRankEmbed ONNX model.
+//! because it downloads + runs the `CodeRankEmbed` ONNX model.
 //!
-//! Run: cargo test -p semantex-core --test coderank_hnsw_backend_test -- --ignored --nocapture
+//! Run: cargo test -p semantex-core --test `coderank_hnsw_backend_test` -- --ignored --nocapture
 #![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
@@ -51,7 +51,7 @@ fn build_and_open(project: &Path) -> Result<HybridSearcher> {
 
 /// Dense-only search returns the topically-correct chunk first.
 #[test]
-#[ignore]
+#[ignore = "downloads and runs the CodeRankEmbed ONNX model"]
 fn coderank_hnsw_dense_search_is_relevant() -> Result<()> {
     let tmp = TempDir::new()?;
     let project = tmp.path().join("repo");
@@ -80,7 +80,7 @@ fn coderank_hnsw_dense_search_is_relevant() -> Result<()> {
 
 /// Determinism: two opens of the same index give identical dense rankings.
 #[test]
-#[ignore]
+#[ignore = "downloads and runs the CodeRankEmbed ONNX model"]
 fn coderank_hnsw_dense_is_deterministic() -> Result<()> {
     let tmp = TempDir::new()?;
     let project = tmp.path().join("repo");
@@ -122,7 +122,7 @@ fn coderank_hnsw_dense_is_deterministic() -> Result<()> {
 /// The deprecated `SEMANTEX_DENSE_BACKEND=coderank-hnsw` alias also selects the
 /// backend (the S0 harness's kept-live alias knob).
 #[test]
-#[ignore]
+#[ignore = "downloads and runs the CodeRankEmbed ONNX model"]
 fn coderank_hnsw_alias_selection_builds_and_searches() -> Result<()> {
     let tmp = TempDir::new()?;
     let project = tmp.path().join("repo");
