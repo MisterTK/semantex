@@ -414,7 +414,7 @@ mod tests {
     ///   SEMANTEX_RERANKER=on cargo test -p semantex-core \
     ///     -- --ignored fastembed_reranker::tests::reranks_when_enabled
     #[test]
-    #[ignore]
+    #[ignore = "downloads ~600 MB of fastembed reranker weights; run with --ignored"]
     fn reranks_when_enabled() {
         with_env(&[(ENV_ENABLE, Some("on")), (ENV_MODEL, None)], || {
             let mut reranker =
@@ -425,9 +425,9 @@ mod tests {
                 "Pizza is a popular Italian dish.",
                 "Rust's slice::binary_search returns the index of a matching element.",
             ];
-            let docs_ref: Vec<&str> = docs.iter().copied().collect();
+            let doc_slices: Vec<&str> = docs.to_vec();
             let results = reranker
-                .rerank("how does binary search work in Rust?", &docs_ref, 4)
+                .rerank("how does binary search work in Rust?", &doc_slices, 4)
                 .expect("rerank failed");
             assert!(!results.is_empty());
             // Top result should be one of the on-topic documents (index 1 or 3).

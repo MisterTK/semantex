@@ -165,7 +165,7 @@ libc = "0.2"
 
 # zip: extract the official ONNX Runtime `.zip` release on Windows (runtime_manager.rs).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_ProcessStatus"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

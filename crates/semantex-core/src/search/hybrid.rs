@@ -2008,8 +2008,10 @@ mod tests {
     /// FusionWeights. This guards the selection logic the hybrid match arm uses.
     #[test]
     fn weighted_rrf_selection_reads_config_rrf_k_and_weights() {
-        let mut cfg = crate::config::SemantexConfig::default();
-        cfg.rrf_k = 42.0;
+        let cfg = crate::config::SemantexConfig {
+            rrf_k: 42.0,
+            ..Default::default()
+        };
         let (weights, k) = weighted_rrf_params(&cfg, query_classifier::QueryType::Identifier);
         assert!(
             (k - 42.0).abs() < f32::EPSILON,

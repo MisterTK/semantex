@@ -3,7 +3,7 @@
 //! synthetic repo, primes the cache with a query, mutates a file + reindexes
 //! (which rewrites meta.json `updated_at`), then asserts the same query returns
 //! the POST-reindex content — proving the stamp-flush invalidation works
-//! end-to-end through HybridSearcher::search. Repo-agnostic; tempdir only.
+//! end-to-end through `HybridSearcher::search`. Repo-agnostic; tempdir only.
 
 use semantex_core::config::SemantexConfig;
 use semantex_core::index::builder::IndexBuilder;

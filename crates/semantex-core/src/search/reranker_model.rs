@@ -256,7 +256,9 @@ mod tests {
                         assert_eq!(spec.session_file, "model.onnx");
                         assert_eq!(spec.files.subdir, "Qwen3-Reranker-0.6B-onnx");
                     }
-                    other => panic!("expected Onnx for {alias}, got {other:?}"),
+                    other @ RerankerChoice::Fastembed(_) => {
+                        panic!("expected Onnx for {alias}, got {other:?}")
+                    }
                 },
             );
         }
@@ -271,7 +273,9 @@ mod tests {
                 RerankerChoice::Onnx(spec) => {
                     assert!(matches!(spec.strategy, ScoreStrategy::ClassifierLogit));
                 }
-                other => panic!("expected Onnx classifier, got {other:?}"),
+                other @ RerankerChoice::Fastembed(_) => {
+                    panic!("expected Onnx classifier, got {other:?}")
+                }
             },
         );
     }
@@ -283,7 +287,9 @@ mod tests {
                 RerankerChoice::Fastembed(m) => {
                     assert_eq!(m, fastembed::RerankerModel::BGERerankerV2M3);
                 }
-                other => panic!("expected Fastembed bge for {v:?}, got {other:?}"),
+                other @ RerankerChoice::Onnx(_) => {
+                    panic!("expected Fastembed bge for {v:?}, got {other:?}")
+                }
             });
         }
     }
@@ -310,15 +316,19 @@ mod tests {
             RerankerChoice::Fastembed(m) => {
                 assert_eq!(m, fastembed::RerankerModel::BGERerankerV2M3);
             }
-            other => panic!("expected Fastembed bge from registry spec, got {other:?}"),
+            other @ RerankerChoice::Onnx(_) => {
+                panic!("expected Fastembed bge from registry spec, got {other:?}")
+            }
         }
     }
 
     #[test]
     fn from_spec_resolves_qwen3_to_onnx_yesno() {
         // Select qwen3 via config (== SEMANTEX_RERANKER_MODEL) -> ONNX yes/no.
-        let mut cfg = SemantexConfig::default();
-        cfg.reranker_model = "qwen3-reranker-0.6b".to_string();
+        let cfg = SemantexConfig {
+            reranker_model: "qwen3-reranker-0.6b".to_string(),
+            ..Default::default()
+        };
         let reg = ModelRegistry::from_config(&cfg, None).unwrap();
         let spec = reg.active_reranker().unwrap();
         match RerankerChoice::from_spec(spec).unwrap() {
@@ -355,7 +365,9 @@ mod tests {
                             "query/doc not injected"
                         );
                     }
-                    other => panic!("expected YesNoLogit, got {other:?}"),
+                    other @ ScoreStrategy::ClassifierLogit => {
+                        panic!("expected YesNoLogit, got {other:?}")
+                    }
                 }
                 assert_eq!(o.session_file, "model.onnx");
                 // FIX 1: max_context plumbed from the spec (Qwen3 CPU-sane cap).
@@ -367,7 +379,9 @@ mod tests {
                         .contains("MisterTK/Qwen3-Reranker-0.6B-onnx")
                 );
             }
-            other => panic!("expected Onnx for qwen3 registry spec, got {other:?}"),
+            other @ RerankerChoice::Fastembed(_) => {
+                panic!("expected Onnx for qwen3 registry spec, got {other:?}")
+            }
         }
     }
 
@@ -387,9 +401,13 @@ mod tests {
                         assert!(rendered.contains("<think>"), "missing <think>");
                         assert_eq!(o.max_context, 2048);
                     }
-                    other => panic!("expected YesNoLogit, got {other:?}"),
+                    other @ ScoreStrategy::ClassifierLogit => {
+                        panic!("expected YesNoLogit, got {other:?}")
+                    }
                 },
-                other => panic!("expected Onnx for qwen3 alias, got {other:?}"),
+                other @ RerankerChoice::Fastembed(_) => {
+                    panic!("expected Onnx for qwen3 alias, got {other:?}")
+                }
             },
         );
     }

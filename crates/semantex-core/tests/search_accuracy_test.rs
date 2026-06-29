@@ -1050,7 +1050,7 @@ fn test_edge_case_empty_query() -> Result<()> {
             assert!(
                 out.results.is_empty(),
                 "Empty query should return no results"
-            )
+            );
         }
         Err(_) => println!("Empty query errored (acceptable)"),
     }
@@ -1064,7 +1064,7 @@ fn test_edge_case_empty_query() -> Result<()> {
             assert!(
                 out.results.is_empty() || out.results.len() < 5,
                 "Whitespace query should return few or no results"
-            )
+            );
         }
         Err(_) => println!("Whitespace query errored (acceptable)"),
     }

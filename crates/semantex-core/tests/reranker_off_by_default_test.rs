@@ -1,5 +1,5 @@
 //! Regression guard for the S3 off-by-default safety contract: with
-//! SEMANTEX_RERANKER unset, building + searching an index must NOT construct a
+//! `SEMANTEX_RERANKER` unset, building + searching an index must NOT construct a
 //! reranker, NOT download weights, and return results in the same order the
 //! fusion produced (rerank stage is a no-op). Repo-agnostic: synthetic tempdir.
 //!
@@ -16,7 +16,7 @@ use semantex_core::search::hybrid::HybridSearcher;
 use semantex_core::types::SearchSource;
 
 #[test]
-#[ignore] // Slow test, requires building full index (downloads embedder weights)
+#[ignore = "slow: builds a full index (downloads the dense embedder weights)"]
 fn rerank_off_by_default_produces_no_reranked_source() {
     // Ensure the master switch is unset for this process.
     // SAFETY: single-threaded test; no other thread reads this var here.
@@ -37,8 +37,11 @@ fn rerank_off_by_default_produces_no_reranked_source() {
     )
     .unwrap();
 
-    let mut config = SemantexConfig::default();
-    config.rerank = true; // even with config.rerank on, the env gate keeps it off
+    // Even with config.rerank on, the env gate keeps it off.
+    let config = SemantexConfig {
+        rerank: true,
+        ..SemantexConfig::default()
+    };
 
     IndexBuilder::new(&config)
         .expect("builder")

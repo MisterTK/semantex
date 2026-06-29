@@ -432,11 +432,9 @@ mod tests {
 
     #[test]
     fn plaid_batch_strictly_below_buffer_size() {
-        assert!(
-            PLAID_BATCH < PLAID_BUFFER_SIZE,
-            "PLAID_BATCH ({PLAID_BATCH}) must be < PLAID_BUFFER_SIZE ({PLAID_BUFFER_SIZE}) \
-             so single-file incremental updates hit the buffer-only fast path"
-        );
+        // Compile-time invariant: PLAID_BATCH must stay below PLAID_BUFFER_SIZE so
+        // single-file incremental updates hit the buffer-only fast path.
+        const { assert!(PLAID_BATCH < PLAID_BUFFER_SIZE) };
     }
 
     /// S1/S7 seam: `embed_text_vector` returns a `Some(Vec<f32>)` of the model
@@ -446,7 +444,7 @@ mod tests {
     /// no hardcoded paths) and opens the colbert-plaid backend from the
     /// per-backend dense subdir.
     #[test]
-    #[ignore] // builds a PLAID index + loads the ColBERT model; run with --ignored
+    #[ignore = "builds a PLAID index + loads the ColBERT model; run with --ignored"]
     fn embed_text_vector_returns_some_with_model_dim() {
         use crate::config::SemantexConfig;
         use crate::index::builder::IndexBuilder;
