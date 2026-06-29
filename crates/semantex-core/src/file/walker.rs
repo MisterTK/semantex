@@ -223,7 +223,13 @@ mod tests {
         let paths = walker.walk(root).unwrap();
         let rel: Vec<String> = paths
             .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                // Normalize separators so assertions hold on Windows too.
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
 
         // legitimate files included
@@ -266,7 +272,13 @@ mod tests {
         let paths = walker.walk(root).unwrap();
         let rel: Vec<String> = paths
             .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                // Normalize separators so assertions hold on Windows too.
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
 
         assert!(

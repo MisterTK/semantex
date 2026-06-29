@@ -1163,7 +1163,10 @@ pub(crate) fn glob_files(root: &Path, pattern: &str) -> HandlerResult {
             continue;
         };
         if glob_set.is_match(rel) {
-            files.push(rel.display().to_string());
+            // Normalize to forward slashes so repo-relative hits are identical
+            // across platforms (the gold matcher / LLM consumers expect `/`,
+            // not Windows `\`).
+            files.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 
