@@ -47,6 +47,8 @@ use semantex_core::server::protocol::{
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// Test fixture builder: a flat positional arg list keeps call sites compact.
+#[allow(clippy::too_many_arguments)]
 fn make_item(
     file: &str,
     start: u32,
@@ -149,6 +151,9 @@ fn snap_search_default_empty() {
 #[test]
 fn snap_search_default_budget_truncation() {
     // Use a tiny budget so only the first result fits and the "… more" line appears.
+    // Casts are on small, known-non-negative loop indices (0..5), so sign/precision
+    // loss cannot occur for these fixture values.
+    #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
     let results: Vec<SearchResultItem> = (0..5)
         .map(|i| {
             make_item(

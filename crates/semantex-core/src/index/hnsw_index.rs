@@ -718,9 +718,14 @@ mod tests {
             dim: 2,
             scales: vec![1.0, 1.0, 1.0],
             vectors: vec![
-                quantize_int8(&[1.0, 0.0]).0,       // id 10
-                quantize_int8(&[0.7071, 0.7071]).0, // id 20
-                quantize_int8(&[0.0, 1.0]).0,       // id 30
+                quantize_int8(&[1.0, 0.0]).0, // id 10
+                // unit vector at 45°: cos45° = 1/√2
+                quantize_int8(&[
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ])
+                .0, // id 20
+                quantize_int8(&[0.0, 1.0]).0, // id 30
             ],
             chunk_ids: vec![10, 20, 30],
         };
@@ -889,7 +894,7 @@ mod tests {
     /// with `EMBEDDING_DIM`-length vectors, and `embed_doc_vectors` round-trips
     /// the stored ids. `#[ignore]` — needs the CodeRankEmbed model download.
     #[test]
-    #[ignore]
+    #[ignore = "needs the CodeRankEmbed model download"]
     fn vector_accessor_methods_return_some_on_built_index() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("dense");

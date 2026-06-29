@@ -1553,6 +1553,7 @@ let double x = x * 2
     /// 2. OCaml `external sqrt`: `external` has no "name" field and no
     ///    canonical identifier-kind children, only a `value_name` child. The
     ///    second pass picks it up.
+    ///
     /// Together, these confirm the two-pass precedence works as intended.
     #[test]
     fn test_extract_name_canonical_kinds_take_precedence_over_value_name() {
@@ -1592,7 +1593,7 @@ let double x = x * 2
     #[test]
     fn test_scala3_given_extension_enum_type() {
         let chunker = AstChunker::new(256, 64);
-        let content = r#"
+        let content = r"
 trait Show[A]:
   def show(a: A): String
 
@@ -1606,7 +1607,7 @@ extension (s: String)
   def kebab: String = s.replace(' ', '-')
 
 type StringMap = Map[String, String]
-"#;
+";
         let chunks = chunker.chunk(Path::new("test.scala"), content).unwrap();
         let ast_chunks: Vec<_> = chunks
             .iter()
@@ -1662,6 +1663,7 @@ type StringMap = Map[String, String]
     ///   - OCaml `type r = { x: int }` and `type t = A | B` (records and sum
     ///     types, both emitted as `type_definition`, not aliases).
     ///   - Scala 3 abstract type members (also `type_definition`).
+    ///
     /// The fix keeps the two kinds distinct: `type_alias` -> `Other("type_alias")`
     /// (true aliases — Dart/Haskell), `type_definition` -> `Other("type_definition")`
     /// (umbrella term; covers Scala 3 + OCaml).
@@ -1682,8 +1684,7 @@ type StringMap = Map[String, String]
         });
         assert!(
             matches!(scala_kind, Some(AstNodeKind::Other(ref s)) if s == "type_definition"),
-            "Scala 3 `type X = ...` should chunk as Other(\"type_definition\"), got: {:?}",
-            scala_kind
+            "Scala 3 `type X = ...` should chunk as Other(\"type_definition\"), got: {scala_kind:?}"
         );
 
         // OCaml record `type r = { x: int }` — grammar emits `type_definition`
@@ -1702,15 +1703,14 @@ type StringMap = Map[String, String]
         assert!(
             matches!(ocaml_kind, Some(AstNodeKind::Other(ref s)) if s == "type_definition"),
             "OCaml `type point = {{ ... }}` (a record) must NOT be labeled \
-             type_alias; expected Other(\"type_definition\"), got: {:?}",
-            ocaml_kind
+             type_alias; expected Other(\"type_definition\"), got: {ocaml_kind:?}"
         );
     }
 
     #[test]
     fn test_csharp_record_and_file_scoped_namespace() {
         let chunker = AstChunker::new(256, 64);
-        let content = r#"
+        let content = r"
 namespace Foo.Bar;
 
 public record Person(string Name, int Age);
@@ -1718,7 +1718,7 @@ public record Person(string Name, int Age);
 public class Other {
     public void Method() { }
 }
-"#;
+";
         let chunks = chunker.chunk(Path::new("test.cs"), content).unwrap();
         let ast_chunks: Vec<_> = chunks
             .iter()
@@ -1830,7 +1830,7 @@ function bar(): Foo {
         }
 
         // --- TypeScript: qualified `new ns.Cache()` — rightmost ident matches ---
-        let ts_qualified = r#"
+        let ts_qualified = r"
 class Cache {
   get(k: string): string { return k; }
 }
@@ -1838,7 +1838,7 @@ class Cache {
 function init(): Cache {
   return new Cache();
 }
-"#;
+";
         let ts_q_chunks = chunker.chunk(Path::new("cache.ts"), ts_qualified).unwrap();
         let cache_chunk = ts_q_chunks.iter().find(|c| match &c.chunk_type {
             ChunkType::AstNode { name, .. } => name == "Cache",
@@ -1865,7 +1865,7 @@ function init(): Cache {
         // The Java chunker keeps the outermost span (class_declaration wins
         // over nested method_declaration), so `App` is the chunk that contains
         // `new Widget()` and gets recorded as the caller.
-        let java_content = r#"
+        let java_content = r"
 class Widget {
     void draw() {}
 }
@@ -1875,7 +1875,7 @@ class App {
         return new Widget();
     }
 }
-"#;
+";
         let java_chunks = chunker.chunk(Path::new("App.java"), java_content).unwrap();
         let widget_chunk = java_chunks.iter().find(|c| match &c.chunk_type {
             ChunkType::AstNode { name, .. } => name == "Widget",

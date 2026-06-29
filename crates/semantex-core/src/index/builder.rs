@@ -1146,7 +1146,7 @@ mod tests {
     /// `resolve_active_dense_dir` must land on that versioned dir. `#[ignore]` —
     /// needs the CodeRankEmbed model download.
     #[test]
-    #[ignore]
+    #[ignore = "needs the CodeRankEmbed model download"]
     fn coderank_hnsw_build_writes_versioned_dir_and_active_pointer() {
         use crate::config::SemantexConfig;
         use crate::search::dense_backend::{
@@ -1276,7 +1276,7 @@ mod tests {
         // Simulate the per-result filter a positional backend's reader runs
         // against the doc_ids it returns. The contract is: a result hitting the
         // tombstone slot must NOT surface as a chunk_id.
-        let passage_ids = vec![0i64, 1, 2];
+        let passage_ids = [0i64, 1, 2];
         let scored: Vec<u64> = passage_ids
             .iter()
             .filter_map(|&doc_id| {

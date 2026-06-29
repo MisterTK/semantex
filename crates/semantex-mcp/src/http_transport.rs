@@ -1158,7 +1158,7 @@ mod tests {
                     let jitter_ms = request
                         .get("params")
                         .and_then(|p| p.get("delay_ms"))
-                        .and_then(|d| d.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0);
                     if jitter_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
