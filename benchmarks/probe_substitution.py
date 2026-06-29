@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_bench as cb  # noqa: E402
 
 ARM = "sx-lateon"
-REPO = "/Users/tk/dev/gin"
+REPO = "/path/to/gin"
 REPS = 3
 OUT = Path(__file__).resolve().parent.parent / "results" / "probe-substitution"
 RAW = OUT / "raw"

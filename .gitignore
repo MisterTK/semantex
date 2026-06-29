@@ -60,8 +60,9 @@ CLAUDE.md
 /results/probe-substitution/*
 !/results/probe-substitution/report.md
 !/results/probe-substitution/parsed.json
-!/results/probe-substitution/raw/
-!/results/probe-substitution/raw_steered/
+# Raw session-dump transcripts stay ignored: they embed local paths,
+# session ids, and env metadata. Only the parsed.json/report.md summaries
+# are published.
 
 # Test output
 crates/semantex-core/tests/TEST_RESULTS.md

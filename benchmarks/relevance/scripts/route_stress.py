@@ -46,9 +46,9 @@ RESULTS = ROOT / "results" / "route_stress"
 # repo -> (corpus fixture, on-disk repo dir). Repo dirs match the route_stress
 # `repo_path_at_gen` fields; override with SEMANTEX_ROUTESTRESS_<REPO>_DIR env.
 REPOS: dict[str, tuple[str, str]] = {
-    "gin": ("gin_route_stress.json", "/Users/tk/dev/gin"),
-    "flask": ("flask_route_stress.json", "/Users/tk/dev/flask"),
-    "platform": ("platform_route_stress.json", "/Users/tk/dev/platform"),
+    "gin": ("gin_route_stress.json", "/path/to/gin"),
+    "flask": ("flask_route_stress.json", "/path/to/flask"),
+    "platform": ("platform_route_stress.json", "/path/to/platform"),
 }
 
 

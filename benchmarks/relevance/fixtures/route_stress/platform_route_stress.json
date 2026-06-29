@@ -1,7 +1,7 @@
 {
   "schema": "route_stress/v1",
   "repo": "platform",
-  "repo_path_at_gen": "/Users/tk/dev/platform",
+  "repo_path_at_gen": "/path/to/platform",
   "match_granularity_default": "file",
   "mechanisms": [
     "glob",
