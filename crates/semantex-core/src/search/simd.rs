@@ -259,18 +259,19 @@ mod avx2 {
     /// Caller must ensure AVX2 is available (the `__m256` argument already implies it).
     #[target_feature(enable = "avx2")]
     unsafe fn hsum256_ps(v: __m256) -> f32 {
-        unsafe {
-            // Fold the high 128 lanes onto the low 128.
-            let low = _mm256_castps256_ps128(v);
-            let high = _mm256_extractf128_ps(v, 1);
-            let sum128 = _mm_add_ps(low, high);
-            // Fold 4 → 2 → 1.
-            let shuf = _mm_movehdup_ps(sum128); // [a1,a1,a3,a3]
-            let sums = _mm_add_ps(sum128, shuf); // [a0+a1, _, a2+a3, _]
-            let hi64 = _mm_movehl_ps(shuf, sums); // bring a2+a3 to lane 0
-            let final_sum = _mm_add_ss(sums, hi64);
-            _mm_cvtss_f32(final_sum)
-        }
+        // All ops below are register-only AVX2 intrinsics, which are safe to call
+        // within this `#[target_feature(enable = "avx2")]` context (no raw-pointer
+        // access), so no inner `unsafe` block is required.
+        // Fold the high 128 lanes onto the low 128.
+        let low = _mm256_castps256_ps128(v);
+        let high = _mm256_extractf128_ps(v, 1);
+        let sum128 = _mm_add_ps(low, high);
+        // Fold 4 → 2 → 1.
+        let shuf = _mm_movehdup_ps(sum128); // [a1,a1,a3,a3]
+        let sums = _mm_add_ps(sum128, shuf); // [a0+a1, _, a2+a3, _]
+        let hi64 = _mm_movehl_ps(shuf, sums); // bring a2+a3 to lane 0
+        let final_sum = _mm_add_ss(sums, hi64);
+        _mm_cvtss_f32(final_sum)
     }
 
     /// # Safety
@@ -365,16 +366,16 @@ mod avx2 {
     /// Caller must ensure AVX2 is available.
     #[target_feature(enable = "avx2")]
     unsafe fn hsum256_epi32(v: __m256i) -> i32 {
-        unsafe {
-            let low = _mm256_castsi256_si128(v);
-            let high = _mm256_extracti128_si256(v, 1);
-            let sum128 = _mm_add_epi32(low, high);
-            let hi64 = _mm_unpackhi_epi64(sum128, sum128);
-            let sum64 = _mm_add_epi32(sum128, hi64);
-            let hi32 = _mm_shuffle_epi32(sum64, 0b01);
-            let sum32 = _mm_add_epi32(sum64, hi32);
-            _mm_cvtsi128_si32(sum32)
-        }
+        // Register-only AVX2 intrinsics — safe within this target-feature context,
+        // so no inner `unsafe` block is required.
+        let low = _mm256_castsi256_si128(v);
+        let high = _mm256_extracti128_si256(v, 1);
+        let sum128 = _mm_add_epi32(low, high);
+        let hi64 = _mm_unpackhi_epi64(sum128, sum128);
+        let sum64 = _mm_add_epi32(sum128, hi64);
+        let hi32 = _mm_shuffle_epi32(sum64, 0b01);
+        let sum32 = _mm_add_epi32(sum64, hi32);
+        _mm_cvtsi128_si32(sum32)
     }
 
     /// Sign-extend 16 packed i8 (a 128-bit load) into 16 i16 lanes (`__m256i`).
@@ -382,13 +383,15 @@ mod avx2 {
     /// Caller must ensure AVX2 is available.
     #[target_feature(enable = "avx2")]
     unsafe fn widen_i8_to_i16(v: __m128i) -> __m256i {
-        unsafe { _mm256_cvtepi8_epi16(v) } // sign-extend 16×i8 → 16×i16
+        // Register-only AVX2 intrinsic — safe within this target-feature context.
+        _mm256_cvtepi8_epi16(v) // sign-extend 16×i8 → 16×i16
     }
 
     /// # Safety
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::cast_precision_loss)] // i32→f32: |sum| ≤ dim·16384 ≪ 2^24, exactly representable
+    #[allow(clippy::cast_ptr_alignment)] // *const i8 → *const __m128i feeds `_mm_loadu_si128` (unaligned load)
     pub unsafe fn dot_i8(a: &[i8], b: &[i8]) -> f32 {
         unsafe {
             let len = a.len();
@@ -416,6 +419,7 @@ mod avx2 {
     /// Caller must ensure AVX2 is available and `a.len() == b.len()`.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::cast_precision_loss)] // i32→f32: bounded magnitudes, exactly representable
+    #[allow(clippy::cast_ptr_alignment)] // *const i8 → *const __m128i feeds `_mm_loadu_si128` (unaligned load)
     pub unsafe fn cosine_i8(a: &[i8], b: &[i8]) -> f32 {
         unsafe {
             let len = a.len();
