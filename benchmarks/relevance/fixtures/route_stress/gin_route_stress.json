@@ -1,7 +1,7 @@
 {
   "schema": "route_stress/v1",
   "repo": "gin",
-  "repo_path_at_gen": "/Users/tk/dev/gin",
+  "repo_path_at_gen": "/path/to/gin",
   "match_granularity_default": "file",
   "mechanisms": [
     "glob",

@@ -15,7 +15,7 @@ Arms (each a hermetic CLAUDE_CONFIG_DIR under ~/.cbench/three_way/<arm>/):
   graphify  no MCP (graphify is a Bash CLI; graph prebuilt) + nudge → `graphify query`.
   serena    serena MCP (LSP symbol tools) + nudge → mcp__serena__*.
 
-Repo: /Users/tk/dev/CopilotKit (large TS monorepo). 3 questions (Q1/Q3/Q5 from
+Repo: /path/to/CopilotKit (large TS monorepo). 3 questions (Q1/Q3/Q5 from
 claude_bench.QUESTIONS). 1 rep. Judged quality + CCB are computed via the SAME
 parser (claude_bench.parse_claude_stream).
 
@@ -49,7 +49,7 @@ import claude_bench as cb  # noqa: E402
 # selects the freshly built binary, falling back to whatever claude_bench found.
 SEMANTEX_BIN = shutil.which("semantex") or cb.SEMANTEX_BIN
 
-REPO = "/Users/tk/dev/CopilotKit"
+REPO = "/path/to/CopilotKit"
 QIDS = ("Q1", "Q3", "Q5")  # architecture / deep_technical / feature_planning
 REPS = 1
 

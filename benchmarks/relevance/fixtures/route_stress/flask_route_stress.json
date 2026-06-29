@@ -1,7 +1,7 @@
 {
   "schema": "route_stress/v1",
   "repo": "flask",
-  "repo_path_at_gen": "/Users/tk/dev/flask",
+  "repo_path_at_gen": "/path/to/flask",
   "match_granularity_default": "file",
   "mechanisms": [
     "glob",
