@@ -718,9 +718,14 @@ mod tests {
             dim: 2,
             scales: vec![1.0, 1.0, 1.0],
             vectors: vec![
-                quantize_int8(&[1.0, 0.0]).0,       // id 10
-                quantize_int8(&[0.7071, 0.7071]).0, // id 20
-                quantize_int8(&[0.0, 1.0]).0,       // id 30
+                quantize_int8(&[1.0, 0.0]).0, // id 10
+                // unit vector at 45°: cos45° = 1/√2
+                quantize_int8(&[
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ])
+                .0, // id 20
+                quantize_int8(&[0.0, 1.0]).0, // id 30
             ],
             chunk_ids: vec![10, 20, 30],
         };
