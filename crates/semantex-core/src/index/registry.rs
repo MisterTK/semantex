@@ -1,11 +1,22 @@
 //! Global project registry — tracks all repos that have been indexed.
 //!
-//! Stored at `~/.semantex/projects.json`. **v2** (contract §A) is a versioned
-//! object: `{ version: 2, projects: [{ path, project_id, display_name,
-//! branches: [...], embedder_fingerprint }] }`. **v1** (pre-v13) was a bare
-//! JSON array of canonical absolute path strings; [`load`] transparently
-//! upgrades a v1 file to v2 in place (the next [`register`]/[`upsert_branch`]
-//! call persists the upgraded shape).
+//! Stored at `<semantex_home>/projects.json` (i.e. `~/.semantex/projects.json`
+//! by default; [`crate::config::SemantexConfig::semantex_home`] honors the
+//! `SEMANTEX_HOME` env var, so the whole registry relocates with it — which is
+//! also how tests and sandboxed environments keep it away from real user
+//! state). **v2** (contract §A) is a versioned object: `{ version: 2,
+//! projects: [{ path, project_id, display_name, branches: [...],
+//! embedder_fingerprint }] }`. **v1** (pre-v13) was a bare JSON array of
+//! canonical absolute path strings; [`load`] transparently upgrades a v1 file
+//! to v2 in place (the next [`register`]/[`upsert_branch`] call persists the
+//! upgraded shape).
+//!
+//! Writes are atomic (tmp file + rename in the same directory), so a crash
+//! mid-save can never leave a torn/corrupt `projects.json` behind. Concurrent
+//! writers (two `semantex index` runs racing) are **last-write-wins** at
+//! whole-file granularity: each writer read-modify-writes the full file, and
+//! the final rename decides. That can drop the other writer's single upsert,
+//! but never corrupts the file — acceptable for a best-effort discovery aid.
 //!
 //! Both the CLI session hook and the MCP server read this to discover repos
 //! that may have drifted (index age > threshold) without waiting for a user
@@ -15,8 +26,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-fn registry_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".semantex").join("projects.json"))
+/// Resolve the registry file location. Routed through
+/// [`SemantexConfig::semantex_home`](crate::config::SemantexConfig::semantex_home)
+/// so it honors `SEMANTEX_HOME` (and never resolves to a developer's real
+/// home when that override is set).
+fn registry_path() -> PathBuf {
+    crate::config::SemantexConfig::semantex_home().join("projects.json")
 }
 
 /// One tracked branch of a registered project (contract §A).
@@ -84,15 +99,10 @@ fn display_name_for_path(path: &Path) -> String {
     )
 }
 
-/// Load the registry, transparently upgrading a v1 (bare path array) file to
-/// the v2 shape in memory. Returns an empty v2 registry if the file is
-/// absent, unreadable, or unparseable as either shape — the registry is a
-/// best-effort discovery aid, never a hard dependency.
-pub fn load() -> RegistryV2 {
-    let Some(path) = registry_path() else {
-        return RegistryV2::default();
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
+/// Path-parameterized core of [`load`]. Tests point this at a tempdir file so
+/// they never read (let alone delete) a developer's real registry.
+fn load_from(path: &Path) -> RegistryV2 {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return RegistryV2::default();
     };
     if let Ok(v2) = serde_json::from_str::<RegistryV2>(&content) {
@@ -121,17 +131,48 @@ pub fn load() -> RegistryV2 {
     RegistryV2::default()
 }
 
-fn save(registry: &RegistryV2) -> bool {
-    let Some(path) = registry_path() else {
+/// Load the registry, transparently upgrading a v1 (bare path array) file to
+/// the v2 shape in memory. Returns an empty v2 registry if the file is
+/// absent, unreadable, or unparseable as either shape — the registry is a
+/// best-effort discovery aid, never a hard dependency.
+pub fn load() -> RegistryV2 {
+    load_from(&registry_path())
+}
+
+/// Atomically persist the registry to `path`: serialize to a tmp file in the
+/// SAME directory, then `rename` over the destination. A crash at any point
+/// leaves either the old complete file or the new complete file — never a
+/// truncated/torn one (which `load_from` would silently read as an empty
+/// registry, losing every registered project). Concurrent writers are
+/// last-write-wins at whole-file granularity (see module doc).
+fn save_to(path: &Path, registry: &RegistryV2) -> bool {
+    let Some(parent) = path.parent() else {
         return false;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
     }
     let Ok(json) = serde_json::to_string_pretty(registry) else {
         return false;
     };
-    std::fs::write(&path, json).is_ok()
+    // Pid-suffixed so two racing processes never stomp each other's tmp file;
+    // same dir as the destination so the rename is atomic (no cross-device).
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    if std::fs::write(&tmp, json).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    let ok = std::fs::rename(&tmp, path).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
 }
 
 /// Read all registered project paths from the registry.
@@ -151,12 +192,9 @@ pub fn read_all_v2() -> RegistryV2 {
     load()
 }
 
-/// Register a project in the global registry (upsert — no duplicates).
-///
-/// Signature preserved from v1. Internally upgrades/creates a v2
-/// [`ProjectEntry`] for `canonical` if one doesn't already exist.
-pub fn register(canonical: &Path) {
-    let mut registry = load();
+/// Path-parameterized core of [`register`].
+fn register_at(path: &Path, canonical: &Path) {
+    let mut registry = load_from(path);
     if registry.projects.iter().any(|p| p.path == canonical) {
         return; // already registered
     }
@@ -167,15 +205,21 @@ pub fn register(canonical: &Path) {
         branches: Vec::new(),
         embedder_fingerprint: String::new(),
     });
-    save(&registry);
+    save_to(path, &registry);
 }
 
-/// Record (upsert) that `branch` of the project at `canonical` was just
-/// indexed, stamping `last_indexed_ts` (Unix seconds) and the resolved
-/// `head_commit`. Creates the project entry first via [`register`]-equivalent
-/// logic if it doesn't exist yet. Used by `IndexBuilder::build` to keep the
-/// registry's branch list in sync with what's actually been built.
-pub fn upsert_branch(
+/// Register a project in the global registry (upsert — no duplicates).
+///
+/// Signature preserved from v1. Internally upgrades/creates a v2
+/// [`ProjectEntry`] for `canonical` if one doesn't already exist.
+pub fn register(canonical: &Path) {
+    register_at(&registry_path(), canonical);
+}
+
+/// Path-parameterized core of [`upsert_branch`].
+#[allow(clippy::too_many_arguments)]
+fn upsert_branch_at(
+    path: &Path,
     canonical: &Path,
     branch: &str,
     branch_key: &str,
@@ -183,7 +227,7 @@ pub fn upsert_branch(
     head_commit: Option<String>,
     embedder_fingerprint: &str,
 ) {
-    let mut registry = load();
+    let mut registry = load_from(path);
     let entry = if let Some(existing) = registry.projects.iter_mut().find(|p| p.path == canonical) {
         existing
     } else {
@@ -213,69 +257,72 @@ pub fn upsert_branch(
             head_commit,
         });
     }
-    save(&registry);
+    save_to(path, &registry);
+}
+
+/// Record (upsert) that `branch` of the project at `canonical` was just
+/// indexed, stamping `last_indexed_ts` (Unix seconds) and the resolved
+/// `head_commit`. Creates the project entry first via [`register`]-equivalent
+/// logic if it doesn't exist yet. Available for Wave 2's multi-branch daemon
+/// to keep the registry's branch list in sync with what's actually been built.
+pub fn upsert_branch(
+    canonical: &Path,
+    branch: &str,
+    branch_key: &str,
+    last_indexed_ts: i64,
+    head_commit: Option<String>,
+    embedder_fingerprint: &str,
+) {
+    upsert_branch_at(
+        &registry_path(),
+        canonical,
+        branch,
+        branch_key,
+        last_indexed_ts,
+        head_commit,
+        embedder_fingerprint,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tempfile::TempDir;
 
-    // `registry_path()` is a fixed `~/.semantex/projects.json` — every test
-    // that touches the real file must be serialized against every other, and
-    // must restore the original content afterward so this suite doesn't
-    // clobber a developer's real registry.
-    static REGISTRY_FILE_LOCK: Mutex<()> = Mutex::new(());
-
-    struct RegistryFileGuard {
-        path: PathBuf,
-        original: Option<String>,
-    }
-
-    impl RegistryFileGuard {
-        fn acquire() -> Self {
-            let path = registry_path().expect("home dir resolvable in test env");
-            let original = std::fs::read_to_string(&path).ok();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::remove_file(&path);
-            Self { path, original }
-        }
-    }
-
-    impl Drop for RegistryFileGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(content) => {
-                    let _ = std::fs::write(&self.path, content);
-                }
-                None => {
-                    let _ = std::fs::remove_file(&self.path);
-                }
-            }
-        }
+    // Every test operates on its own tempdir registry file via the `_at`/
+    // `_from`/`_to` internals — the public wrappers only add path resolution
+    // (`registry_path()`), so this covers all the logic while guaranteeing no
+    // test can ever read, overwrite, or delete a developer's real
+    // `~/.semantex/projects.json`. (The old delete-and-restore guard was
+    // unsafe: a SIGKILL/panic=abort inside the window destroyed the real
+    // file permanently.) No env-var mutation either, so tests stay
+    // parallel-safe.
+    fn tmp_registry() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("projects.json");
+        (tmp, path)
     }
 
     #[test]
     fn register_and_read_all_round_trip() {
-        let _lock = REGISTRY_FILE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = RegistryFileGuard::acquire();
+        let (_tmp, reg) = tmp_registry();
 
         let p1 = PathBuf::from("/tmp/project-one");
         let p2 = PathBuf::from("/tmp/project-two");
-        register(&p1);
-        register(&p2);
-        register(&p1); // duplicate — must not double-register
+        register_at(&reg, &p1);
+        register_at(&reg, &p2);
+        register_at(&reg, &p1); // duplicate — must not double-register
 
-        let all = read_all();
+        let all: Vec<PathBuf> = load_from(&reg)
+            .projects
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
         assert_eq!(all.len(), 2);
         assert!(all.contains(&p1));
         assert!(all.contains(&p2));
 
-        let v2 = read_all_v2();
+        let v2 = load_from(&reg);
         assert_eq!(v2.version, 2);
         let entry = v2.projects.iter().find(|p| p.path == p1).unwrap();
         assert_eq!(entry.project_id, project_id_for_path(&p1));
@@ -284,36 +331,33 @@ mod tests {
 
     #[test]
     fn v1_array_is_upgraded_to_v2_on_load() {
-        let _lock = REGISTRY_FILE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = RegistryFileGuard::acquire();
+        let (_tmp, reg) = tmp_registry();
 
-        let path = registry_path().unwrap();
         let v1_json =
             serde_json::to_string(&vec!["/repo/a".to_string(), "/repo/b".to_string()]).unwrap();
-        std::fs::write(&path, v1_json).unwrap();
+        std::fs::write(&reg, v1_json).unwrap();
 
-        let v2 = load();
+        let v2 = load_from(&reg);
         assert_eq!(v2.version, 2);
         assert_eq!(v2.projects.len(), 2);
         assert!(v2.projects.iter().any(|p| p.path == Path::new("/repo/a")));
 
-        // read_all() (the pre-existing API surface) must also see the
-        // upgraded content transparently.
-        let all = read_all();
-        assert_eq!(all.len(), 2);
+        // Registering upgrades the persisted file to v2 (versioned object,
+        // v1 content preserved).
+        register_at(&reg, Path::new("/repo/c"));
+        let raw = std::fs::read_to_string(&reg).unwrap();
+        let persisted: RegistryV2 = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.version, 2);
+        assert_eq!(persisted.projects.len(), 3);
     }
 
     #[test]
     fn upsert_branch_creates_project_and_updates_existing_branch() {
-        let _lock = REGISTRY_FILE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = RegistryFileGuard::acquire();
+        let (_tmp, reg) = tmp_registry();
 
         let proj = PathBuf::from("/tmp/branchy-project");
-        upsert_branch(
+        upsert_branch_at(
+            &reg,
             &proj,
             "main",
             "main-abc12345",
@@ -321,14 +365,15 @@ mod tests {
             Some("c1".into()),
             "fp1",
         );
-        let v2 = read_all_v2();
+        let v2 = load_from(&reg);
         let entry = v2.projects.iter().find(|p| p.path == proj).unwrap();
         assert_eq!(entry.branches.len(), 1);
         assert_eq!(entry.branches[0].last_indexed_ts, 100);
         assert_eq!(entry.embedder_fingerprint, "fp1");
 
         // Re-indexing the SAME branch_key updates in place, not append.
-        upsert_branch(
+        upsert_branch_at(
+            &reg,
             &proj,
             "main",
             "main-abc12345",
@@ -336,7 +381,7 @@ mod tests {
             Some("c2".into()),
             "fp2",
         );
-        let v2 = read_all_v2();
+        let v2 = load_from(&reg);
         let entry = v2.projects.iter().find(|p| p.path == proj).unwrap();
         assert_eq!(entry.branches.len(), 1);
         assert_eq!(entry.branches[0].last_indexed_ts, 200);
@@ -344,10 +389,47 @@ mod tests {
         assert_eq!(entry.embedder_fingerprint, "fp2");
 
         // A second branch appends rather than replacing.
-        upsert_branch(&proj, "develop", "develop-def67890", 50, None, "fp2");
-        let v2 = read_all_v2();
+        upsert_branch_at(&reg, &proj, "develop", "develop-def67890", 50, None, "fp2");
+        let v2 = load_from(&reg);
         let entry = v2.projects.iter().find(|p| p.path == proj).unwrap();
         assert_eq!(entry.branches.len(), 2);
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_file_left_behind() {
+        let (_tmp, reg) = tmp_registry();
+        register_at(&reg, Path::new("/tmp/atomic-project"));
+
+        // The registry file exists and parses; no tmp artifact lingers in
+        // the directory (write went through tmp-then-rename).
+        assert!(reg.exists());
+        let entries: Vec<_> = std::fs::read_dir(reg.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["projects.json".to_string()], "{entries:?}");
+    }
+
+    #[test]
+    fn corrupt_registry_loads_as_empty_and_is_replaced_on_next_save() {
+        let (_tmp, reg) = tmp_registry();
+        std::fs::write(&reg, "{ this is not json").unwrap();
+        assert!(load_from(&reg).projects.is_empty());
+        register_at(&reg, Path::new("/tmp/recovered"));
+        assert_eq!(load_from(&reg).projects.len(), 1);
+    }
+
+    #[test]
+    fn registry_path_honors_semantex_home_layout() {
+        // registry_path() must be `<semantex_home>/projects.json` — the same
+        // resolution the rest of the crate uses (gate.rs, models dir), which
+        // honors the SEMANTEX_HOME env override. We assert the relationship
+        // rather than mutating the env (env mutation is process-global and
+        // racy under the parallel test runner).
+        assert_eq!(
+            registry_path(),
+            crate::config::SemantexConfig::semantex_home().join("projects.json")
+        );
     }
 
     #[test]

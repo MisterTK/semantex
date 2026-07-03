@@ -18,11 +18,20 @@
 //! authoritative location for the currently-open branch** — exactly as
 //! today, byte-for-byte, so every existing reader keeps working with zero
 //! changes. On top of that, this module builds the v13 `indexes/<branch_key>/`
-//! structure the contract specifies, by hard-linking (never copying — no
-//! re-embed, no wasted disk) the root's current content into the branch
-//! directory after every successful build/update. Hard links make the two
-//! locations byte-identical without a data copy; a `hard_link` failure
-//! (e.g. a cross-device mount) falls back to a real copy.
+//! structure the contract specifies, mirroring the root's current content
+//! into the branch directory after every successful build/update.
+//!
+//! The mirror is a **snapshot, not an alias**. Root artifacts that mutate
+//! in place after a later build (SQLite writes pages inside `chunks.db`;
+//! `fs::write` truncates-and-rewrites `dense/**` and `meta.json` through the
+//! same inode) are **copied** — `chunks.db` via SQLite `VACUUM INTO` (which
+//! also folds in any not-yet-checkpointed WAL content), the rest byte-copies.
+//! Hard-linking those would silently morph an old branch's mirror into the
+//! new branch's data on the next incremental build. Only `sparse/` (tantivy)
+//! is hard-linked: tantivy segment files are write-once and its own
+//! `meta.json` is replaced by atomic rename, both of which are hard-link-safe
+//! — and they're the bulk of the index, so the snapshot stays near-free on
+//! disk. A `hard_link` failure (e.g. cross-device) falls back to a real copy.
 //!
 //! The top-level `meta.json` gains the v13 fields (`layout_version`,
 //! `project_id`, `default_branch`) via [`ProjectMeta`], which
@@ -32,13 +41,16 @@
 //! `semantex-mcp`'s warm-state fast path and every other non-owned consumer
 //! stays green without being touched.
 //!
-//! `indexes/<branch_key>/meta.json` mirrors the plain (unflattened)
-//! `IndexMeta` — the contract also asks for "branch name, head_commit" on
-//! the per-index meta; rather than adding fields to the shared `IndexMeta`
-//! struct (which nine files across the workspace construct via struct
-//! literals with no `..Default::default()`, several outside spine's
-//! ownership), that data is written to a small sidecar,
-//! `indexes/<branch_key>/branch.json` ([`BranchMeta`]).
+//! `indexes/<branch_key>/meta.json` is a snapshot of whatever the root
+//! `meta.json` was at mirror time — plain [`IndexMeta`] on the very first
+//! migration of a legacy index, the flattened [`ProjectMeta`] superset on
+//! every sync after that. Either way it parses as `IndexMeta` (flattening
+//! exists precisely for that compatibility). The contract also asks for
+//! "branch name, head_commit" on the per-index meta; rather than adding
+//! fields to the shared `IndexMeta` struct (which nine files across the
+//! workspace construct via struct literals with no `..Default::default()`,
+//! several outside spine's ownership), that data is written to a small
+//! sidecar, `indexes/<branch_key>/branch.json` ([`BranchMeta`]).
 
 use crate::types::IndexMeta;
 use anyhow::Result;
@@ -114,10 +126,19 @@ pub fn project_meta_path(project_root: &Path) -> PathBuf {
 
 // ── branch_key derivation ───────────────────────────────────────────────────
 
-/// Replace every non-alphanumeric (ASCII) byte with `-`. Applied to the
-/// branch name before appending the ref-name hash.
+/// Longest sanitized-name prefix kept in a branch_key. The 8-hex ref-name
+/// hash carries the identity; the name prefix is only for human readability,
+/// so capping it keeps `indexes/<branch_key>/...` paths clear of filesystem
+/// name-length limits (ENAMETOOLONG) for pathological branch names.
+const BRANCH_KEY_NAME_MAX: usize = 64;
+
+/// Replace every non-alphanumeric (ASCII) byte with `-`, capped at
+/// [`BRANCH_KEY_NAME_MAX`] chars. Applied to the branch name before
+/// appending the ref-name hash. Output is pure ASCII (non-ASCII chars are
+/// not alphanumeric-ASCII, so they map to `-`).
 fn sanitize_branch_name(name: &str) -> String {
     name.chars()
+        .take(BRANCH_KEY_NAME_MAX)
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
@@ -182,30 +203,50 @@ pub fn resolve_git_head_branch(project_root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve HEAD's commit hash on a best-effort basis (loose ref file, with a
-/// `packed-refs` fallback) rather than shelling out to `git`, matching the
-/// rest of this module's no-git2-dependency approach.
+/// Look up `ref_name` (e.g. `refs/heads/main`) in `git_dir`: loose ref file
+/// first, then `packed-refs`.
+fn resolve_ref_in(git_dir: &Path, ref_name: &str) -> Option<String> {
+    if let Ok(hash) = std::fs::read_to_string(git_dir.join(ref_name)) {
+        return Some(hash.trim().to_string());
+    }
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?;
+        (name == ref_name).then(|| hash.to_string())
+    })
+}
+
+/// Resolve HEAD's commit hash on a best-effort basis (loose ref file, with
+/// `packed-refs` and worktree-`commondir` fallbacks) rather than shelling out
+/// to `git`, matching the rest of this module's no-git2-dependency approach.
 pub fn resolve_git_head_commit(project_root: &Path) -> Option<String> {
     let git_dir = resolve_git_dir(project_root)?;
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(rest) = head.strip_prefix("ref: ") {
-        let ref_path = git_dir.join(rest);
-        if let Ok(hash) = std::fs::read_to_string(&ref_path) {
-            return Some(hash.trim().to_string());
+        if let Some(hash) = resolve_ref_in(&git_dir, rest) {
+            return Some(hash);
         }
-        // Loose ref file absent — HEAD may be recorded in packed-refs.
-        let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
-        return packed.lines().find_map(|line| {
-            let line = line.trim();
-            if line.starts_with('#') {
-                return None;
-            }
-            let mut parts = line.split_whitespace();
-            let hash = parts.next()?;
-            let name = parts.next()?;
-            (name == rest).then(|| hash.to_string())
-        });
+        // Linked worktree: its private gitdir (`.git/worktrees/<name>/`) holds
+        // HEAD but NOT the shared refs/packed-refs — those live in the main
+        // repo's git dir, pointed to by the `commondir` file (a path relative
+        // to the worktree gitdir, usually `../..`).
+        if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+            let common = PathBuf::from(common.trim());
+            let common_dir = if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            };
+            return resolve_ref_in(&common_dir, rest);
+        }
+        return None;
     }
     // Detached HEAD: the file content IS the commit hash.
     Some(head.to_string())
@@ -290,6 +331,11 @@ pub fn open_memory_db(path: &Path) -> Result<Connection> {
 /// under `dst`, creating directories as needed. Falls back to a real copy
 /// for any file where `hard_link` fails (e.g. a cross-device mount) so the
 /// mirror is always complete, just potentially non-free on odd filesystems.
+///
+/// ONLY safe for write-once/rename-replaced artifacts (tantivy `sparse/`):
+/// hard links share the inode, so anything the builder later mutates
+/// *in place* (SQLite page writes, `fs::write` truncation) would mutate the
+/// mirror too. Mutable artifacts go through [`copy_tree`] instead.
 fn hardlink_tree(src: &Path, dst: &Path) -> Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -307,6 +353,61 @@ fn hardlink_tree(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Recursively byte-copy every file under `src` into `dst` — a true
+/// snapshot with its own inodes, immune to later in-place mutation of the
+/// source. Used for the artifacts the builder rewrites in place
+/// (`dense/**`, `meta.json`, `models.toml`).
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            copy_tree(&src.join(&name), &dst.join(&name))?;
+        }
+    } else if src.is_file() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Snapshot a live SQLite database into `dst`.
+///
+/// Primary path is `VACUUM INTO`, which produces a complete, consistent,
+/// compacted copy **including any content still sitting in the `-wal` file**
+/// — critical because the builder's own WAL-mode connection is typically
+/// still open (un-checkpointed) when the mirror runs, so a plain file copy
+/// of `chunks.db` alone would miss the newest rows. If `VACUUM INTO` is
+/// unavailable/fails, fall back to `PRAGMA wal_checkpoint(TRUNCATE)` (fold
+/// the WAL back into the main file) followed by a byte copy.
+fn snapshot_sqlite_db(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(src)?;
+    // VACUUM INTO refuses to overwrite; dst lives in a fresh tmp dir so it
+    // never exists, but be defensive for the fallback/retry case.
+    if dst.exists() {
+        std::fs::remove_file(dst)?;
+    }
+    let dst_str = dst.to_string_lossy().into_owned();
+    match conn.execute("VACUUM INTO ?1", [&dst_str]) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::debug!("VACUUM INTO failed ({e}); falling back to checkpoint + copy");
+            // Best-effort checkpoint; TRUNCATE also resets the -wal file so
+            // the main db file is complete on its own. (query_row: this
+            // PRAGMA returns a result row, so `execute` would error.)
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            std::fs::copy(src, dst)?;
+            Ok(())
+        }
+    }
 }
 
 /// Mirror the container root's current index content into
@@ -335,17 +436,31 @@ pub fn mirror_into_branch_dir(project_root: &Path, branch_key: &str) -> Result<(
     }
     std::fs::create_dir_all(&tmp_dir)?;
 
-    for name in ["chunks.db", "meta.json", "models.toml"] {
+    // chunks.db: SQLite snapshot — includes un-checkpointed WAL content and
+    // detaches the mirror from future in-place page writes (see
+    // `snapshot_sqlite_db`). NEVER hard-link a live SQLite db.
+    snapshot_sqlite_db(&container.join("chunks.db"), &tmp_dir.join("chunks.db"))?;
+
+    // meta.json / models.toml: rewritten in place by `fs::write` on later
+    // builds (same inode, truncate + rewrite) — must be copies.
+    for name in ["meta.json", "models.toml"] {
         let src = container.join(name);
         if src.is_file() {
-            hardlink_tree(&src, &tmp_dir.join(name))?;
+            copy_tree(&src, &tmp_dir.join(name))?;
         }
     }
-    for dir_name in ["sparse", "dense"] {
-        let src = container.join(dir_name);
-        if src.is_dir() {
-            hardlink_tree(&src, &tmp_dir.join(dir_name))?;
-        }
+    // dense/**: vectors/pointer files are rewritten via `fs::write` on
+    // incremental builds — must be copies.
+    let dense_src = container.join("dense");
+    if dense_src.is_dir() {
+        copy_tree(&dense_src, &tmp_dir.join("dense"))?;
+    }
+    // sparse/ (tantivy): segment files are write-once and tantivy's own
+    // meta.json is replaced by atomic rename — hard-link-safe, and it's the
+    // bulk of the index, so links keep the snapshot near-free on disk.
+    let sparse_src = container.join("sparse");
+    if sparse_src.is_dir() {
+        hardlink_tree(&sparse_src, &tmp_dir.join("sparse"))?;
     }
 
     if branch_dir.exists() {
@@ -616,8 +731,10 @@ mod tests {
         let chunk = migrated_store.get_chunk(chunk_id).unwrap();
         assert_eq!(chunk.content, "fn legacy() {}");
 
-        // The branch meta.json is a plain IndexMeta (not flattened) — the
-        // per-index meta shape is unchanged from pre-v13.
+        // The branch meta.json is a snapshot of the root meta.json as of
+        // mirror time (plain IndexMeta on this first legacy migration; the
+        // flattened ProjectMeta on later syncs) — either way it must parse
+        // as IndexMeta, the shape every per-index reader expects.
         let branch_meta_json = std::fs::read_to_string(branch_dir.join("meta.json")).unwrap();
         let branch_meta: IndexMeta = serde_json::from_str(&branch_meta_json).unwrap();
         assert_eq!(branch_meta.chunk_count, 9);
@@ -655,5 +772,267 @@ mod tests {
         assert!(!branch_dir.join("chunks.db").exists());
         assert!(history_db_path(tmp.path()).exists());
         assert!(memory_db_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn branch_key_name_prefix_is_capped() {
+        let long_name = "x".repeat(500);
+        let key = branch_key_for_branch(&long_name);
+        // capped prefix + '-' + 8 hex chars
+        assert_eq!(key.len(), BRANCH_KEY_NAME_MAX + 1 + 8, "key was: {key}");
+        // Identity still lives in the hash: two long names sharing the first
+        // 64 chars must still get distinct keys.
+        let key2 = branch_key_for_branch(&format!("{}{}", "x".repeat(64), "different-tail"));
+        assert_ne!(key, key2);
+        // And the same name is still deterministic.
+        assert_eq!(key, branch_key_for_branch(&long_name));
+    }
+
+    /// Linked-worktree layout: the worktree's private gitdir holds HEAD but
+    /// refs/packed-refs live in the main repo's git dir, reachable via the
+    /// `commondir` pointer file. head_commit must resolve through it.
+    #[test]
+    fn worktree_commondir_fallback_resolves_head_commit() {
+        let tmp = TempDir::new().unwrap();
+        // Main repo git dir with the actual ref.
+        let main_git = tmp.path().join("main.git");
+        std::fs::create_dir_all(main_git.join("refs").join("heads")).unwrap();
+        std::fs::write(
+            main_git.join("refs").join("heads").join("main"),
+            "cafebabe\n",
+        )
+        .unwrap();
+        // Worktree private gitdir: HEAD + commondir, but NO refs of its own.
+        let wt_git = main_git.join("worktrees").join("wt1");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_git.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_git_head_commit(&worktree),
+            Some("cafebabe".to_string())
+        );
+        // packed-refs via commondir too.
+        std::fs::remove_file(main_git.join("refs").join("heads").join("main")).unwrap();
+        std::fs::write(main_git.join("packed-refs"), "deadf00d refs/heads/main\n").unwrap();
+        assert_eq!(
+            resolve_git_head_commit(&worktree),
+            Some("deadf00d".to_string())
+        );
+    }
+
+    /// THE snapshot guarantee (adversarial-review followup #3): after a
+    /// mirror, mutating the ROOT index in place — new SQLite rows in
+    /// chunks.db, `fs::write` truncation of dense/** and meta.json (exactly
+    /// what an incremental re-index after a branch switch does) — must NOT
+    /// change the mirrored branch dir. Hard-linked aliases fail this test;
+    /// snapshots pass it.
+    #[test]
+    fn mirror_is_a_snapshot_not_an_alias_of_the_root() {
+        use crate::index::storage::ChunkStore;
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let container = container_dir(project);
+        std::fs::create_dir_all(container.join("dense").join("backend")).unwrap();
+
+        let chunk = |id: u64, content: &str| Chunk {
+            id,
+            file_path: PathBuf::from("src/lib.rs"),
+            start_line: 1,
+            end_line: 2,
+            content: content.to_string(),
+            chunk_type: ChunkType::TextWindow { window_index: 0 },
+        };
+
+        let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+        let old_id = store
+            .insert_chunk(&chunk(0, "fn old_branch() {}"), 1, 0)
+            .unwrap();
+        std::fs::write(
+            container.join("meta.json"),
+            serde_json::to_string(&sample_index_meta()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            container.join("dense").join("backend").join("vectors.bin"),
+            b"old-branch-vectors",
+        )
+        .unwrap();
+
+        mirror_into_branch_dir(project, "oldbranch-aaaa1111").unwrap();
+        let mirror = branch_index_dir(project, "oldbranch-aaaa1111");
+
+        // Simulate `git switch` + incremental re-index mutating the ROOT
+        // in place, through the same inodes the old code hard-linked:
+        // SQLite in-place writes...
+        let new_id = store
+            .insert_chunk(&chunk(0, "fn new_branch() {}"), 2, 0)
+            .unwrap();
+        drop(store);
+        // ...and fs::write truncation of dense + meta.
+        std::fs::write(
+            container.join("dense").join("backend").join("vectors.bin"),
+            b"NEW-branch-vectors-completely-different",
+        )
+        .unwrap();
+        let mut new_meta = sample_index_meta();
+        new_meta.chunk_count = 999;
+        std::fs::write(
+            container.join("meta.json"),
+            serde_json::to_string(&new_meta).unwrap(),
+        )
+        .unwrap();
+
+        // The mirror must still be the OLD branch's data, untouched.
+        let mirror_store = ChunkStore::open(&mirror.join("chunks.db")).unwrap();
+        assert_eq!(
+            mirror_store.get_chunk(old_id).unwrap().content,
+            "fn old_branch() {}"
+        );
+        assert!(
+            mirror_store.get_chunk(new_id).is_err(),
+            "post-mirror root writes must NOT leak into the mirror"
+        );
+        assert_eq!(
+            std::fs::read(mirror.join("dense").join("backend").join("vectors.bin")).unwrap(),
+            b"old-branch-vectors"
+        );
+        let mirror_meta: IndexMeta =
+            serde_json::from_str(&std::fs::read_to_string(mirror.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            mirror_meta.chunk_count, 9,
+            "meta snapshot must not follow the root"
+        );
+    }
+
+    /// WAL correctness (followup #3a): the builder's WAL-mode connection is
+    /// still OPEN (rows un-checkpointed, living only in `chunks.db-wal`)
+    /// when the mirror runs. The snapshot must still contain those rows —
+    /// `VACUUM INTO` (or checkpoint-then-copy) guarantees it; a naive file
+    /// copy/hard-link of `chunks.db` alone would silently drop them.
+    #[test]
+    fn mirror_captures_unchekpointed_wal_content() {
+        use crate::index::storage::ChunkStore;
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let container = container_dir(project);
+        std::fs::create_dir_all(&container).unwrap();
+
+        // ChunkStore opens in WAL mode; KEEP the connection open across the
+        // mirror so nothing gets checkpointed by a connection close.
+        let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+        let id = store
+            .insert_chunk(
+                &Chunk {
+                    id: 0,
+                    file_path: PathBuf::from("src/wal.rs"),
+                    start_line: 1,
+                    end_line: 1,
+                    content: "fn only_in_wal() {}".to_string(),
+                    chunk_type: ChunkType::TextWindow { window_index: 0 },
+                },
+                7,
+                0,
+            )
+            .unwrap();
+
+        mirror_into_branch_dir(project, "walbranch-bbbb2222").unwrap();
+
+        let mirror = branch_index_dir(project, "walbranch-bbbb2222");
+        let mirror_store = ChunkStore::open(&mirror.join("chunks.db")).unwrap();
+        assert_eq!(
+            mirror_store.get_chunk(id).unwrap().content,
+            "fn only_in_wal() {}",
+            "rows still in the root's WAL must be present in the snapshot"
+        );
+        drop(store);
+    }
+
+    /// Branch-switch simulation (followup #4 semantics): after switching git
+    /// HEAD to a new branch, a sync — even one triggered by a build that
+    /// found zero content changes — must create the NEW branch's index dir
+    /// while leaving the old branch's mirror intact.
+    #[test]
+    fn sync_after_branch_switch_creates_new_branch_dir_and_keeps_old() {
+        use crate::index::storage::ChunkStore;
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let container = container_dir(project);
+        std::fs::create_dir_all(&container).unwrap();
+
+        // Fake git repo on branch `main`.
+        let git = project.join(".git");
+        std::fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("refs").join("heads").join("main"), "abc123\n").unwrap();
+
+        {
+            let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+            store
+                .insert_chunk(
+                    &Chunk {
+                        id: 0,
+                        file_path: PathBuf::from("src/a.rs"),
+                        start_line: 1,
+                        end_line: 1,
+                        content: "fn a() {}".to_string(),
+                        chunk_type: ChunkType::TextWindow { window_index: 0 },
+                    },
+                    1,
+                    0,
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            container.join("meta.json"),
+            serde_json::to_string(&sample_index_meta()).unwrap(),
+        )
+        .unwrap();
+
+        sync_v13_layout(project, "proj-sw").unwrap();
+        let main_dir = branch_index_dir(project, &branch_key_for_branch("main"));
+        assert!(main_dir.join("chunks.db").exists());
+
+        // `git switch -c feature/new` (same tree → a re-index would find
+        // zero content changes and take the builder's early return — which
+        // now also syncs).
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/feature/new\n").unwrap();
+        std::fs::write(git.join("refs").join("heads").join("feature"), "").unwrap(); // noise
+        sync_v13_layout(project, "proj-sw").unwrap();
+
+        let feature_dir = branch_index_dir(project, &branch_key_for_branch("feature/new"));
+        assert!(
+            feature_dir.join("chunks.db").exists(),
+            "new branch dir must be created by a no-change sync"
+        );
+        assert!(
+            main_dir.join("chunks.db").exists(),
+            "old branch mirror must survive the switch"
+        );
+        // Each carries its own branch identity sidecar.
+        let feature_meta: BranchMeta = serde_json::from_str(
+            &std::fs::read_to_string(feature_dir.join("branch.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(feature_meta.branch, "feature/new");
+        let main_meta: BranchMeta =
+            serde_json::from_str(&std::fs::read_to_string(main_dir.join("branch.json")).unwrap())
+                .unwrap();
+        assert_eq!(main_meta.branch, "main");
     }
 }

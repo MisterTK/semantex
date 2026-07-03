@@ -7,10 +7,12 @@
 //! 2. The [`IndexSearcher`] trait — the seam a per-target search
 //!    implementation plugs into (single-repo today; a multi-client daemon
 //!    or cross-repo runner in Wave 2).
-//! 3. Cross-target fusion ([`fuse_targets`]): per-target min-max score
-//!    normalization, then Reciprocal Rank Fusion (k=60 by default) across
-//!    targets, with `(project, branch)` provenance preserved on every
-//!    [`FederatedHit`].
+//! 3. Cross-target fusion ([`fuse_targets`]): rank-based Reciprocal Rank
+//!    Fusion (k=60 by default) across targets — rank-based fusion is
+//!    inherently immune to targets whose backends put raw scores on
+//!    different numeric ranges (see [`fuse_targets_with_k`] for why no
+//!    score normalization step is needed) — with `(project, branch)`
+//!    provenance preserved on every [`FederatedHit`].
 //!
 //! `SearchScope::CurrentRepo` always resolves to exactly one [`IndexTarget`]
 //! for the caller's own repo/branch, and [`search_single_target`] performs no
@@ -158,19 +160,26 @@ pub fn fuse_targets(per_target_hits: Vec<(IndexTarget, Vec<SearchResult>)>) -> V
     fuse_targets_with_k(per_target_hits, DEFAULT_RRF_K)
 }
 
-/// Cross-target fusion (contract §B): within each target, hits are
-/// min-max-normalized to `[0.0, 1.0]` and re-ranked by that normalized
-/// score (this is what makes the subsequent RRF pass compare *ranks*
-/// established on a common scale, rather than raw scores that different
-/// backends may put on very different numeric ranges). Then every hit's
-/// final score is `1 / (k + rank_within_its_target)` (1-indexed), i.e.
-/// standard Reciprocal Rank Fusion applied across targets — each hit
-/// appears in exactly one target's list, so this reduces to re-scoring by
-/// rank rather than merging duplicate keys, but it is the same formula used
+/// Cross-target fusion (contract §B): purely **rank-based** Reciprocal Rank
+/// Fusion. Within each target, hits are ordered by their raw score
+/// (descending), then every hit's final score is
+/// `1 / (k + rank_within_its_target)` (1-indexed) — the same formula used
 /// for the existing intra-target dense/sparse/exact fusion
-/// (`search/triple_fusion.rs`), just applied one level up. Provenance
-/// (`target.project_root`, `target.branch_key`) is preserved on every
-/// returned hit. The final list is sorted by fused score, descending.
+/// (`search/triple_fusion.rs`), just applied one level up. Each hit appears
+/// in exactly one target's list, so this reduces to re-scoring by rank
+/// rather than merging duplicate keys.
+///
+/// Because RRF consumes only *ranks*, per-target score normalization (e.g.
+/// min-max) is deliberately omitted: any monotonic rescaling of one
+/// target's scores is a rank-order no-op, so it could never change the
+/// output. This is exactly what makes RRF the right cross-target combiner —
+/// different targets' backends may put raw scores on wildly different
+/// numeric ranges, and rank-based fusion is immune to that by construction.
+///
+/// Provenance (`target.project_root`, `target.branch_key`) is preserved on
+/// every returned hit. The final list is sorted by fused score, descending
+/// (ties between same-rank hits of different targets are input-order
+/// stable).
 pub fn fuse_targets_with_k(
     per_target_hits: Vec<(IndexTarget, Vec<SearchResult>)>,
     k: f32,
@@ -178,24 +187,15 @@ pub fn fuse_targets_with_k(
     let mut fused = Vec::new();
 
     for (target, hits) in per_target_hits {
-        if hits.is_empty() {
-            continue;
-        }
-        let min = hits.iter().map(|h| h.score).fold(f32::INFINITY, f32::min);
-        let max = hits
-            .iter()
-            .map(|h| h.score)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let range = (max - min).max(f32::EPSILON);
+        let mut ranked: Vec<usize> = (0..hits.len()).collect();
+        ranked.sort_by(|&a, &b| {
+            hits[b]
+                .score
+                .partial_cmp(&hits[a].score)
+                .unwrap_or(Ordering::Equal)
+        });
 
-        let mut ranked: Vec<(usize, f32)> = hits
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (i, (h.score - min) / range))
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-
-        for (rank, (orig_idx, _normalized)) in ranked.into_iter().enumerate() {
+        for (rank, orig_idx) in ranked.into_iter().enumerate() {
             let rrf_score = 1.0 / (k + (rank as f32 + 1.0));
             let mut result = hits[orig_idx].clone();
             result.score = rrf_score;
