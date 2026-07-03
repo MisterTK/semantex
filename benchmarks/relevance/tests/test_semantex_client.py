@@ -220,6 +220,39 @@ def test_unknown_route_raises():
         assert "deep" in str(e)
 
 
+def test_search_with_content_omits_no_content_flag():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=SAMPLE_JSON, stderr="")
+        client.search("q1", "x", ablation="hybrid", k=5, with_content=True)
+    assert "--no-content" not in mr.call_args.args[0]
+
+
+def test_search_default_still_omits_content():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=SAMPLE_JSON, stderr="")
+        client.search("q1", "x", ablation="hybrid", k=5)
+    assert "--no-content" in mr.call_args.args[0]
+
+
+def test_parse_results_stashes_raw_dicts():
+    rr = parse_results("q1", SAMPLE_JSON)
+    assert len(rr.raw) == 2
+    assert rr.raw[0]["file"] == "auth.py"
+
+
+def test_search_agent_auto_builds_no_route_command():
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=SAMPLE_JSON, stderr="")
+        rr = client.search_agent_auto("q1", "auth handler")
+    args = mr.call_args.args[0]
+    assert args == ["semantex", "agent", "--json-hits", "--", "auth handler"]
+    assert "--route" not in args
+    assert rr.ranked_files == ("auth.py", "db.py")
+
+
 def test_route_failure_raises_with_stderr():
     client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
     with patch("subprocess.run") as mr:

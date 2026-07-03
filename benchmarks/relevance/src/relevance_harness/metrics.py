@@ -25,6 +25,23 @@ def mrr_at_k(relevances: list[list[int]], *, k: int) -> float:
     return sum(_reciprocal_rank(r, k) for r in relevances) / len(relevances)
 
 
+def acc_at_k(relevances: list[list[int]], *, k: int) -> float:
+    """Fraction of queries with >=1 relevant doc in the top-k ("hit rate").
+
+    This is the file-level Acc@k SweRank and LocAgent report for SWE-bench
+    localisation: a query counts as correct iff ANY gold file is retrieved
+    within the top-k, regardless of how many gold files exist or how many of
+    them were found. It differs from recall_at_k, which averages the
+    FRACTION of gold docs retrieved (relevant when a query has multiple gold
+    docs and partial credit matters); Acc@k gives no partial credit, matching
+    the published protocol so numbers are directly comparable.
+    """
+    if not relevances:
+        return 0.0
+    hits = sum(1 for rels in relevances if any(rels[:k]))
+    return hits / len(relevances)
+
+
 def recall_at_k(relevances: list[list[int]], *, k: int, n_relevant: list[int]) -> float:
     """Mean over queries of (relevant retrieved in top-k) / (total relevant)."""
     if not relevances:
