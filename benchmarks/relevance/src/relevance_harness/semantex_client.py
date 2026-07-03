@@ -56,11 +56,16 @@ def _doc_id(item: dict) -> str:
 
 
 def parse_results(query_id: str, stdout: str) -> RankedResult:
-    """Parse the `semantex search --json` array into a RankedResult."""
+    """Parse the `semantex search --json` array into a RankedResult.
+
+    Always stashes the raw per-hit dicts on `.raw` (empty list -> empty tuple)
+    so a caller who asked for content (via `with_content=True`) can measure
+    payload size (tokens-returned) without a second parse pass.
+    """
     data = json.loads(stdout) if stdout.strip() else []
     doc_ids = tuple(_doc_id(it) for it in data)
     files = tuple(it["file"] for it in data)
-    return RankedResult(query_id=query_id, ranked_doc_ids=doc_ids, ranked_files=files)
+    return RankedResult(query_id=query_id, ranked_doc_ids=doc_ids, ranked_files=files, raw=tuple(data))
 
 
 class SemantexClient:
@@ -79,10 +84,17 @@ class SemantexClient:
         self.embedder = embedder
         self.timeout_secs = timeout_secs
 
-    def _build_args(self, query: str, *, ablation: str, k: int) -> list[str]:
+    def _build_args(
+        self, query: str, *, ablation: str, k: int, with_content: bool = False
+    ) -> list[str]:
         if ablation not in _ABLATIONS:
             raise ValueError(f"unknown ablation {ablation!r}; expected one of {_ABLATIONS}")
-        args = [self.binary, "--json", "--no-content", "-m", str(k)]
+        args = [self.binary, "--json", "-m", str(k)]
+        if not with_content:
+            # Default: paths + metadata only (smaller, faster subprocess I/O).
+            # with_content=True omits this flag so `.raw[i]["content"]` is
+            # populated, for tokens-returned instrumentation.
+            args.append("--no-content")
         if ablation == "sparse-only":
             args.append("--sparse-only")
         elif ablation == "dense-only":
@@ -162,6 +174,7 @@ class SemantexClient:
         ablation: str,
         k: int,
         route: Optional[str] = None,
+        with_content: bool = False,
     ) -> RankedResult:
         """Run a query and return its ranked, repo-relative-file results.
 
@@ -171,13 +184,35 @@ class SemantexClient:
         the same JSON shape. `ablation` is ignored when `route` is set — the
         route owns mechanism selection. The result shape is identical either
         way, so the file-level gold matcher consumes it unchanged.
+
+        `with_content=True` (search path only; `agent --json-hits` always
+        returns content, there's no equivalent flag) omits `--no-content` so
+        `.raw[i]["content"]` is populated — used to estimate tokens-returned.
         """
         if route is not None:
             args = self._build_route_args(query, route=route)
             failure_label = "agent --json-hits"
         else:
-            args = self._build_args(query, ablation=ablation, k=k)
+            args = self._build_args(query, ablation=ablation, k=k, with_content=with_content)
             failure_label = "search"
+        return self._run(args, failure_label, query_id)
+
+    def search_agent_auto(self, query_id: str, query: str) -> RankedResult:
+        """Run `agent --json-hits` with NO forced route: the engine's own
+        keyword classifier (see semantex_core::search::agent_classifier)
+        picks the retrieval mechanism, same as a real user's unforced `agent`
+        call. This is the "semantex agent routed search" arm — distinct from
+        `search(..., route=<name>)`, which OVERRIDES the classifier to force
+        one specific mechanism (used by route_eval's oracle-regret sweep).
+
+        Requires an already-running daemon (`agent` has no search-style
+        auto-spawn); the caller must start one first (see
+        relevance_harness.route_eval.start_daemon).
+        """
+        args = [self.binary, "agent", "--json-hits", "--", query]
+        return self._run(args, "agent --json-hits (auto-routed)", query_id)
+
+    def _run(self, args: list[str], failure_label: str, query_id: str) -> RankedResult:
         proc = subprocess.run(
             args,
             cwd=self.corpus_dir,

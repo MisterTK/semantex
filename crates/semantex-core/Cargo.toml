@@ -94,9 +94,13 @@ tree-sitter-elixir = "0.3.5"
 tree-sitter-svelte-next = "0.1"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-vue-next = "0.1"
-# tree-sitter-sql (0.19): Not yet available with tree-sitter 0.26+ API
-# (LANGUAGE static). Falls back to text chunking until a compatible version
-# is published.
+# `tree-sitter-sql` (0.0.2, last published 2021) never adopted the LANGUAGE-static
+# API and is unmaintained. `tree-sitter-sequel` is the actively maintained fork
+# (derekstride/tree-sitter-sql) that publishes under a different crate name; it
+# depends only on `tree-sitter-language` (already in this tree) for the runtime
+# `LanguageFn`, so it works with our `tree-sitter 0.26.9` without needing a
+# matching version pin (its own `tree-sitter` dep is dev-only, for its test suite).
+tree-sitter-sequel = "0.3.11"
 
 # File handling
 ignore = "0.4"
