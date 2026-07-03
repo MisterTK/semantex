@@ -819,6 +819,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Svelte => Some(tree_sitter_svelte_next::LANGUAGE.into()),
         FileType::Vue => Some(tree_sitter_vue_next::LANGUAGE.into()),
         FileType::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        FileType::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -934,6 +935,25 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "object_declaration",
             "interface_declaration",
         ]),
+        // tree-sitter-sequel wraps every top-level statement in a `statement`
+        // node; `collect_definitions` recurses through it regardless, so we
+        // list the inner DDL node kinds directly. Only CREATE statements are
+        // treated as definitions (mirrors other languages chunking
+        // declarations, not usages) — ALTER/DROP/DML are left as gap text.
+        FileType::Sql => Some(&[
+            "create_table",
+            "create_view",
+            "create_materialized_view",
+            "create_function",
+            "create_trigger",
+            "create_index",
+            "create_type",
+            "create_sequence",
+            "create_schema",
+            "create_role",
+            "create_database",
+            "create_extension",
+        ]),
         _ => None,
     }
 }
@@ -1048,6 +1068,24 @@ fn extract_name(node: &Node, source: &[u8]) -> Option<String> {
         }
     }
 
+    // Third pass: `object_reference` (tree-sitter-sequel/SQL-specific). Most
+    // `create_*` statement nodes don't carry a direct `name` field or bare
+    // `identifier` child — the target object name is one level down, inside
+    // an `object_reference` child that itself has a `name` field (e.g.
+    // `create_table` -> `object_reference` -> name: `identifier`). Statements
+    // with more than one `object_reference` (e.g. `create_trigger`, which also
+    // references the table and function it attaches to) emit the defined
+    // object's reference first, so the first match wins.
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32)
+            && child.kind() == "object_reference"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let text = &source[name_node.start_byte()..name_node.end_byte()];
+            return Some(String::from_utf8_lossy(text).to_string());
+        }
+    }
+
     None
 }
 
@@ -1063,7 +1101,8 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "getter_signature"
         | "setter_signature"
         | "external"
-        | "external_declaration" => AstNodeKind::Function,
+        | "external_declaration"
+        | "create_function" => AstNodeKind::Function,
         "method_definition"
         | "method_declaration"
         | "method"
@@ -1072,9 +1111,10 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "class_definition" | "class_declaration" | "class_specifier" | "class" => {
             AstNodeKind::Class
         }
-        "struct_item" | "struct_specifier" | "struct_declaration" | "record_declaration" => {
-            AstNodeKind::Struct
-        }
+        // `create_table` (SQL): a table's columns are conceptually fields, so
+        // it maps to Struct like other languages' record types.
+        "struct_item" | "struct_specifier" | "struct_declaration" | "record_declaration"
+        | "create_table" => AstNodeKind::Struct,
         "enum_item" | "enum_declaration" | "enum_definition" => AstNodeKind::Enum,
         "interface_declaration"
         | "trait_item"
@@ -1088,7 +1128,8 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "namespace_declaration"
         | "file_scoped_namespace_declaration"
         | "module_definition"
-        | "object_definition" => AstNodeKind::Module,
+        | "object_definition"
+        | "create_schema" => AstNodeKind::Module,
         // `type_alias` (Dart, Haskell): always a true alias (`typedef Foo = Bar`).
         // `type_definition` (Scala 3, OCaml): umbrella for type-level declarations
         //   that may or may not be aliases — Scala 3 emits it for `type X = Y` and
@@ -1099,9 +1140,20 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "type_alias" => AstNodeKind::Other("type_alias".to_string()),
         "type_definition" => AstNodeKind::Other("type_definition".to_string()),
         "impl_item" => AstNodeKind::Other("impl".to_string()),
-        "type_declaration" => AstNodeKind::Other("type".to_string()),
+        "type_declaration" | "create_type" => AstNodeKind::Other("type".to_string()),
         "given_definition" => AstNodeKind::Other("given".to_string()),
         "extension_definition" => AstNodeKind::Other("extension".to_string()),
+        // SQL DDL (tree-sitter-sequel): views/materialized views/indexes/etc.
+        // have no close analogue in the shared AstNodeKind set, so they stay
+        // Other(_). (create_table/create_function/create_schema/create_type
+        // are folded into the shared arms above.)
+        "create_view" | "create_materialized_view" => AstNodeKind::Other("view".to_string()),
+        "create_trigger" => AstNodeKind::Other("trigger".to_string()),
+        "create_index" => AstNodeKind::Other("index".to_string()),
+        "create_sequence" => AstNodeKind::Other("sequence".to_string()),
+        "create_role" => AstNodeKind::Other("role".to_string()),
+        "create_database" => AstNodeKind::Other("database".to_string()),
+        "create_extension" => AstNodeKind::Other("extension_stmt".to_string()),
         other => AstNodeKind::Other(other.to_string()),
     }
 }
@@ -1907,5 +1959,151 @@ class App {
                 _ => panic!("Expected AstNode with structured_meta for Widget"),
             }
         }
+    }
+
+    /// Regression test for the SQL grammar wiring: `tree-sitter-sequel`
+    /// (see Cargo.toml) provides the LANGUAGE compatible with our
+    /// `tree-sitter 0.26.9`. This asserts SQL files produce real `AstNode`
+    /// chunks (CREATE TABLE, CREATE FUNCTION, ...), not a silent TextWindow
+    /// fallback.
+    #[test]
+    fn test_sql_ast_chunking_not_text_fallback() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r"
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE
+);
+
+CREATE FUNCTION add_numbers(a INTEGER, b INTEGER) RETURNS INTEGER AS $$
+BEGIN
+    RETURN a + b;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE VIEW active_users AS
+SELECT * FROM users WHERE active = true;
+
+CREATE INDEX idx_users_email ON users (email);
+
+SELECT * FROM users;
+";
+        let chunks = chunker.chunk(Path::new("schema.sql"), content).unwrap();
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "SQL must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let table_chunk = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "users" && matches!(kind, AstNodeKind::Struct)
+            }
+            _ => false,
+        });
+        assert!(
+            table_chunk.is_some(),
+            "Should find CREATE TABLE users as a Struct-kind AstNode: {:?}",
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+        assert!(
+            table_chunk.unwrap().content.contains("PRIMARY KEY"),
+            "Table chunk should contain its column definitions"
+        );
+
+        let function_chunk = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "add_numbers" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            function_chunk.is_some(),
+            "Should find CREATE FUNCTION add_numbers as a Function-kind AstNode"
+        );
+        assert!(
+            function_chunk.unwrap().content.contains("RETURN a + b"),
+            "Function chunk should contain the function body"
+        );
+
+        let view_chunk = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "active_users" && matches!(kind, AstNodeKind::Other(s) if s == "view")
+            }
+            _ => false,
+        });
+        assert!(
+            view_chunk,
+            "Should find CREATE VIEW active_users as Other(\"view\")"
+        );
+
+        let index_chunk = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "idx_users_email" && matches!(kind, AstNodeKind::Other(s) if s == "index")
+            }
+            _ => false,
+        });
+        assert!(
+            index_chunk,
+            "Should find CREATE INDEX idx_users_email as Other(\"index\")"
+        );
+
+        // The bare trailing `SELECT * FROM users;` is not a definition — it
+        // should surface as gap text, not a spurious AstNode.
+        let has_text_window = chunks
+            .iter()
+            .any(|c| matches!(c.chunk_type, ChunkType::TextWindow { .. }));
+        assert!(
+            has_text_window,
+            "The standalone SELECT statement should remain a TextWindow gap chunk"
+        );
+    }
+
+    /// Additional SQL DDL coverage beyond the core CREATE TABLE/FUNCTION case:
+    /// CREATE SCHEMA (-> Module) and CREATE TRIGGER, whose `object_reference`
+    /// name-extraction must pick the trigger's own name, not the table or
+    /// function it references.
+    #[test]
+    fn test_sql_schema_and_trigger_naming() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r"
+CREATE SCHEMA analytics;
+
+CREATE TRIGGER audit_trigger AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_change();
+";
+        let chunks = chunker.chunk(Path::new("schema.sql"), content).unwrap();
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+
+        let has_schema = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "analytics" && matches!(kind, AstNodeKind::Module)
+            }
+            _ => false,
+        });
+        assert!(
+            has_schema,
+            "Should find CREATE SCHEMA analytics as a Module-kind AstNode: {:?}",
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+
+        let has_trigger = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "audit_trigger" && matches!(kind, AstNodeKind::Other(s) if s == "trigger")
+            }
+            _ => false,
+        });
+        assert!(
+            has_trigger,
+            "Trigger name extraction must pick the trigger's own name (first \
+             object_reference), not the referenced table/function: {:?}",
+            ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
     }
 }

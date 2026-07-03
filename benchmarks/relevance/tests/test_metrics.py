@@ -3,7 +3,7 @@ import math
 import pytest
 
 from relevance_harness.metrics import (
-    average_precision, mean_average_precision, mrr_at_k, ndcg_at_k, recall_at_k,
+    acc_at_k, average_precision, mean_average_precision, mrr_at_k, ndcg_at_k, recall_at_k,
 )
 
 
@@ -20,6 +20,26 @@ def test_mrr_no_relevant_in_top_k_is_zero():
 def test_mrr_averages_across_queries():
     # q1: first rel at rank 1 -> 1.0 ; q2: first rel at rank 4 -> 0.25
     assert mrr_at_k([[1, 0], [0, 0, 0, 1]], k=10) == pytest.approx((1.0 + 0.25) / 2)
+
+
+def test_acc_at_k_hit_when_any_relevant_in_top_k():
+    # one relevant doc at rank 2 -> hit at k=5, miss at k=1
+    assert acc_at_k([[0, 1, 0]], k=5) == pytest.approx(1.0)
+    assert acc_at_k([[0, 1, 0]], k=1) == pytest.approx(0.0)
+
+
+def test_acc_at_k_no_partial_credit_for_multi_gold():
+    # 2 gold docs, only 1 retrieved in top-k -> still a full hit (unlike recall)
+    assert acc_at_k([[1, 0, 0]], k=3) == pytest.approx(1.0)
+
+
+def test_acc_at_k_averages_across_queries():
+    # q1 hits, q2 misses -> 0.5
+    assert acc_at_k([[1, 0], [0, 0]], k=2) == pytest.approx(0.5)
+
+
+def test_acc_at_k_empty_relevances_is_zero():
+    assert acc_at_k([], k=10) == pytest.approx(0.0)
 
 
 def test_recall_at_k_counts_relevant_in_top_k():
