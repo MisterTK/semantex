@@ -57,6 +57,10 @@ class RankedResult:
     query_id: str
     ranked_doc_ids: tuple[str, ...]
     ranked_files: tuple[str, ...] = field(default_factory=tuple)
+    # Raw per-hit dicts as parsed from `--json` (may or may not carry a
+    # "content" field depending on --no-content/--snippet). Empty unless the
+    # caller asked for content; see relevance_harness.tokens for the consumer.
+    raw: tuple[dict, ...] = field(default_factory=tuple)
 
     def rank_of(self, doc_id: str) -> Optional[int]:
         """1-based rank of `doc_id`, or None if absent."""
