@@ -22,13 +22,17 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 tokio = { workspace = true, optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
 tower = { version = "0.5", default-features = false, optional = true }
+# Bearer-token auth (Wave 1 section C): rand 0.9 already resolves in
+# Cargo.lock via semantex-core's dependency graph, so this direct edge adds
+# zero new compiled crates.
+rand = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = ["http"]
-http = ["dep:tokio", "dep:axum", "dep:tower"]
+http = ["dep:tokio", "dep:axum", "dep:tower", "dep:rand"]
 llm = ["semantex-core/llm", "dep:tokio"]
 
 [lints]
