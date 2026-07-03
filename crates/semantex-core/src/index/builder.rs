@@ -11,8 +11,10 @@ use crate::file::hasher;
 use crate::file::walker::FileWalker;
 use crate::index::file_classifier;
 use crate::index::global_graph;
+use crate::index::layout;
 use crate::index::page_rank;
 use crate::index::pattern_catalog::{self, PatternCatalog, PatternLang};
+use crate::index::registry;
 use crate::index::storage::ChunkStore;
 use crate::search::code_tokenizer;
 use crate::search::dense_backend::{
@@ -840,6 +842,37 @@ impl IndexBuilder {
         };
         let meta_json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(index_dir.join("meta.json"), meta_json)?;
+
+        // Storage layout v13 (Wave 0 spine, contract §A): mirror the
+        // just-built root index into `.semantex/indexes/<branch_key>/`
+        // (migrating a legacy flat layout on first encounter), create the
+        // `history.db` / `memory.db` schemas, and upgrade the top-level
+        // `meta.json` to the v13 shape. The root itself (everything written
+        // above) is untouched by any of this — see `index/layout.rs`'s
+        // module doc for why that matters. Best-effort: a failure here is
+        // logged, never propagated, since the just-completed build above is
+        // already valid and searchable on its own.
+        //
+        // Deliberately does NOT call `registry::register` /
+        // `registry::upsert_branch` here: those touch the shared, global
+        // `~/.semantex/projects.json`, and `IndexBuilder::build` runs inside
+        // a huge number of existing tests against tempdir projects — making
+        // every one of those a hidden writer of real user/CI global state
+        // would be a correctness and flakiness regression in its own right.
+        // `project_id_for_path` is pure (no I/O) so it's safe to call here.
+        // The CLI and MCP entry points already call `registry::register` at
+        // the point a real project is actually opened; `registry::upsert_branch`
+        // stays available (and tested) for Wave 2's multi-branch daemon to
+        // call from its own, deliberately-invoked call sites.
+        let project_id = registry::project_id_for_path(&project_path);
+        match layout::sync_v13_layout(&project_path, &project_id) {
+            Ok(branch_dir) => {
+                tracing::debug!(branch_dir = %branch_dir.display(), "v13 layout synced");
+            }
+            Err(e) => {
+                tracing::warn!("v13 layout sync failed (root index still valid): {e}");
+            }
+        }
 
         let duration = start.elapsed();
         tracing::info!(
