@@ -41,6 +41,14 @@ struct HandlerContext {
     start_time: Instant,
     shutdown: Arc<AtomicBool>,
     project_root: PathBuf,
+    /// Number of connection-handler threads currently running (F2/F5). The
+    /// accept loop uses it to (a) treat in-flight requests as activity so
+    /// the idle timeout can't fire mid-request, (b) drain with a bounded
+    /// grace period before exiting so clients aren't cut off mid-write —
+    /// including the Shutdown caller's own "shutting_down" response — and
+    /// (c) apply backpressure once `SEMANTEX_DAEMON_MAX_CONNECTIONS`
+    /// threads are already in flight instead of spawning unboundedly.
+    in_flight: AtomicU64,
     /// Optional LLM backend; injected via [`Listener::with_llm`] at daemon
     /// startup and passed to every `Handler` so `AgentPipeline` can use the
     /// LLM classifier when present. Cloned per request to avoid borrow gymnastics.
@@ -157,6 +165,7 @@ impl Listener {
             start_time: Instant::now(),
             shutdown: shutdown.clone(),
             project_root,
+            in_flight: AtomicU64::new(0),
             #[cfg(feature = "llm")]
             llm: None,
             #[cfg(feature = "llm")]
@@ -239,11 +248,22 @@ impl Listener {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024);
+        // F5: cap on concurrent connection-handler threads. A burst of
+        // searches beyond the cap waits at the accept loop (backpressure)
+        // instead of piling up threads — each in-flight request can hold a
+        // full searcher, so unbounded spawning risks tripping the RSS guard
+        // into daemon exit.
+        let max_connections: u64 = std::env::var("SEMANTEX_DAEMON_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16);
 
         tracing::info!(
             port = self.port(),
             idle_timeout_s = self.idle_timeout.as_secs(),
             rss_limit_mb,
+            max_connections,
             "Daemon listening on 127.0.0.1:{}",
             self.port()
         );
@@ -261,6 +281,14 @@ impl Listener {
             if self.shutdown.load(Ordering::Relaxed) {
                 tracing::info!("Shutdown signal received");
                 break;
+            }
+
+            // F2: in-flight requests count as activity — `last_activity` is
+            // only stamped at ACCEPT time, so without this a request still
+            // running when the idle window elapses would get its daemon
+            // yanked out from under it mid-write.
+            if self.ctx.in_flight.load(Ordering::Relaxed) > 0 {
+                last_activity = Instant::now();
             }
 
             // Check idle timeout
@@ -316,6 +344,23 @@ impl Listener {
                     // even if a concurrent request evicts it from the cache
                     // map in the meantime.
                     //
+                    // F5 backpressure: wait for a connection-thread slot
+                    // rather than spawning unboundedly. The client's request
+                    // simply sits in its socket buffer until we admit it. If
+                    // shutdown fires while we wait, drop the connection —
+                    // the loop's next iteration exits.
+                    let mut admitted = true;
+                    while self.ctx.in_flight.load(Ordering::Relaxed) >= max_connections {
+                        if self.shutdown.load(Ordering::Relaxed) {
+                            admitted = false;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if !admitted {
+                        continue;
+                    }
+
                     // Isolate per-connection failures exactly as before: a
                     // panic on one connection's weird input must not take
                     // down anything else. Previously that meant "must not
@@ -324,7 +369,14 @@ impl Listener {
                     // automatically contained by the runtime regardless — we
                     // still wrap in `catch_unwind` purely to keep the same
                     // structured warning/error log line instead of falling
-                    // back to the default panic hook's raw stderr dump.
+                    // back to the default panic hook's raw stderr dump. The
+                    // catch also guarantees the `in_flight` decrement below
+                    // runs even on a panicking connection, so the drain /
+                    // idle / backpressure accounting can't leak.
+                    //
+                    // Increment BEFORE spawning so the count is never
+                    // transiently under-reported to the backpressure check.
+                    self.ctx.in_flight.fetch_add(1, Ordering::Relaxed);
                     let ctx = Arc::clone(&self.ctx);
                     let handle = std::thread::Builder::new()
                         .name("semantex-daemon-conn".to_string())
@@ -348,8 +400,11 @@ impl Listener {
                                     );
                                 }
                             }
+                            ctx.in_flight.fetch_sub(1, Ordering::Relaxed);
                         });
                     if let Err(e) = handle {
+                        // Spawn failed — the increment above must be undone.
+                        self.ctx.in_flight.fetch_sub(1, Ordering::Relaxed);
                         tracing::error!("Failed to spawn connection handler thread: {}", e);
                     }
                 }
@@ -364,17 +419,29 @@ impl Listener {
             }
         }
 
+        // F2: drain in-flight connection-handler threads with a bounded
+        // grace period before tearing down. Without this, `run()` returning
+        // lets the daemon process exit while handler threads are mid-write —
+        // clients see ECONNRESET, and even the Shutdown caller's own
+        // "shutting_down" response is racy (the flag is set BEFORE the
+        // response bytes are written, and this loop polls the flag every
+        // ≤10 ms). New connections are no longer accepted; existing ones get
+        // up to 30 s to finish (matching the client-side read timeout on the
+        // slowest request type).
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
+        while self.ctx.in_flight.load(Ordering::Relaxed) > 0 && Instant::now() < drain_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let leftover = self.ctx.in_flight.load(Ordering::Relaxed);
+        if leftover > 0 {
+            tracing::warn!(
+                in_flight = leftover,
+                "Drain grace period elapsed with connections still in flight — exiting anyway"
+            );
+        }
+
         self.cleanup();
         Ok(())
-    }
-
-    /// Drop every cached searcher for this daemon's project, regardless of
-    /// branch key. Exposed for callers that already know a rebuild just
-    /// completed (e.g. `semantex watch`'s re-index loop) and want the NEXT
-    /// request to reopen immediately rather than wait for the per-request
-    /// staleness marker check to notice on its own.
-    pub fn invalidate_cached_searcher(&self) {
-        self.ctx.cache.invalidate_project(&self.ctx.project_root);
     }
 
     fn cleanup(&self) {

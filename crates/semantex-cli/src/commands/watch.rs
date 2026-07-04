@@ -6,6 +6,7 @@ use semantex_core::index::branches;
 use semantex_core::index::layout;
 use semantex_core::index::updater::IndexUpdater;
 use semantex_core::search::hybrid::HybridSearcher;
+use semantex_core::server::cache::SearcherCache;
 use semantex_core::server::listener::Listener;
 use std::path::Path;
 use std::sync::Arc;
@@ -86,9 +87,21 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
     let port_file = index_dir.join("semantex.port");
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Open searcher for daemon
+    // Open searcher for daemon. The watch loop keeps a handle on the
+    // daemon's SearcherCache so each completed re-index below can invalidate
+    // the cached searcher directly — the daemon's own per-request staleness
+    // marker (meta.json mtime) would catch it anyway, but an explicit
+    // invalidation removes even the coarse-timestamp-filesystem edge and
+    // makes the next query reopen immediately.
+    let mut daemon_cache: Option<Arc<SearcherCache>> = None;
     match HybridSearcher::open(&index_dir, config) {
         Ok(searcher) => {
+            let cache = Arc::new(SearcherCache::seeded(
+                config.clone(),
+                &project_path,
+                searcher,
+            ));
+            daemon_cache = Some(Arc::clone(&cache));
             let shutdown_clone = shutdown.clone();
             let port_file_clone = port_file.clone();
             let project_path_clone = project_path.clone();
@@ -108,9 +121,9 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
                     cap
                 });
             std::thread::spawn(move || {
-                match Listener::bind(
+                match Listener::bind_with_cache(
                     &port_file_clone,
-                    searcher,
+                    cache,
                     project_path_clone,
                     Duration::from_hours(24), // 24h timeout (watch keeps it alive)
                     shutdown_clone,
@@ -190,11 +203,14 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
                     stats.duration.as_secs_f64()
                 );
 
-                // Notify the daemon to reload (the daemon's Tantivy reader needs a reload)
-                // We send a health check which doesn't reload, but the searcher's
-                // sparse index will pick up changes on the next reader reload.
-                // For now, the watch loop and daemon share the same index files,
-                // and the searcher will re-read on next query via Tantivy's mmap.
+                // Tell the daemon its cached searcher is now stale: the next
+                // query reopens against the just-rebuilt index. The daemon's
+                // per-request meta.json-mtime marker would notice on its own,
+                // but this direct invalidation is deterministic even on
+                // filesystems with coarse timestamps (F4).
+                if let Some(cache) = &daemon_cache {
+                    cache.invalidate_project(&project_path);
+                }
             }
             Err(e) => {
                 eprintln!("   {} Re-index failed: {}", "Error:".red(), e);

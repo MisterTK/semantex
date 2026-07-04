@@ -1091,6 +1091,102 @@ mod tests {
         let _ = server_thread.join();
     }
 
+    /// F2 + concurrency (real socket, multi-threaded): several clients firing
+    /// searches at the daemon simultaneously must each get a well-formed
+    /// response (each connection runs on its own handler thread), and a
+    /// graceful `Shutdown` request must receive its "shutting_down" response
+    /// BEFORE the daemon tears down — the accept loop drains in-flight
+    /// connection threads with a bounded grace period instead of exiting the
+    /// moment the shutdown flag is observed (which raced the response write).
+    #[test]
+    fn daemon_serves_concurrent_clients_and_shutdown_response_lands() {
+        use crate::config::SemantexConfig;
+        use crate::index::storage::ChunkStore;
+        use crate::search::hybrid::HybridSearcher;
+        use crate::server::listener::Listener;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        // Same minimal sparse-only harness as `daemon_survives_handler_panic`.
+        let dir = TempDir::new().expect("tempdir");
+        let semantex_dir = dir.path().join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        {
+            let _store =
+                ChunkStore::open(&semantex_dir.join("chunks.db")).expect("create empty store");
+        }
+        let config = SemantexConfig::default();
+        let searcher =
+            HybridSearcher::open_sparse_only(&semantex_dir, &config).expect("open searcher");
+
+        let port_file = semantex_dir.join("semantex.port");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let listener = Listener::bind(
+            &port_file,
+            searcher,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            shutdown.clone(),
+        )
+        .expect("bind listener");
+        let port = listener.port();
+
+        let server_thread = std::thread::spawn(move || {
+            let _ = listener.run();
+        });
+
+        // 1. Concurrent clients: 4 threads each firing a search — every one
+        //    must receive a Search response (empty index → empty results).
+        let make_search = || {
+            BinaryRequest::Search(SearchRequest {
+                query: "concurrent daemon clients".to_string(),
+                max_results: 5,
+                use_dense: false,
+                use_sparse: true,
+                use_rerank: false,
+                include_types: vec![],
+                exclude_types: vec![],
+                code_only: false,
+                include_content: false,
+                snippet: false,
+                grep_mode: false,
+                regex_pattern: None,
+                auto_peek_top: false,
+            })
+        };
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                let req = make_search();
+                std::thread::spawn(move || send_binary_for_test(port, &req, 10))
+            })
+            .collect();
+        for client in clients {
+            let resp = client
+                .join()
+                .unwrap()
+                .expect("concurrent search must succeed");
+            assert!(
+                matches!(resp, BinaryResponse::Search(_)),
+                "expected Search response, got {resp:?}"
+            );
+        }
+
+        // 2. F2 load-bearing assertion: the Shutdown caller must receive the
+        //    "shutting_down" response — pre-drain, run() could return (and in
+        //    the real daemon, the process could exit) between the flag being
+        //    set and the response bytes being written.
+        let resp = send_binary_for_test(port, &BinaryRequest::Shutdown, 5)
+            .expect("Shutdown response must be written before the daemon exits");
+        assert!(
+            matches!(resp, BinaryResponse::Shutdown(_)),
+            "expected Shutdown response, got {resp:?}"
+        );
+
+        server_thread.join().unwrap();
+    }
+
     /// Minimal binary-protocol client for the integration test: connect, send a
     /// framed request, read the framed response. Mirrors
     /// `server::mod::send_binary_request` but lives here to keep the test
