@@ -304,6 +304,60 @@ impl McpServer {
         self.cache.lock().remove(index_dir);
     }
 
+    // -------------------------------------------------------------------------
+    // Cross-repo federation (Wave 2 §B): `scope` param on semantex_agent /
+    // semantex_search
+    // -------------------------------------------------------------------------
+
+    /// Parse the optional `scope` tool argument into a
+    /// [`SearchScope`](semantex_core::search::federation::SearchScope).
+    ///
+    /// String values go through the SAME grammar as the CLI's `--scope`
+    /// flag ([`federation::parse_scope_str`]): `"repo"`/empty → CurrentRepo,
+    /// `"all"` → All, and any OTHER string is treated as comma-separated
+    /// project names (`Named`) — never silently mapped to CurrentRepo, so a
+    /// client sending `scope: "frontend"` (or a typo like `"All"`) gets the
+    /// Named path, where unmatched names are surfaced in `skipped` instead
+    /// of quietly returning wrong-scope results. Absent scope or a
+    /// non-string/non-array JSON type is the safe default CurrentRepo.
+    fn parse_scope(args: &serde_json::Value) -> semantex_core::search::federation::SearchScope {
+        use semantex_core::search::federation::{SearchScope, parse_scope_str};
+        match args.get("scope") {
+            Some(serde_json::Value::String(s)) => parse_scope_str(s),
+            Some(serde_json::Value::Array(arr)) => {
+                let names: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                if names.is_empty() {
+                    SearchScope::CurrentRepo
+                } else {
+                    SearchScope::Named(names)
+                }
+            }
+            _ => SearchScope::CurrentRepo,
+        }
+    }
+
+    /// `IndexSearcher` impl backed by the server's own LRU searcher cache
+    /// ([`McpServer::get_searcher`]) — the searcher-opening machinery
+    /// `semantex_search`/`semantex_agent` already use for the single-repo
+    /// path. Federating N targets through this just calls `get_searcher`
+    /// once per target: with the default `max_cached=1`, each new target
+    /// evicts the previous one BEFORE opening (see `get_searcher`), so a
+    /// federated query still only ever holds one dense index resident at a
+    /// time — "open sequentially, search, release" falls out of the
+    /// existing eviction policy for free. Raising `SEMANTEX_MCP_CACHE_SIZE`
+    /// lets an operator keep more targets warm across federated calls, at
+    /// the RSS cost of doing so (still bounded by `check_rss_and_evict`).
+    fn get_searcher_for_target(
+        &self,
+        target: &semantex_core::search::federation::IndexTarget,
+    ) -> Result<Arc<CachedSearcher>> {
+        let index_dir = semantex_core::search::federation::target_index_dir(target);
+        self.get_searcher(&index_dir)
+    }
+
     /// Check process RSS and apply graduated memory pressure relief.
     /// Called after each tool invocation to prevent runaway memory growth.
     ///
@@ -787,13 +841,21 @@ impl McpServer {
                             "type": "string",
                             "enum": ["concise", "detailed"],
                             "description": "Output verbosity. 'concise' returns ~1/3 the context (paths + minimal snippets); 'detailed' returns fuller results. Omit for the server default. Ignored if an explicit 'budget' is set."
+                        },
+                        "scope": {
+                            "description": "Which repo(s) to search. 'repo' (default) = only the current project at 'path' — identical to omitting this field. 'all' = every project registered in the local semantex registry (~/.semantex/projects.json), fanned out and RRF-fused with per-hit provenance. Any OTHER string is treated as comma-separated project display names/paths, and an array of names does the same (e.g. [\"frontend\", \"backend\"]) — names matching no registered project are reported in the response's skipped list rather than silently ignored. Cross-repo scopes always run a hybrid search: 'mode'/'depth'/'focus' route classification is skipped and those fields are ignored. Results carry a 'project' field and formatted paths are prefixed '[project] '.",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}}
+                            ]
                         }
                     }
                 }),
                 // NOTE: name/lang are nullable (the agent always emits these keys,
                 // null when absent) — intentional divergence from semantex_search,
                 // which omits them. `results` is required: it's always present when
-                // structuredContent is emitted (only set when hits exist).
+                // structuredContent is emitted (only set when hits exist). `project`
+                // is only present on hits from a cross-repo ('scope' != 'repo') call.
                 output_schema: Some(serde_json::json!({
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
                     "type": "object",
@@ -808,7 +870,8 @@ impl McpServer {
                                     "score": {"type":"number"},
                                     "name": {"type":["string","null"]},
                                     "snippet": {"type":"string"},
-                                    "lang": {"type":["string","null"]}
+                                    "lang": {"type":["string","null"]},
+                                    "project": {"type":"string"}
                                 },
                                 "required": ["file","lines","score","snippet"]
                             }
@@ -837,7 +900,14 @@ impl McpServer {
                         "path": { "type": "string", "description": "Project path to search (defaults to cwd)" },
                         "max_results": { "type": "integer", "description": "Maximum results to return", "default": 10 },
                         "rerank": { "type": "boolean", "description": "Enable cross-encoder reranking (slower but may improve ranking)", "default": false },
-                        "grep_mode": { "type": "boolean", "description": "Fast grep-like search using only sparse+exact matching (no embedding model needed)", "default": false }
+                        "grep_mode": { "type": "boolean", "description": "Fast grep-like search using only sparse+exact matching (no embedding model needed)", "default": false },
+                        "scope": {
+                            "description": "Which repo(s) to search. 'repo' (default) = only 'path' — identical to omitting this field. 'all' = every project in the local semantex registry, RRF-fused with provenance. Any OTHER string is treated as comma-separated project display names/paths, and an array of names does the same — names matching no registered project are reported in the response's 'skipped' list rather than silently ignored.",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}}
+                            ]
+                        }
                     },
                     "required": ["query"]
                 }),
@@ -855,7 +925,8 @@ impl McpServer {
                                     "score": { "type": "number" },
                                     "snippet": { "type": "string" },
                                     "name": { "type": "string" },
-                                    "lang": { "type": "string" }
+                                    "lang": { "type": "string" },
+                                    "project": { "type": "string" }
                                 },
                                 "required": ["file", "lines", "score", "snippet"]
                             }
@@ -867,6 +938,23 @@ impl McpServer {
                                 "result_count": { "type": "integer" },
                                 "query_type": { "type": "string" }
                             }
+                        },
+                        "skipped": {
+                            "type": "array",
+                            "description": "Cross-repo ('scope' != 'repo') calls only: targets left out of the federated query — projects whose index wasn't ready, and scope names that matched no registered project.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "project": { "type": "string" },
+                                    "path": { "type": "string" },
+                                    "reason": { "type": "string" }
+                                },
+                                "required": ["project", "path", "reason"]
+                            }
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "Cross-repo calls only: set when scope resolution itself produced nothing to query (e.g. 'all' with an empty registry)."
                         }
                     },
                     "required": ["results"]
@@ -1265,6 +1353,15 @@ impl McpServer {
             |p| Ok(PathBuf::from(p)),
         )?;
 
+        // `scope` != CurrentRepo bypasses the single-repo route-classification
+        // pipeline below entirely (see `tool_agent_federated`'s doc comment for
+        // why): this is what keeps `scope: "repo"` (the default) byte-identical
+        // to every pre-federation caller.
+        let scope = Self::parse_scope(args);
+        if scope != semantex_core::search::federation::SearchScope::CurrentRepo {
+            return Ok(self.tool_agent_federated(args, &queries, &path, &scope));
+        }
+
         let full_code = args
             .get("full_code")
             .and_then(serde_json::Value::as_bool)
@@ -1398,6 +1495,150 @@ impl McpServer {
         }
     }
 
+    /// `semantex_agent` with `scope` != `repo`.
+    ///
+    /// Cross-repo federation intentionally does NOT run the single-repo route
+    /// classifier (`AgentRoute::{Structural,Deep,Architecture,FeaturePlanning}`
+    /// are graph-walk/synthesis routes tied to one repo's call graph — "callers
+    /// of X across every registered repo" isn't a coherent single operation).
+    /// Instead every federated query always runs a hybrid dense+sparse search
+    /// per target ([`McpFederatedSearcher`]), fused with RRF
+    /// ([`federation::run_federated_search`]) exactly like `tool_search_federated`.
+    /// Formatted output is rendered with the existing
+    /// [`format_search_results`] (so it reads the same as any other search
+    /// route's answer), with each hit's path prefixed `[project] `; the
+    /// `structuredContent`/hits JSON keeps `file` clean and adds a sibling
+    /// `project` field instead (so existing single-repo JSON consumers that
+    /// might one day read a `scope: "all"` response aren't surprised by a
+    /// mutated `file`).
+    fn tool_agent_federated(
+        &self,
+        args: &serde_json::Value,
+        queries: &[String],
+        path: &std::path::Path,
+        scope: &semantex_core::search::federation::SearchScope,
+    ) -> ToolOutput {
+        use semantex_core::search::agent_formatter::{
+            DEFAULT_BUDGET, FormatStyle, format_search_results,
+        };
+        use semantex_core::search::federation::{self, project_display_name};
+        use semantex_core::server::protocol::{SearchResponse, SearchResultItem};
+        use std::fmt::Write as _;
+
+        let budget = args
+            .get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(self.mcp_defaults.budget, |v| v as usize);
+        let response_format = args.get("response_format").and_then(|v| v.as_str());
+        let budget = if args.get("budget").is_some() {
+            budget
+        } else {
+            budget_for_format(response_format, budget)
+        };
+        let budget = if budget == 0 { DEFAULT_BUDGET } else { budget };
+
+        let cwd = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let registry_v2 = registry::read_all_v2();
+        let searcher = McpFederatedSearcher {
+            server: self,
+            rerank: true,
+            grep_mode: false,
+        };
+
+        tracing::info!(?queries, ?scope, path = %cwd.display(), "MCP federated agent search");
+
+        let mut sections: Vec<String> = Vec::with_capacity(queries.len());
+        let mut all_hits: Vec<serde_json::Value> = Vec::new();
+        let mut skipped_projects: Vec<String> = Vec::new();
+        // Scope-level diagnosis (e.g. `all` with an empty registry) — the
+        // same for every query in the batch, so keep the first one seen.
+        let mut federation_note: Option<String> = None;
+
+        for q in queries {
+            let outcome =
+                federation::run_federated_search(scope, &registry_v2, &cwd, q, 20, &searcher);
+
+            let items: Vec<SearchResultItem> = outcome
+                .hits
+                .iter()
+                .map(|h| {
+                    let project = project_display_name(&registry_v2, &h.target.project_root);
+                    let mut item = federated_hit_to_item(h);
+                    item.file = format!("[{project}] {}", item.file);
+                    item
+                })
+                .collect();
+
+            for h in &outcome.hits {
+                let project = project_display_name(&registry_v2, &h.target.project_root);
+                let item = federated_hit_to_item(h);
+                all_hits.push(serde_json::json!({
+                    "file": item.file,
+                    "lines": format!("{}-{}", item.start_line, item.end_line),
+                    "score": item.score,
+                    "name": item.name,
+                    "snippet": item.summary.clone().unwrap_or_default(),
+                    "lang": item.language,
+                    "project": project,
+                }));
+            }
+
+            for s in &outcome.skipped {
+                skipped_projects.push(format!(
+                    "{} ({})",
+                    project_display_name(&registry_v2, &s.target.project_root),
+                    s.reason
+                ));
+            }
+            if federation_note.is_none() {
+                federation_note.clone_from(&outcome.note);
+            }
+
+            let resp = SearchResponse {
+                results: items,
+                duration_ms: 0,
+                dense_count: 0,
+                sparse_count: 0,
+                fused_count: outcome.hits.len(),
+                metrics: None,
+                confidence: None,
+                disambiguation: None,
+            };
+            sections.push(format_search_results(&resp, FormatStyle::Default, budget));
+        }
+
+        let mut combined = if sections.len() > 1 {
+            format!(
+                "[Batch results for {} queries — merged]\n\n{}",
+                sections.len(),
+                sections.join("\n\n---\n\n")
+            )
+        } else {
+            sections.remove(0)
+        };
+
+        if let Some(note) = &federation_note {
+            let _ = write!(combined, "\n\n[federation: {note}]");
+        }
+
+        if !skipped_projects.is_empty() {
+            skipped_projects.sort();
+            skipped_projects.dedup();
+            let _ = write!(
+                combined,
+                "\n\n[federation: skipped {} target(s): {}]",
+                skipped_projects.len(),
+                skipped_projects.join(", ")
+            );
+        }
+
+        if all_hits.is_empty() {
+            ToolOutput::text(combined)
+        } else {
+            ToolOutput::text_with_structured(combined, serde_json::json!({ "results": all_hits }))
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Tool: semantex_search
     // -------------------------------------------------------------------------
@@ -1430,6 +1671,31 @@ impl McpServer {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
+        // `scope` != CurrentRepo takes a completely separate path
+        // (`tool_search_federated`) that never touches the single-repo
+        // `idx_state`/background-index machinery below — this is what keeps
+        // `scope: "repo"` (the default, and every pre-federation caller)
+        // byte-identical to today.
+        let scope = Self::parse_scope(args);
+        if scope != semantex_core::search::federation::SearchScope::CurrentRepo {
+            tracing::info!(
+                query,
+                ?scope,
+                max_results,
+                rerank,
+                grep_mode,
+                "MCP federated search"
+            );
+            return self.tool_search_federated(
+                query,
+                &path,
+                max_results,
+                rerank,
+                grep_mode,
+                &scope,
+            );
+        }
+
         tracing::info!(query, path = %path.display(), max_results, rerank, grep_mode, "MCP search");
 
         let idx_state = Self::detect_state_fast(&path);
@@ -1444,6 +1710,105 @@ impl McpServer {
             }
             IndexState::Building => Self::do_ripgrep_fallback(query, &path, max_results),
         }
+    }
+
+    /// `semantex_search` with `scope` != `repo`: fan the query out across
+    /// every target `scope` resolves to (via [`McpFederatedSearcher`], which
+    /// reuses the same LRU searcher cache as the single-repo path), fuse
+    /// with RRF ([`federation::run_federated_search`]), and shape the
+    /// output like `do_semantex_search`'s JSON but with an added `project`
+    /// field per hit and a `skipped` list for targets that weren't ready.
+    fn tool_search_federated(
+        &self,
+        query: &str,
+        path: &std::path::Path,
+        max_results: usize,
+        rerank: bool,
+        grep_mode: bool,
+        scope: &semantex_core::search::federation::SearchScope,
+    ) -> Result<ToolOutput> {
+        use semantex_core::search::federation::{self, project_display_name};
+
+        let cwd = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let registry_v2 = registry::read_all_v2();
+        let searcher = McpFederatedSearcher {
+            server: self,
+            rerank,
+            grep_mode,
+        };
+        let outcome = federation::run_federated_search(
+            scope,
+            &registry_v2,
+            &cwd,
+            query,
+            max_results,
+            &searcher,
+        );
+
+        let json_results: Vec<serde_json::Value> = outcome
+            .hits
+            .iter()
+            .map(|h| {
+                let snippet = make_snippet_mcp(&h.result.chunk.content, &h.result.chunk.chunk_type);
+                // Federated scores are RRF values (~1/(60+rank), so ranks
+                // differ only in the 4th-5th decimal) — round to 5 decimals,
+                // NOT the single-repo path's 2, which would collapse most of
+                // the ranking into identical values.
+                let score = (h.result.score * 100_000.0_f32).round() / 100_000.0_f32;
+                let project = project_display_name(&registry_v2, &h.target.project_root);
+                let mut val = serde_json::json!({
+                    "file": h.result.chunk.file_path.display().to_string(),
+                    "lines": format!("{}-{}", h.result.chunk.start_line, h.result.chunk.end_line),
+                    "score": score,
+                    "snippet": snippet,
+                    "project": project,
+                });
+                if let semantex_core::types::ChunkType::AstNode { name, language, .. } =
+                    &h.result.chunk.chunk_type
+                {
+                    val["name"] = serde_json::Value::String(name.clone());
+                    val["lang"] = serde_json::Value::String(language.clone());
+                }
+                val
+            })
+            .collect();
+
+        let skipped_json: Vec<serde_json::Value> = outcome
+            .skipped
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "project": project_display_name(&registry_v2, &s.target.project_root),
+                    "path": s.target.project_root.display().to_string(),
+                    "reason": s.reason,
+                })
+            })
+            .collect();
+
+        let mut structured = serde_json::json!({
+            "results": json_results,
+            "skipped": skipped_json,
+        });
+        if let Some(note) = &outcome.note {
+            structured["note"] = serde_json::Value::String(note.clone());
+        }
+
+        let json_text = serde_json::to_string(&json_results)?;
+        let mut footer = format!(
+            "[semantex_federation: hits={} skipped={}]",
+            json_results.len(),
+            skipped_json.len()
+        );
+        if let Some(note) = &outcome.note {
+            use std::fmt::Write as _;
+            let _ = write!(footer, "\n[federation: {note}]");
+        }
+        let text = format!("{json_text}\n\n{footer}");
+
+        Ok(ToolOutput {
+            text,
+            structured: Some(structured),
+        })
     }
 
     fn do_semantex_search(
@@ -2827,6 +3192,47 @@ impl McpAgentDefaults {
 }
 
 // =============================================================================
+// Cross-repo federation: IndexSearcher wired through the LRU searcher cache
+// =============================================================================
+
+/// [`IndexSearcher`](semantex_core::search::federation::IndexSearcher) impl
+/// used by the `scope != repo` paths of `semantex_search`/`semantex_agent`.
+/// Opens each target through [`McpServer::get_searcher_for_target`] (the
+/// existing LRU cache with idle-timeout + RSS-pressure eviction), so a
+/// federated query reuses the exact same searcher-opening machinery as a
+/// single-repo call rather than a parallel ad hoc one.
+struct McpFederatedSearcher<'a> {
+    server: &'a McpServer,
+    rerank: bool,
+    grep_mode: bool,
+}
+
+impl semantex_core::search::federation::IndexSearcher for McpFederatedSearcher<'_> {
+    fn search_target(
+        &self,
+        target: &semantex_core::search::federation::IndexTarget,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<semantex_core::types::SearchResult>> {
+        if self.grep_mode {
+            // Sparse-only: skip the ONNX/dense load entirely, matching the
+            // single-repo `do_semantex_search` grep_mode path. Not cached
+            // (mirrors that path too) — grep-mode opens are cheap.
+            let index_dir = semantex_core::search::federation::target_index_dir(target);
+            let searcher = HybridSearcher::open_sparse_only(&index_dir, &self.server.config)?;
+            let sq = SearchQuery::new(query).grep_mode().max_results(limit);
+            return Ok(searcher.search(&sq)?.results);
+        }
+        let cached = self.server.get_searcher_for_target(target)?;
+        let mut sq = SearchQuery::new(query).max_results(limit);
+        if !self.rerank {
+            sq = sq.no_rerank();
+        }
+        Ok(cached.searcher.search(&sq)?.results)
+    }
+}
+
+// =============================================================================
 // Tool output helper
 // =============================================================================
 
@@ -2902,6 +3308,38 @@ fn truncate_lines_mcp(content: &str, n: usize) -> String {
         format!("{}...", lines[..n].join("\n"))
     } else {
         lines.join("\n")
+    }
+}
+
+/// Convert a federated hit into a plain [`SearchResultItem`] with `file` left
+/// bare (repo-relative, un-prefixed). `tool_agent_federated` prefixes `[project]
+/// ` onto a CLONE of `.file` only for the human-formatted text path;
+/// JSON/structuredContent builders read this bare form and carry `project` as
+/// a separate sibling field instead — see that function's doc comment.
+fn federated_hit_to_item(
+    hit: &semantex_core::search::federation::FederatedHit,
+) -> semantex_core::server::protocol::SearchResultItem {
+    use semantex_core::server::protocol::SearchResultItem;
+    use semantex_core::types::ChunkType;
+
+    let (name, language) = match &hit.result.chunk.chunk_type {
+        ChunkType::AstNode { name, language, .. } => (Some(name.clone()), Some(language.clone())),
+        _ => (None, None),
+    };
+    let summary = make_snippet_mcp(&hit.result.chunk.content, &hit.result.chunk.chunk_type);
+
+    SearchResultItem {
+        file: hit.result.chunk.file_path.display().to_string(),
+        start_line: hit.result.chunk.start_line,
+        end_line: hit.result.chunk.end_line,
+        score: hit.result.score,
+        source: format!("{:?}", hit.result.source),
+        chunk_type: format!("{:?}", hit.result.chunk.chunk_type),
+        name,
+        language,
+        content: Some(hit.result.chunk.content.clone()),
+        kind: None,
+        summary: Some(summary),
     }
 }
 
@@ -4114,6 +4552,153 @@ mod tests {
         assert_eq!(
             agent.input_schema.get("$schema").and_then(|v| v.as_str()),
             Some("https://json-schema.org/draft/2020-12/schema")
+        );
+    }
+
+    #[test]
+    fn agent_input_schema_declares_scope_param() {
+        let agent = McpServer::all_tools()
+            .into_iter()
+            .find(|t| t.name == "semantex_agent")
+            .unwrap();
+        let scope = &agent.input_schema["properties"]["scope"];
+        assert!(
+            scope.is_object(),
+            "semantex_agent schema must declare a 'scope' property"
+        );
+        let one_of = scope["oneOf"]
+            .as_array()
+            .expect("scope is oneOf[string,array]");
+        assert_eq!(one_of.len(), 2);
+        // The string branch must NOT be an enum: any non-'repo'/'all' string
+        // is valid input (treated as comma-separated project names — the
+        // same grammar as the CLI's --scope), so an enum would reject it.
+        let string_variant = one_of
+            .iter()
+            .find(|v| v["type"] == "string")
+            .expect("one oneOf branch is a string");
+        assert!(
+            string_variant.get("enum").is_none(),
+            "scope string branch must accept arbitrary project names, not just repo/all"
+        );
+        let array_variant = one_of
+            .iter()
+            .find(|v| v["type"] == "array")
+            .expect("one oneOf branch is an array of names");
+        assert_eq!(array_variant["items"]["type"], "string");
+        // The description must document the names-grammar and skipped
+        // reporting so clients aren't surprised by the non-enum string.
+        let desc = scope["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("skipped"),
+            "scope description documents skipped reporting: {desc}"
+        );
+    }
+
+    #[test]
+    fn search_input_schema_declares_scope_param() {
+        let search = McpServer::all_tools()
+            .into_iter()
+            .find(|t| t.name == "semantex_search")
+            .unwrap();
+        assert!(
+            search.input_schema["properties"]["scope"].is_object(),
+            "semantex_search schema must declare a 'scope' property"
+        );
+    }
+
+    #[test]
+    fn agent_output_schema_declares_project_field() {
+        let agent = McpServer::all_tools()
+            .into_iter()
+            .find(|t| t.name == "semantex_agent")
+            .unwrap();
+        let output = agent
+            .output_schema
+            .expect("semantex_agent has an output schema");
+        assert_eq!(
+            output["properties"]["results"]["items"]["properties"]["project"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn search_output_schema_declares_project_field() {
+        let search = McpServer::all_tools()
+            .into_iter()
+            .find(|t| t.name == "semantex_search")
+            .unwrap();
+        let output = search
+            .output_schema
+            .expect("semantex_search has an output schema");
+        assert_eq!(
+            output["properties"]["results"]["items"]["properties"]["project"]["type"],
+            "string"
+        );
+        // Federated calls also emit `skipped` and `note` — both declared.
+        let skipped = &output["properties"]["skipped"];
+        assert_eq!(skipped["type"], "array");
+        for field in ["project", "path", "reason"] {
+            assert_eq!(skipped["items"]["properties"][field]["type"], "string");
+        }
+        assert_eq!(output["properties"]["note"]["type"], "string");
+    }
+
+    #[test]
+    fn parse_scope_defaults_to_current_repo() {
+        use semantex_core::search::federation::SearchScope;
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({})),
+            SearchScope::CurrentRepo
+        );
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "repo"})),
+            SearchScope::CurrentRepo
+        );
+        // A malformed (wrong-JSON-type) value degrades to the safe
+        // single-repo default rather than erroring.
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": 42})),
+            SearchScope::CurrentRepo
+        );
+    }
+
+    /// Scope-grammar parity with the CLI: a non-'repo'/'all' string is
+    /// Named (comma-split), NOT silently CurrentRepo — `scope: "frontend"`
+    /// must never quietly return current-repo results, and a typo like
+    /// "All" resolves to zero targets and is surfaced via `skipped`.
+    #[test]
+    fn parse_scope_treats_unknown_strings_as_named() {
+        use semantex_core::search::federation::SearchScope;
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "frontend"})),
+            SearchScope::Named(vec!["frontend".to_string()])
+        );
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "frontend,backend"})),
+            SearchScope::Named(vec!["frontend".to_string(), "backend".to_string()])
+        );
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "All"})),
+            SearchScope::Named(vec!["All".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_scope_all_and_named() {
+        use semantex_core::search::federation::SearchScope;
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "all"})),
+            SearchScope::All
+        );
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": ["frontend", "backend"]})),
+            SearchScope::Named(vec!["frontend".to_string(), "backend".to_string()])
+        );
+        // An empty array is not a valid Named scope — falls back to CurrentRepo.
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": []})),
+            SearchScope::CurrentRepo
         );
     }
 
