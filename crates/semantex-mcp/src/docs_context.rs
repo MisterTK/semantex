@@ -101,10 +101,10 @@ pub fn run(
             Ok(DocsContextResult { text, structured })
         }
         Scope::Module(module_path) => {
-            let mut scaffold = docs_scaffold::build_module_scaffold(store, &module_path)
+            let mut scaffold = docs_scaffold::build_module_scaffold(store, db_path, &module_path)
                 .with_context(|| {
-                    format!("Failed to build module docs scaffold for `{module_path}`")
-                })?;
+                format!("Failed to build module docs scaffold for `{module_path}`")
+            })?;
             apply_module_budget(&mut scaffold, budget_tokens);
             let text = render_module_text(&scaffold);
             let structured = serde_json::to_value(&scaffold)

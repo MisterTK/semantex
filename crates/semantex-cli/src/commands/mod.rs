@@ -2,6 +2,7 @@ pub mod connect;
 pub mod disconnect;
 pub mod download;
 pub mod federated;
+pub mod history;
 pub mod hooks;
 pub mod index;
 pub mod install;

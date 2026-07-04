@@ -166,6 +166,10 @@ impl IndexBuilder {
         let mut files_deleted = 0u64;
         let mut removed_chunk_ids: Vec<u64> = Vec::new();
         let mut new_chunk_ids: Vec<u64> = Vec::new();
+        // v13 Wave 2 (history): files actually (re)chunked in THIS build —
+        // the opt-in `SEMANTEX_HISTORY_BLAME` pass only ever blames these,
+        // never the whole tree, keeping it bounded per-build.
+        let mut changed_rel_paths: Vec<PathBuf> = Vec::new();
 
         // E3 / E7 — buffered per-chunk annotations and pattern matches,
         // persisted after the indexing transaction commits. Buffering lets us
@@ -320,6 +324,8 @@ impl IndexBuilder {
                 pb.inc(1);
                 continue;
             }
+
+            changed_rel_paths.push(rel_path.to_path_buf());
 
             // Collect file-level import texts from structured metadata (for module_edges)
             #[allow(clippy::collapsible_if)]
@@ -605,6 +611,14 @@ impl IndexBuilder {
             // to be created from the (unchanged) root. Cheap: hard links +
             // small copies of an index that already exists.
             sync_v13_layout_best_effort(&project_path);
+            // v13 Wave 2: commit history is independent of chunk content —
+            // still worth catching up even on the no-op path (e.g. `git pull`
+            // with no tree changes relative to the index, or a bare
+            // `semantex index` re-run to pick up new commits). Ordering
+            // relative to the mirror sync above is deliberately irrelevant:
+            // history.db is repo-global and excluded from branch snapshots
+            // (see layout::mirror_root_as).
+            crate::index::history::populate_history_best_effort(&project_path, &changed_rel_paths);
             tracing::info!(
                 files_scanned,
                 files_indexed,
@@ -851,6 +865,14 @@ impl IndexBuilder {
         std::fs::write(index_dir.join("meta.json"), meta_json)?;
 
         sync_v13_layout_best_effort(&project_path);
+        // v13 Wave 2: populate `history.db` (commits/file_commits, plus the
+        // opt-in per-chunk blame pass) same-process, still under the
+        // `.semantex.lock` this function has held since entry. Best-effort —
+        // see `history::populate_history_best_effort`'s doc comment.
+        // Ordering relative to the mirror sync above is deliberately
+        // irrelevant: history.db is repo-global and excluded from branch
+        // snapshots (see layout::mirror_root_as).
+        crate::index::history::populate_history_best_effort(&project_path, &changed_rel_paths);
 
         let duration = start.elapsed();
         tracing::info!(
