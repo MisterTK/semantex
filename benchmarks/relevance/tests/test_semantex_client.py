@@ -88,6 +88,53 @@ def test_search_rerank_adds_flag_on_hybrid():
     assert "--dense-only" not in args and "--sparse-only" not in args
 
 
+def test_search_rerank_sets_both_gate_envs(monkeypatch):
+    # --rerank alone is not enough for a daemon-served query: (1)
+    # RerankerEngine::from_config gates on the SEMANTEX_RERANKER master switch
+    # (S3 off-by-default safety contract), and (2) the DAEMON's own
+    # SemantexConfig.rerank (set via SEMANTEX_RERANK at ITS spawn time, wholly
+    # separate from the per-query --rerank flag the client sends) must also be
+    # true, or `query.use_rerank && self.config.rerank` short-circuits false
+    # and the rerank stage is skipped without even an error. Confirmed
+    # empirically (see results/rerank-experiment.md) — this ISN'T a defensive
+    # guess, dropping either env var silently degrades `rerank` to `hybrid`.
+    monkeypatch.delenv("SEMANTEX_RERANKER", raising=False)
+    monkeypatch.delenv("SEMANTEX_RERANK", raising=False)
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        client.search("q1", "x", ablation="rerank", k=5)
+    env = mr.call_args.kwargs["env"]
+    assert env["SEMANTEX_RERANKER"] == "on"
+    assert env["SEMANTEX_RERANK"] == "1"
+
+
+def test_search_non_rerank_ablations_do_not_set_rerank_gate_envs(monkeypatch):
+    monkeypatch.delenv("SEMANTEX_RERANKER", raising=False)
+    monkeypatch.delenv("SEMANTEX_RERANK", raising=False)
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        client.search("q1", "x", ablation="hybrid", k=5)
+    env = mr.call_args.kwargs["env"]
+    assert "SEMANTEX_RERANKER" not in env
+    assert "SEMANTEX_RERANK" not in env
+
+
+def test_search_rerank_respects_explicit_gate_env_overrides(monkeypatch):
+    # An explicit export (e.g. measuring what happens with a gate forced off
+    # despite --rerank) still wins over the setdefault.
+    monkeypatch.setenv("SEMANTEX_RERANKER", "off")
+    monkeypatch.setenv("SEMANTEX_RERANK", "0")
+    client = SemantexClient(semantex_binary="semantex", corpus_dir="/tmp/c")
+    with patch("subprocess.run") as mr:
+        mr.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        client.search("q1", "x", ablation="rerank", k=5)
+    env = mr.call_args.kwargs["env"]
+    assert env["SEMANTEX_RERANKER"] == "off"
+    assert env["SEMANTEX_RERANK"] == "0"
+
+
 def test_embedder_sets_env():
     client = SemantexClient(
         semantex_binary="semantex", corpus_dir="/tmp/c", embedder="coderank-137m"

@@ -4,18 +4,24 @@ against. Given an issue's title+body, rank the files the gold patch touched;
 score with the same Acc@k / MRR protocol SweRank and LocAgent report, so the
 numbers are directly comparable to published ones (see README.md).
 
-Four arms per instance: `semantex search` (hybrid), `semantex search
---sparse-only` (BM25 baseline), `semantex agent` auto-routed search (no
-forced route — the engine's own keyword classifier picks the mechanism), and
-an external ripgrep keyword baseline (no semantex at all).
+Five arms per instance: `semantex search` (hybrid), `semantex search
+--sparse-only` (BM25 baseline), `semantex search --rerank` (hybrid + the
+shipped cross-encoder reranker — isolates rerank's effect on the SAME
+retrieval pool `hybrid` uses), `semantex agent` auto-routed search (no forced
+route — the engine's own keyword classifier picks the mechanism), and an
+external ripgrep keyword baseline (no semantex at all).
 
-Fully offline after setup: instances must already be checked out + indexed
-under $SWE_BENCH_REPO_CACHE (run `benchmarks/swe_bench/scripts/pre_index.py`
-first), OR pass `--local-fixture` to run entirely against the tiny synthetic
-fixture (no network, no real git history). No LLM calls either way — see the
-swe_loc_runner module docstring. Deterministic: instances are always
-processed in sorted instance_id order, so `--limit N` always picks the same
-N instances.
+Fully offline after setup EXCEPT `rerank`, which downloads the cross-encoder
+model on its first-ever invocation (then caches it): instances must already
+be checked out + indexed under $SWE_BENCH_REPO_CACHE (run
+`benchmarks/swe_bench/scripts/pre_index.py` first), OR pass `--local-fixture`
+to run entirely against the tiny synthetic fixture (no network, no real git
+history — network is still needed the first time for the reranker weights).
+No LLM calls either way — see the swe_loc_runner module docstring.
+Deterministic: instances are always processed in sorted instance_id order, so
+`--limit N` always picks the same N instances. Each arm also records cold/warm
+per-query latency (see swe_loc_runner.ArmQueryResult) so Acc@k gains from
+reranking can be weighed against its latency cost.
 
 Usage:
   # offline smoke run against the tiny synthetic fixture: point
@@ -38,6 +44,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -49,7 +56,7 @@ if SWE_BENCH_SRC.is_dir():
     sys.path.insert(0, str(SWE_BENCH_SRC))
 
 from relevance_harness.datasets.swe_loc import load_swe_loc_queries
-from relevance_harness.metrics import acc_at_k, mrr_at_k
+from relevance_harness.metrics import acc_at_k, mrr_at_k, percentile
 from relevance_harness.report import (
     ReproStamp, current_git_rev, render_report_json, render_report_md,
 )
@@ -69,12 +76,27 @@ def _phase_a_ids() -> set[str] | None:
     return {ln.strip() for ln in f.read_text().splitlines() if ln.strip()}
 
 
+def _pct_ms(values: list[float], p: float) -> Optional[float]:
+    """p-th percentile of `values` (seconds) in milliseconds, or None if empty
+    (an arm can have zero latency samples if every instance errored)."""
+    return round(percentile(values, p) * 1000, 1) if values else None
+
+
 def compute_arm_rows(
     relevances: dict[str, list[list[int]]],
     tokens: dict[str, list[int]],
     errors: dict[str, int],
+    durations: dict[str, list[float]] | None = None,
+    warm_durations: dict[str, list[float]] | None = None,
 ) -> list[dict]:
-    """One report row per arm: Acc@{1,5,10}, MRR@10, avg tokens-returned."""
+    """One report row per arm: Acc@{1,5,10}, MRR@10, avg tokens-returned, and
+    (when `durations`/`warm_durations` are given) p50/p95 cold + warm
+    per-query latency in ms. `warm_durations` is empty/missing for arms that
+    don't measure a warm rerun (agent-routed, ripgrep) — those columns render
+    as null rather than being omitted, so every row has the same shape.
+    """
+    durations = durations or {}
+    warm_durations = warm_durations or {}
     rows = []
     for arm in ARMS:
         rels = relevances[arm]
@@ -90,6 +112,10 @@ def compute_arm_rows(
             "acc_at_10": round(acc_at_k(rels, k=10), 4),
             "mrr_at_10": round(mrr_at_k(rels, k=10), 4),
             "avg_tokens_returned": round(avg_tokens, 1),
+            "p50_latency_ms": _pct_ms(durations.get(arm, []), 50),
+            "p95_latency_ms": _pct_ms(durations.get(arm, []), 95),
+            "p50_warm_latency_ms": _pct_ms(warm_durations.get(arm, []), 50),
+            "p95_warm_latency_ms": _pct_ms(warm_durations.get(arm, []), 95),
         })
     return rows
 
@@ -123,6 +149,8 @@ def main(local_fixture, limit, k, run_id, semantex_bin):
     relevances: dict[str, list[list[int]]] = {a: [] for a in ARMS}
     tokens: dict[str, list[int]] = {a: [] for a in ARMS}
     errors: dict[str, int] = {a: 0 for a in ARMS}
+    durations: dict[str, list[float]] = {a: [] for a in ARMS}
+    warm_durations: dict[str, list[float]] = {a: [] for a in ARMS}
     per_instance: list[dict] = []
 
     cache_dir = _repo_cache_dir()
@@ -148,16 +176,25 @@ def main(local_fixture, limit, k, run_id, semantex_bin):
             tokens[ar.arm].append(ar.tokens_returned)
             if ar.error:
                 errors[ar.arm] += 1
+            else:
+                # Latency is only meaningful for a call that actually completed.
+                durations[ar.arm].append(ar.duration_secs)
+                if ar.warm_duration_secs is not None:
+                    warm_durations[ar.arm].append(ar.warm_duration_secs)
             record["arms"][ar.arm] = {
                 "ranked_files": list(ar.ranked_files),
                 "tokens_returned": ar.tokens_returned,
                 "error": ar.error,
+                "duration_secs": round(ar.duration_secs, 4),
+                "warm_duration_secs": (
+                    round(ar.warm_duration_secs, 4) if ar.warm_duration_secs is not None else None
+                ),
             }
             summary.append(f"{ar.arm}={'hit' if any(rels) else ('err' if ar.error else 'miss')}")
         per_instance.append(record)
         click.echo(f"[{len(per_instance)}/{len(queries)}] {q.query_id}: " + ", ".join(summary))
 
-    rows = compute_arm_rows(relevances, tokens, errors)
+    rows = compute_arm_rows(relevances, tokens, errors, durations, warm_durations)
     stamp = ReproStamp(
         git_rev=current_git_rev(),
         dense_backend=os.environ.get("SEMANTEX_EMBEDDER")

@@ -102,3 +102,22 @@ def mean_average_precision(
         average_precision(rels, n_relevant=nrel)
         for rels, nrel in zip(relevances, n_relevant)
     ) / len(relevances)
+
+
+def percentile(values: list[float], p: float) -> float:
+    """p-th percentile (0-100) of `values`, linear interpolation between the
+    two closest ranks (matches `numpy.percentile`'s default 'linear' method,
+    without taking a numpy dependency for a handful of latency numbers).
+    Empty input -> 0.0.
+    """
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    rank = (len(s) - 1) * (p / 100.0)
+    lo = math.floor(rank)
+    hi = math.ceil(rank)
+    if lo == hi:
+        return s[int(rank)]
+    return s[int(lo)] * (hi - rank) + s[int(hi)] * (rank - lo)
