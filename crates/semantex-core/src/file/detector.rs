@@ -110,9 +110,6 @@ impl FileType {
                 | FileType::Vue
                 | FileType::Kotlin
                 | FileType::Sql
-                | FileType::Markdown
-                | FileType::Toml
-                | FileType::Json
         )
     }
 

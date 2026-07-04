@@ -271,10 +271,10 @@ semantex watch /path/to/project     # Auto-reindex on file changes
 
 ## Supported Languages
 
-29 file types, including 24 with tree-sitter AST-aware chunking:
+29 file types, including 25 with tree-sitter AST-aware chunking:
 
-- **AST-parsed (24):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte, Vue
-- **Text-chunked (5):** Markdown, JSON, TOML, YAML, SQL
+- **AST-parsed (25):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte, Vue, SQL
+- **Text-chunked (4):** Markdown, JSON, TOML, YAML
 - Fallback text chunking for any other file type
 
 ## Architecture

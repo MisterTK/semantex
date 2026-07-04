@@ -9,6 +9,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::too_many_lines)]
 
+pub mod docs_context;
 pub mod protocol;
 pub mod server;
 

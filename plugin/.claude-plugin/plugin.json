@@ -7,7 +7,7 @@
   },
   "repository": "https://github.com/MisterTK/semantex",
   "license": "Apache-2.0",
-  "keywords": ["search", "semantic", "code", "grep", "retrieval", "mcp"],
+  "keywords": ["search", "semantic", "code", "grep", "retrieval", "mcp", "documentation", "docs"],
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json",
   "mcp": "./.mcp.json"
