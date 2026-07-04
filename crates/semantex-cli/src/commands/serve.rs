@@ -30,24 +30,22 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Wave 2 — KNOWN LIMITATION: branch-switch reconciliation happens at
-    // daemon STARTUP ONLY. The daemon opens one `HybridSearcher` and serves
-    // it for its whole lifetime (up to 24h); `Listener::run`'s accept loop
-    // has no searcher-reopen hook, and mutating the index files under a live
-    // open searcher is exactly the torn-read/WAL-replay hazard the
-    // branch-switch handling locks against — so a `git switch` made while
-    // the daemon is running is NOT picked up by the daemon itself. It IS
-    // picked up by every other entry point (`semantex index`/`watch`, any
-    // MCP session's initialize + per-search checks), each of which
-    // reconciles under the exclusive index lock; this daemon sees the new
-    // content only after a restart. If `Listener` ever grows a searcher
-    // reload mechanism, wire `branches::detect_and_handle_branch_switch`
-    // into it.
+    // Wave 2 batch 2: this is now only the STARTUP-time reconcile — it still
+    // runs a full incremental update before the daemon ever opens its first
+    // searcher, so day-one startup after a branch switch immediately serves
+    // fresh results (leaving the root's `chunks.db` written for the wrong
+    // branch would mean the daemon serves mismatched results until the
+    // per-request hook below happens to trigger). The daemon no longer needs
+    // a RESTART to notice a `git switch` made mid-session, though: `Listener`
+    // now resolves its searcher per-request through a
+    // `server::cache::SearcherCache`, which runs the SAME
+    // `branches::branch_switch_pending` / `detect_and_handle_branch_switch`
+    // check on every request (see that module's docs for the full flow,
+    // including the residual "SnapshottedOutgoing" narrow window it
+    // documents) and separately reloads when the index is rebuilt beneath it
+    // (e.g. `semantex index` run again in another terminal) — the daemon no
+    // longer pins one `HybridSearcher` for its whole lifetime.
     //
-    // If HEAD moved since the root was last synced, restore/snapshot as
-    // usual, then run an incremental update BEFORE opening the searcher —
-    // leaving the root's `chunks.db` written for the wrong branch would mean
-    // the daemon serves mismatched results for its entire lifetime.
     // Unchanged/first-build is a no-op — `serve` still requires
     // `semantex index` to have run at least once (unchanged behavior).
     match branches::detect_and_handle_branch_switch(&project_path) {

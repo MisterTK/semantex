@@ -225,6 +225,17 @@ impl HybridSearcher {
         Ok(())
     }
 
+    /// The config this searcher was opened with. Exposed so callers that
+    /// only hold an already-open `HybridSearcher` (no separate `&SemantexConfig`
+    /// in scope) can still re-open a fresh instance later against the SAME
+    /// config — e.g. `server::cache::SearcherCache::seeded`, which wraps a
+    /// pre-opened searcher as the cache's first entry and needs its config to
+    /// open FUTURE entries (a different branch's snapshot, a reopen after a
+    /// detected rebuild) with the same settings.
+    pub fn config(&self) -> &SemantexConfig {
+        &self.config
+    }
+
     /// Execute a search query through the full pipeline
     #[tracing::instrument(skip(self), fields(
         query = %query.text,

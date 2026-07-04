@@ -1,6 +1,8 @@
+use super::cache::SearcherCache;
 use super::handler::Handler;
 use super::protocol::{
-    self, BINARY_MAGIC, BinaryFrameError, BinaryResponse, ErrorResponse, Request, Response,
+    self, BINARY_MAGIC, BinaryFrameError, BinaryResponse, ErrorResponse, HealthResponse, Request,
+    Response,
 };
 use crate::config::SemantexConfig;
 use crate::embedding::single_vector::SingleVectorEmbedder;
@@ -10,6 +12,7 @@ use crate::search::hybrid::HybridSearcher;
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,16 +25,20 @@ use crate::memory::current_rss_bytes;
 /// bypass the full `state::detect` pass on subsequent calls.
 pub const WARM_STATE_SENTINEL: &str = "warm_state.lock";
 
-/// TCP localhost listener for the semantex daemon
+/// Everything a per-connection handler thread needs, `Arc`-shared so the
+/// accept loop can spawn one thread per connection (true concurrent-client
+/// support — Wave 2 batch 2) without cloning heavyweight state.
+///
+/// Resolving a searcher is now a per-request [`SearcherCache::get`] call
+/// instead of a field read — see `server::cache` for the branch-reconcile +
+/// staleness-reload hook this enables. `Health`/`Shutdown` are answered
+/// WITHOUT touching the cache at all (see [`HandlerContext::handle_connection`]):
+/// they must stay instant even while a searcher reopen would otherwise block.
 #[allow(clippy::struct_field_names)]
-pub struct Listener {
-    port_file: PathBuf,
-    sentinel_file: PathBuf,
-    listener: TcpListener,
-    searcher: HybridSearcher,
+struct HandlerContext {
+    cache: Arc<SearcherCache>,
     search_count: AtomicU64,
     start_time: Instant,
-    idle_timeout: Duration,
     shutdown: Arc<AtomicBool>,
     project_root: PathBuf,
     /// Optional LLM backend; injected via [`Listener::with_llm`] at daemon
@@ -48,12 +55,53 @@ pub struct Listener {
     llm_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
+/// TCP localhost listener for the semantex daemon
+#[allow(clippy::struct_field_names)]
+pub struct Listener {
+    port_file: PathBuf,
+    sentinel_file: PathBuf,
+    listener: TcpListener,
+    ctx: Arc<HandlerContext>,
+    idle_timeout: Duration,
+    shutdown: Arc<AtomicBool>,
+}
+
 impl Listener {
-    /// Create a new TCP listener bound to an OS-assigned ephemeral port.
-    /// Writes the assigned port number to `port_file`.
+    /// Create a new TCP listener bound to an OS-assigned ephemeral port,
+    /// serving a single pre-opened searcher for the lifetime of the daemon.
+    ///
+    /// Kept for backward compatibility with callers that already eagerly
+    /// open a [`HybridSearcher`] (`semantex watch`'s daemon; the existing
+    /// panic-isolation integration test) and want the SAME one-shot-open
+    /// behavior as before Wave 2 batch 2. Internally this just seeds a
+    /// single-entry [`SearcherCache`] with the given searcher (reusing the
+    /// config it was opened with, via [`HybridSearcher::config`]) and
+    /// delegates to [`Listener::bind_with_cache`] — so even this path now
+    /// gets the per-request branch-reconcile + staleness-reload hook for
+    /// free; it just starts warm instead of lazily opening on first use.
     pub fn bind(
         port_file: &std::path::Path,
         searcher: HybridSearcher,
+        project_root: PathBuf,
+        idle_timeout: Duration,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let config = searcher.config().clone();
+        let cache = Arc::new(SearcherCache::seeded(config, &project_root, searcher));
+        Self::bind_with_cache(port_file, cache, project_root, idle_timeout, shutdown)
+    }
+
+    /// Create a new TCP listener backed by a (possibly empty, possibly
+    /// pre-seeded) [`SearcherCache`] instead of a single fixed searcher.
+    ///
+    /// This is the Wave 2 batch 2 entry point: `SemantexServer::run` uses
+    /// this so the daemon's accept loop resolves a searcher PER REQUEST via
+    /// `cache.get(project_root)`, which transparently reconciles a pending
+    /// branch switch and reopens on detected staleness — see `server::cache`
+    /// module docs for the full flow.
+    pub fn bind_with_cache(
+        port_file: &std::path::Path,
+        cache: Arc<SearcherCache>,
         project_root: PathBuf,
         idle_timeout: Duration,
         shutdown: Arc<AtomicBool>,
@@ -103,20 +151,25 @@ impl Listener {
                 }
             };
 
-        Ok(Self {
-            port_file: port_file.to_path_buf(),
-            sentinel_file,
-            listener,
-            searcher,
+        let ctx = Arc::new(HandlerContext {
+            cache,
             search_count: AtomicU64::new(0),
             start_time: Instant::now(),
-            idle_timeout,
-            shutdown,
+            shutdown: shutdown.clone(),
             project_root,
             #[cfg(feature = "llm")]
             llm: None,
             #[cfg(feature = "llm")]
             llm_runtime,
+        });
+
+        Ok(Self {
+            port_file: port_file.to_path_buf(),
+            sentinel_file,
+            listener,
+            ctx,
+            idle_timeout,
+            shutdown,
         })
     }
 
@@ -126,7 +179,14 @@ impl Listener {
     /// reachable. Per Spec L §4 Item 1.4.
     #[cfg(feature = "llm")]
     pub fn with_llm(mut self, llm: Option<Arc<dyn crate::llm::LlmCapability>>) -> Self {
-        self.llm = llm;
+        // `ctx` is freshly constructed in `bind_with_cache` (this is the only
+        // other holder at this point, before `run()` ever clones it into a
+        // connection-handler thread), so `Arc::get_mut` always succeeds here.
+        if let Some(ctx) = Arc::get_mut(&mut self.ctx) {
+            ctx.llm = llm;
+        } else {
+            tracing::warn!("with_llm called after Listener::run started — LLM backend ignored");
+        }
         self
     }
 
@@ -243,40 +303,54 @@ impl Listener {
                     last_activity = Instant::now();
                     loop_count = 0; // reset so we don't exit right after heavy search
 
-                    // Isolate per-connection failures. The accept loop is the
-                    // single thread serving ALL concurrent callers and holding
-                    // the in-RAM model. semantex runs across tens of thousands
-                    // of diverse repos, so a panic somewhere in the agent/search
-                    // pipeline on one weird input WILL happen eventually. Without
-                    // this guard the panic would unwind past the `Result` check
-                    // below and kill the loop, taking the whole daemon — and every
-                    // other caller — down. `catch_unwind` (under `panic = "unwind"`,
-                    // see Cargo.toml) converts that panic into a caught error so we
-                    // log it and keep serving. The daemon state we touch after a
-                    // caught panic (a read-mostly searcher + an atomic counter) is
-                    // safe to reuse, so `AssertUnwindSafe` is the correct + standard
-                    // wrapper here — same as the per-file `catch_unwind` sites in
-                    // the chunking/PDF path.
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.handle_connection(stream)
-                    })) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!("Connection error: {}", e);
-                        }
-                        Err(panic_payload) => {
-                            let msg = panic_payload
-                                .downcast_ref::<&str>()
-                                .map(|s| (*s).to_string())
-                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "<non-string panic>".to_string());
-                            tracing::error!(
-                                "Connection handler PANICKED (isolated; daemon continues): {}",
-                                msg
-                            );
-                            // Fall through to the next loop iteration — do NOT
-                            // break or propagate. The accept loop keeps serving.
-                        }
+                    // Wave 2 batch 2: true multi-client concurrency. Each
+                    // connection now runs on its OWN thread instead of being
+                    // handled synchronously in this accept loop — a slow
+                    // search from one client (or one blocking a branch-switch
+                    // reconcile) no longer stalls every other client's
+                    // connection from even being accepted. `ctx` is `Arc`,
+                    // so cloning it is cheap; the searcher itself is resolved
+                    // per-request from `ctx.cache` (see `HandlerContext::
+                    // handle_connection`), and an `Arc<CachedSearcher>`
+                    // handle stays valid for the connection's whole lifetime
+                    // even if a concurrent request evicts it from the cache
+                    // map in the meantime.
+                    //
+                    // Isolate per-connection failures exactly as before: a
+                    // panic on one connection's weird input must not take
+                    // down anything else. Previously that meant "must not
+                    // kill the single shared accept-loop thread"; now that
+                    // each connection has its OWN thread, a panic there is
+                    // automatically contained by the runtime regardless — we
+                    // still wrap in `catch_unwind` purely to keep the same
+                    // structured warning/error log line instead of falling
+                    // back to the default panic hook's raw stderr dump.
+                    let ctx = Arc::clone(&self.ctx);
+                    let handle = std::thread::Builder::new()
+                        .name("semantex-daemon-conn".to_string())
+                        .spawn(move || {
+                            match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                ctx.handle_connection(stream)
+                            })) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!("Connection error: {}", e);
+                                }
+                                Err(panic_payload) => {
+                                    let msg = panic_payload
+                                        .downcast_ref::<&str>()
+                                        .map(|s| (*s).to_string())
+                                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                        .unwrap_or_else(|| "<non-string panic>".to_string());
+                                    tracing::error!(
+                                        "Connection handler PANICKED (isolated; daemon continues): {}",
+                                        msg
+                                    );
+                                }
+                            }
+                        });
+                    if let Err(e) = handle {
+                        tracing::error!("Failed to spawn connection handler thread: {}", e);
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -294,15 +368,41 @@ impl Listener {
         Ok(())
     }
 
-    /// Build a per-request `Handler`, threading through the optional LLM
-    /// backend and shared runtime when the `llm` feature is enabled.
-    /// Centralising this keeps the two protocol paths (binary + JSON) in sync
-    /// on LLM injection.
-    fn build_handler(&self) -> Handler<'_> {
+    /// Drop every cached searcher for this daemon's project, regardless of
+    /// branch key. Exposed for callers that already know a rebuild just
+    /// completed (e.g. `semantex watch`'s re-index loop) and want the NEXT
+    /// request to reopen immediately rather than wait for the per-request
+    /// staleness marker check to notice on its own.
+    pub fn invalidate_cached_searcher(&self) {
+        self.ctx.cache.invalidate_project(&self.ctx.project_root);
+    }
+
+    fn cleanup(&self) {
+        if self.port_file.exists() {
+            let _ = std::fs::remove_file(&self.port_file);
+        }
+        // E8(d): remove warm-state sentinel so the MCP layer falls back to
+        // full state checks once the daemon is gone.
+        // Finding 13: only remove if the sentinel still belongs to us.
+        remove_sentinel_if_ours(&self.sentinel_file);
+        tracing::info!(
+            searches = self.ctx.search_count.load(Ordering::Relaxed),
+            uptime_s = self.ctx.start_time.elapsed().as_secs(),
+            "Daemon stopped"
+        );
+    }
+}
+
+impl HandlerContext {
+    /// Build a per-request `Handler` over an already-resolved searcher,
+    /// threading through the optional LLM backend and shared runtime when the
+    /// `llm` feature is enabled. Centralising this keeps the two protocol
+    /// paths (binary + JSON) in sync on LLM injection.
+    fn build_handler<'a>(&'a self, cached: &'a super::cache::CachedSearcher) -> Handler<'a> {
         #[cfg(feature = "llm")]
         {
             Handler::new(
-                &self.searcher,
+                &cached.searcher,
                 &self.search_count,
                 self.project_root.clone(),
             )
@@ -312,10 +412,41 @@ impl Listener {
         #[cfg(not(feature = "llm"))]
         {
             Handler::new(
-                &self.searcher,
+                &cached.searcher,
                 &self.search_count,
                 self.project_root.clone(),
             )
+        }
+    }
+
+    /// Dispatch one already-decoded [`Request`] to a [`Response`].
+    ///
+    /// `Health`/`Shutdown` are answered directly, WITHOUT touching
+    /// `self.cache` — they must stay instant (no I/O, no possible reconcile
+    /// block) even while a searcher reopen is in flight or the index is
+    /// mid-rebuild. Every other request resolves its searcher via
+    /// `self.cache.get(&self.project_root)` first, which transparently
+    /// reconciles a pending branch switch and reopens on detected staleness
+    /// (see `server::cache` module docs) before the `Handler` ever runs.
+    fn dispatch(&self, request: Request) -> Response {
+        match request {
+            Request::Health => Response::Health(HealthResponse {
+                status: "ok".to_string(),
+                uptime_s: self.start_time.elapsed().as_secs(),
+                searches: self.search_count.load(Ordering::Relaxed),
+            }),
+            Request::Shutdown => {
+                self.shutdown.store(true, Ordering::Relaxed);
+                Response::Shutdown(protocol::ShutdownResponse {
+                    status: "shutting_down".to_string(),
+                })
+            }
+            other => match self.cache.get(&self.project_root) {
+                Ok(cached) => self.build_handler(&cached).handle(other, self.start_time),
+                Err(e) => Response::Error(ErrorResponse {
+                    message: format!("Failed to open search index: {e}"),
+                }),
+            },
         }
     }
 
@@ -367,18 +498,7 @@ impl Listener {
         reader.read_exact(&mut body)?;
 
         let response = match protocol::decode_binary_request(&body) {
-            Ok(bin_req) => {
-                let request: Request = bin_req.into();
-                let is_shutdown = matches!(request, Request::Shutdown);
-                let handler = self.build_handler();
-                let resp = handler.handle(request, self.start_time);
-
-                if is_shutdown {
-                    self.shutdown.store(true, Ordering::Relaxed);
-                }
-
-                resp
-            }
+            Ok(bin_req) => self.dispatch(bin_req.into()),
             Err(BinaryFrameError::UnsupportedVersion { expected, got }) => {
                 tracing::warn!(
                     expected,
@@ -435,17 +555,7 @@ impl Listener {
 
         // Parse request
         let response = match serde_json::from_str::<Request>(line) {
-            Ok(request) => {
-                let is_shutdown = matches!(request, Request::Shutdown);
-                let handler = self.build_handler();
-                let response = handler.handle(request, self.start_time);
-
-                if is_shutdown {
-                    self.shutdown.store(true, Ordering::Relaxed);
-                }
-
-                response
-            }
+            Ok(request) => self.dispatch(request),
             Err(e) => Response::Error(ErrorResponse {
                 message: format!("Invalid request: {e}"),
             }),
@@ -459,27 +569,6 @@ impl Listener {
         writer.flush()?;
 
         Ok(())
-    }
-
-    /// Reload the underlying searcher (for watch integration)
-    pub fn reload_searcher(&mut self, searcher: HybridSearcher) {
-        self.searcher = searcher;
-        tracing::info!("Searcher reloaded");
-    }
-
-    fn cleanup(&self) {
-        if self.port_file.exists() {
-            let _ = std::fs::remove_file(&self.port_file);
-        }
-        // E8(d): remove warm-state sentinel so the MCP layer falls back to
-        // full state checks once the daemon is gone.
-        // Finding 13: only remove if the sentinel still belongs to us.
-        remove_sentinel_if_ours(&self.sentinel_file);
-        tracing::info!(
-            searches = self.search_count.load(Ordering::Relaxed),
-            uptime_s = self.start_time.elapsed().as_secs(),
-            "Daemon stopped"
-        );
     }
 }
 
