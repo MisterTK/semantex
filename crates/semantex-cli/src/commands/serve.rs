@@ -30,14 +30,25 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Wave 2: the daemon opens the index once at startup and keeps serving
-    // it for the whole session (no per-search rebuild), so this is the one
-    // moment a `serve` invocation can reconcile a branch switch. If HEAD
-    // moved since the root was last synced, restore/snapshot as usual, then
-    // run an incremental update BEFORE opening the searcher below — leaving
-    // the root's `chunks.db` written for the wrong branch would mean the
-    // daemon serves stale/mismatched results for its entire (up to 24h)
-    // lifetime. Unchanged/first-build is a no-op — `serve` still requires
+    // Wave 2 — KNOWN LIMITATION: branch-switch reconciliation happens at
+    // daemon STARTUP ONLY. The daemon opens one `HybridSearcher` and serves
+    // it for its whole lifetime (up to 24h); `Listener::run`'s accept loop
+    // has no searcher-reopen hook, and mutating the index files under a live
+    // open searcher is exactly the torn-read/WAL-replay hazard the
+    // branch-switch handling locks against — so a `git switch` made while
+    // the daemon is running is NOT picked up by the daemon itself. It IS
+    // picked up by every other entry point (`semantex index`/`watch`, any
+    // MCP session's initialize + per-search checks), each of which
+    // reconciles under the exclusive index lock; this daemon sees the new
+    // content only after a restart. If `Listener` ever grows a searcher
+    // reload mechanism, wire `branches::detect_and_handle_branch_switch`
+    // into it.
+    //
+    // If HEAD moved since the root was last synced, restore/snapshot as
+    // usual, then run an incremental update BEFORE opening the searcher —
+    // leaving the root's `chunks.db` written for the wrong branch would mean
+    // the daemon serves mismatched results for its entire lifetime.
+    // Unchanged/first-build is a no-op — `serve` still requires
     // `semantex index` to have run at least once (unchanged behavior).
     match branches::detect_and_handle_branch_switch(&project_path) {
         Ok(action) if action.switched() => {

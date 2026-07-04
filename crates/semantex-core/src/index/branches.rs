@@ -95,7 +95,20 @@ pub fn branch_switch_pending(project_root: &Path) -> bool {
 /// Detect a branch switch since the root was last synced and, if one
 /// happened, reconcile the root's index content (see module doc for the two
 /// cases). Idempotent and cheap when nothing has changed (`Unchanged`).
+///
+/// Locking: the no-switch path is read-only and lock-free. When a switch IS
+/// detected, this acquires the same exclusive `.semantex/.semantex.lock`
+/// that `IndexBuilder::build` takes, **blocking** until it's free, because
+/// the reconcile mutates the live root (renames over `chunks.db`, swaps
+/// `dense/`/`sparse/`): readers use that lock as the "index is being
+/// mutated" signal (`state::detect` → `Building`), so mutating without it
+/// would let concurrent searches read a torn root; and two processes racing
+/// through here must serialize rather than interleave restores. After the
+/// lock is acquired the switch is re-checked — the process we waited on may
+/// have already reconciled it.
 pub fn detect_and_handle_branch_switch(project_root: &Path) -> Result<BranchSwitchAction> {
+    // Cheap lock-free pre-check: the overwhelmingly common no-switch case
+    // must not pay (or block on) the exclusive lock.
     let new_key = layout::current_branch_key(project_root);
     let Some(root_meta) = layout::read_root_branch_meta(project_root) else {
         return Ok(BranchSwitchAction::FirstBuild);
@@ -105,6 +118,29 @@ pub fn detect_and_handle_branch_switch(project_root: &Path) -> Result<BranchSwit
             branch_key: new_key,
         });
     }
+
+    // A switch is pending — everything below mutates the root, so take the
+    // exclusive index lock (blocking; released on drop at function exit).
+    let container = layout::container_dir(project_root);
+    std::fs::create_dir_all(&container)?;
+    let lock_file = std::fs::File::create(container.join(".semantex.lock"))?;
+    lock_file.lock()?;
+
+    // Re-check under the lock: whoever held it may have been another process
+    // reconciling this very switch (or a build that re-synced the root).
+    let Some(root_meta) = layout::read_root_branch_meta(project_root) else {
+        return Ok(BranchSwitchAction::FirstBuild);
+    };
+    if root_meta.branch_key == new_key {
+        return Ok(BranchSwitchAction::Unchanged {
+            branch_key: new_key,
+        });
+    }
+
+    // With the lock held, any leftover mirror/restore tmp artifact is an
+    // orphan from a crashed process (every writer of those names runs under
+    // this lock) — sweep them so they can't accumulate forever.
+    layout::cleanup_stale_tmp_artifacts(project_root);
 
     let new_branch_dir = layout::branch_index_dir(project_root, &new_key);
     if new_branch_dir.join("chunks.db").exists() {
@@ -124,12 +160,34 @@ pub fn detect_and_handle_branch_switch(project_root: &Path) -> Result<BranchSwit
         // `mirror_into_branch_dir`, which would re-derive the sidecar's
         // branch name from the CURRENT git HEAD (already the new branch by
         // the time this runs) and mislabel the outgoing snapshot.
-        layout::mirror_root_as(project_root, &root_meta)?;
-        tracing::info!(
-            from = %root_meta.branch_key,
-            to = %new_key,
-            "Branch switch detected: snapshotted outgoing branch, root will be re-indexed in place"
-        );
+        //
+        // UNLESS the outgoing branch already has a snapshot taken at the
+        // same commit the root sidecar records: then the snapshot already
+        // captures exactly what a re-mirror would, and the root may even be
+        // WORSE than the snapshot — a build for the NEW branch that failed
+        // midway leaves hybrid root content with the old sidecar still in
+        // place, and re-mirroring would overwrite the clean snapshot with
+        // that hybrid. Skip the re-mirror in that case.
+        let outgoing_snapshot_current = root_meta.head_commit.is_some()
+            && layout::branch_index_dir(project_root, &root_meta.branch_key)
+                .join("chunks.db")
+                .exists()
+            && layout::read_branch_dir_meta(project_root, &root_meta.branch_key)
+                .is_some_and(|snap| snap.head_commit == root_meta.head_commit);
+        if outgoing_snapshot_current {
+            tracing::info!(
+                from = %root_meta.branch_key,
+                to = %new_key,
+                "Branch switch detected: outgoing branch snapshot already current, keeping it"
+            );
+        } else {
+            layout::mirror_root_as(project_root, &root_meta)?;
+            tracing::info!(
+                from = %root_meta.branch_key,
+                to = %new_key,
+                "Branch switch detected: snapshotted outgoing branch, root will be re-indexed in place"
+            );
+        }
         Ok(BranchSwitchAction::SnapshottedOutgoing {
             from_branch_key: root_meta.branch_key,
             to_branch_key: new_key,
@@ -275,7 +333,7 @@ pub fn record_branch_indexed(project_root: &Path) {
 mod tests {
     use super::*;
     use crate::index::storage::ChunkStore;
-    use crate::types::{Chunk, ChunkType, IndexMeta};
+    use crate::types::{Chunk, ChunkType, FileEntry, IndexMeta};
     use tempfile::TempDir;
 
     fn sample_index_meta() -> IndexMeta {
@@ -302,6 +360,10 @@ mod tests {
     }
 
     fn build_root_index(project: &Path, content: &str) -> u64 {
+        build_root_index_with_hash(project, content, 1)
+    }
+
+    fn build_root_index_with_hash(project: &Path, content: &str, file_hash: u64) -> u64 {
         let container = layout::container_dir(project);
         std::fs::create_dir_all(&container).unwrap();
         let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
@@ -315,9 +377,20 @@ mod tests {
                     content: content.to_string(),
                     chunk_type: ChunkType::TextWindow { window_index: 0 },
                 },
-                1,
+                file_hash,
                 0,
             )
+            .unwrap();
+        // Also record the file-level hash — `IndexBuilder`'s incremental
+        // skip decision reads the `files` table (`get_file_hash`), so the
+        // round-trip test's "no re-embed" assertion checks this value.
+        store
+            .set_file_entry(&FileEntry {
+                path: std::path::PathBuf::from("src/a.rs"),
+                hash: file_hash,
+                size: content.len() as u64,
+                mtime: 0,
+            })
             .unwrap();
         std::fs::write(
             container.join("meta.json"),
@@ -356,10 +429,11 @@ mod tests {
         drop(root_store);
 
         // Simulate the caller's incremental build for "b": overwrite root
-        // content with B's, then sync (this is what IndexBuilder::build +
+        // content with B's (different file hash — B's version of the file),
+        // then sync (this is what IndexBuilder::build +
         // sync_v13_layout_best_effort do together).
         std::fs::remove_file(layout::container_dir(project).join("chunks.db")).unwrap();
-        build_root_index(project, "fn on_b() {}");
+        build_root_index_with_hash(project, "fn on_b() {}", 2);
         layout::sync_v13_layout(project, "proj").unwrap();
 
         let b_key = layout::current_branch_key(project);
@@ -386,6 +460,17 @@ mod tests {
             restored_store.get_chunk(a_id).unwrap().content,
             "fn on_a() {}",
             "switching back to A must restore A's snapshot, not keep B's content"
+        );
+        // N2: no-re-embed proof at the mechanism level — the incremental
+        // updater decides skip-vs-re-embed by comparing each file's current
+        // hash against the STORED file_hash. After the restore, the root's
+        // stored hash for src/a.rs must be A's (1), not B's (2): a file
+        // unchanged on branch A therefore hash-matches and is skipped, i.e.
+        // never re-chunked/re-embedded.
+        assert_eq!(
+            restored_store.get_file_hash(Path::new("src/a.rs")).unwrap(),
+            Some(1),
+            "restored root must carry A's stored file hashes so the updater skips unchanged files"
         );
     }
 
@@ -481,6 +566,215 @@ mod tests {
         let current_key = layout::branch_key_for_branch("c");
         let evicted = enforce_retention_with_cap(project, &current_key, 5).unwrap();
         assert!(evicted.is_empty(), "3 snapshots is under a cap of 5");
+    }
+
+    /// B1: a pending reconcile that would mutate the root MUST serialize on
+    /// the same exclusive `.semantex.lock` the index builder takes — while
+    /// another handle holds it, `detect_and_handle_branch_switch` blocks
+    /// instead of tearing the root under a concurrent build/reader.
+    #[test]
+    fn reconcile_blocks_while_index_lock_is_held() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().to_path_buf();
+
+        // Branch "a" indexed + snapshotted, then "b" indexed + snapshotted,
+        // then HEAD back to "a": a restore (root mutation) is now pending.
+        write_fake_git_head(&project, "a");
+        build_root_index(&project, "fn on_a() {}");
+        layout::sync_v13_layout(&project, "proj").unwrap();
+        write_fake_git_head(&project, "b");
+        detect_and_handle_branch_switch(&project).unwrap();
+        std::fs::remove_file(layout::container_dir(&project).join("chunks.db")).unwrap();
+        build_root_index_with_hash(&project, "fn on_b() {}", 2);
+        layout::sync_v13_layout(&project, "proj").unwrap();
+        write_fake_git_head(&project, "a");
+        assert!(branch_switch_pending(&project));
+
+        // Hold the index lock (as IndexBuilder::build would).
+        let lock_path = layout::container_dir(&project).join(".semantex.lock");
+        let lock_file = std::fs::File::create(&lock_path).unwrap();
+        lock_file.lock().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = project.clone();
+        let handle = std::thread::spawn(move || {
+            let result = detect_and_handle_branch_switch(&p2);
+            let _ = tx.send(());
+            result
+        });
+
+        // While the lock is held, the reconcile must NOT complete.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(400))
+                .is_err(),
+            "reconcile must block on the exclusive index lock, not mutate the live root"
+        );
+
+        // Release the lock; the reconcile must now finish as a restore.
+        drop(lock_file);
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("reconcile should complete once the lock is released");
+        let action = handle.join().unwrap().unwrap();
+        assert!(
+            matches!(action, BranchSwitchAction::Restored { .. }),
+            "{action:?}"
+        );
+    }
+
+    /// B2: the root's chunks.db is WAL-mode; a restore renames another
+    /// branch's db over it, so any surviving `-wal`/`-shm` sidecars from the
+    /// OLD branch would be replayed onto the NEW file by the next connection
+    /// (hybrid content or outright corruption). The restore must drop them.
+    #[test]
+    fn restore_removes_stale_wal_and_shm_beside_replaced_chunks_db() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        write_fake_git_head(project, "a");
+        let a_id = build_root_index(project, "fn on_a() {}");
+        layout::sync_v13_layout(project, "proj").unwrap();
+        write_fake_git_head(project, "b");
+        detect_and_handle_branch_switch(project).unwrap();
+        std::fs::remove_file(layout::container_dir(project).join("chunks.db")).unwrap();
+        build_root_index_with_hash(project, "fn on_b() {}", 2);
+        layout::sync_v13_layout(project, "proj").unwrap();
+
+        // Plant stale WAL/SHM sidecars, as a long-lived connection to B's db
+        // would leave behind.
+        let container = layout::container_dir(project);
+        std::fs::write(container.join("chunks.db-wal"), b"stale wal frames").unwrap();
+        std::fs::write(container.join("chunks.db-shm"), b"stale shm").unwrap();
+
+        write_fake_git_head(project, "a");
+        let action = detect_and_handle_branch_switch(project).unwrap();
+        assert!(matches!(action, BranchSwitchAction::Restored { .. }));
+
+        assert!(
+            !container.join("chunks.db-wal").exists(),
+            "stale -wal must be removed with the replaced chunks.db"
+        );
+        assert!(
+            !container.join("chunks.db-shm").exists(),
+            "stale -shm must be removed with the replaced chunks.db"
+        );
+        // And the restored db opens clean with A's content.
+        let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+        assert_eq!(store.get_chunk(a_id).unwrap().content, "fn on_a() {}");
+    }
+
+    /// S3: a build for the NEW branch that fails midway leaves hybrid root
+    /// content with the OLD branch's sidecar still in place. A later
+    /// reconcile must NOT re-mirror that hybrid root over the outgoing
+    /// branch's clean snapshot when the snapshot already matches the
+    /// sidecar's head_commit.
+    #[test]
+    fn failed_build_does_not_contaminate_outgoing_branch_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        write_fake_git_head(project, "a");
+        let a_id = build_root_index(project, "fn on_a() {}");
+        layout::sync_v13_layout(project, "proj").unwrap();
+
+        // Switch to "b" (no snapshot): outgoing "a" snapshot is already
+        // current (same head_commit), so it is kept as-is.
+        write_fake_git_head(project, "b");
+        let action = detect_and_handle_branch_switch(project).unwrap();
+        assert!(matches!(
+            action,
+            BranchSwitchAction::SnapshottedOutgoing { .. }
+        ));
+
+        // Simulate a build for "b" that died midway: hybrid root content,
+        // root sidecar still recording "a" (sync never ran).
+        std::fs::remove_file(layout::container_dir(project).join("chunks.db")).unwrap();
+        build_root_index_with_hash(project, "fn hybrid_torn_build() {}", 99);
+
+        // Retry path (e.g. next entry point call): must keep A's clean
+        // snapshot rather than overwrite it with the hybrid root.
+        let retry = detect_and_handle_branch_switch(project).unwrap();
+        assert!(matches!(
+            retry,
+            BranchSwitchAction::SnapshottedOutgoing { .. }
+        ));
+
+        let a_key = layout::branch_key_for_branch("a");
+        let snap =
+            ChunkStore::open(&layout::branch_index_dir(project, &a_key).join("chunks.db")).unwrap();
+        assert_eq!(
+            snap.get_chunk(a_id).unwrap().content,
+            "fn on_a() {}",
+            "outgoing branch's clean snapshot must not be overwritten by a hybrid root"
+        );
+    }
+
+    /// S3 complement: when the outgoing snapshot is genuinely stale
+    /// (different head_commit than the root sidecar records), the re-mirror
+    /// DOES run and refreshes it from the root.
+    #[test]
+    fn stale_outgoing_snapshot_is_remirrored_on_switch() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        write_fake_git_head(project, "a");
+        let a_id = build_root_index(project, "fn on_a_v2() {}");
+        layout::sync_v13_layout(project, "proj").unwrap();
+
+        // Backdate the snapshot's identity to an older commit than the root
+        // sidecar records — the snapshot no longer matches the root.
+        let a_key = layout::branch_key_for_branch("a");
+        let snap_sidecar = layout::branch_index_dir(project, &a_key).join("branch.json");
+        let mut meta: layout::BranchMeta =
+            serde_json::from_str(&std::fs::read_to_string(&snap_sidecar).unwrap()).unwrap();
+        meta.head_commit = Some("0000000000000000000000000000000000000000".into());
+        std::fs::write(&snap_sidecar, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        write_fake_git_head(project, "b");
+        let action = detect_and_handle_branch_switch(project).unwrap();
+        assert!(matches!(
+            action,
+            BranchSwitchAction::SnapshottedOutgoing { .. }
+        ));
+
+        let snap =
+            ChunkStore::open(&layout::branch_index_dir(project, &a_key).join("chunks.db")).unwrap();
+        assert_eq!(
+            snap.get_chunk(a_id).unwrap().content,
+            "fn on_a_v2() {}",
+            "a stale outgoing snapshot must be refreshed from the root on switch"
+        );
+    }
+
+    /// N6: orphaned `*.tmp-mirror.*`/`*.tmp-restore.*` artifacts from a
+    /// crashed process are swept on the next reconcile (they are excluded
+    /// from retention, so nothing else would ever GC them).
+    #[test]
+    fn orphaned_tmp_artifacts_are_swept_on_switch() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        write_fake_git_head(project, "a");
+        build_root_index(project, "fn on_a() {}");
+        layout::sync_v13_layout(project, "proj").unwrap();
+
+        let indexes = layout::indexes_root(project);
+        let orphan_dir = indexes.join("dead-b1c2d3e4.tmp-mirror.99999");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("chunks.db"), b"half-written").unwrap();
+        let orphan_file = indexes.join("dead-b1c2d3e4.chunks.tmp-restore.99999");
+        std::fs::write(&orphan_file, b"half-written").unwrap();
+
+        write_fake_git_head(project, "b");
+        detect_and_handle_branch_switch(project).unwrap();
+
+        assert!(
+            !orphan_dir.exists(),
+            "orphaned tmp-mirror dir must be swept"
+        );
+        assert!(
+            !orphan_file.exists(),
+            "orphaned tmp-restore file must be swept"
+        );
     }
 
     /// `max_branch_indexes()` itself (the env-var-reading wrapper) — the one

@@ -78,11 +78,15 @@ impl FileWatcher {
     /// `bool` rather than the `notify` type itself, so callers outside this
     /// crate don't need a direct `notify` dependency just to call this).
     ///
-    /// Used by `semantex watch` to additionally watch the git `HEAD` file
-    /// (which, for a linked worktree, lives OUTSIDE the project root and so
-    /// wouldn't be seen by the recursive project-root watch at all) so a
-    /// branch switch is detected even when it changes no tracked file
-    /// (e.g. `git switch -c` from an identical tree).
+    /// Used by `semantex watch` to additionally watch the directory holding
+    /// the git `HEAD` file (which, for a linked worktree, lives OUTSIDE the
+    /// project root and so wouldn't be seen by the recursive project-root
+    /// watch at all) so a branch switch is detected even when it changes no
+    /// tracked file (e.g. `git switch -c` from an identical tree). The
+    /// directory rather than `HEAD` itself: git swaps `HEAD` in by rename,
+    /// and an inotify watch on the file's inode fires once and then dies
+    /// with the replaced inode — a non-recursive directory watch keeps
+    /// reporting every subsequent switch.
     pub fn watch_additional(&mut self, path: &Path, recursive: bool) -> Result<()> {
         let mode = if recursive {
             RecursiveMode::Recursive

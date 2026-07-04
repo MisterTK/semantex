@@ -53,7 +53,7 @@
 //! sidecar, `indexes/<branch_key>/branch.json` ([`BranchMeta`]).
 
 use crate::types::IndexMeta;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -146,6 +146,19 @@ pub fn root_branch_meta_path(project_root: &Path) -> PathBuf {
 /// switch to reconcile" rather than an error.
 pub fn read_root_branch_meta(project_root: &Path) -> Option<BranchMeta> {
     let content = std::fs::read_to_string(root_branch_meta_path(project_root)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Read the branch identity sidecar of a saved snapshot
+/// (`indexes/<branch_key>/branch.json`), if present. Used by the
+/// branch-switch handling to decide whether an outgoing branch's snapshot is
+/// already current (same `head_commit` as the root's sidecar) and must NOT
+/// be overwritten by a possibly-contaminated root (a build for the NEW
+/// branch that failed midway leaves hybrid root content with the OLD
+/// branch's sidecar still in place).
+pub fn read_branch_dir_meta(project_root: &Path, branch_key: &str) -> Option<BranchMeta> {
+    let path = branch_index_dir(project_root, branch_key).join("branch.json");
+    let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -490,7 +503,12 @@ pub fn mirror_root_as(project_root: &Path, branch_meta: &BranchMeta) -> Result<(
 
     let branch_key = branch_meta.branch_key.as_str();
     let branch_dir = branch_index_dir(project_root, branch_key);
-    let tmp_dir = indexes_root(project_root).join(format!("{branch_key}.tmp-mirror"));
+    // Pid-suffixed so two processes racing to mirror the same branch never
+    // stomp each other's half-built tmp dir (same idiom as
+    // `registry::save_registry_to`). Orphans from crashed processes are
+    // swept by `cleanup_stale_tmp_artifacts` under the index lock.
+    let tmp_dir =
+        indexes_root(project_root).join(format!("{branch_key}.tmp-mirror.{}", std::process::id()));
     if tmp_dir.exists() {
         std::fs::remove_dir_all(&tmp_dir)?;
     }
@@ -523,15 +541,20 @@ pub fn mirror_root_as(project_root: &Path, branch_meta: &BranchMeta) -> Result<(
         hardlink_tree(&sparse_src, &tmp_dir.join("sparse"))?;
     }
 
+    // Branch identity sidecar (contract: per-index meta carries branch name +
+    // head_commit; kept out of the shared IndexMeta struct — see module doc).
+    // Written INTO the tmp dir BEFORE the swap so a crash can never leave a
+    // snapshot in place without its identity sidecar (an identity-less
+    // snapshot would be invisible to `read_branch_dir_meta` and wrongly
+    // re-mirrored over on the next branch switch).
+    let json = serde_json::to_string_pretty(branch_meta)?;
+    std::fs::write(tmp_dir.join("branch.json"), &json)?;
+
     if branch_dir.exists() {
         std::fs::remove_dir_all(&branch_dir)?;
     }
     std::fs::rename(&tmp_dir, &branch_dir)?;
 
-    // Branch identity sidecar (contract: per-index meta carries branch name +
-    // head_commit; kept out of the shared IndexMeta struct — see module doc).
-    let json = serde_json::to_string_pretty(branch_meta)?;
-    std::fs::write(branch_dir.join("branch.json"), &json)?;
     // Wave 2: also stamp the root sidecar so `read_root_branch_meta` always
     // reflects which branch the LIVE `.semantex/` content currently belongs
     // to — the signal `index::branches::detect_and_handle_branch_switch`
@@ -562,6 +585,13 @@ pub fn mirror_root_as(project_root: &Path, branch_meta: &BranchMeta) -> Result<(
 /// individually intact, and safe to retry.
 ///
 /// No-op if `branch_key` has no snapshot yet (nothing to restore).
+///
+/// MUST be called with the exclusive `<project>/.semantex/.semantex.lock`
+/// held (the same lock `IndexBuilder::build` takes): readers use that lock
+/// as the "index is being mutated" signal (`state::detect` returns
+/// `Building` while it's held), and the WAL/SHM removal below is only safe
+/// when no live writer connection exists. The one production caller,
+/// [`crate::index::branches::detect_and_handle_branch_switch`], acquires it.
 pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Result<()> {
     let branch_dir = branch_index_dir(project_root, branch_key);
     if !branch_dir.join("chunks.db").exists() {
@@ -570,23 +600,67 @@ pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Re
     let container = container_dir(project_root);
     std::fs::create_dir_all(&container)?;
 
+    // All tmp names are pid-suffixed so two processes racing to restore never
+    // clobber each other's half-written files (same idiom as
+    // `registry::save_registry_to`); orphans from crashed processes are swept
+    // by `cleanup_stale_tmp_artifacts` under the index lock.
+    let pid = std::process::id();
+
     // chunks.db: snapshot into a tmp file, then atomic rename over the root's.
-    let tmp_chunks = indexes_root(project_root).join(format!("{branch_key}.chunks.tmp-restore"));
+    let tmp_chunks =
+        indexes_root(project_root).join(format!("{branch_key}.chunks.tmp-restore.{pid}"));
     if tmp_chunks.exists() {
         std::fs::remove_file(&tmp_chunks)?;
     }
     snapshot_sqlite_db(&branch_dir.join("chunks.db"), &tmp_chunks)?;
     std::fs::rename(&tmp_chunks, container.join("chunks.db"))?;
 
+    // The root's chunks.db is WAL-mode and long-lived connections are the
+    // norm (serve daemon, MCP cached searchers), so the OLD branch's
+    // `chunks.db-wal` / `chunks.db-shm` can survive the rename above. Left
+    // in place, the next connection would replay the old branch's WAL frames
+    // onto the NEW branch's freshly-restored db file — hybrid content or
+    // outright "database disk image is malformed". The caller holds the
+    // exclusive index lock here (see `branches::detect_and_handle_branch_switch`),
+    // so no live writer exists and dropping the sidecar files is safe.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = container.join(format!("chunks.db{suffix}"));
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "restore: failed to remove stale {} beside the restored chunks.db",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+
     // meta.json / models.toml: plain copies, tmp-then-rename swapped in.
+    // When the snapshot LACKS one of these, remove the root's leftover copy
+    // rather than keeping the old branch's — a stale root `models.toml`
+    // could silently change embedder selection for the restored branch.
     for name in ["meta.json", "models.toml"] {
         let src = branch_dir.join(name);
+        let dst = container.join(name);
         if !src.is_file() {
+            match std::fs::remove_file(&dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("restore: failed to remove leftover {}", dst.display())
+                    });
+                }
+            }
             continue;
         }
-        let tmp = indexes_root(project_root).join(format!("{branch_key}.{name}.tmp-restore"));
+        let tmp = indexes_root(project_root).join(format!("{branch_key}.{name}.tmp-restore.{pid}"));
         std::fs::copy(&src, &tmp)?;
-        std::fs::rename(&tmp, container.join(name))?;
+        std::fs::rename(&tmp, dst)?;
     }
 
     // dense/**: rewritten in place by the builder — restore as a fresh copy,
@@ -595,7 +669,8 @@ pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Re
     let dense_dst = container.join("dense");
     let dense_src = branch_dir.join("dense");
     if dense_src.is_dir() {
-        let tmp_dense = indexes_root(project_root).join(format!("{branch_key}.dense.tmp-restore"));
+        let tmp_dense =
+            indexes_root(project_root).join(format!("{branch_key}.dense.tmp-restore.{pid}"));
         if tmp_dense.exists() {
             std::fs::remove_dir_all(&tmp_dense)?;
         }
@@ -615,7 +690,7 @@ pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Re
     let sparse_src = branch_dir.join("sparse");
     if sparse_src.is_dir() {
         let tmp_sparse =
-            indexes_root(project_root).join(format!("{branch_key}.sparse.tmp-restore"));
+            indexes_root(project_root).join(format!("{branch_key}.sparse.tmp-restore.{pid}"));
         if tmp_sparse.exists() {
             std::fs::remove_dir_all(&tmp_sparse)?;
         }
@@ -634,6 +709,40 @@ pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Re
     }
 
     Ok(())
+}
+
+/// Best-effort sweep of orphaned in-flight artifacts (`*.tmp-mirror.*` /
+/// `*.tmp-restore.*` files and dirs) left in `indexes/` by a crashed
+/// mirror/restore. They are deliberately excluded from retention's eviction
+/// (a live process's tmp dir must never be GC'd as a "stale branch"), so
+/// without this sweep they would accumulate forever.
+///
+/// ONLY call while holding the exclusive `.semantex.lock` — every writer of
+/// these tmp names (mirror via the builder's lock, restore via
+/// `branches::detect_and_handle_branch_switch`'s lock) runs under it, so
+/// with the lock held, anything matching the pattern is guaranteed to be an
+/// orphan from a dead process, not another process's work in flight.
+pub fn cleanup_stale_tmp_artifacts(project_root: &Path) {
+    let indexes = indexes_root(project_root);
+    let Ok(entries) = std::fs::read_dir(&indexes) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.contains(".tmp-") {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => tracing::info!(path = %path.display(), "Removed orphaned tmp artifact"),
+            Err(e) => tracing::debug!(path = %path.display(), "Could not remove tmp artifact: {e}"),
+        }
+    }
 }
 
 /// Ensure the full v13 layout exists for `project_root`: migrate/refresh the

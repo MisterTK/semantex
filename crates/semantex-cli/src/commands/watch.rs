@@ -143,20 +143,24 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
     }
     println!();
 
-    // Start watching. Also watch the resolved git HEAD file (which for a
-    // linked worktree lives outside project_path, so the recursive watch
-    // above wouldn't see it) so a branch switch that touches no tracked
-    // file (e.g. `git switch -c` from an identical tree) still triggers a
-    // wake-up — see `reconcile_branch_switch`.
+    // Start watching. Also watch the directory CONTAINING the resolved git
+    // HEAD file (which for a linked worktree lives outside project_path, so
+    // the recursive watch above wouldn't see it) so a branch switch that
+    // touches no tracked file (e.g. `git switch -c` from an identical tree)
+    // still triggers a wake-up — see `reconcile_branch_switch`.
+    //
+    // The PARENT directory, not the HEAD file itself: git replaces HEAD via
+    // write-tmp-then-rename, and inotify watches the inode — a watch on the
+    // file itself fires once for the first switch and is then auto-removed
+    // with the old inode, so every later switch would go unseen. A
+    // non-recursive directory watch survives renames of its children.
     let mut watcher = FileWatcher::new()?;
     let rx = watcher.watch(&project_path)?;
     if let Some(head_file) = layout::git_head_file(&project_path)
-        && let Err(e) = watcher.watch_additional(&head_file, false)
+        && let Some(git_dir) = head_file.parent()
+        && let Err(e) = watcher.watch_additional(git_dir, false)
     {
-        tracing::debug!(
-            "Could not watch git HEAD file ({}): {e}",
-            head_file.display()
-        );
+        tracing::debug!("Could not watch git dir ({}): {e}", git_dir.display());
     }
 
     while let Ok(changed_paths) = rx.recv() {
