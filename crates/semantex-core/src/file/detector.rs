@@ -109,9 +109,7 @@ impl FileType {
                 | FileType::Svelte
                 | FileType::Vue
                 | FileType::Kotlin
-                | FileType::Markdown
-                | FileType::Toml
-                | FileType::Json
+                | FileType::Sql
         )
     }
 
@@ -213,6 +211,7 @@ mod tests {
     fn test_supports_ast() {
         assert!(FileType::Rust.supports_ast());
         assert!(FileType::Python.supports_ast());
+        assert!(FileType::Sql.supports_ast());
         assert!(!FileType::Pdf.supports_ast());
         assert!(!FileType::Binary.supports_ast());
         assert!(!FileType::PlainText.supports_ast());

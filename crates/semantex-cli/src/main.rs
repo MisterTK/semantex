@@ -210,6 +210,19 @@ struct Cli {
     /// Returns a curated prose answer instead of raw results.
     #[arg(long, conflicts_with_all = ["json", "grep", "refs", "peek", "around", "content"])]
     deep: bool,
+
+    /// Which repo(s) to search: `repo` (default, just this project), `all`
+    /// (every project registered in ~/.semantex/projects.json), or a
+    /// comma-separated list of project display names/paths — any string
+    /// other than `repo`/`all` is treated as names; names matching no
+    /// registered project are reported as skipped. Non-`repo` scopes always
+    /// run a hybrid dense+sparse search fanned out across targets and
+    /// RRF-fused, with results prefixed `[project]`; they honor only
+    /// --max-count/--rerank/--grep-mode/--json — other single-repo flags
+    /// (--refs, --peek, --deep, --around, --dense-only, --sparse-only, ...)
+    /// are ignored.
+    #[arg(long, default_value = "repo")]
+    scope: String,
 }
 
 #[derive(Subcommand)]
@@ -256,8 +269,9 @@ enum Commands {
         #[arg(long, default_value_t = 5050, requires = "http")]
         port: u16,
 
-        /// Allow binding to 0.0.0.0 (any interface). Off by default — only
-        /// loopback is safe without auth. Prints a stderr warning when enabled.
+        /// Allow binding to 0.0.0.0 (any interface). Off by default. Bearer-token
+        /// auth is REQUIRED when this is set (see --auth-token / SEMANTEX_HTTP_TOKEN) —
+        /// the server refuses to start remote without a resolvable token.
         #[arg(long, requires = "http")]
         allow_remote: bool,
 
@@ -265,6 +279,19 @@ enum Commands {
         /// or `all` (13 tools, default).
         #[arg(long, value_name = "NAME", default_value = "all")]
         toolset: String,
+
+        /// Bearer token required to call `/mcp/*` over HTTP. Takes precedence
+        /// over `SEMANTEX_HTTP_TOKEN`; if neither is set, a token is
+        /// auto-generated and persisted at `~/.semantex/http_token` (0600).
+        /// Only used with --http.
+        #[arg(long, value_name = "TOKEN", requires = "http")]
+        auth_token: Option<String>,
+
+        /// Require bearer-token auth even on loopback (127.0.0.1). Auth is
+        /// always required when --allow-remote is set, regardless of this
+        /// flag. Only used with --http.
+        #[arg(long, requires = "http")]
+        require_auth: bool,
     },
     /// Install Claude Code integration
     InstallClaudeCode {
@@ -341,6 +368,19 @@ enum Commands {
         /// routes (deep / architecture / feature_planning) emit `[]`.
         #[arg(long, conflicts_with = "json")]
         json_hits: bool,
+
+        /// Which repo(s) to search: `repo` (default, just `path`, via the
+        /// daemon exactly as before), `all` (every project registered in
+        /// ~/.semantex/projects.json), or a comma-separated list of project
+        /// display names/paths — any string other than `repo`/`all` is
+        /// treated as names; names matching no registered project are
+        /// reported as skipped. Non-`repo` scopes run entirely in-process
+        /// (no daemon): a hybrid dense+sparse search fanned out across
+        /// targets and RRF-fused — `--route` and `--full` are ignored, since
+        /// route classification (structural walks, deep synthesis, ...) is a
+        /// single-repo concept. Results are prefixed `[project]`.
+        #[arg(long, default_value = "repo")]
+        scope: String,
     },
     /// Show LLM backend status and run a 1-token health-check classify call.
     ///
@@ -699,8 +739,17 @@ fn main() -> Result<()> {
 
     // Fast daemon path: skip config loading + ORT detection when daemon port file exists.
     // Saves ~5-7ms by avoiding YAML config I/O + ORT dylib stat() calls.
+    // Skipped entirely for non-CurrentRepo scopes: the daemon only ever
+    // knows about the ONE project it was started for, so a cross-repo query
+    // falls through to the slower (config-loading) path below, where the
+    // federated branch lives. Gated on the PARSED scope (not a string
+    // compare) so values that parse to CurrentRepo — e.g. `--scope ""` —
+    // stay on the fast single-repo path.
     #[allow(clippy::collapsible_if)]
-    if cli.command.is_none() {
+    if cli.command.is_none()
+        && commands::federated::parse_scope(&cli.scope)
+            == semantex_core::search::federation::SearchScope::CurrentRepo
+    {
         // Fast path for --around: graph walk via daemon
         if let Some(ref symbol) = cli.around {
             let path = cli.path.as_deref().unwrap_or(Path::new("."));
@@ -840,9 +889,19 @@ fn main() -> Result<()> {
             port,
             allow_remote,
             toolset,
+            auth_token,
+            require_auth,
         }) => {
             telemetry::track("mcp");
-            commands::mcp::run(&config, http, port, allow_remote, &toolset)
+            commands::mcp::run(
+                &config,
+                http,
+                port,
+                allow_remote,
+                &toolset,
+                auth_token,
+                require_auth,
+            )
         }
         Some(Commands::InstallClaudeCode { scope }) => {
             telemetry::track("install_claude_code");
@@ -882,10 +941,45 @@ fn main() -> Result<()> {
             budget,
             json,
             json_hits,
+            scope,
         }) => {
             use semantex_core::search::agent_classifier::AgentRoute;
             use semantex_core::server::protocol::AgentRequest;
             telemetry::track("agent");
+
+            // `--scope` != `repo` runs entirely in-process (no daemon
+            // required) and never falls through to the daemon-based path
+            // below — see `commands::federated::run_agent`'s doc comment for
+            // why route classification is skipped for cross-repo queries.
+            // This keeps `--scope repo` (the default) byte-identical to
+            // every pre-federation invocation.
+            let parsed_scope = commands::federated::parse_scope(&scope);
+            if parsed_scope != semantex_core::search::federation::SearchScope::CurrentRepo {
+                let project_path = path
+                    .canonicalize()
+                    .with_context(|| format!("Invalid path: {}", path.display()))?;
+                let (formatted, hits) = commands::federated::run_agent(
+                    &parsed_scope,
+                    &project_path,
+                    &query,
+                    budget.unwrap_or(0),
+                    &config,
+                );
+                if json_hits {
+                    println!("{}", serde_json::to_string_pretty(&hits)?);
+                } else if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "formatted": formatted,
+                            "results": hits,
+                        }))?
+                    );
+                } else {
+                    println!("{formatted}");
+                }
+                return Ok(());
+            }
 
             // Accept any AgentRoute variant via FromStr (covers snake_case
             // and no-separator forms). Two convenience aliases stay: "search"
@@ -954,6 +1048,33 @@ fn main() -> Result<()> {
                 Cli::command().print_help()?;
                 println!();
                 Ok(())
+            } else if commands::federated::parse_scope(&cli.scope)
+                != semantex_core::search::federation::SearchScope::CurrentRepo
+            {
+                // Cross-repo fan-out — see `commands::federated::run_search`'s
+                // doc comment. Gated on the PARSED scope so any value that
+                // parses to CurrentRepo (`repo`, empty) takes the unchanged
+                // single-repo branch below. NOTE: federated mode honors only
+                // query/--max-count/--rerank/--grep-mode/--json; single-repo
+                // flags like --refs/--peek/--deep/--around/--dense-only/
+                // --sparse-only are ignored on this path (see --scope's help
+                // text).
+                telemetry::track("search_federated");
+                let parsed_scope = commands::federated::parse_scope(&cli.scope);
+                let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
+                let project_path = path
+                    .canonicalize()
+                    .with_context(|| format!("Invalid path: {}", path.display()))?;
+                commands::federated::run_search(
+                    &parsed_scope,
+                    &project_path,
+                    cli.queries.first().map_or("", String::as_str),
+                    cli.max_count,
+                    cli.rerank,
+                    cli.grep_mode,
+                    cli.json,
+                    &config,
+                )
             } else {
                 telemetry::track("search");
                 let search_opts = commands::search::SearchOpts {
@@ -1099,5 +1220,99 @@ mod arg_peek_tests {
         // Bare invocation / pure flags (help/version): no download.
         assert!(!command_wants_onnxruntime(Vec::<&str>::new()));
         assert!(!command_wants_onnxruntime(["--version"]));
+    }
+}
+
+/// Clap-level tests for the `mcp` subcommand's HTTP auth flag plumbing
+/// (`--auth-token`, `--require-auth`). See `commands::mcp::run` for the
+/// resolution logic these flags feed into.
+#[cfg(test)]
+mod mcp_auth_arg_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn auth_token_and_require_auth_parse_with_http() {
+        let cli = Cli::try_parse_from([
+            "semantex",
+            "mcp",
+            "--http",
+            "--auth-token",
+            "s3cr3t",
+            "--require-auth",
+        ])
+        .expect("clap should accept --auth-token and --require-auth with --http");
+        let Some(Commands::Mcp {
+            http,
+            allow_remote,
+            auth_token,
+            require_auth,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Commands::Mcp");
+        };
+        assert!(http);
+        assert!(!allow_remote);
+        assert_eq!(auth_token.as_deref(), Some("s3cr3t"));
+        assert!(require_auth);
+    }
+
+    #[test]
+    fn auth_flags_default_to_none_and_off() {
+        let cli = Cli::try_parse_from(["semantex", "mcp", "--http"])
+            .expect("clap should accept --http alone");
+        let Some(Commands::Mcp {
+            auth_token,
+            require_auth,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Commands::Mcp");
+        };
+        assert_eq!(auth_token, None);
+        assert!(!require_auth);
+    }
+
+    #[test]
+    fn allow_remote_and_auth_token_compose() {
+        let cli = Cli::try_parse_from([
+            "semantex",
+            "mcp",
+            "--http",
+            "--allow-remote",
+            "--auth-token",
+            "tok",
+        ])
+        .expect("clap should accept --allow-remote with --auth-token");
+        let Some(Commands::Mcp {
+            allow_remote,
+            auth_token,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Commands::Mcp");
+        };
+        assert!(allow_remote);
+        assert_eq!(auth_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn auth_token_without_http_is_rejected() {
+        // `requires = "http"` on --auth-token: stdio mode has no HTTP auth surface.
+        let result = Cli::try_parse_from(["semantex", "mcp", "--auth-token", "tok"]);
+        assert!(
+            result.is_err(),
+            "--auth-token without --http should fail to parse"
+        );
+    }
+
+    #[test]
+    fn require_auth_without_http_is_rejected() {
+        let result = Cli::try_parse_from(["semantex", "mcp", "--require-auth"]);
+        assert!(
+            result.is_err(),
+            "--require-auth without --http should fail to parse"
+        );
     }
 }

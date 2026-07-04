@@ -516,6 +516,54 @@ pub fn all_tools() -> Vec<ToolMetadata> {
             mutates: false,
             live: false,
         },
+        // ---- v13 Wave 2 — deterministic docs scaffold (zero LLM wiring) ----
+        ToolMetadata {
+            name: "semantex_docs_context",
+            title: "Documentation Context Scaffold",
+            description: concat!(
+                "Deterministic documentation scaffold — NOT an LLM call, does not write prose. ",
+                "Returns structurally-complete data (symbol inventory, call-graph edges, import ",
+                "edges, existing doc-comment text, file:line provenance) for the calling agent to ",
+                "turn into maintained markdown docs. Pair with the `semantex-docs` skill for the ",
+                "full write/refresh workflow."
+            ),
+            when_to_use: &[
+                "Asked to document a codebase, write architecture docs, or generate a README.",
+                "Keeping existing docs under `semantex_docs/` in sync with code that changed.",
+            ],
+            args: &[
+                ToolArg {
+                    name: "scope",
+                    ty: "string | object",
+                    required: true,
+                    description: "\"overview\" for the repo-wide architecture + module inventory scaffold, or {\"module\": \"<path>\"} for one file's symbol/call/import scaffold.",
+                },
+                ToolArg {
+                    name: "path",
+                    ty: "string",
+                    required: false,
+                    description: "Project path (defaults to current working directory).",
+                },
+                ToolArg {
+                    name: "budget",
+                    ty: "integer",
+                    required: false,
+                    description: "Approximate token budget for the returned scaffold (default 6000). Oversized scaffolds are trimmed deterministically.",
+                },
+            ],
+            examples: &[
+                ToolExample {
+                    label: "Repo-wide architecture + module inventory",
+                    args_json: r#"{"scope": "overview"}"#,
+                },
+                ToolExample {
+                    label: "Symbol/call/import scaffold for one file",
+                    args_json: r#"{"scope": {"module": "src/index/storage.rs"}}"#,
+                },
+            ],
+            mutates: false,
+            live: true,
+        },
     ]
 }
 

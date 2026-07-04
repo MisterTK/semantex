@@ -46,6 +46,12 @@
           "default": "3600",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "SEMANTEX_HTTP_TOKEN",
+          "description": "Bearer token for the HTTP/SSE MCP transport (--http). Required whenever --allow-remote is used; optional on loopback unless --require-auth is passed. If unset, a --auth-token flag takes precedence, and if neither is given a token is auto-generated and persisted at ~/.semantex/http_token (0600 perms).",
+          "isRequired": false,
+          "isSecret": true
         }
       ]
     }
@@ -59,6 +65,11 @@
           "name": "content-type",
           "value": "application/json",
           "description": "JSON-RPC over HTTP requires application/json."
+        },
+        {
+          "name": "Authorization",
+          "value": "Bearer {token}",
+          "description": "Bearer token auth. Required when the server was started with --allow-remote or --require-auth; see SEMANTEX_HTTP_TOKEN."
         }
       ]
     }
@@ -74,11 +85,11 @@
         },
         "http": {
           "command": "semantex mcp --http --port 5050",
-          "description": "HTTP/SSE transport. Binds 127.0.0.1 by default; --allow-remote to listen on all interfaces (no authentication — only use on trusted networks).",
+          "description": "HTTP/SSE transport. Binds 127.0.0.1 by default; --allow-remote to listen on all interfaces and REQUIRES bearer-token auth (--auth-token, SEMANTEX_HTTP_TOKEN, or an auto-generated token persisted at ~/.semantex/http_token). On loopback, auth is off by default; pass --require-auth to opt in.",
           "routes": {
-            "POST /mcp/{toolset}": "Streamable HTTP — JSON-RPC body in, JSON-RPC body out.",
-            "GET /mcp/{toolset}/events": "Server-Sent Events stream for notifications.",
-            "GET /healthz": "Liveness probe."
+            "POST /mcp/{toolset}": "Streamable HTTP — JSON-RPC body in, JSON-RPC body out. Requires bearer auth when enabled.",
+            "GET /mcp/{toolset}/events": "Server-Sent Events stream for notifications. Requires bearer auth when enabled.",
+            "GET /healthz": "Liveness probe. Never requires auth."
           }
         }
       },

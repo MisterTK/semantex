@@ -1,0 +1,9 @@
+[
+  {
+    "instance_id": "tiny__tiny-1",
+    "repo": "tiny/tiny",
+    "base_commit": "0000000000000000000000000000000000000009",
+    "problem_statement": "Login fails to authenticate a user with a password: the session token is never issued.",
+    "patch": "diff --git a/auth.py b/auth.py\n--- a/auth.py\n+++ b/auth.py\n@@ -1,4 +1,4 @@\n-def login(username, password):\n+def login(username, password):\n     token = _issue_token(username)\n     return token\n"
+  }
+]

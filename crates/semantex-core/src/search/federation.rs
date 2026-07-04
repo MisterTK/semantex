@@ -23,6 +23,7 @@
 
 use crate::index::layout;
 use crate::index::registry::RegistryV2;
+use crate::index::state::{self, IndexState};
 use crate::types::SearchResult;
 use anyhow::Result;
 use std::cmp::Ordering;
@@ -67,6 +68,36 @@ pub enum SearchScope {
     Named(Vec<String>),
 }
 
+/// Parse a caller-supplied scope *string* into a [`SearchScope`] — the ONE
+/// grammar the CLI's `--scope` flag and the MCP tools' string-typed `scope`
+/// argument share, so `scope: "frontend"` means the same thing at every
+/// entry point: `"repo"`/empty → `CurrentRepo`; `"all"` → `All`; anything
+/// else is split on commas into project display names/paths (`Named`).
+///
+/// Unknown strings are deliberately treated as `Named` rather than silently
+/// mapped to `CurrentRepo`: a typo ("al", "All", "frontnd") then resolves to
+/// zero targets and is surfaced per-name by [`run_federated_search`] in
+/// `skipped` — diagnosable — instead of quietly searching the wrong scope.
+pub fn parse_scope_str(raw: &str) -> SearchScope {
+    match raw {
+        "repo" | "" => SearchScope::CurrentRepo,
+        "all" => SearchScope::All,
+        other => {
+            let names: Vec<String> = other
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if names.is_empty() {
+                SearchScope::CurrentRepo
+            } else {
+                SearchScope::Named(names)
+            }
+        }
+    }
+}
+
 /// Default Reciprocal Rank Fusion constant for cross-target fusion
 /// (contract §B: "RRF k=60 across targets"). Mirrors
 /// `SemantexConfig::rrf_k`'s existing default for the intra-target
@@ -90,18 +121,24 @@ pub fn resolve_targets(scope: &SearchScope, registry: &Registry, cwd: &Path) -> 
         SearchScope::Named(names) => registry
             .projects
             .iter()
-            .filter(|p| {
-                names.iter().any(|n| {
-                    n == &p.display_name
-                        || n == &p.path.to_string_lossy()
-                        || p.path
-                            .file_name()
-                            .is_some_and(|f| f.to_string_lossy() == *n)
-                })
-            })
+            .filter(|p| names.iter().any(|n| project_matches_name(p, n)))
             .flat_map(project_targets)
             .collect(),
     }
+}
+
+/// The `Named`-scope matching rule: `name` matches a registered project when
+/// it equals the project's `display_name`, its full path, or the path's
+/// final component. Shared by [`resolve_targets`] and
+/// [`run_federated_search`]'s unmatched-name reporting so the two can never
+/// disagree about what "matched" means.
+fn project_matches_name(project: &crate::index::registry::ProjectEntry, name: &str) -> bool {
+    name == project.display_name
+        || name == project.path.to_string_lossy()
+        || project
+            .path
+            .file_name()
+            .is_some_and(|f| f.to_string_lossy() == name)
 }
 
 /// One target per branch the registry has recorded for this project; if
@@ -213,6 +250,216 @@ pub fn fuse_targets_with_k(
             .unwrap_or(Ordering::Equal)
     });
     fused
+}
+
+// ── Wave 2: cross-repo callers ──────────────────────────────────────────────
+//
+// Everything below this point is the Wave 2 wiring the module doc promised:
+// a concrete on-disk `IndexSearcher`, target readiness/skip handling, and the
+// orchestration function (`run_federated_search`) that `semantex-mcp` and
+// `semantex-cli` call for any `SearchScope` other than `CurrentRepo`.
+//
+// `SearchScope::CurrentRepo` callers MUST keep calling their existing
+// single-repo code path directly and never route through
+// `run_federated_search` — that is what guarantees byte-identical output for
+// every pre-v13 consumer (contract Wave 2 §3). Federation is opt-in.
+
+/// Resolve the on-disk index directory to open for `target`.
+///
+/// Wave 2 federates ACROSS REPOS, not across a repo's branch snapshots: this
+/// always resolves to the container root (`<project_root>/.semantex/`) — the
+/// live, currently-checked-out-branch index (see `index/layout.rs`'s module
+/// doc: the root stays authoritative for "the currently-open branch" after
+/// every build). `target.branch_key` is carried on `IndexTarget`/
+/// `FederatedHit` for provenance/display only; it is NOT used to select a
+/// `indexes/<branch_key>/` snapshot here. Multi-branch federation (reading a
+/// branch OTHER than the one currently checked out on disk) is a distinct
+/// Wave 2 preview item (contract §F) this batch does not implement.
+pub fn target_index_dir(target: &IndexTarget) -> PathBuf {
+    layout::container_dir(&target.project_root)
+}
+
+/// Check whether `target`'s index is ready to be queried, without ever
+/// triggering a build. Federation degrades gracefully: a target whose index
+/// is missing, mid-build, or stale is skipped (with a reason) rather than
+/// failing the whole federated query.
+pub fn target_readiness(target: &IndexTarget) -> Result<(), String> {
+    match state::detect(&target.project_root) {
+        IndexState::Ready => Ok(()),
+        IndexState::NotIndexed => Err("not indexed".to_string()),
+        IndexState::Building => Err("index build in progress".to_string()),
+        IndexState::Stale => Err("index schema is stale — needs rebuild".to_string()),
+    }
+}
+
+/// A target that a federated query skipped rather than erroring on — either
+/// its index wasn't ready ([`target_readiness`]) or [`IndexSearcher::search_target`]
+/// itself failed (e.g. a corrupt on-disk index). Surfaced in response
+/// metadata so callers can tell the user which repos were left out.
+#[derive(Debug, Clone)]
+pub struct SkippedTarget {
+    pub target: IndexTarget,
+    pub reason: String,
+}
+
+/// Result of [`run_federated_search`]: the fused hits plus any targets that
+/// were skipped along the way, and an optional caller-facing `note` for the
+/// cases where scope resolution itself produced nothing queryable.
+#[derive(Debug, Clone, Default)]
+pub struct FederatedSearchOutcome {
+    pub hits: Vec<FederatedHit>,
+    pub skipped: Vec<SkippedTarget>,
+    /// Set when the scope resolved to zero targets for a reason the user
+    /// should see (today: `All` against an empty registry). Callers surface
+    /// this instead of returning a bare, indistinguishable empty success.
+    pub note: Option<String>,
+}
+
+/// Resolve `scope` to targets, query every ready one through `searcher`, and
+/// fuse the results with [`fuse_targets`] (RRF k=60). Targets that aren't
+/// ready ([`target_readiness`]) or whose search call errors are recorded in
+/// `skipped` instead of aborting the whole query — one bad repo in `All`
+/// scope must never prevent results from the rest.
+///
+/// `limit` is applied twice: each target is queried for up to `limit` hits,
+/// and the final FUSED list is also truncated to `limit` — so callers get at
+/// most `limit` results total, not `limit × N_targets`.
+///
+/// Diagnosability of "nothing happened": a `Named` name that matched no
+/// registered project is reported in `skipped` (reason `"no registered
+/// project matched '<name>'"`, with the name itself as the synthetic
+/// target's `project_root`), and `All` against an empty registry sets
+/// `note` — an empty result is never silently ambiguous with "searched
+/// everything, found nothing".
+pub fn run_federated_search(
+    scope: &SearchScope,
+    registry: &Registry,
+    cwd: &Path,
+    query: &str,
+    limit: usize,
+    searcher: &dyn IndexSearcher,
+) -> FederatedSearchOutcome {
+    let mut targets = resolve_targets(scope, registry, cwd);
+
+    // A project with N recorded branches yields N targets, but every
+    // branch_key resolves to the same live container root today (see
+    // target_index_dir) — dedupe by resolved index dir (keeping the first)
+    // so such a project is searched once, not N times, which would both
+    // duplicate its hits and give them N× the RRF weight.
+    {
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|t| seen.insert(target_index_dir(t)));
+    }
+
+    let mut skipped = Vec::new();
+
+    if let SearchScope::Named(names) = scope {
+        for name in names {
+            if !registry
+                .projects
+                .iter()
+                .any(|p| project_matches_name(p, name))
+            {
+                skipped.push(SkippedTarget {
+                    target: IndexTarget {
+                        project_root: PathBuf::from(name),
+                        branch_key: String::new(),
+                    },
+                    reason: format!("no registered project matched '{name}'"),
+                });
+            }
+        }
+    }
+
+    let note = if matches!(scope, SearchScope::All) && registry.projects.is_empty() {
+        Some(
+            "registry has no projects — nothing to federate (build an index in a repo to register it)"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    let mut per_target_hits: Vec<(IndexTarget, Vec<SearchResult>)> =
+        Vec::with_capacity(targets.len());
+
+    for target in targets {
+        if let Err(reason) = target_readiness(&target) {
+            skipped.push(SkippedTarget { target, reason });
+            continue;
+        }
+        match searcher.search_target(&target, query, limit) {
+            Ok(hits) => per_target_hits.push((target, hits)),
+            Err(e) => skipped.push(SkippedTarget {
+                target,
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    let mut hits = fuse_targets(per_target_hits);
+    hits.truncate(limit);
+    FederatedSearchOutcome {
+        hits,
+        skipped,
+        note,
+    }
+}
+
+/// Look up the `display_name` the registry has recorded for the project at
+/// `project_root`, falling back to the root's own directory name when the
+/// project isn't registered (e.g. `SearchScope::CurrentRepo`'s target, which
+/// never touches the registry — see [`resolve_targets`]).
+pub fn project_display_name(registry: &Registry, project_root: &Path) -> String {
+    registry
+        .projects
+        .iter()
+        .find(|p| p.path == project_root)
+        .map(|p| p.display_name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| {
+            project_root.file_name().map_or_else(
+                || project_root.to_string_lossy().to_string(),
+                |n| n.to_string_lossy().to_string(),
+            )
+        })
+}
+
+/// Builds the per-target `SearchQuery` from the raw query text and the
+/// requested per-target limit — lets [`SequentialIndexSearcher`] callers opt
+/// into grep-mode/no-rerank/etc. the same way the single-repo path does,
+/// without widening `IndexSearcher::search_target`'s signature. A boxed
+/// closure (rather than a bare `fn`) so callers can capture CLI flags
+/// (`--rerank`, `--grep-mode`, ...) instead of needing one free function per
+/// flag combination. Named as a `type` alias (rather than inlined) per
+/// clippy::type_complexity.
+pub type QueryBuilder<'a> = Box<dyn Fn(&str, usize) -> crate::search::SearchQuery + 'a>;
+
+/// A simple, no-cache [`IndexSearcher`]: opens `target`'s index, runs one
+/// hybrid search, and drops the searcher before returning. Peak memory is
+/// bounded to one open index at a time — the right default for a short-lived
+/// CLI process with no long-lived cache to amortize the open cost across
+/// calls. Long-lived hosts (the MCP server, a future multi-client daemon)
+/// should instead implement `IndexSearcher` on top of their own searcher
+/// cache (see `semantex-mcp`'s LRU `McpServer::get_searcher`) so warm repos
+/// stay warm across federated calls instead of reopening every time.
+pub struct SequentialIndexSearcher<'a> {
+    pub config: &'a crate::config::SemantexConfig,
+    pub build_query: QueryBuilder<'a>,
+}
+
+impl IndexSearcher for SequentialIndexSearcher<'_> {
+    fn search_target(
+        &self,
+        target: &IndexTarget,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let index_dir = target_index_dir(target);
+        let searcher = crate::search::hybrid::HybridSearcher::open(&index_dir, self.config)?;
+        let sq = (self.build_query)(query, limit);
+        Ok(searcher.search(&sq)?.results)
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +644,407 @@ mod tests {
         };
         let fused = fuse_targets(vec![(target, vec![])]);
         assert!(fused.is_empty());
+    }
+
+    // ── Wave 2 additions ────────────────────────────────────────────────────
+
+    fn write_ready_index(project_root: &Path) {
+        let semantex_dir = project_root.join(".semantex");
+        std::fs::create_dir_all(&semantex_dir).unwrap();
+        let meta = serde_json::json!({
+            "schema_version": crate::types::IndexMeta::CURRENT_SCHEMA_VERSION,
+            "project_path": project_root,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "file_count": 1,
+            "chunk_count": 1,
+            "embedding_model": "test",
+            "embedding_dim": 8,
+            "use_bm25_stemmer": true,
+            "dense_backend": "coderank-hnsw",
+            "embedder_fingerprint": "test",
+        });
+        std::fs::write(semantex_dir.join("meta.json"), meta.to_string()).unwrap();
+    }
+
+    #[test]
+    fn target_index_dir_is_the_project_container_root() {
+        let target = IndexTarget {
+            project_root: PathBuf::from("/repo/a"),
+            branch_key: "some-other-branch-11112222".to_string(),
+        };
+        // Deliberately NOT indexes/<branch_key>/ — see target_index_dir's doc.
+        assert_eq!(
+            target_index_dir(&target),
+            PathBuf::from("/repo/a/.semantex")
+        );
+    }
+
+    #[test]
+    fn target_readiness_reports_not_indexed_for_a_fresh_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = IndexTarget {
+            project_root: tmp.path().to_path_buf(),
+            branch_key: "default".to_string(),
+        };
+        assert_eq!(target_readiness(&target), Err("not indexed".to_string()));
+    }
+
+    #[test]
+    fn target_readiness_is_ok_for_a_ready_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_ready_index(tmp.path());
+        let target = IndexTarget {
+            project_root: tmp.path().to_path_buf(),
+            branch_key: "default".to_string(),
+        };
+        assert_eq!(target_readiness(&target), Ok(()));
+    }
+
+    /// Stub [`IndexSearcher`] for orchestration tests: returns canned hits per
+    /// project_root, or errors for paths not in its map — lets tests exercise
+    /// `run_federated_search`'s skip/fuse behaviour without touching disk.
+    struct StubSearcher {
+        by_project: std::collections::HashMap<PathBuf, Vec<SearchResult>>,
+    }
+
+    impl IndexSearcher for StubSearcher {
+        fn search_target(
+            &self,
+            target: &IndexTarget,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchResult>> {
+            self.by_project
+                .get(&target.project_root)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("stub: no hits configured for this target"))
+        }
+    }
+
+    #[test]
+    fn run_federated_search_skips_not_ready_targets_and_reports_them() {
+        let tmp_ready = tempfile::TempDir::new().unwrap();
+        write_ready_index(tmp_ready.path());
+        let tmp_not_indexed = tempfile::TempDir::new().unwrap();
+
+        let mut registry = Registry::default();
+        registry.projects.push(ProjectEntry {
+            path: tmp_ready.path().to_path_buf(),
+            project_id: "ready".into(),
+            display_name: "ready-project".into(),
+            branches: vec![],
+            embedder_fingerprint: String::new(),
+        });
+        registry.projects.push(ProjectEntry {
+            path: tmp_not_indexed.path().to_path_buf(),
+            project_id: "notready".into(),
+            display_name: "not-ready-project".into(),
+            branches: vec![],
+            embedder_fingerprint: String::new(),
+        });
+
+        let mut by_project = std::collections::HashMap::new();
+        by_project.insert(tmp_ready.path().to_path_buf(), vec![make_result(1, 0.5)]);
+        let searcher = StubSearcher { by_project };
+
+        let outcome = run_federated_search(
+            &SearchScope::All,
+            &registry,
+            Path::new("/anywhere"),
+            "query",
+            10,
+            &searcher,
+        );
+
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(outcome.hits[0].result.chunk.id, 1);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(
+            outcome.skipped[0].target.project_root,
+            tmp_not_indexed.path()
+        );
+        assert_eq!(outcome.skipped[0].reason, "not indexed");
+    }
+
+    #[test]
+    fn run_federated_search_reports_searcher_errors_as_skipped_not_a_hard_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_ready_index(tmp.path());
+
+        let mut registry = Registry::default();
+        registry.projects.push(ProjectEntry {
+            path: tmp.path().to_path_buf(),
+            project_id: "p".into(),
+            display_name: "p".into(),
+            branches: vec![],
+            embedder_fingerprint: String::new(),
+        });
+
+        // No hits configured for this project → StubSearcher errors.
+        let searcher = StubSearcher {
+            by_project: std::collections::HashMap::new(),
+        };
+
+        let outcome = run_federated_search(
+            &SearchScope::All,
+            &registry,
+            Path::new("/anywhere"),
+            "query",
+            10,
+            &searcher,
+        );
+
+        assert!(outcome.hits.is_empty());
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(outcome.skipped[0].target.project_root, tmp.path());
+    }
+
+    /// Fix 1 regression guard: a project with N recorded branches must be
+    /// searched ONCE per federated query, because every branch_key resolves
+    /// to the same live container root — N searches would return N duplicate
+    /// copies of each hit and give that repo N× the RRF weight.
+    #[test]
+    fn run_federated_search_dedupes_multi_branch_projects_by_index_dir() {
+        use std::sync::Mutex;
+
+        struct CountingSearcher {
+            calls: Mutex<usize>,
+            hits: Vec<SearchResult>,
+        }
+        impl IndexSearcher for CountingSearcher {
+            fn search_target(
+                &self,
+                _target: &IndexTarget,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<SearchResult>> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(self.hits.clone())
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_ready_index(tmp.path());
+
+        let mut registry = Registry::default();
+        registry.projects.push(ProjectEntry {
+            path: tmp.path().to_path_buf(),
+            project_id: "p".into(),
+            display_name: "p".into(),
+            branches: vec![
+                BranchEntry {
+                    branch: "main".into(),
+                    branch_key: "main-aaaa1111".into(),
+                    last_indexed_ts: 1,
+                    head_commit: None,
+                },
+                BranchEntry {
+                    branch: "dev".into(),
+                    branch_key: "dev-bbbb2222".into(),
+                    last_indexed_ts: 2,
+                    head_commit: None,
+                },
+            ],
+            embedder_fingerprint: "fp".into(),
+        });
+        // Sanity: the registry really does resolve to 2 targets pre-dedupe.
+        assert_eq!(
+            resolve_targets(&SearchScope::All, &registry, Path::new("/anywhere")).len(),
+            2
+        );
+
+        let searcher = CountingSearcher {
+            calls: Mutex::new(0),
+            hits: vec![make_result(1, 0.9), make_result(2, 0.5)],
+        };
+
+        let outcome = run_federated_search(
+            &SearchScope::All,
+            &registry,
+            Path::new("/anywhere"),
+            "query",
+            10,
+            &searcher,
+        );
+
+        assert_eq!(
+            *searcher.calls.lock().unwrap(),
+            1,
+            "a multi-branch project must be searched exactly once"
+        );
+        assert_eq!(outcome.hits.len(), 2, "no duplicated hits");
+        let ids: Vec<u64> = outcome.hits.iter().map(|h| h.result.chunk.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(outcome.skipped.is_empty());
+    }
+
+    /// Fix 2 regression guard: `limit` bounds the FUSED list, not just each
+    /// target — N targets × limit hits each must still return `limit` total.
+    #[test]
+    fn run_federated_search_truncates_fused_list_to_limit() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        write_ready_index(tmp_a.path());
+        write_ready_index(tmp_b.path());
+
+        let mut registry = Registry::default();
+        for (id, tmp) in [("a", &tmp_a), ("b", &tmp_b)] {
+            registry.projects.push(ProjectEntry {
+                path: tmp.path().to_path_buf(),
+                project_id: id.into(),
+                display_name: id.into(),
+                branches: vec![],
+                embedder_fingerprint: String::new(),
+            });
+        }
+
+        let mut by_project = std::collections::HashMap::new();
+        by_project.insert(
+            tmp_a.path().to_path_buf(),
+            (0..5)
+                .map(|i| make_result(i, 1.0 - i as f32 * 0.1))
+                .collect(),
+        );
+        by_project.insert(
+            tmp_b.path().to_path_buf(),
+            (10..15)
+                .map(|i| make_result(i, 1.0 - i as f32 * 0.01))
+                .collect(),
+        );
+        let searcher = StubSearcher { by_project };
+
+        let outcome = run_federated_search(
+            &SearchScope::All,
+            &registry,
+            Path::new("/anywhere"),
+            "query",
+            3,
+            &searcher,
+        );
+
+        assert_eq!(
+            outcome.hits.len(),
+            3,
+            "fused list must be truncated to `limit`, not limit × N_targets"
+        );
+        // And it keeps the TOP fused hits: both targets' rank-1 hits survive.
+        let ids: std::collections::HashSet<u64> =
+            outcome.hits.iter().map(|h| h.result.chunk.id).collect();
+        assert!(ids.contains(&0), "target a's rank-1 hit kept");
+        assert!(ids.contains(&10), "target b's rank-1 hit kept");
+    }
+
+    /// Fix 4: the shared string grammar both the CLI flag and the MCP
+    /// string-typed `scope` argument parse with.
+    #[test]
+    fn parse_scope_str_grammar() {
+        assert_eq!(parse_scope_str("repo"), SearchScope::CurrentRepo);
+        assert_eq!(parse_scope_str(""), SearchScope::CurrentRepo);
+        assert_eq!(parse_scope_str("all"), SearchScope::All);
+        assert_eq!(
+            parse_scope_str("frontend"),
+            SearchScope::Named(vec!["frontend".to_string()])
+        );
+        assert_eq!(
+            parse_scope_str("frontend, backend"),
+            SearchScope::Named(vec!["frontend".to_string(), "backend".to_string()])
+        );
+        // Near-misses of the enum keywords are Named (→ diagnosable via
+        // skipped), NOT silently CurrentRepo and NOT silently All.
+        assert_eq!(
+            parse_scope_str("All"),
+            SearchScope::Named(vec!["All".to_string()])
+        );
+        assert_eq!(
+            parse_scope_str("al"),
+            SearchScope::Named(vec!["al".to_string()])
+        );
+        // Degenerate comma-only input has no names → safe default.
+        assert_eq!(parse_scope_str(",,"), SearchScope::CurrentRepo);
+    }
+
+    /// Fix 5: empty resolutions must be diagnosable, not empty successes.
+    #[test]
+    fn run_federated_search_reports_unmatched_named_scope_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_ready_index(tmp.path());
+        let mut registry = Registry::default();
+        registry.projects.push(ProjectEntry {
+            path: tmp.path().to_path_buf(),
+            project_id: "real".into(),
+            display_name: "real-project".into(),
+            branches: vec![],
+            embedder_fingerprint: String::new(),
+        });
+
+        let mut by_project = std::collections::HashMap::new();
+        by_project.insert(tmp.path().to_path_buf(), vec![make_result(1, 0.5)]);
+        let searcher = StubSearcher { by_project };
+
+        let outcome = run_federated_search(
+            &SearchScope::Named(vec!["real-project".to_string(), "typo-projct".to_string()]),
+            &registry,
+            Path::new("/anywhere"),
+            "query",
+            10,
+            &searcher,
+        );
+
+        // The matched project still returns hits...
+        assert_eq!(outcome.hits.len(), 1);
+        // ...and the unmatched name is called out by name in skipped.
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(
+            outcome.skipped[0].reason,
+            "no registered project matched 'typo-projct'"
+        );
+        assert_eq!(
+            outcome.skipped[0].target.project_root,
+            PathBuf::from("typo-projct")
+        );
+        assert!(outcome.note.is_none());
+    }
+
+    #[test]
+    fn run_federated_search_all_scope_empty_registry_sets_note() {
+        let registry = Registry::default();
+        let searcher = StubSearcher {
+            by_project: std::collections::HashMap::new(),
+        };
+        let outcome = run_federated_search(
+            &SearchScope::All,
+            &registry,
+            Path::new("/anywhere"),
+            "query",
+            10,
+            &searcher,
+        );
+        assert!(outcome.hits.is_empty());
+        assert!(outcome.skipped.is_empty());
+        let note = outcome.note.expect("All + empty registry must set note");
+        assert!(note.contains("no projects"), "actionable note: {note}");
+    }
+
+    #[test]
+    fn project_display_name_prefers_registry_entry_then_falls_back_to_dir_name() {
+        let mut registry = Registry::default();
+        registry.projects.push(ProjectEntry {
+            path: PathBuf::from("/home/dev/my-project"),
+            project_id: "p".into(),
+            display_name: "My Project".into(),
+            branches: vec![],
+            embedder_fingerprint: String::new(),
+        });
+
+        assert_eq!(
+            project_display_name(&registry, Path::new("/home/dev/my-project")),
+            "My Project"
+        );
+        // Unregistered path (e.g. CurrentRepo's own target) → dir name fallback.
+        assert_eq!(
+            project_display_name(&registry, Path::new("/home/dev/unregistered")),
+            "unregistered"
+        );
     }
 }

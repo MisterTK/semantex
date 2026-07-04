@@ -2,7 +2,15 @@
 
 **Cut your agent's token usage by 40%, context burden by 67%, and tool calls by 55% — with zero quality loss.**
 
-semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loops AI agents use to explore codebases. It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
+semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loop AI agents fall into when exploring a codebase — the industry-default retrieval pattern, whose cognitive cost compounds quadratically with every extra tool call (see below). It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
+
+As of mid-2026, three things separate semantex from the rest of the semantic code search field:
+
+- **The only active tool doing local ColBERT late-interaction retrieval.** Most semantic code search tools use single-vector embeddings; semantex uses per-token MaxSim scoring (ColBERT/PLAID) — the retrieval method the field has converged on for precision — and runs it entirely on-device.
+- **The most self-contained implementation of that convergent architecture.** Single binary, no vector database, no embedding API, no API keys to provision or rotate. Your code and your queries never leave the machine.
+- **Adoption machinery, not just an engine.** Hooks and generated skill files for 9 agent platforms (Claude Code, Cursor, Codex, Aider, Gemini CLI, Copilot CLI, OpenCode, Windsurf, Trae) route agents to semantex automatically instead of relying on the agent to remember it exists.
+
+See [How semantex compares](#how-semantex-compares) for an honest look at where it's ahead and where it isn't.
 
 ### Quick Start
 
@@ -87,7 +95,26 @@ Instead of the agent iteratively searching and reading, semantex does it interna
 
 The -40% token saving is the billing metric. The **-67% cumulative context burden** is the cognitive metric — how much the model actually had to attend to across all turns. Fewer turns × smaller context = quadratically less waste.
 
-> Full methodology and per-question data available in the benchmark suite.
+> Self-reported benchmark, run by the semantex team. Full methodology and per-question data available in the benchmark suite (`benchmarks/`).
+
+## How semantex compares
+
+No retrieval tool is right for every codebase or team. Here's how semantex compares to the tools agent users are most likely to already have installed, as of mid-2026:
+
+| | semantex | Serena | claude-context (Zilliz) | Grep-only (the default) | Cloud context platforms (e.g. Augment) |
+|---|---|---|---|---|---|
+| **Retrieval type** | ColBERT late-interaction + BM25 hybrid, fully local | LSP symbol lookup — no conceptual/semantic search | Dense vector + BM25 hybrid | Regex / keyword only | Proprietary semantic indexing, server-side |
+| **Infra required** | None — single binary | None — manages per-project language servers | Milvus (self-hosted) or Zilliz Cloud | None | None (fully hosted by vendor) |
+| **API keys** | None | None | Embedding API key (OpenAI, Voyage, Gemini) unless using local Ollama | None | Vendor account |
+| **Privacy** | Code never leaves the machine | Code never leaves the machine | Code chunks sent to the embedding API (unless using local Ollama); vectors stored in Milvus/Zilliz Cloud | Code never leaves the machine | Code indexed on vendor infrastructure |
+| **Price** | Free, open source (Apache-2.0) | Free, open source (MIT) | Free, open source; embedding API usage + optional Zilliz Cloud costs extra | Free (built into the agent) | $20–$200+/seat/month; enterprise custom |
+
+Where semantex is behind, honestly:
+
+- **Symbol precision.** Serena's LSP backend gives exact go-to-definition/rename/refactor semantics across dozens of languages via real language servers. semantex's chunk-level retrieval finds the right region of code but doesn't do LSP-grade symbol operations — the two are complementary rather than competing, and some users run both.
+- **Mindshare and ecosystem breadth.** claude-context/Zilliz is better known and already integrates with more agent clients (Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, Windsurf, Augment, and others). semantex's own platform coverage (9 platforms, above) is comparable but newer and less established.
+- **Below roughly 1,000 files, plain grep is often enough.** semantex's advantage grows with codebase size and query ambiguity; on small, well-organized repos the overhead of maintaining an index may not pay for itself.
+- **Multi-branch and team indexing.** semantex indexes one branch at a time per project today; cloud platforms and some hybrid setups already offer cross-branch and team-shared indexing.
 
 ## How It Works
 
@@ -244,9 +271,9 @@ semantex watch /path/to/project     # Auto-reindex on file changes
 
 ## Supported Languages
 
-27 file types, including 23 with tree-sitter AST-aware chunking:
+29 file types, including 25 with tree-sitter AST-aware chunking:
 
-- **AST-parsed (23):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte
+- **AST-parsed (25):** Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, PHP, C#, Dart, Scala, Kotlin, Swift, Elixir, Lua, Haskell, OCaml, Zig, R, HTML, Svelte, Vue, SQL
 - **Text-chunked (4):** Markdown, JSON, TOML, YAML
 - Fallback text chunking for any other file type
 
