@@ -1,5 +1,6 @@
 pub mod architecture;
 pub mod builder;
+pub mod docs_scaffold;
 pub mod file_classifier;
 pub mod gate;
 pub mod global_graph;

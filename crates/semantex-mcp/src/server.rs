@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use semantex_core::index::registry;
 
-/// Default toolset bundle: exposes the full surface (all 13 tools).
+/// Default toolset bundle: exposes the full surface (all 14 tools).
 pub const DEFAULT_TOOLSET: &str = "all";
 
 /// Valid toolset names: `core`, `structural`, `all`.
@@ -697,7 +697,7 @@ impl McpServer {
     /// - `core`: 4 tools — `semantex_search`, `semantex_deep`, `semantex_agent`, `semantex_symbol`.
     /// - `structural`: 5 tools — `semantex_symbol`, `semantex_callers`, `semantex_callees`,
     ///   `semantex_implementations`, `semantex_architecture`.
-    /// - `all` (default): every tool registered with the server (13 total).
+    /// - `all` (default): every tool registered with the server (14 total).
     ///
     /// Unknown toolset names fall back to `all` so callers (e.g. W7's HTTP
     /// transport) cannot accidentally lock themselves out of the surface.
@@ -724,7 +724,7 @@ impl McpServer {
             .collect()
     }
 
-    /// Build the full tool catalog (all 13 tools). Single source of truth used
+    /// Build the full tool catalog (all 14 tools). Single source of truth used
     /// by both `tools/list` (filtered by toolset) and `tool_call` (dispatch).
     #[allow(clippy::too_many_lines)]
     fn all_tools() -> Vec<Tool> {
@@ -1009,6 +1009,70 @@ impl McpServer {
             // External surface returns to the v0.2 set: 7 tools, with
             // `semantex_agent` as the unconditional entry point.
             // -------------------------------------------------------------
+            // -------------------------------------------------------------
+            // v13 Wave 2 — semantex_docs_context.
+            //
+            // Registered ADDITIVELY at the end of this list (and the
+            // dispatch match in `handle_tool_call` below) per the Wave 0/2
+            // integration plan, to minimize merge conflicts with other
+            // teams editing tool registration this batch.
+            //
+            // Deterministic documentation-scaffold tool: zero LLM wiring
+            // (Wave 0 contract §F maintainer decision). Emits a
+            // structurally-complete JSON scaffold — symbol inventory,
+            // call-graph edges, import edges, existing doc-comment text,
+            // file:line provenance — that the *host* agent (the user's own
+            // LLM) turns into prose under `semantex_docs/` in the user's
+            // repo, guided by the `semantex-docs` Skill. See
+            // `semantex_core::index::docs_scaffold` and
+            // `crate::docs_context` for the implementation.
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_docs_context".into(),
+                title: Some("Documentation Context Scaffold".into()),
+                description: concat!(
+                    "Deterministic documentation scaffold — NOT an LLM call, does not write prose. ",
+                    "Returns structurally-complete data (symbol inventory, call-graph edges, import ",
+                    "edges, existing doc-comment text, file:line provenance) for you, the calling agent, ",
+                    "to turn into maintained markdown docs. Use scope=\"overview\" once per repo for the ",
+                    "architectural primer (god nodes / communities / boundaries) plus a module inventory ",
+                    "and language stats — write this to `semantex_docs/README.md`. Use ",
+                    "scope={\"module\": \"<path>\"} per file/directory you want to document in depth — ",
+                    "write each to `semantex_docs/<module>.md`. Every scaffold item carries file:line ",
+                    "provenance: cite it, and verify claims against the source before writing prose. ",
+                    "On repeat runs, diff the scaffold against the existing doc and update only drifted ",
+                    "sections. See the `semantex-docs` Skill for the full workflow."
+                ).into(),
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "description": "\"overview\" for the repo-wide architecture + module inventory scaffold, or {\"module\": \"<path>\"} for one file's symbol/call/import scaffold. <path> must match the file path as indexed (project-relative).",
+                            "oneOf": [
+                                { "const": "overview" },
+                                {
+                                    "type": "object",
+                                    "properties": { "module": { "type": "string" } },
+                                    "required": ["module"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Project path (defaults to current working directory)"
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Approximate token budget for the returned scaffold (default 6000, clamped to [500, 100000]). Oversized scaffolds are trimmed deterministically — highest-signal items (most-referenced symbols, most-connected modules) survive."
+                        }
+                    },
+                    "required": ["scope"]
+                }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::read_only("Documentation Context Scaffold")),
+            },
         ]
     }
 
@@ -1078,6 +1142,8 @@ impl McpServer {
             "semantex_implementations" => self.tool_implementations(&arguments),
             "semantex_examples" => self.tool_examples(&arguments),
             "semantex_architecture" => self.tool_architecture(&arguments),
+            // v13 Wave 2 — additive, see the Tool registration above.
+            "semantex_docs_context" => self.tool_docs_context(&arguments),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 
@@ -2476,6 +2542,39 @@ impl McpServer {
             structured: Some(structured),
         })
     }
+
+    // -------------------------------------------------------------------------
+    // v13 Wave 2 — semantex_docs_context
+    //
+    // Deterministic documentation scaffold. Param parsing, scaffold
+    // construction and text rendering live in `crate::docs_context` so this
+    // handler stays a thin wrapper matching the shape of every other tool
+    // handler above (resolve path → gate on index readiness → open store →
+    // delegate).
+    // -------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self, args), fields(tool = "docs_context"))]
+    fn tool_docs_context(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let path = resolve_project_path(args)?;
+
+        if !require_index_ready(&path) {
+            self.spawn_background_index(&path);
+            return Ok(ToolOutput::text(
+                "Index not ready. Building in background — retry shortly.".to_string(),
+            ));
+        }
+
+        let index_dir = SemantexConfig::project_index_dir(&path);
+        let db_path = index_dir.join("chunks.db");
+        let store = ChunkStore::open_for_search(&db_path)
+            .context("Failed to open chunk store for semantex_docs_context")?;
+
+        let result = crate::docs_context::run(&store, &db_path, args)?;
+        Ok(ToolOutput {
+            text: result.text,
+            structured: Some(result.structured),
+        })
+    }
 }
 
 // =============================================================================
@@ -3117,12 +3216,16 @@ mod tests {
         // vs v0.2. They're hidden from tools/list (the *visible* surface).
         // Their handler dispatch remains in handle_tool_call for backward
         // compat with clients that learned the names from v0.3.0.
+        //
+        // v13 Wave 2 adds `semantex_docs_context` as a genuinely new visible
+        // tool (not one of the suppressed M1-M6), so the count is now 8.
         let server = make_server("all");
         let tools = server.tools_for_toolset("all");
         assert_eq!(
             tools.len(),
-            7,
-            "toolset 'all' must expose the v0.2 set of 7 visible tools, got {}",
+            8,
+            "toolset 'all' must expose the v0.2 set of 7 visible tools plus \
+             v13's semantex_docs_context, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3134,6 +3237,7 @@ mod tests {
             "semantex_health",
             "semantex_validate",
             "semantex_index",
+            "semantex_docs_context",
         ] {
             assert!(names.contains(required), "missing visible tool {required}");
         }
@@ -3176,8 +3280,8 @@ mod tests {
         let tools = server.tools_for_toolset("structural");
         assert_eq!(
             tools.len(),
-            7,
-            "structural toolset is now an alias for all (M1-M6 hidden)"
+            8,
+            "structural toolset is now an alias for all (M1-M6 hidden, v13 docs_context added)"
         );
     }
 
@@ -3186,8 +3290,9 @@ mod tests {
         let server = make_server("nonsense");
         assert_eq!(server.toolset(), "all");
         let tools = server.tools_for_toolset("nonsense");
-        // Filter falls through to `all` (Phase 3: 7 visible tools).
-        assert_eq!(tools.len(), 7);
+        // Filter falls through to `all` (Phase 3: 7 visible tools + v13's
+        // semantex_docs_context = 8).
+        assert_eq!(tools.len(), 8);
     }
 
     // (Backward-compat dispatch for hidden M1-M6 is already proven by the
@@ -4248,6 +4353,152 @@ mod tests {
             Some("string"),
             "mode must be type string"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v13 Wave 2 — semantex_docs_context: schema + dispatch tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn docs_context_tool_is_registered_read_only_and_additive() {
+        let tools = McpServer::all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "semantex_docs_context")
+            .expect("semantex_docs_context must be registered");
+        assert_eq!(
+            tool.name,
+            tools.last().expect("tool list non-empty").name,
+            "semantex_docs_context must be registered at the END of the tool list \
+             (additive registration to minimize merge conflicts)"
+        );
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true),
+            "semantex_docs_context must be readOnlyHint: true"
+        );
+        assert_eq!(
+            tool.input_schema["required"],
+            serde_json::json!(["scope"]),
+            "scope must be required"
+        );
+        // Visible in the default "all" toolset (no allowlist entry needed —
+        // tools_for_toolset returns everything for any toolset other than
+        // core/structural).
+        let server = make_server("all");
+        let visible = server.tools_for_toolset("all");
+        assert!(
+            visible.iter().any(|t| t.name == "semantex_docs_context"),
+            "semantex_docs_context must be visible in the 'all' toolset"
+        );
+    }
+
+    #[test]
+    fn tool_docs_context_missing_scope_errors() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let result = server.tool_docs_context(&serde_json::json!({
+            "path": project.display().to_string(),
+        }));
+        assert!(result.is_err(), "missing 'scope' should error");
+    }
+
+    #[test]
+    fn tool_docs_context_overview_dispatches_and_returns_structured_scaffold() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_docs_context(&serde_json::json!({
+                "scope": "overview",
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        assert!(s.get("god_nodes").is_some(), "god_nodes missing: {s}");
+        assert!(
+            s.get("module_inventory").is_some(),
+            "module_inventory missing: {s}"
+        );
+        assert!(
+            s.get("language_stats").is_some(),
+            "language_stats missing: {s}"
+        );
+        assert!(
+            out.text.contains("Overview scaffold"),
+            "text rendering must be human-readable: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn tool_docs_context_module_scope_dispatches_and_finds_symbol() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let out = server
+            .tool_docs_context(&serde_json::json!({
+                "scope": { "module": "src/a.rs" },
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s = out.structured.expect("structured");
+        assert_eq!(s["path"].as_str(), Some("src/a.rs"));
+        let symbols = s["symbols"].as_array().expect("symbols array");
+        assert_eq!(symbols.len(), 1, "src/a.rs has exactly one symbol: foo");
+        assert_eq!(symbols[0]["name"].as_str(), Some("foo"));
+        assert_eq!(symbols[0]["provenance"]["file"].as_str(), Some("src/a.rs"));
+        assert!(
+            out.text.contains("Module scaffold: src/a.rs"),
+            "text rendering must name the module: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn tool_docs_context_module_scope_resolves_call_edge() {
+        // Fixture: bar (src/b.rs) calls foo (src/a.rs). Querying src/b.rs's
+        // module scaffold must show a resolved outgoing call edge to foo;
+        // querying src/a.rs must show a resolved incoming call edge from bar.
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+
+        let out_b = server
+            .tool_docs_context(&serde_json::json!({
+                "scope": { "module": "src/b.rs" },
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s_b = out_b.structured.expect("structured");
+        let calls_out = s_b["calls_out"].as_array().expect("calls_out array");
+        assert_eq!(calls_out.len(), 1);
+        assert_eq!(calls_out[0]["callee_name"].as_str(), Some("foo"));
+        assert_eq!(
+            calls_out[0]["resolved"]["file"].as_str(),
+            Some("src/a.rs"),
+            "call edge to foo must resolve to src/a.rs"
+        );
+
+        let out_a = server
+            .tool_docs_context(&serde_json::json!({
+                "scope": { "module": "src/a.rs" },
+                "path": project.display().to_string(),
+            }))
+            .expect("call");
+        let s_a = out_a.structured.expect("structured");
+        let calls_in = s_a["calls_in"].as_array().expect("calls_in array");
+        assert_eq!(calls_in.len(), 1);
+        assert_eq!(calls_in[0]["caller_symbol"].as_str(), Some("bar"));
+        assert_eq!(calls_in[0]["provenance"]["file"].as_str(), Some("src/b.rs"));
+    }
+
+    #[test]
+    fn tool_docs_context_unknown_scope_shape_errors() {
+        let (_dir, project) = build_minimal_index();
+        let server = make_server("all");
+        let result = server.tool_docs_context(&serde_json::json!({
+            "scope": "bogus",
+            "path": project.display().to_string(),
+        }));
+        assert!(result.is_err(), "unknown scope string should error");
     }
 }
 
