@@ -614,7 +614,10 @@ impl IndexBuilder {
             // v13 Wave 2: commit history is independent of chunk content —
             // still worth catching up even on the no-op path (e.g. `git pull`
             // with no tree changes relative to the index, or a bare
-            // `semantex index` re-run to pick up new commits).
+            // `semantex index` re-run to pick up new commits). Ordering
+            // relative to the mirror sync above is deliberately irrelevant:
+            // history.db is repo-global and excluded from branch snapshots
+            // (see layout::mirror_root_as).
             crate::index::history::populate_history_best_effort(&project_path, &changed_rel_paths);
             tracing::info!(
                 files_scanned,
@@ -866,6 +869,9 @@ impl IndexBuilder {
         // opt-in per-chunk blame pass) same-process, still under the
         // `.semantex.lock` this function has held since entry. Best-effort —
         // see `history::populate_history_best_effort`'s doc comment.
+        // Ordering relative to the mirror sync above is deliberately
+        // irrelevant: history.db is repo-global and excluded from branch
+        // snapshots (see layout::mirror_root_as).
         crate::index::history::populate_history_best_effort(&project_path, &changed_rel_paths);
 
         let duration = start.elapsed();

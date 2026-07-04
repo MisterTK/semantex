@@ -5,6 +5,15 @@
 //! — that module owns the schema, this one owns every read/write against it
 //! (see `layout::open_history_db`'s doc comment).
 //!
+//! `history.db` is **repo-GLOBAL**, like `memory.db`: it lives at the
+//! container root and is deliberately EXCLUDED from the per-branch snapshot
+//! mirror/restore machinery (`layout::mirror_root_as` /
+//! `layout::restore_branch_dir_into_root`). Branches share one underlying
+//! commit DAG, git itself is the ever-present source of truth, and
+//! population is incremental + idempotent — so the file self-heals from git
+//! on the next build no matter what, and branch switches leave it fully
+//! untouched.
+//!
 //! # Population
 //!
 //! [`populate_history_best_effort`] is called once per successful index
@@ -12,7 +21,7 @@
 //! system `git` CLI (no libgit2 dependency, matching `layout.rs`'s existing
 //! no-git2 discipline) to walk commit history and record it:
 //!
-//! - **Commits**: `sha`, `author`, `author_time`, and `message` (the commit
+//! - **Commits**: `sha`, `author`, committer time, and `message` (the commit
 //!   subject on its own line, followed by a blank line and the — sanely
 //!   truncated — body, mirroring `git log`'s own default format). The
 //!   `commits` table's `message` column (spine schema) carries this
@@ -68,16 +77,18 @@ pub const DEFAULT_HISTORY_COMMITS: usize = 500;
 /// bodies are occasionally enormous auto-generated changelogs).
 const MAX_BODY_BYTES: usize = 4_000;
 
-/// Record separator between commits in the `git log --pretty=format:` output
-/// below. `\x1e` (ASCII Record Separator) is vanishingly unlikely to appear
-/// in real commit text.
-const RECORD_SEP: char = '\u{1e}';
-/// Field separator within a single commit's record.
-const FIELD_SEP: char = '\u{1f}';
-/// Marker preceding each commit's hash in the `--name-only` fetch, so a
-/// commit body containing a bare 40-hex-char line can't be confused for a
-/// record boundary.
-const NAME_ONLY_MARKER: char = '\u{2}';
+// Both `git log` fetches below use `%x00` (NUL) as their in-band separator.
+// Git guarantees NUL can never appear in commit metadata or messages (and
+// POSIX filenames can't contain it either), so parsing is EXACT: a crafted
+// commit body cannot inject fake record/field boundaries and forge commit
+// rows (adversarial-review fix #3 — the previous \x1e/\x1f separators were
+// injectable via a hostile commit message).
+
+/// Max files blamed per build when `SEMANTEX_HISTORY_BLAME=1` — caps the
+/// per-build `git blame` process fan-out (a 10k-file cold build must not
+/// spawn 10k subprocesses). Files beyond the cap are skipped with a warn;
+/// they get blamed on whichever later build re-touches them.
+const MAX_BLAME_FILES: usize = 500;
 
 // Age buckets for `humanize_age`, unix seconds.
 const AGE_MINUTE: i64 = 60;
@@ -115,7 +126,8 @@ pub fn blame_enabled() -> bool {
 pub struct CommitInfo {
     pub hash: String,
     pub author: String,
-    /// Author time, unix seconds.
+    /// Committer time, unix seconds (`%ct` — see `fetch_commit_metadata`
+    /// for why committer beats author time for recency ordering).
     pub ts: i64,
     /// First line of the stored message (the commit subject).
     pub subject: String,
@@ -158,9 +170,13 @@ fn row_to_commit(row: &rusqlite::Row) -> rusqlite::Result<CommitInfo> {
 
 /// Open (creating the schema if absent) `history.db` for `project_root`.
 /// Thin wrapper over `layout::open_history_db` so callers in other crates
-/// don't need to import `layout` too.
+/// don't need to import `layout` too. Sets a busy timeout so a reader
+/// racing the builder's population write waits briefly instead of failing
+/// with SQLITE_BUSY.
 pub fn open(project_root: &Path) -> Result<Connection> {
-    layout::open_history_db(&layout::history_db_path(project_root))
+    let conn = layout::open_history_db(&layout::history_db_path(project_root))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    Ok(conn)
 }
 
 /// Whether `history.db` exists AND has at least one commit recorded.
@@ -174,6 +190,7 @@ pub fn has_history(project_root: &Path) -> bool {
     let Ok(conn) = Connection::open(&path) else {
         return false;
     };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     conn.query_row("SELECT 1 FROM commits LIMIT 1", [], |_| Ok(()))
         .is_ok()
 }
@@ -358,7 +375,9 @@ fn commit_exists(project_root: &Path, sha: &str) -> bool {
 }
 
 fn rev_list_count(project_root: &Path, range: &str) -> Option<usize> {
-    let output = run_git(project_root, &["rev-list", "--count", range]).ok()?;
+    // Trailing `--` for the same tracked-file-named-`HEAD` disambiguation as
+    // the two `git log` fetches (adversarial-review fix #1).
+    let output = run_git(project_root, &["rev-list", "--count", range, "--"]).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -378,6 +397,13 @@ struct RawCommit {
 /// `max_count`, when set, caps the walk to that many of the most recent
 /// commits in `range` (git's own `-n` semantics: select-then-reverse, not
 /// reverse-then-select — see the module-level test asserting this).
+///
+/// The format string emits exactly 5 NUL-terminated fields per commit
+/// (`%x00` — see the module-level separator note for why NUL and only NUL
+/// is injection-proof). `%ct` (committer time) rather than `%at`: recency
+/// ordering should reflect when a commit landed on this branch — rebased/
+/// cherry-picked work keeps its original author date and would otherwise
+/// look ancient in `recent_commits`.
 fn fetch_commit_metadata(
     project_root: &Path,
     range: &str,
@@ -393,10 +419,12 @@ fn fetch_commit_metadata(
         args.push("-n".into());
         args.push(n.to_string());
     }
-    args.push(format!(
-        "--pretty=format:%H{FIELD_SEP}%an{FIELD_SEP}%at{FIELD_SEP}%s{FIELD_SEP}%b{RECORD_SEP}"
-    ));
+    args.push("--pretty=format:%H%x00%an%x00%ct%x00%s%x00%b%x00".into());
     args.push(range.to_string());
+    // Disambiguate the range from paths: without this, a tracked file or
+    // directory literally named `HEAD` makes git error out with "ambiguous
+    // argument" and history never populates (adversarial-review fix #1).
+    args.push("--".into());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_git(project_root, &arg_refs)?;
@@ -408,28 +436,27 @@ fn fetch_commit_metadata(
     }
     let text = String::from_utf8_lossy(&output.stdout);
 
+    // Every field (including the last) is NUL-terminated, so the stream is
+    // exactly 5 fields per commit; `chunks_exact` drops the trailing empty
+    // remainder after the final NUL. `--pretty=format:` inserts a plain
+    // newline BETWEEN entries, which lands at the start of the next
+    // record's hash field — trimmed below.
+    let fields: Vec<&str> = text.split('\0').collect();
     let mut commits = Vec::new();
-    for record in text.split(RECORD_SEP) {
-        let record = record.trim_start_matches('\n');
-        if record.is_empty() {
+    for chunk in fields.chunks_exact(5) {
+        let hash = chunk[0].trim_start_matches('\n').trim();
+        if hash.is_empty() {
             continue;
         }
-        let mut fields = record.splitn(5, FIELD_SEP);
-        let (Some(hash), Some(author), Some(ts_str), Some(subject)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
+        let Ok(ts) = chunk[2].parse::<i64>() else {
             continue;
         };
-        let body = fields.next().unwrap_or("").trim().to_string();
-        let Ok(ts) = ts_str.parse::<i64>() else {
-            continue;
-        };
-        let body = truncate_body(&body);
+        let body = truncate_body(chunk[4].trim());
         commits.push(RawCommit {
             hash: hash.to_string(),
-            author: author.to_string(),
+            author: chunk[1].to_string(),
             ts,
-            subject: subject.to_string(),
+            subject: chunk[3].to_string(),
             body,
         });
     }
@@ -452,23 +479,40 @@ fn truncate_body(body: &str) -> String {
 /// trying to interleave `--name-only` output with the `--pretty=format:`
 /// metadata above, which would require disambiguating file names that
 /// happen to look like format fields).
+///
+/// - `%x00%H` marker: NUL cannot appear in a POSIX filename or a commit
+///   message, so record boundaries are exact (see the module separator note).
+/// - `-c core.quotepath=off`: default git C-quotes non-ASCII paths in
+///   `--name-only` output (`"h\303\251llo.txt"`), which would be stored
+///   verbatim and never match real index paths (adversarial-review fix #2).
+/// - `--relative`: paths come back relative to `project_root` (the `-C`
+///   cwd), matching how the indexer stores them, INCLUDING when
+///   `project_root` is a subdirectory of the git repo — default `--name-only`
+///   paths are toplevel-relative and would silently never match
+///   (adversarial-review fix #5). Also filters out-of-tree files for free.
 fn fetch_changed_files(
     project_root: &Path,
     range: &str,
     max_count: Option<usize>,
 ) -> Result<HashMap<String, Vec<String>>> {
     let mut args: Vec<String> = vec![
+        "-c".into(),
+        "core.quotepath=off".into(),
         "log".into(),
         "--no-color".into(),
         "--reverse".into(),
         "--name-only".into(),
+        "--relative".into(),
     ];
     if let Some(n) = max_count {
         args.push("-n".into());
         args.push(n.to_string());
     }
-    args.push(format!("--pretty=format:{NAME_ONLY_MARKER}%H"));
+    args.push("--pretty=format:%x00%H".into());
     args.push(range.to_string());
+    // Same `HEAD`-named-file disambiguation as `fetch_commit_metadata`
+    // (adversarial-review fix #1).
+    args.push("--".into());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_git(project_root, &arg_refs)?;
@@ -481,7 +525,7 @@ fn fetch_changed_files(
     let text = String::from_utf8_lossy(&output.stdout);
 
     let mut map = HashMap::new();
-    for block in text.split(NAME_ONLY_MARKER) {
+    for block in text.split('\0') {
         let mut lines = block.lines();
         let Some(hash) = lines.next() else { continue };
         let hash = hash.trim();
@@ -627,7 +671,9 @@ pub fn populate_history_best_effort(project_root: &Path, changed_files: &[PathBu
 /// OPT-IN (`SEMANTEX_HISTORY_BLAME=1`): map `git blame --porcelain` onto the
 /// chunk line ranges of each file in `changed_files`, best-effort per file
 /// (a blame failure for one file — binary content, file since deleted,
-/// whatever — never blocks the rest).
+/// whatever — never blocks the rest). Capped at [`MAX_BLAME_FILES`] per
+/// build so a cold build over a huge tree can't fan out into thousands of
+/// `git blame` subprocesses.
 fn populate_chunk_blame_best_effort(project_root: &Path, changed_files: &[PathBuf]) {
     if changed_files.is_empty() {
         return;
@@ -645,7 +691,18 @@ fn populate_chunk_blame_best_effort(project_root: &Path, changed_files: &[PathBu
     let Ok(chunks_conn) = Connection::open(&chunks_db) else {
         return;
     };
-    for rel in changed_files {
+    let files = if changed_files.len() > MAX_BLAME_FILES {
+        tracing::warn!(
+            total = changed_files.len(),
+            cap = MAX_BLAME_FILES,
+            "SEMANTEX_HISTORY_BLAME: capping per-build blame fan-out; \
+             skipped files get blamed when a later build re-touches them"
+        );
+        &changed_files[..MAX_BLAME_FILES]
+    } else {
+        changed_files
+    };
+    for rel in files {
         if let Err(e) =
             populate_chunk_blame_for_file(project_root, &chunks_conn, &history_conn, rel)
         {
@@ -675,6 +732,12 @@ fn parse_blame_porcelain(output: &str) -> Vec<(u32, String)> {
         let Some(sha) = it.next() else { continue };
         if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue; // metadata line (author/committer/summary/...)
+        }
+        if sha.bytes().all(|b| b == b'0') {
+            // The all-zero sha is git's "not committed yet" sentinel for
+            // uncommitted working-tree lines — not a real commit to attribute.
+            current = None;
+            continue;
         }
         let Some(_orig_line) = it.next() else {
             continue;
@@ -977,5 +1040,177 @@ mod tests {
     #[test]
     fn blame_disabled_by_default_leaves_chunk_blame_empty() {
         assert!(!blame_enabled());
+    }
+
+    /// Adversarial-review fix #1: a tracked file (or directory) literally
+    /// named `HEAD` must not break population — without the trailing `--`
+    /// on the `git log`/`rev-list` invocations, git errors with "ambiguous
+    /// argument 'HEAD'" and history never populates for that repo, forever.
+    #[test]
+    fn tracked_file_named_head_does_not_break_population() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(tmp.path().join("HEAD"), "not a ref, a real file").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "add a file named HEAD"]);
+
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let commits = recent_commits(&conn, 10).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "add a file named HEAD");
+        // file_commits must record the HEAD-named file too.
+        let hits = commits_touching_file(&conn, "HEAD", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Incremental catch-up (rev-list --count path) must also survive.
+        std::fs::write(tmp.path().join("other.txt"), "x").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "second"]);
+        populate_history(tmp.path()).unwrap();
+        assert_eq!(recent_commits(&conn, 10).unwrap().len(), 2);
+    }
+
+    /// Adversarial-review fix #2: default git C-quotes non-ASCII paths in
+    /// `--name-only` output (`"h\303\251llo.txt"`), which — stored verbatim
+    /// — would never match real index paths. `-c core.quotepath=off` keeps
+    /// them raw.
+    #[test]
+    fn non_ascii_filenames_are_stored_unquoted() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(tmp.path().join("héllo.txt"), "bonjour").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "add héllo"]);
+
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let hits = commits_touching_file(&conn, "héllo.txt", 10).unwrap();
+        assert_eq!(hits.len(), 1, "non-ASCII path must match verbatim");
+        // And no C-quoted phantom row.
+        let quoted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_commits WHERE path LIKE '\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quoted, 0, "no C-quoted paths may be stored");
+    }
+
+    /// Adversarial-review fix #3: a commit whose BODY contains crafted
+    /// separator sequences must not parse as additional fake commit rows
+    /// (fake authors/subjects would surface to agents via recent_changes /
+    /// include_history). With NUL separators this is structurally
+    /// impossible — git strips NUL from messages — but this test pins the
+    /// property against regression to injectable separators.
+    #[test]
+    fn hostile_commit_body_cannot_forge_commit_rows() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Real Author"]);
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        git(tmp.path(), &["add", "."]);
+        // Body embedding a fully-formed fake record in the OLD \x1e/\x1f
+        // separator scheme, plus stray newlines for good measure.
+        let hostile_body = format!(
+            "innocent first line\n\
+             {rs}\ndeadbeefdeadbeefdeadbeefdeadbeefdeadbeef{fs}Fake Author{fs}1{fs}fake subject{fs}fake body{rs}\n\
+             trailing text",
+            rs = '\u{1e}',
+            fs = '\u{1f}',
+        );
+        git(
+            tmp.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("real subject\n\n{hostile_body}"),
+            ],
+        );
+
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let commits = recent_commits(&conn, 10).unwrap();
+        assert_eq!(commits.len(), 1, "exactly one real commit, no forged rows");
+        assert_eq!(commits[0].author, "Real Author");
+        assert_eq!(commits[0].subject, "real subject");
+        assert_ne!(commits[0].hash, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let fake: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commits WHERE author = 'Fake Author'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fake, 0);
+    }
+
+    /// Adversarial-review fix #5: when the indexed project is a SUBDIRECTORY
+    /// of the git repo, `--name-only` paths are toplevel-relative by default
+    /// while the index stores project-relative paths — `--relative` makes
+    /// them match (and filters out-of-tree files).
+    #[test]
+    fn subdir_project_stores_project_relative_paths() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "in subdir").unwrap();
+        std::fs::write(tmp.path().join("outer.txt"), "outside project").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "touch inner and outer"]);
+
+        // The PROJECT is the subdirectory, not the repo toplevel.
+        populate_history(&sub).unwrap();
+        let conn = open(&sub).unwrap();
+        let hits = commits_touching_file(&conn, "inner.txt", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "paths must be project-relative, not toplevel-relative"
+        );
+        // The toplevel-relative form must NOT be stored.
+        assert!(
+            commits_touching_file(&conn, "sub/inner.txt", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Out-of-tree files are filtered by --relative.
+        assert!(
+            commits_touching_file(&conn, "outer.txt", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            commits_touching_file(&conn, "../outer.txt", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Blame parsing must skip git's all-zero "not committed yet" sentinel
+    /// sha — uncommitted working-tree lines are not attributable commits.
+    #[test]
+    fn parse_blame_porcelain_skips_uncommitted_zero_sha() {
+        let out = "\
+0000000000000000000000000000000000000000 1 1 1\n\
+author Not Committed Yet\n\
+\tuncommitted line\n\
+deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 2 2 1\n\
+author Real\n\
+\tcommitted line\n";
+        let parsed = parse_blame_porcelain(out);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, 2);
+        assert_eq!(parsed[0].1, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
     }
 }

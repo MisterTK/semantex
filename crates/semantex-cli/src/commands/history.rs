@@ -70,11 +70,17 @@ pub fn run(file: &str, path: &Path, limit: usize) -> Result<()> {
 /// Best-effort normalization: if `file` is absolute (or relative to CWD but
 /// outside the project root), rewrite it relative to `project_path` when
 /// possible; otherwise pass it through unchanged (an already repo-relative
-/// path — the common case — needs no rewriting).
+/// path — the common case — needs no rewriting, beyond stripping any `./`
+/// prefixes: the index stores plain relative paths, so `./src/lib.rs` from
+/// shell tab-completion would otherwise never match).
 fn normalize_query_path(project_path: &Path, file: &str) -> String {
     let candidate = PathBuf::from(file);
     if candidate.is_relative() {
-        return file.replace('\\', "/");
+        let mut normalized = file.replace('\\', "/");
+        while let Some(rest) = normalized.strip_prefix("./") {
+            normalized = rest.to_string();
+        }
+        return normalized;
     }
     candidate
         .canonicalize()
@@ -101,6 +107,19 @@ mod tests {
         assert_eq!(
             normalize_query_path(project, "src/lib.rs"),
             "src/lib.rs".to_string()
+        );
+    }
+
+    #[test]
+    fn normalize_query_path_strips_dot_slash_prefix() {
+        let project = Path::new("/does/not/matter");
+        assert_eq!(
+            normalize_query_path(project, "./src/lib.rs"),
+            "src/lib.rs".to_string()
+        );
+        assert_eq!(
+            normalize_query_path(project, "././a.rs"),
+            "a.rs".to_string()
         );
     }
 

@@ -240,7 +240,11 @@ fn open_history_readonly(db_path: &Path) -> Option<rusqlite::Connection> {
     if !history_path.exists() {
         return None;
     }
-    rusqlite::Connection::open(&history_path).ok()
+    let conn = rusqlite::Connection::open(&history_path).ok()?;
+    // Wait briefly instead of failing with SQLITE_BUSY if a concurrent
+    // build is populating history.db right now.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    Some(conn)
 }
 
 /// Hydrate a batch of chunk ids into a `chunk_id -> Chunk` map in one query.

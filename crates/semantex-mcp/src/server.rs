@@ -3081,6 +3081,9 @@ fn history_addendum_for_hits(
         return None;
     }
     let conn = rusqlite::Connection::open(&db_path).ok()?;
+    // Wait briefly instead of failing with SQLITE_BUSY if a concurrent
+    // build is populating history.db right now.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     let mut seen = std::collections::HashSet::new();
     let mut lines = Vec::new();
