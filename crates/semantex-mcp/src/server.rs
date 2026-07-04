@@ -311,14 +311,19 @@ impl McpServer {
 
     /// Parse the optional `scope` tool argument into a
     /// [`SearchScope`](semantex_core::search::federation::SearchScope).
-    /// Anything unrecognized (absent, `"repo"`, wrong JSON type) is the safe
-    /// default `CurrentRepo` — the single-repo path every pre-federation
-    /// caller already takes, so an unknown/malformed `scope` degrades to
-    /// today's behavior rather than erroring.
+    ///
+    /// String values go through the SAME grammar as the CLI's `--scope`
+    /// flag ([`federation::parse_scope_str`]): `"repo"`/empty → CurrentRepo,
+    /// `"all"` → All, and any OTHER string is treated as comma-separated
+    /// project names (`Named`) — never silently mapped to CurrentRepo, so a
+    /// client sending `scope: "frontend"` (or a typo like `"All"`) gets the
+    /// Named path, where unmatched names are surfaced in `skipped` instead
+    /// of quietly returning wrong-scope results. Absent scope or a
+    /// non-string/non-array JSON type is the safe default CurrentRepo.
     fn parse_scope(args: &serde_json::Value) -> semantex_core::search::federation::SearchScope {
-        use semantex_core::search::federation::SearchScope;
+        use semantex_core::search::federation::{SearchScope, parse_scope_str};
         match args.get("scope") {
-            Some(serde_json::Value::String(s)) if s == "all" => SearchScope::All,
+            Some(serde_json::Value::String(s)) => parse_scope_str(s),
             Some(serde_json::Value::Array(arr)) => {
                 let names: Vec<String> = arr
                     .iter()
@@ -838,9 +843,9 @@ impl McpServer {
                             "description": "Output verbosity. 'concise' returns ~1/3 the context (paths + minimal snippets); 'detailed' returns fuller results. Omit for the server default. Ignored if an explicit 'budget' is set."
                         },
                         "scope": {
-                            "description": "Which repo(s) to search. 'repo' (default) = only the current project at 'path' — identical to omitting this field. 'all' = every project registered in the local semantex registry (~/.semantex/projects.json), fanned out and RRF-fused with per-hit provenance. An array of project display names/paths restricts the fan-out to just those projects (e.g. [\"frontend\", \"backend\"]). Cross-repo scopes always run a hybrid search (no route classification); results carry a 'project' field and formatted paths are prefixed '[project] '.",
+                            "description": "Which repo(s) to search. 'repo' (default) = only the current project at 'path' — identical to omitting this field. 'all' = every project registered in the local semantex registry (~/.semantex/projects.json), fanned out and RRF-fused with per-hit provenance. Any OTHER string is treated as comma-separated project display names/paths, and an array of names does the same (e.g. [\"frontend\", \"backend\"]) — names matching no registered project are reported in the response's skipped list rather than silently ignored. Cross-repo scopes always run a hybrid search: 'mode'/'depth'/'focus' route classification is skipped and those fields are ignored. Results carry a 'project' field and formatted paths are prefixed '[project] '.",
                             "oneOf": [
-                                {"type": "string", "enum": ["repo", "all"]},
+                                {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}}
                             ]
                         }
@@ -897,9 +902,9 @@ impl McpServer {
                         "rerank": { "type": "boolean", "description": "Enable cross-encoder reranking (slower but may improve ranking)", "default": false },
                         "grep_mode": { "type": "boolean", "description": "Fast grep-like search using only sparse+exact matching (no embedding model needed)", "default": false },
                         "scope": {
-                            "description": "Which repo(s) to search. 'repo' (default) = only 'path' — identical to omitting this field. 'all' = every project in the local semantex registry, RRF-fused with provenance. An array of project display names/paths restricts the fan-out to just those projects.",
+                            "description": "Which repo(s) to search. 'repo' (default) = only 'path' — identical to omitting this field. 'all' = every project in the local semantex registry, RRF-fused with provenance. Any OTHER string is treated as comma-separated project display names/paths, and an array of names does the same — names matching no registered project are reported in the response's 'skipped' list rather than silently ignored.",
                             "oneOf": [
-                                {"type": "string", "enum": ["repo", "all"]},
+                                {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}}
                             ]
                         }
@@ -933,6 +938,23 @@ impl McpServer {
                                 "result_count": { "type": "integer" },
                                 "query_type": { "type": "string" }
                             }
+                        },
+                        "skipped": {
+                            "type": "array",
+                            "description": "Cross-repo ('scope' != 'repo') calls only: targets left out of the federated query — projects whose index wasn't ready, and scope names that matched no registered project.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "project": { "type": "string" },
+                                    "path": { "type": "string" },
+                                    "reason": { "type": "string" }
+                                },
+                                "required": ["project", "path", "reason"]
+                            }
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "Cross-repo calls only: set when scope resolution itself produced nothing to query (e.g. 'all' with an empty registry)."
                         }
                     },
                     "required": ["results"]
@@ -1462,6 +1484,9 @@ impl McpServer {
         let mut sections: Vec<String> = Vec::with_capacity(queries.len());
         let mut all_hits: Vec<serde_json::Value> = Vec::new();
         let mut skipped_projects: Vec<String> = Vec::new();
+        // Scope-level diagnosis (e.g. `all` with an empty registry) — the
+        // same for every query in the batch, so keep the first one seen.
+        let mut federation_note: Option<String> = None;
 
         for q in queries {
             let outcome =
@@ -1493,7 +1518,14 @@ impl McpServer {
             }
 
             for s in &outcome.skipped {
-                skipped_projects.push(project_display_name(&registry_v2, &s.target.project_root));
+                skipped_projects.push(format!(
+                    "{} ({})",
+                    project_display_name(&registry_v2, &s.target.project_root),
+                    s.reason
+                ));
+            }
+            if federation_note.is_none() {
+                federation_note.clone_from(&outcome.note);
             }
 
             let resp = SearchResponse {
@@ -1519,12 +1551,16 @@ impl McpServer {
             sections.remove(0)
         };
 
+        if let Some(note) = &federation_note {
+            let _ = write!(combined, "\n\n[federation: {note}]");
+        }
+
         if !skipped_projects.is_empty() {
             skipped_projects.sort();
             skipped_projects.dedup();
             let _ = write!(
                 combined,
-                "\n\n[federation: skipped {} project(s) with no ready index: {}]",
+                "\n\n[federation: skipped {} target(s): {}]",
                 skipped_projects.len(),
                 skipped_projects.join(", ")
             );
@@ -1648,7 +1684,11 @@ impl McpServer {
             .iter()
             .map(|h| {
                 let snippet = make_snippet_mcp(&h.result.chunk.content, &h.result.chunk.chunk_type);
-                let score = (h.result.score * 100.0_f32).round() / 100.0_f32;
+                // Federated scores are RRF values (~1/(60+rank), so ranks
+                // differ only in the 4th-5th decimal) — round to 5 decimals,
+                // NOT the single-repo path's 2, which would collapse most of
+                // the ranking into identical values.
+                let score = (h.result.score * 100_000.0_f32).round() / 100_000.0_f32;
                 let project = project_display_name(&registry_v2, &h.target.project_root);
                 let mut val = serde_json::json!({
                     "file": h.result.chunk.file_path.display().to_string(),
@@ -1679,17 +1719,24 @@ impl McpServer {
             })
             .collect();
 
-        let structured = serde_json::json!({
+        let mut structured = serde_json::json!({
             "results": json_results,
             "skipped": skipped_json,
         });
+        if let Some(note) = &outcome.note {
+            structured["note"] = serde_json::Value::String(note.clone());
+        }
 
         let json_text = serde_json::to_string(&json_results)?;
-        let footer = format!(
+        let mut footer = format!(
             "[semantex_federation: hits={} skipped={}]",
             json_results.len(),
             skipped_json.len()
         );
+        if let Some(note) = &outcome.note {
+            use std::fmt::Write as _;
+            let _ = write!(footer, "\n[federation: {note}]");
+        }
         let text = format!("{json_text}\n\n{footer}");
 
         Ok(ToolOutput {
@@ -4418,22 +4465,29 @@ mod tests {
             .as_array()
             .expect("scope is oneOf[string,array]");
         assert_eq!(one_of.len(), 2);
+        // The string branch must NOT be an enum: any non-'repo'/'all' string
+        // is valid input (treated as comma-separated project names — the
+        // same grammar as the CLI's --scope), so an enum would reject it.
         let string_variant = one_of
             .iter()
             .find(|v| v["type"] == "string")
             .expect("one oneOf branch is a string");
-        let enum_vals: Vec<&str> = string_variant["enum"]
-            .as_array()
-            .expect("string branch enumerates values")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert_eq!(enum_vals, vec!["repo", "all"]);
+        assert!(
+            string_variant.get("enum").is_none(),
+            "scope string branch must accept arbitrary project names, not just repo/all"
+        );
         let array_variant = one_of
             .iter()
             .find(|v| v["type"] == "array")
             .expect("one oneOf branch is an array of names");
         assert_eq!(array_variant["items"]["type"], "string");
+        // The description must document the names-grammar and skipped
+        // reporting so clients aren't surprised by the non-enum string.
+        let desc = scope["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("skipped"),
+            "scope description documents skipped reporting: {desc}"
+        );
     }
 
     #[test]
@@ -4476,6 +4530,13 @@ mod tests {
             output["properties"]["results"]["items"]["properties"]["project"]["type"],
             "string"
         );
+        // Federated calls also emit `skipped` and `note` — both declared.
+        let skipped = &output["properties"]["skipped"];
+        assert_eq!(skipped["type"], "array");
+        for field in ["project", "path", "reason"] {
+            assert_eq!(skipped["items"]["properties"][field]["type"], "string");
+        }
+        assert_eq!(output["properties"]["note"]["type"], "string");
     }
 
     #[test]
@@ -4489,15 +4550,32 @@ mod tests {
             McpServer::parse_scope(&serde_json::json!({"scope": "repo"})),
             SearchScope::CurrentRepo
         );
-        // Malformed/unknown values degrade to the safe single-repo default
-        // rather than erroring.
+        // A malformed (wrong-JSON-type) value degrades to the safe
+        // single-repo default rather than erroring.
         assert_eq!(
             McpServer::parse_scope(&serde_json::json!({"scope": 42})),
             SearchScope::CurrentRepo
         );
+    }
+
+    /// Scope-grammar parity with the CLI: a non-'repo'/'all' string is
+    /// Named (comma-split), NOT silently CurrentRepo — `scope: "frontend"`
+    /// must never quietly return current-repo results, and a typo like
+    /// "All" resolves to zero targets and is surfaced via `skipped`.
+    #[test]
+    fn parse_scope_treats_unknown_strings_as_named() {
+        use semantex_core::search::federation::SearchScope;
         assert_eq!(
-            McpServer::parse_scope(&serde_json::json!({"scope": "not-a-real-scope"})),
-            SearchScope::CurrentRepo
+            McpServer::parse_scope(&serde_json::json!({"scope": "frontend"})),
+            SearchScope::Named(vec!["frontend".to_string()])
+        );
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "frontend,backend"})),
+            SearchScope::Named(vec!["frontend".to_string(), "backend".to_string()])
+        );
+        assert_eq!(
+            McpServer::parse_scope(&serde_json::json!({"scope": "All"})),
+            SearchScope::Named(vec!["All".to_string()])
         );
     }
 

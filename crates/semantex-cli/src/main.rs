@@ -213,9 +213,14 @@ struct Cli {
 
     /// Which repo(s) to search: `repo` (default, just this project), `all`
     /// (every project registered in ~/.semantex/projects.json), or a
-    /// comma-separated list of project display names/paths. Non-`repo`
-    /// scopes always run a hybrid dense+sparse search fanned out across
-    /// targets and RRF-fused, with results prefixed `[project]`.
+    /// comma-separated list of project display names/paths — any string
+    /// other than `repo`/`all` is treated as names; names matching no
+    /// registered project are reported as skipped. Non-`repo` scopes always
+    /// run a hybrid dense+sparse search fanned out across targets and
+    /// RRF-fused, with results prefixed `[project]`; they honor only
+    /// --max-count/--rerank/--grep-mode/--json — other single-repo flags
+    /// (--refs, --peek, --deep, --around, --dense-only, --sparse-only, ...)
+    /// are ignored.
     #[arg(long, default_value = "repo")]
     scope: String,
 }
@@ -367,10 +372,12 @@ enum Commands {
         /// Which repo(s) to search: `repo` (default, just `path`, via the
         /// daemon exactly as before), `all` (every project registered in
         /// ~/.semantex/projects.json), or a comma-separated list of project
-        /// display names/paths. Non-`repo` scopes run entirely in-process
+        /// display names/paths — any string other than `repo`/`all` is
+        /// treated as names; names matching no registered project are
+        /// reported as skipped. Non-`repo` scopes run entirely in-process
         /// (no daemon): a hybrid dense+sparse search fanned out across
-        /// targets and RRF-fused — `--route` is ignored, since route
-        /// classification (structural walks, deep synthesis, ...) is a
+        /// targets and RRF-fused — `--route` and `--full` are ignored, since
+        /// route classification (structural walks, deep synthesis, ...) is a
         /// single-repo concept. Results are prefixed `[project]`.
         #[arg(long, default_value = "repo")]
         scope: String,
@@ -732,12 +739,17 @@ fn main() -> Result<()> {
 
     // Fast daemon path: skip config loading + ORT detection when daemon port file exists.
     // Saves ~5-7ms by avoiding YAML config I/O + ORT dylib stat() calls.
-    // Skipped entirely for `--scope` != `repo`: the daemon only ever knows
-    // about the ONE project it was started for, so a cross-repo query falls
-    // through to the slower (config-loading) path below, where the
-    // federated branch lives.
+    // Skipped entirely for non-CurrentRepo scopes: the daemon only ever
+    // knows about the ONE project it was started for, so a cross-repo query
+    // falls through to the slower (config-loading) path below, where the
+    // federated branch lives. Gated on the PARSED scope (not a string
+    // compare) so values that parse to CurrentRepo — e.g. `--scope ""` —
+    // stay on the fast single-repo path.
     #[allow(clippy::collapsible_if)]
-    if cli.command.is_none() && cli.scope == "repo" {
+    if cli.command.is_none()
+        && commands::federated::parse_scope(&cli.scope)
+            == semantex_core::search::federation::SearchScope::CurrentRepo
+    {
         // Fast path for --around: graph walk via daemon
         if let Some(ref symbol) = cli.around {
             let path = cli.path.as_deref().unwrap_or(Path::new("."));
@@ -1036,10 +1048,17 @@ fn main() -> Result<()> {
                 Cli::command().print_help()?;
                 println!();
                 Ok(())
-            } else if cli.scope != "repo" {
+            } else if commands::federated::parse_scope(&cli.scope)
+                != semantex_core::search::federation::SearchScope::CurrentRepo
+            {
                 // Cross-repo fan-out — see `commands::federated::run_search`'s
-                // doc comment. `--scope repo` (the default) never reaches this
-                // branch, so single-repo output is unaffected.
+                // doc comment. Gated on the PARSED scope so any value that
+                // parses to CurrentRepo (`repo`, empty) takes the unchanged
+                // single-repo branch below. NOTE: federated mode honors only
+                // query/--max-count/--rerank/--grep-mode/--json; single-repo
+                // flags like --refs/--peek/--deep/--around/--dense-only/
+                // --sparse-only are ignored on this path (see --scope's help
+                // text).
                 telemetry::track("search_federated");
                 let parsed_scope = commands::federated::parse_scope(&cli.scope);
                 let path = cli.path.unwrap_or_else(|| PathBuf::from("."));

@@ -35,28 +35,13 @@ use semantex_core::types::ChunkType;
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// Parse a `--scope` CLI value into a [`SearchScope`]. `"repo"` (the
-/// default) and any unrecognized value map to `CurrentRepo`; `"all"` maps to
-/// `All`; anything else is split on commas into project display
-/// names/paths (`Named`).
+/// Parse a `--scope` CLI value into a [`SearchScope`]. Thin wrapper over the
+/// shared grammar in [`federation::parse_scope_str`] — the MCP tools parse
+/// their string-typed `scope` argument through the SAME function, so
+/// `--scope frontend` and `scope: "frontend"` can never mean different
+/// things at different entry points.
 pub fn parse_scope(raw: &str) -> SearchScope {
-    match raw {
-        "repo" | "" => SearchScope::CurrentRepo,
-        "all" => SearchScope::All,
-        other => {
-            let names: Vec<String> = other
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            if names.is_empty() {
-                SearchScope::CurrentRepo
-            } else {
-                SearchScope::Named(names)
-            }
-        }
-    }
+    federation::parse_scope_str(raw)
 }
 
 /// Convert a federated hit into a plain [`SearchResultItem`] with `file` left
@@ -144,6 +129,15 @@ pub fn run_search(
     if outcome.hits.is_empty() {
         if json {
             println!("[]");
+            if let Some(note) = &outcome.note {
+                eprintln!("[federation: {note}]");
+            }
+        } else if let Some(note) = &outcome.note {
+            // e.g. `--scope all` with an empty registry — say WHY it's
+            // empty instead of a bare "No results found."
+            eprintln!("No results: {note}");
+        } else if !outcome.skipped.is_empty() {
+            eprintln!("No results found (all resolved targets were skipped — see below).");
         } else {
             eprintln!("No results found.");
         }
@@ -267,17 +261,27 @@ pub fn run_agent(
     let effective_budget = if budget == 0 { DEFAULT_BUDGET } else { budget };
     let mut formatted = format_search_results(&resp, FormatStyle::Default, effective_budget);
 
+    if let Some(note) = &outcome.note {
+        let _ = write!(formatted, "\n\n[federation: {note}]");
+    }
+
     if !outcome.skipped.is_empty() {
         let mut names: Vec<String> = outcome
             .skipped
             .iter()
-            .map(|s| project_display_name(&registry_v2, &s.target.project_root))
+            .map(|s| {
+                format!(
+                    "{} ({})",
+                    project_display_name(&registry_v2, &s.target.project_root),
+                    s.reason
+                )
+            })
             .collect();
         names.sort();
         names.dedup();
         let _ = write!(
             formatted,
-            "\n\n[federation: skipped {} project(s) with no ready index: {}]",
+            "\n\n[federation: skipped {} target(s): {}]",
             names.len(),
             names.join(", ")
         );
