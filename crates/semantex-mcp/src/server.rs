@@ -1219,6 +1219,101 @@ impl McpServer {
                 output_schema: None,
                 annotations: Some(ToolAnnotations::read_only("Documentation Context Scaffold")),
             },
+            // -------------------------------------------------------------
+            // v13 Wave 2 — semantex_memory_save / semantex_memory_recall.
+            //
+            // Registered ADDITIVELY at the end of this list (and the
+            // dispatch match in `handle_tool_call` below), same convention
+            // as `semantex_docs_context` above, to minimize merge conflicts
+            // with other teams editing tool registration this batch.
+            //
+            // Project memory: durable, project-scoped notes an agent saves
+            // across sessions in `<project>/.semantex/memory.db` (schema +
+            // CRUD in `semantex_core::index::memory`; param parsing +
+            // rendering in `crate::memory_tools`). Independent of the code
+            // index — no readiness gate, no `ChunkStore` open.
+            // -------------------------------------------------------------
+            Tool {
+                name: "semantex_memory_save".into(),
+                title: Some("Save Project Memory Note".into()),
+                description: concat!(
+                    "Save a short note to durable project memory — persists across sessions in ",
+                    "`.semantex/memory.db`, independent of the code index. USE for things you had to ",
+                    "figure out that aren't recoverable by searching the code: a design decision and its ",
+                    "rationale, a gotcha/footgun you hit, a convention the team follows that isn't ",
+                    "obviously stated anywhere, or a TODO/follow-up tied to a specific scope. Do NOT use ",
+                    "for anything derivable by reading or searching the code (e.g. \"function foo calls ",
+                    "bar\") — use semantex_search / semantex_agent for that instead, and don't save notes ",
+                    "reflexively on every turn. `scope` groups related notes for later recall; suggested ",
+                    "conventions: \"global\" (project-wide), \"file:<rel_path>\", \"module:<dir>\", ",
+                    "\"task:<slug>\" — but any freeform string works. Notes are capped per project ",
+                    "(oldest evicted first) so this is for durable, high-signal notes, not a scratch log."
+                ).into(),
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The note text. Keep it short and self-contained (a sentence or two) — this is a durable memory entry, not a log line."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Freeform scope key to group this note under (default \"global\"). Suggested conventions: \"global\", \"file:<rel_path>\", \"module:<dir>\", \"task:<slug>\"."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional freeform tags for this note (e.g. [\"gotcha\", \"perf\"])."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Project path (defaults to current working directory)"
+                        }
+                    },
+                    "required": ["content"]
+                }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::local_mutation("Save Project Memory Note")),
+            },
+            Tool {
+                name: "semantex_memory_recall".into(),
+                title: Some("Recall Project Memory Notes".into()),
+                description: concat!(
+                    "Recall notes previously saved with semantex_memory_save, ranked best-match-first. ",
+                    "USE at the start of a task (or before making a decision that might already have prior ",
+                    "context) to check whether a relevant decision, gotcha, or convention was already ",
+                    "recorded for this project — cheaper than rediscovering it. Do NOT use as a substitute ",
+                    "for code search: if nothing relevant was ever explicitly saved, this returns nothing ",
+                    "useful and you should fall back to semantex_search / semantex_agent. Omit `query` to ",
+                    "list the most recent notes instead of ranking by relevance. Filter with `scope` to ",
+                    "match semantex_memory_save's scope conventions (e.g. \"file:<rel_path>\")."
+                ).into(),
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Free text to rank notes by relevance against. Omit to just list the most recent notes."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Restrict to notes saved under this exact scope key."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max notes to return (default 5, clamped to [1, 50])."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Project path (defaults to current working directory)"
+                        }
+                    }
+                }),
+                output_schema: None,
+                annotations: Some(ToolAnnotations::read_only("Recall Project Memory Notes")),
+            },
         ]
     }
 
@@ -1290,6 +1385,8 @@ impl McpServer {
             "semantex_architecture" => self.tool_architecture(&arguments),
             // v13 Wave 2 — additive, see the Tool registration above.
             "semantex_docs_context" => self.tool_docs_context(&arguments),
+            "semantex_memory_save" => self.tool_memory_save(&arguments),
+            "semantex_memory_recall" => self.tool_memory_recall(&arguments),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 
@@ -3059,6 +3156,42 @@ impl McpServer {
             structured: Some(result.structured),
         })
     }
+
+    // -------------------------------------------------------------------------
+    // v13 Wave 2 — semantex_memory_save / semantex_memory_recall
+    //
+    // Project memory lives in its own `memory.db`, independent of the code
+    // index — no index-readiness gate, no `ChunkStore`. Param parsing, CRUD
+    // dispatch, and text rendering live in `crate::memory_tools` /
+    // `semantex_core::index::memory`; these handlers just resolve the
+    // project path and delegate, matching every other tool handler's shape.
+    // -------------------------------------------------------------------------
+
+    // `&self` is unused in both handlers below (memory notes need neither
+    // the RSS-cache/searcher state nor the index-readiness gate other
+    // handlers use `self` for) but is kept so both fit the `self.tool_x(...)`
+    // dispatch shape every other arm in `handle_tool_call` uses.
+    #[allow(clippy::unused_self)]
+    #[tracing::instrument(skip(self, args), fields(tool = "memory_save"))]
+    fn tool_memory_save(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let path = resolve_project_path(args)?;
+        let result = crate::memory_tools::run_save(&path, args)?;
+        Ok(ToolOutput {
+            text: result.text,
+            structured: Some(result.structured),
+        })
+    }
+
+    #[allow(clippy::unused_self)]
+    #[tracing::instrument(skip(self, args), fields(tool = "memory_recall"))]
+    fn tool_memory_recall(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let path = resolve_project_path(args)?;
+        let result = crate::memory_tools::run_recall(&path, args)?;
+        Ok(ToolOutput {
+            text: result.text,
+            structured: Some(result.structured),
+        })
+    }
 }
 
 /// v13 Wave 2 (history): `semantex_agent`'s `include_history` addendum.
@@ -3831,14 +3964,16 @@ mod tests {
         // compat with clients that learned the names from v0.3.0.
         //
         // v13 Wave 2 adds `semantex_docs_context` as a genuinely new visible
-        // tool (not one of the suppressed M1-M6), so the count is now 8.
+        // tool (not one of the suppressed M1-M6), plus `semantex_memory_save`
+        // / `semantex_memory_recall` (also new, also visible), so the count
+        // is now 10.
         let server = make_server("all");
         let tools = server.tools_for_toolset("all");
         assert_eq!(
             tools.len(),
-            8,
+            10,
             "toolset 'all' must expose the v0.2 set of 7 visible tools plus \
-             v13's semantex_docs_context, got {}",
+             v13's semantex_docs_context and semantex_memory_save/recall, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3851,6 +3986,8 @@ mod tests {
             "semantex_validate",
             "semantex_index",
             "semantex_docs_context",
+            "semantex_memory_save",
+            "semantex_memory_recall",
         ] {
             assert!(names.contains(required), "missing visible tool {required}");
         }
@@ -3893,8 +4030,9 @@ mod tests {
         let tools = server.tools_for_toolset("structural");
         assert_eq!(
             tools.len(),
-            8,
-            "structural toolset is now an alias for all (M1-M6 hidden, v13 docs_context added)"
+            10,
+            "structural toolset is now an alias for all (M1-M6 hidden, v13 docs_context \
+             + memory_save/recall added)"
         );
     }
 
@@ -3904,8 +4042,8 @@ mod tests {
         assert_eq!(server.toolset(), "all");
         let tools = server.tools_for_toolset("nonsense");
         // Filter falls through to `all` (Phase 3: 7 visible tools + v13's
-        // semantex_docs_context = 8).
-        assert_eq!(tools.len(), 8);
+        // semantex_docs_context + memory_save/recall = 10).
+        assert_eq!(tools.len(), 10);
     }
 
     // (Backward-compat dispatch for hidden M1-M6 is already proven by the
@@ -5266,12 +5404,24 @@ mod tests {
             .iter()
             .find(|t| t.name == "semantex_docs_context")
             .expect("semantex_docs_context must be registered");
-        assert_eq!(
-            tool.name,
-            tools.last().expect("tool list non-empty").name,
-            "semantex_docs_context must be registered at the END of the tool list \
-             (additive registration to minimize merge conflicts)"
-        );
+        // Registered additively, after the original v0.2 set. It's no longer
+        // literally the LAST entry — the MEMORY workstream (same v13 Wave 2
+        // batch) appended `semantex_memory_save`/`semantex_memory_recall`
+        // after it, following the same additive-registration convention —
+        // but it must still come before those newer entries.
+        let docs_context_idx = tools
+            .iter()
+            .position(|t| t.name == "semantex_docs_context")
+            .unwrap();
+        for later in ["semantex_memory_save", "semantex_memory_recall"] {
+            let idx = tools.iter().position(|t| t.name == later);
+            if let Some(idx) = idx {
+                assert!(
+                    docs_context_idx < idx,
+                    "semantex_docs_context must precede later additive registrations like {later}"
+                );
+            }
+        }
         assert_eq!(
             tool.annotations.as_ref().and_then(|a| a.read_only_hint),
             Some(true),
@@ -5399,6 +5549,180 @@ mod tests {
             "path": project.display().to_string(),
         }));
         assert!(result.is_err(), "unknown scope string should error");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v13 Wave 2 — semantex_memory_save / semantex_memory_recall: schema +
+    // dispatch tests (mirrors the semantex_docs_context test pattern above).
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_tools_are_registered_additive_and_correctly_annotated() {
+        let tools = McpServer::all_tools();
+
+        let save = tools
+            .iter()
+            .find(|t| t.name == "semantex_memory_save")
+            .expect("semantex_memory_save must be registered");
+        assert_eq!(
+            save.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(false),
+            "semantex_memory_save mutates state — must NOT be readOnlyHint: true"
+        );
+        assert_eq!(
+            save.input_schema["required"],
+            serde_json::json!(["content"]),
+            "content must be the only required field"
+        );
+
+        let recall = tools
+            .iter()
+            .find(|t| t.name == "semantex_memory_recall")
+            .expect("semantex_memory_recall must be registered");
+        assert_eq!(
+            recall.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true),
+            "semantex_memory_recall must be readOnlyHint: true"
+        );
+
+        // Additive: both come after semantex_docs_context in the list, and
+        // both are the last two entries (this workstream's own append point).
+        let save_idx = tools
+            .iter()
+            .position(|t| t.name == "semantex_memory_save")
+            .unwrap();
+        let recall_idx = tools
+            .iter()
+            .position(|t| t.name == "semantex_memory_recall")
+            .unwrap();
+        assert_eq!(
+            recall_idx,
+            tools.len() - 1,
+            "semantex_memory_recall must be registered at the END of the tool list"
+        );
+        assert_eq!(
+            save_idx,
+            tools.len() - 2,
+            "semantex_memory_save must immediately precede semantex_memory_recall"
+        );
+
+        // Visible in the default "all" toolset.
+        let server = make_server("all");
+        let visible = server.tools_for_toolset("all");
+        assert!(visible.iter().any(|t| t.name == "semantex_memory_save"));
+        assert!(visible.iter().any(|t| t.name == "semantex_memory_recall"));
+    }
+
+    #[test]
+    fn tool_memory_save_missing_content_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = make_server("all");
+        let result = server.tool_memory_save(&serde_json::json!({
+            "path": dir.path().display().to_string(),
+        }));
+        assert!(result.is_err(), "missing 'content' should error");
+    }
+
+    #[test]
+    fn tool_memory_save_then_recall_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = make_server("all");
+
+        let save_out = server
+            .tool_memory_save(&serde_json::json!({
+                "content": "always run migrations before enforcing the note cap",
+                "scope": "module:index",
+                "tags": ["gotcha"],
+                "path": dir.path().display().to_string(),
+            }))
+            .expect("save should succeed");
+        let structured = save_out.structured.expect("structured content");
+        let id = structured["id"].as_i64().expect("id present");
+        assert!(id > 0);
+        assert!(save_out.text.contains("Saved note"));
+
+        let recall_out = server
+            .tool_memory_recall(&serde_json::json!({
+                "query": "migrations note cap",
+                "scope": "module:index",
+                "path": dir.path().display().to_string(),
+            }))
+            .expect("recall should succeed");
+        let structured = recall_out.structured.expect("structured content");
+        let notes = structured["notes"].as_array().expect("notes array");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["id"].as_i64(), Some(id));
+        assert_eq!(notes[0]["scope"].as_str(), Some("module:index"));
+    }
+
+    #[test]
+    fn tool_memory_recall_defaults_limit_and_handles_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = make_server("all");
+        let out = server
+            .tool_memory_recall(&serde_json::json!({
+                "path": dir.path().display().to_string(),
+            }))
+            .expect("recall on empty store should succeed, not error");
+        let structured = out.structured.expect("structured content");
+        assert_eq!(structured["count"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn tool_memory_dispatch_reachable_via_handle_tool_call() {
+        // Proves the `handle_tool_call` match arms (not just the direct
+        // method calls above) reach the memory handlers, same pattern the
+        // M1-M6 backward-compat comment above references.
+        let dir = tempfile::tempdir().unwrap();
+        let server = make_server("all");
+        let writer = super::NotificationWriter {
+            stdout: std::sync::Arc::new(parking_lot::Mutex::new(std::io::BufWriter::new(
+                std::io::stdout(),
+            ))),
+        };
+
+        let save_response = server.handle_tool_call(
+            Some(serde_json::json!(1)),
+            &serde_json::json!({
+                "name": "semantex_memory_save",
+                "arguments": {
+                    "content": "dispatch reachability check",
+                    "path": dir.path().display().to_string(),
+                }
+            }),
+            &writer,
+        );
+        let save_json = serde_json::to_value(&save_response).unwrap();
+        assert_ne!(
+            save_json["result"]["isError"],
+            serde_json::json!(true),
+            "save dispatch should not error: {save_json}"
+        );
+
+        let recall_response = server.handle_tool_call(
+            Some(serde_json::json!(2)),
+            &serde_json::json!({
+                "name": "semantex_memory_recall",
+                "arguments": {
+                    "query": "dispatch reachability",
+                    "path": dir.path().display().to_string(),
+                }
+            }),
+            &writer,
+        );
+        let recall_json = serde_json::to_value(&recall_response).unwrap();
+        assert_ne!(
+            recall_json["result"]["isError"],
+            serde_json::json!(true),
+            "recall dispatch should not error: {recall_json}"
+        );
+        let text = recall_json["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("dispatch reachability check") || text.contains("memory note"),
+            "recall text should reflect the saved note: {text}"
+        );
     }
 }
 

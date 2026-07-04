@@ -8,6 +8,7 @@ pub mod global_graph;
 pub mod history;
 pub mod hnsw_index;
 pub mod layout;
+pub mod memory;
 pub mod page_rank;
 pub mod pattern_catalog;
 pub mod registry;
