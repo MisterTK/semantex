@@ -60,6 +60,22 @@
 //!    a real build restamped the sidecar). We do NOT stamp the sidecar with
 //!    the new identity from the daemon — that would silently clear the
 //!    pending signal the CLI/MCP entry points rely on.
+//!
+//!    **W1 — Windows graceful degradation.** The project's cached entries
+//!    are dropped BEFORE the reconcile runs (closing our own `chunks.db` /
+//!    tantivy handles — on Windows an open handle makes the restore's
+//!    rename-over fail with error 32, where POSIX just keeps the old inode
+//!    alive), and a reconcile that still fails (an in-flight request's
+//!    searcher holding the files) degrades instead of poisoning the daemon:
+//!    the error is logged, the current (possibly old-branch) index keeps
+//!    being served, and the reconcile is retried after a short cooldown
+//!    ([`RECONCILE_RETRY_COOLDOWN`]) once the blocking handles have had a
+//!    chance to close. Safe to retry because
+//!    `layout::restore_branch_dir_into_root` mutates `chunks.db` first (the
+//!    exact file every open searcher holds → open-handle failures abort
+//!    before any mutation) and writes the root `branch.json` sidecar last —
+//!    so a failed restore leaves `branch_switch_pending` true and the next
+//!    attempt redoes the whole restore idempotently.
 //! 2. **Staleness probe** (cheap: one `stat` of `meta.json`). Compares the
 //!    file's nanosecond mtime + length against the value recorded when the
 //!    cached entry was opened. A mismatch means the index was rebuilt
@@ -112,7 +128,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Default cap on resident `HybridSearcher` instances, overridable via
 /// `SEMANTEX_DAEMON_MAX_SEARCHERS`. Kept small (2) — enough to keep the
@@ -121,6 +137,14 @@ use std::time::Instant;
 /// dev workflow), without unbounded RAM growth for a daemon that may run for
 /// hours.
 const DEFAULT_MAX_SEARCHERS: usize = 2;
+
+/// W1: how long to keep serving the previous (possibly stale) searcher after
+/// a FAILED branch-switch reconcile before retrying. Long enough that a burst
+/// of concurrent requests doesn't retry (and re-fail, and reopen) on every
+/// single request while some in-flight query still holds the old files open
+/// on Windows; short enough that the daemon converges within seconds of the
+/// blocking handles closing.
+const RECONCILE_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// A cached, ready-to-query searcher plus the bookkeeping the LRU/staleness
 /// logic needs. `Arc`-wrapped by [`SearcherCache::get`] so an in-flight query
@@ -178,6 +202,20 @@ pub struct SearcherCache {
     /// has performed. Read via [`SearcherCache::open_count`]; the F1/F3 tests
     /// use it to prove thrash/duplicate opens can't happen.
     opens: AtomicU64,
+    /// W1 (Windows graceful degradation): per-project timestamp of the last
+    /// FAILED `detect_and_handle_branch_switch`. On Windows the restore's
+    /// rename-over-`chunks.db` fails with error 32 while any open searcher
+    /// holds the file (SQLite's win32 VFS opens without `FILE_SHARE_DELETE`;
+    /// tantivy's mmapped segments likewise block rename-over). A failure must
+    /// degrade — keep serving, retry later once handles have closed — not
+    /// poison the daemon or thrash a retry on every request. Entries here
+    /// suppress re-attempts for [`SearcherCache::reconcile_retry_cooldown`];
+    /// cleared on the next successful reconcile.
+    failed_reconciles: Mutex<HashMap<PathBuf, Instant>>,
+    /// How long to keep serving the (possibly stale) cached searcher after a
+    /// failed reconcile before retrying. Default
+    /// [`RECONCILE_RETRY_COOLDOWN`]; tests shrink it via struct-update.
+    reconcile_retry_cooldown: Duration,
 }
 
 impl SearcherCache {
@@ -193,6 +231,8 @@ impl SearcherCache {
             reconciled_outgoing: Mutex::new(HashMap::new()),
             flight_locks: Mutex::new(HashMap::new()),
             opens: AtomicU64::new(0),
+            failed_reconciles: Mutex::new(HashMap::new()),
+            reconcile_retry_cooldown: RECONCILE_RETRY_COOLDOWN,
         }
     }
 
@@ -326,29 +366,52 @@ impl SearcherCache {
         None
     }
 
-    /// Item 2 + F1: probe for a pending branch switch and reconcile it at
-    /// most ONCE per actual switch. Only the (rare) pending case pays the
-    /// reconcile-gate lock + `detect_and_handle_branch_switch`'s own
-    /// exclusive-lock wait; the overwhelmingly common unchanged case is two
-    /// small file reads and nothing else, and an already-tombstoned
-    /// `SnapshottedOutgoing` switch costs two more small reads (no gate, no
-    /// flock, no cache drop).
+    /// Item 2 + F1 + W1: probe for a pending branch switch and reconcile it
+    /// at most ONCE per actual switch, with graceful degradation on failure.
+    /// Only the (rare) pending case pays the reconcile-gate lock +
+    /// `detect_and_handle_branch_switch`'s own exclusive-lock wait; the
+    /// overwhelmingly common unchanged case is two small file reads and
+    /// nothing else. An already-tombstoned `SnapshottedOutgoing` switch and a
+    /// recently-FAILED reconcile (W1 cooldown) cost a couple more small
+    /// reads/map lookups — no gate, no flock, no cache drop.
     fn reconcile_pending_branch_switch(&self, canonical: &Path) {
         if !branches::branch_switch_pending(canonical)
             || self.outgoing_switch_already_reconciled(canonical)
+            || self.reconcile_recently_failed(canonical)
         {
             return;
         }
         let _gate = self.reconcile_gate.lock();
         // Re-check now that we hold the gate — another thread may have
-        // already reconciled this exact switch while we were waiting.
+        // already reconciled (or just failed to reconcile) this exact switch
+        // while we were waiting.
         if !branches::branch_switch_pending(canonical)
             || self.outgoing_switch_already_reconciled(canonical)
+            || self.reconcile_recently_failed(canonical)
         {
             return;
         }
+
+        // W1: drop this project's cached entries BEFORE running the
+        // reconcile, not after. The restore path renames over `chunks.db`
+        // and replaces `sparse/`/`dense/`; on POSIX open handles keep the
+        // old inodes alive and the renames succeed regardless, but on
+        // Windows a file that any open searcher holds (SQLite's win32 VFS
+        // opens without FILE_SHARE_DELETE; tantivy's mmapped segments block
+        // rename-over even with it) makes the rename fail with error 32. Our
+        // OWN cached handles are the ones we can close — dropping them first
+        // means an idle daemon reconciles cleanly on Windows; only handles
+        // held by requests actually in flight can still block it (handled by
+        // the Err arm below). Entries would be dropped after a switch anyway,
+        // so this reordering costs nothing on POSIX. (If the reconcile then
+        // finds Unchanged — another process beat us under the flock — we pay
+        // one unnecessary reopen. Rare and benign.)
+        self.entries.lock().retain(|(root, _), _| root != canonical);
+
         match branches::detect_and_handle_branch_switch(canonical) {
             Ok(action) => {
+                // Success clears any failure cooldown for the project.
+                self.failed_reconciles.lock().remove(canonical);
                 match &action {
                     branches::BranchSwitchAction::SnapshottedOutgoing {
                         from_branch_key,
@@ -377,19 +440,32 @@ impl SearcherCache {
                         ?action,
                         "Daemon: branch switch reconciled"
                     );
-                    // Drop every cached entry for this project: its live root
-                    // just changed identity (or, for SnapshottedOutgoing, is
-                    // pending a real rebuild — see module docs) so nothing
-                    // currently cached for it is trustworthy under a fresh
-                    // key.
-                    self.entries.lock().retain(|(root, _), _| root != canonical);
                 }
             }
             Err(e) => {
+                // W1: graceful degradation. Most likely cause on Windows: an
+                // in-flight request's open searcher blocked the restore's
+                // rename-over. The restore mutates `chunks.db` FIRST and
+                // writes the root `branch.json` sidecar LAST
+                // (layout::restore_branch_dir_into_root), and every searcher
+                // holds `chunks.db` open — so an open-handle failure aborts
+                // before anything changed, and any later-step failure leaves
+                // individually-intact files with the OLD sidecar. Either
+                // way `branch_switch_pending` stays true and a retry heals.
+                // Record the failure so we serve the current (possibly
+                // old-branch) content for the cooldown window instead of
+                // paying flock + cache-drop + reopen on every request, then
+                // retry once handles have had a chance to close. No
+                // tombstone — this switch is NOT handled yet.
+                self.failed_reconciles
+                    .lock()
+                    .insert(canonical.to_path_buf(), Instant::now());
                 tracing::warn!(
                     path = %canonical.display(),
                     err = %e,
-                    "Daemon: branch switch check failed (continuing with cached/current index)"
+                    retry_in_s = self.reconcile_retry_cooldown.as_secs(),
+                    "Daemon: branch-switch reconcile failed (open index handles?) — \
+                     serving current index, will retry"
                 );
             }
         }
@@ -410,6 +486,23 @@ impl SearcherCache {
             return false;
         };
         root_meta.branch_key == *from_key && layout::current_branch_key(canonical) == *to_key
+    }
+
+    /// W1 cooldown check: `true` while the last reconcile attempt for this
+    /// project failed less than [`Self::reconcile_retry_cooldown`] ago.
+    /// Expired entries are removed so the map stays tidy and the next request
+    /// retries.
+    fn reconcile_recently_failed(&self, canonical: &Path) -> bool {
+        let mut failures = self.failed_reconciles.lock();
+        let Some(failed_at) = failures.get(canonical) else {
+            return false;
+        };
+        if failed_at.elapsed() < self.reconcile_retry_cooldown {
+            true
+        } else {
+            failures.remove(canonical);
+            false
+        }
     }
 
     /// Drop every cached entry for `project_root`, regardless of branch key.
@@ -746,6 +839,16 @@ mod tests {
             "reconcile must have cleared the pending switch"
         );
 
+        // Windows: release our handle on branch a's searcher BEFORE the next
+        // switch. The restore below renames over `chunks.db`; POSIX keeps the
+        // old inode alive for open handles, but on Windows an open handle
+        // (SQLite opens without FILE_SHARE_DELETE) makes the rename fail with
+        // error 32 — which is exactly the W1 graceful-degradation path, not
+        // the round-trip semantics this test is about. The cache's own map
+        // entry is dropped by the reconcile itself (before the restore runs);
+        // this drop releases the only OTHER holder.
+        drop(cached);
+
         // Switch forward to "b" again — must serve b's content, proving the
         // reconcile isn't a one-shot fluke and the cache key correctly
         // differentiates branches.
@@ -876,10 +979,14 @@ mod tests {
     }
 
     /// Staleness reload: simulate "someone ran `semantex index` again in
-    /// another terminal" by rewriting `chunks.db`/`meta.json` directly (no
-    /// branch switch involved). The next `get()` must notice the marker
-    /// (meta.json mtime-ns + length, F4) changed and reopen rather than keep
-    /// serving the old cached searcher's content.
+    /// another terminal" the way a REAL incremental build mutates a live
+    /// index — SQLite rewrites `chunks.db` IN PLACE via a second connection
+    /// and `meta.json` is rewritten. (Deleting/renaming-over the files, as an
+    /// earlier version of this test did, is NOT what a rebuild does and fails
+    /// with error 32 on Windows while the cached searcher holds the db open.)
+    /// The next `get()` must notice the marker (meta.json mtime-ns + length,
+    /// F4) changed and reopen rather than keep serving the old cached
+    /// searcher's content.
     #[test]
     fn staleness_marker_reload_serves_fresh_content_after_rebuild() {
         let tmp = TempDir::new().unwrap();
@@ -890,16 +997,45 @@ mod tests {
         let cache = SearcherCache::new(test_config());
         let first = cache.get(project).unwrap();
         assert_eq!(read_chunk_content(&first.searcher), "fn before() {}");
-
-        // Simulate an out-of-band rebuild: new content, rewritten meta.json.
-        // Deliberately the SAME updated_at value ("1") — the F4 marker must
-        // catch the rebuild from the file's mtime alone, exactly the two-
-        // rebuilds-in-one-second case the parsed updated_at (whole seconds)
-        // could not distinguish. Must drop the old sqlite handle before
-        // overwriting the file, same as a real rebuild replacing chunks.db.
         drop(first);
-        std::fs::remove_file(layout::container_dir(project).join("chunks.db")).unwrap();
-        build_index(project, "fn after() {}", "1");
+
+        // In-place content rewrite through a second SQLite connection — the
+        // cache's own entry (and its open connection) stays resident, exactly
+        // like a daemon serving while `semantex index` runs next door.
+        let container = layout::container_dir(project);
+        {
+            let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+            store.delete_chunks_for_file(Path::new("src/a.rs")).unwrap();
+            store
+                .insert_chunk(
+                    &Chunk {
+                        id: 0,
+                        file_path: PathBuf::from("src/a.rs"),
+                        start_line: 1,
+                        end_line: 1,
+                        content: "fn after() {}".to_string(),
+                        chunk_type: ChunkType::TextWindow { window_index: 0 },
+                    },
+                    2,
+                    0,
+                )
+                .unwrap();
+        }
+        // Windows file-time granularity can be as coarse as ~15 ms — make
+        // sure the meta.json rewrite lands in a later tick so its mtime
+        // actually moves (real rebuilds are seconds apart; this test isn't).
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Rewrite meta.json with the SAME updated_at value ("1") — the F4
+        // marker must catch the rebuild from the file's mtime alone, exactly
+        // the two-rebuilds-in-one-second case the parsed updated_at (whole
+        // seconds) could not distinguish.
+        let mut meta = sample_meta();
+        meta.updated_at = "1".to_string();
+        std::fs::write(
+            container.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
 
         let second = cache.get(project).unwrap();
         assert_eq!(
@@ -907,6 +1043,85 @@ mod tests {
             "fn after() {}",
             "get() must detect the meta.json mtime marker change and reopen"
         );
+    }
+
+    /// W1 (Windows graceful degradation): a FAILED
+    /// `detect_and_handle_branch_switch` (on Windows: the restore's
+    /// rename-over blocked by an in-flight request's open handles) must not
+    /// poison the daemon — `get()` still serves the current (old-branch)
+    /// content, no retry thrash during the cooldown window, and the reconcile
+    /// is retried and succeeds once the blocker is gone. The failure is
+    /// injected cross-platform by planting a DIRECTORY at the
+    /// `.semantex.lock` path (`File::create` fails with EISDIR/access-denied
+    /// on every OS, even running as root — unlike a chmod-based injection).
+    #[test]
+    fn failed_reconcile_degrades_gracefully_and_retries_after_cooldown() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        // Branch "a" indexed + snapshotted, then "b" indexed + snapshotted.
+        write_fake_git_head(project, "a");
+        build_index(project, "fn on_a() {}", "100");
+        layout::sync_v13_layout(project, "proj").unwrap();
+        write_fake_git_head(project, "b");
+        std::fs::remove_file(layout::container_dir(project).join("chunks.db")).unwrap();
+        build_index(project, "fn on_b() {}", "200");
+        layout::sync_v13_layout(project, "proj").unwrap();
+
+        // Switch back to "a": a restore is now pending. Inject the failure.
+        write_fake_git_head(project, "a");
+        assert!(branches::branch_switch_pending(project));
+        let lock_path = layout::container_dir(project).join(".semantex.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        std::fs::create_dir_all(&lock_path).unwrap();
+
+        let cache = SearcherCache {
+            reconcile_retry_cooldown: Duration::from_millis(100),
+            ..SearcherCache::new(test_config())
+        };
+
+        // Degraded, not poisoned: get() succeeds and serves the CURRENT
+        // (unreconciled, old-branch) root content under the new branch key.
+        let degraded = cache.get(project).unwrap();
+        assert_eq!(
+            read_chunk_content(&degraded.searcher),
+            "fn on_b() {}",
+            "a failed reconcile must degrade to serving the current index, not error out"
+        );
+        assert!(
+            branches::branch_switch_pending(project),
+            "a failed reconcile must leave the switch pending (no tombstone) so it is retried"
+        );
+        let opens_after_failure = cache.open_count();
+
+        // Within the cooldown: no retry (no flock attempt, no cache drop) —
+        // the same cached searcher is served, proving no per-request thrash.
+        let during_cooldown = cache.get(project).unwrap();
+        assert!(
+            Arc::ptr_eq(&degraded, &during_cooldown),
+            "requests during the failure cooldown must reuse the cached searcher"
+        );
+        assert_eq!(
+            cache.open_count(),
+            opens_after_failure,
+            "no reopen may happen during the failure cooldown"
+        );
+
+        // Heal the injection, release OUR handles (on Windows an open
+        // searcher would legitimately block the restore's rename-over), and
+        // let the cooldown lapse: the next get() retries and succeeds.
+        std::fs::remove_dir(&lock_path).unwrap();
+        drop(degraded);
+        drop(during_cooldown);
+        std::thread::sleep(Duration::from_millis(150));
+
+        let healed = cache.get(project).unwrap();
+        assert_eq!(
+            read_chunk_content(&healed.searcher),
+            "fn on_a() {}",
+            "after the cooldown the reconcile must be retried and serve the restored branch"
+        );
+        assert!(!branches::branch_switch_pending(project));
     }
 
     /// `SEMANTEX_DAEMON_MAX_SEARCHERS` cap override actually bounds the
