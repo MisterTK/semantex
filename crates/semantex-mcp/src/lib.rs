@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_lines)]
 
 pub mod docs_context;
+pub mod memory_tools;
 pub mod protocol;
 pub mod server;
 
