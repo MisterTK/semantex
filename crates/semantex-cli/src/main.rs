@@ -210,6 +210,14 @@ struct Cli {
     /// Returns a curated prose answer instead of raw results.
     #[arg(long, conflicts_with_all = ["json", "grep", "refs", "peek", "around", "content"])]
     deep: bool,
+
+    /// Which repo(s) to search: `repo` (default, just this project), `all`
+    /// (every project registered in ~/.semantex/projects.json), or a
+    /// comma-separated list of project display names/paths. Non-`repo`
+    /// scopes always run a hybrid dense+sparse search fanned out across
+    /// targets and RRF-fused, with results prefixed `[project]`.
+    #[arg(long, default_value = "repo")]
+    scope: String,
 }
 
 #[derive(Subcommand)]
@@ -355,6 +363,17 @@ enum Commands {
         /// routes (deep / architecture / feature_planning) emit `[]`.
         #[arg(long, conflicts_with = "json")]
         json_hits: bool,
+
+        /// Which repo(s) to search: `repo` (default, just `path`, via the
+        /// daemon exactly as before), `all` (every project registered in
+        /// ~/.semantex/projects.json), or a comma-separated list of project
+        /// display names/paths. Non-`repo` scopes run entirely in-process
+        /// (no daemon): a hybrid dense+sparse search fanned out across
+        /// targets and RRF-fused — `--route` is ignored, since route
+        /// classification (structural walks, deep synthesis, ...) is a
+        /// single-repo concept. Results are prefixed `[project]`.
+        #[arg(long, default_value = "repo")]
+        scope: String,
     },
     /// Show LLM backend status and run a 1-token health-check classify call.
     ///
@@ -713,8 +732,12 @@ fn main() -> Result<()> {
 
     // Fast daemon path: skip config loading + ORT detection when daemon port file exists.
     // Saves ~5-7ms by avoiding YAML config I/O + ORT dylib stat() calls.
+    // Skipped entirely for `--scope` != `repo`: the daemon only ever knows
+    // about the ONE project it was started for, so a cross-repo query falls
+    // through to the slower (config-loading) path below, where the
+    // federated branch lives.
     #[allow(clippy::collapsible_if)]
-    if cli.command.is_none() {
+    if cli.command.is_none() && cli.scope == "repo" {
         // Fast path for --around: graph walk via daemon
         if let Some(ref symbol) = cli.around {
             let path = cli.path.as_deref().unwrap_or(Path::new("."));
@@ -906,10 +929,45 @@ fn main() -> Result<()> {
             budget,
             json,
             json_hits,
+            scope,
         }) => {
             use semantex_core::search::agent_classifier::AgentRoute;
             use semantex_core::server::protocol::AgentRequest;
             telemetry::track("agent");
+
+            // `--scope` != `repo` runs entirely in-process (no daemon
+            // required) and never falls through to the daemon-based path
+            // below — see `commands::federated::run_agent`'s doc comment for
+            // why route classification is skipped for cross-repo queries.
+            // This keeps `--scope repo` (the default) byte-identical to
+            // every pre-federation invocation.
+            let parsed_scope = commands::federated::parse_scope(&scope);
+            if parsed_scope != semantex_core::search::federation::SearchScope::CurrentRepo {
+                let project_path = path
+                    .canonicalize()
+                    .with_context(|| format!("Invalid path: {}", path.display()))?;
+                let (formatted, hits) = commands::federated::run_agent(
+                    &parsed_scope,
+                    &project_path,
+                    &query,
+                    budget.unwrap_or(0),
+                    &config,
+                );
+                if json_hits {
+                    println!("{}", serde_json::to_string_pretty(&hits)?);
+                } else if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "formatted": formatted,
+                            "results": hits,
+                        }))?
+                    );
+                } else {
+                    println!("{formatted}");
+                }
+                return Ok(());
+            }
 
             // Accept any AgentRoute variant via FromStr (covers snake_case
             // and no-separator forms). Two convenience aliases stay: "search"
@@ -978,6 +1036,26 @@ fn main() -> Result<()> {
                 Cli::command().print_help()?;
                 println!();
                 Ok(())
+            } else if cli.scope != "repo" {
+                // Cross-repo fan-out — see `commands::federated::run_search`'s
+                // doc comment. `--scope repo` (the default) never reaches this
+                // branch, so single-repo output is unaffected.
+                telemetry::track("search_federated");
+                let parsed_scope = commands::federated::parse_scope(&cli.scope);
+                let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
+                let project_path = path
+                    .canonicalize()
+                    .with_context(|| format!("Invalid path: {}", path.display()))?;
+                commands::federated::run_search(
+                    &parsed_scope,
+                    &project_path,
+                    cli.queries.first().map_or("", String::as_str),
+                    cli.max_count,
+                    cli.rerank,
+                    cli.grep_mode,
+                    cli.json,
+                    &config,
+                )
             } else {
                 telemetry::track("search");
                 let search_opts = commands::search::SearchOpts {
