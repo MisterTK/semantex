@@ -242,7 +242,16 @@ impl IndexMeta {
     /// NO further schema bump — a change of active embedder/backend is caught by
     /// the per-embedder `embedder_fingerprint` staleness (auto-rebuild into the
     /// versioned dense dir) + the open-time backend-mismatch guard in `hybrid.rs`.
-    pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+    ///
+    /// v13 (Wave 0 spine): storage layout v13 — per-branch index directories
+    /// under `.semantex/indexes/<branch_key>/`, a versioned top-level
+    /// `.semantex/meta.json` (project_id/default_branch), `history.db` /
+    /// `memory.db` schema creation, and registry v2. `IndexMeta` itself is
+    /// UNCHANGED (see `index/layout.rs` module doc for why the branch/
+    /// head_commit metadata lives in a sidecar rather than as new fields
+    /// here) — the bump exists purely to force any pre-v13 index `Stale` so
+    /// it picks up the new layout on its next build.
+    pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 }
 
 /// File metadata for incremental indexing
@@ -333,9 +342,12 @@ mod tests {
     /// (`dense/coderank-hnsw/vectors.bin`). Older indexes become `Stale`.
     /// D4: bumped 11 → 12 when the ColBERT/PLAID backend was removed; any
     /// straggler colbert-plaid index becomes `Stale` and rebuilds.
+    /// Wave 0 spine: bumped 12 → 13 for storage layout v13 (per-branch index
+    /// dirs, registry v2 — see `index/layout.rs`). Any pre-v13 index becomes
+    /// `Stale` and rebuilds, migrating into the new layout on the way.
     #[test]
-    fn current_schema_version_is_12() {
-        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 12);
+    fn current_schema_version_is_13() {
+        assert_eq!(IndexMeta::CURRENT_SCHEMA_VERSION, 13);
     }
 
     #[test]
@@ -356,7 +368,7 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: IndexMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.dense_backend, "coderank-hnsw");
-        assert_eq!(back.schema_version, 12);
+        assert_eq!(back.schema_version, IndexMeta::CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

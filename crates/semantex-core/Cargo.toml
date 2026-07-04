@@ -113,6 +113,12 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# SHA256 for v13 storage-layout branch_key derivation (index/layout.rs):
+# sanitized branch name + first 8 hex of SHA256(ref name), per the Wave 0
+# contract. Already resolved transitively in Cargo.lock (via other deps in
+# the tree) at 0.10.9, so this promotes it to a direct dependency rather
+# than adding new tree weight.
+sha2 = "0.10"
 
 # Parallelism
 rayon = "1"

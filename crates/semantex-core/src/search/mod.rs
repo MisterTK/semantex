@@ -7,6 +7,7 @@ pub mod colbert_plaid_backend;
 pub mod deep;
 pub mod dense_backend;
 pub mod fastembed_reranker;
+pub mod federation;
 pub mod graph_propagation;
 pub mod graph_stage;
 pub mod hybrid;
