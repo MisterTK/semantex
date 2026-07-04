@@ -256,8 +256,9 @@ enum Commands {
         #[arg(long, default_value_t = 5050, requires = "http")]
         port: u16,
 
-        /// Allow binding to 0.0.0.0 (any interface). Off by default — only
-        /// loopback is safe without auth. Prints a stderr warning when enabled.
+        /// Allow binding to 0.0.0.0 (any interface). Off by default. Bearer-token
+        /// auth is REQUIRED when this is set (see --auth-token / SEMANTEX_HTTP_TOKEN) —
+        /// the server refuses to start remote without a resolvable token.
         #[arg(long, requires = "http")]
         allow_remote: bool,
 
@@ -265,6 +266,19 @@ enum Commands {
         /// or `all` (13 tools, default).
         #[arg(long, value_name = "NAME", default_value = "all")]
         toolset: String,
+
+        /// Bearer token required to call `/mcp/*` over HTTP. Takes precedence
+        /// over `SEMANTEX_HTTP_TOKEN`; if neither is set, a token is
+        /// auto-generated and persisted at `~/.semantex/http_token` (0600).
+        /// Only used with --http.
+        #[arg(long, value_name = "TOKEN", requires = "http")]
+        auth_token: Option<String>,
+
+        /// Require bearer-token auth even on loopback (127.0.0.1). Auth is
+        /// always required when --allow-remote is set, regardless of this
+        /// flag. Only used with --http.
+        #[arg(long, requires = "http")]
+        require_auth: bool,
     },
     /// Install Claude Code integration
     InstallClaudeCode {
@@ -840,9 +854,19 @@ fn main() -> Result<()> {
             port,
             allow_remote,
             toolset,
+            auth_token,
+            require_auth,
         }) => {
             telemetry::track("mcp");
-            commands::mcp::run(&config, http, port, allow_remote, &toolset)
+            commands::mcp::run(
+                &config,
+                http,
+                port,
+                allow_remote,
+                &toolset,
+                auth_token,
+                require_auth,
+            )
         }
         Some(Commands::InstallClaudeCode { scope }) => {
             telemetry::track("install_claude_code");
@@ -1099,5 +1123,99 @@ mod arg_peek_tests {
         // Bare invocation / pure flags (help/version): no download.
         assert!(!command_wants_onnxruntime(Vec::<&str>::new()));
         assert!(!command_wants_onnxruntime(["--version"]));
+    }
+}
+
+/// Clap-level tests for the `mcp` subcommand's HTTP auth flag plumbing
+/// (`--auth-token`, `--require-auth`). See `commands::mcp::run` for the
+/// resolution logic these flags feed into.
+#[cfg(test)]
+mod mcp_auth_arg_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn auth_token_and_require_auth_parse_with_http() {
+        let cli = Cli::try_parse_from([
+            "semantex",
+            "mcp",
+            "--http",
+            "--auth-token",
+            "s3cr3t",
+            "--require-auth",
+        ])
+        .expect("clap should accept --auth-token and --require-auth with --http");
+        let Some(Commands::Mcp {
+            http,
+            allow_remote,
+            auth_token,
+            require_auth,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Commands::Mcp");
+        };
+        assert!(http);
+        assert!(!allow_remote);
+        assert_eq!(auth_token.as_deref(), Some("s3cr3t"));
+        assert!(require_auth);
+    }
+
+    #[test]
+    fn auth_flags_default_to_none_and_off() {
+        let cli = Cli::try_parse_from(["semantex", "mcp", "--http"])
+            .expect("clap should accept --http alone");
+        let Some(Commands::Mcp {
+            auth_token,
+            require_auth,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Commands::Mcp");
+        };
+        assert_eq!(auth_token, None);
+        assert!(!require_auth);
+    }
+
+    #[test]
+    fn allow_remote_and_auth_token_compose() {
+        let cli = Cli::try_parse_from([
+            "semantex",
+            "mcp",
+            "--http",
+            "--allow-remote",
+            "--auth-token",
+            "tok",
+        ])
+        .expect("clap should accept --allow-remote with --auth-token");
+        let Some(Commands::Mcp {
+            allow_remote,
+            auth_token,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Commands::Mcp");
+        };
+        assert!(allow_remote);
+        assert_eq!(auth_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn auth_token_without_http_is_rejected() {
+        // `requires = "http"` on --auth-token: stdio mode has no HTTP auth surface.
+        let result = Cli::try_parse_from(["semantex", "mcp", "--auth-token", "tok"]);
+        assert!(
+            result.is_err(),
+            "--auth-token without --http should fail to parse"
+        );
+    }
+
+    #[test]
+    fn require_auth_without_http_is_rejected() {
+        let result = Cli::try_parse_from(["semantex", "mcp", "--require-auth"]);
+        assert!(
+            result.is_err(),
+            "--require-auth without --http should fail to parse"
+        );
     }
 }

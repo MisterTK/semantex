@@ -12,11 +12,18 @@
 //! Toolsets: `core`, `structural`, `all` (per spec section 2.5 I3).
 //! `POST /mcp/` (no toolset) is an alias for `/mcp/all`.
 //!
-//! ### Security defaults (per spec risk D3)
+//! ### Security defaults (per spec risk D3 / Wave 0 contract section C)
 //! * Binds to `127.0.0.1` (loopback) by default.
 //! * `--allow-remote` (forwarded via `allow_remote`) required to bind `0.0.0.0`.
 //!   A loud stderr warning is printed when remote binding is enabled.
 //! * CORS is disabled by default (no `Access-Control-Allow-*` headers).
+//! * Bearer-token auth (see [`AuthConfig`]) is REQUIRED whenever `--allow-remote`
+//!   is set — the server refuses to start remote without a resolvable token.
+//!   On loopback, auth stays off by default; `--require-auth` opts in. Token
+//!   resolution precedence: `--auth-token` flag > `SEMANTEX_HTTP_TOKEN` env >
+//!   auto-generated 32-byte hex token persisted at `~/.semantex/http_token`
+//!   (0600 perms on Unix). `/healthz` is always open; `/mcp/*` (including the
+//!   SSE `/events` routes) require the token the same way once auth is on.
 //!
 //! ### Workaround note
 //! This module currently proxies JSON-RPC requests to a child `semantex mcp`
@@ -28,13 +35,14 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use rand::RngCore;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -567,12 +575,188 @@ impl Backend for SubprocessBackend {
 }
 
 // ============================================================================
+// Bearer-token auth (Wave 0 contract section C)
+// ============================================================================
+
+/// Length in bytes of an auto-generated token (before hex-encoding, so the
+/// persisted file holds 64 hex characters).
+const GENERATED_TOKEN_BYTES: usize = 32;
+
+/// Raw auth inputs forwarded from the CLI. Kept separate from the resolved
+/// `Option<String>` token so `resolve` can apply the full precedence order
+/// (flag > env > auto-generated persisted) in one place, with unit tests
+/// exercising each branch independently of the CLI's clap parsing.
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    /// `--auth-token <TOKEN>`, if the caller passed one explicitly.
+    pub cli_token: Option<String>,
+    /// `--require-auth`: force enforcement even on loopback.
+    pub require_auth: bool,
+}
+
+impl AuthConfig {
+    /// Resolve the token to enforce for this run, given whether the server
+    /// is binding remotely.
+    ///
+    /// Returns:
+    /// * `Ok(Some(token))` — auth is enforced with this token.
+    /// * `Ok(None)` — auth is not requested (loopback, no `--require-auth`,
+    ///   no explicit token/env) and stays off, matching today's behavior.
+    /// * `Err(_)` — auth was requested (remote, `--require-auth`, or an
+    ///   explicit token/env was set) but no token could be materialized.
+    ///   Callers must fail closed rather than start unauthenticated.
+    pub fn resolve(&self, allow_remote: bool) -> Result<Option<String>> {
+        let env_token = std::env::var("SEMANTEX_HTTP_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        // Precedence: --auth-token flag > SEMANTEX_HTTP_TOKEN env. An empty
+        // string in either slot is ignored (never enforce an empty token —
+        // a bare `Authorization: Bearer ` header would trivially match it).
+        let explicit = self
+            .cli_token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(env_token);
+
+        // Whenever `--allow-remote` is set, auth is REQUIRED (contract C) —
+        // the old fully-open 0.0.0.0 mode must become impossible. On
+        // loopback, auth stays off unless the caller opted in via
+        // `--require-auth` or by supplying a token explicitly. A present but
+        // empty `--auth-token` still counts as opting in (falls through to
+        // the generated token) so a degenerate flag never disables auth.
+        let auth_wanted =
+            allow_remote || self.require_auth || explicit.is_some() || self.cli_token.is_some();
+        if !auth_wanted {
+            return Ok(None);
+        }
+        if let Some(token) = explicit {
+            return Ok(Some(token));
+        }
+
+        // Auto-generate + persist at ~/.semantex/http_token.
+        load_or_generate_persisted_token(&default_token_path()).map(Some)
+    }
+}
+
+/// `~/.semantex/http_token` — the default persisted-token location. Routed
+/// through `semantex_home()` so a `SEMANTEX_HOME` override relocates the
+/// token alongside every other per-user semantex file (`semantex_home()`
+/// itself falls back to a temp dir when no home directory exists, so this
+/// always yields a usable path).
+fn default_token_path() -> PathBuf {
+    semantex_core::config::SemantexConfig::semantex_home().join("http_token")
+}
+
+/// Read the persisted token at `path` if present and non-empty; otherwise
+/// generate a fresh 32-byte random hex token, persist it (0600 on Unix, best
+/// effort elsewhere), and print the *path* (never the token) to stderr.
+fn load_or_generate_persisted_token(path: &FsPath) -> Result<String> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let token = generate_token_hex();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    write_token_file(path, &token)
+        .with_context(|| format!("failed to persist auth token at {}", path.display()))?;
+    eprintln!(
+        "semantex mcp --http: generated a new bearer token, saved to {}",
+        path.display()
+    );
+    Ok(token)
+}
+
+/// Generate a random 32-byte token, hex-encoded (64 chars).
+fn generate_token_hex() -> String {
+    use std::fmt::Write;
+    let mut bytes = [0u8; GENERATED_TOKEN_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+#[cfg(unix)]
+fn write_token_file(path: &FsPath, token: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, token)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_token_file(path: &FsPath, token: &str) -> Result<()> {
+    // Best-effort on non-Unix targets: no POSIX permission bits to restrict.
+    std::fs::write(path, token).context("failed to write token file")
+}
+
+/// Constant-time byte comparison. Runs in time proportional to the length of
+/// the SHORTER input regardless of where the first mismatch occurs (the only
+/// thing that leaks via timing is a length mismatch, which is not sensitive —
+/// token length isn't secret). Hand-rolled per contract section C ("use
+/// `subtle` ONLY if already in the dependency tree; otherwise hand-roll a
+/// branchless byte-compare") — `subtle` is only present transitively via
+/// `rustls`, not a direct dependency of any workspace crate, so this avoids
+/// promoting it to a direct dep for one function.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Check the `Authorization: Bearer <token>` header against the expected
+/// token using constant-time comparison. Returns `None` when auth passes (or
+/// is disabled, i.e. `expected` is `None`); `Some(response)` (401 +
+/// `WWW-Authenticate: Bearer`) when it fails.
+fn check_bearer_auth(headers: &HeaderMap, expected: Option<&str>) -> Option<Response> {
+    let expected = expected?;
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => None,
+        _ => Some(unauthorized_response()),
+    }
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(serde_json::json!({
+            "error": "unauthorized",
+            "hint": "missing or invalid bearer token; set the Authorization: Bearer <token> header",
+        })),
+    )
+        .into_response()
+}
+
+// ============================================================================
 // HTTP server
 // ============================================================================
 
 /// State shared by all axum handlers.
 struct AppState<B: Backend> {
     backend: Arc<B>,
+    /// `Some(token)` when bearer auth is enforced on `/mcp/*` routes (both
+    /// POST and the SSE `/events` routes); `None` when auth is disabled
+    /// (loopback default, no `--require-auth`, no explicit token/env).
+    /// `/healthz` never consults this — it is always open.
+    auth_token: Option<Arc<str>>,
 }
 
 // Manual `Clone` impl because the derive would require `B: Clone`, but the
@@ -581,6 +765,7 @@ impl<B: Backend> Clone for AppState<B> {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
+            auth_token: self.auth_token.clone(),
         }
     }
 }
@@ -590,17 +775,40 @@ impl<B: Backend> Clone for AppState<B> {
 /// * `port` — TCP port to bind.
 /// * `allow_remote` — if `false`, binds `127.0.0.1`; if `true`, binds `0.0.0.0`
 ///   and prints a security warning to stderr.
+/// * `auth` — bearer-token auth inputs (`--auth-token` / `--require-auth`).
+///   Resolved here per contract section C precedence; remote binds refuse to
+///   start if no token can be resolved.
 /// * `backend` — JSON-RPC dispatcher (today: `SubprocessBackend`).
 pub async fn run_http_server<B: Backend>(
     port: u16,
     allow_remote: bool,
+    auth: AuthConfig,
     backend: Arc<B>,
 ) -> Result<()> {
+    // Resolve auth BEFORE binding: `--allow-remote` must refuse to start if
+    // no token is resolvable (contract C — the old unauthenticated 0.0.0.0
+    // mode is no longer allowed to exist).
+    let auth_token = auth
+        .resolve(allow_remote)
+        .context("failed to resolve HTTP bearer auth token")?;
+    if allow_remote && auth_token.is_none() {
+        anyhow::bail!(
+            "refusing to bind 0.0.0.0 without a bearer auth token; pass --auth-token, \
+             set SEMANTEX_HTTP_TOKEN, or ensure a home directory is available for the \
+             auto-generated token at ~/.semantex/http_token",
+        );
+    }
+
     let bind_host = if allow_remote {
         eprintln!(
-            "semantex mcp serve --http --allow-remote: binding to 0.0.0.0:{port}\n  WARNING: anyone on the network can issue MCP requests against this server.\n  Requests are not authenticated. Use only on a trusted network.",
+            "semantex mcp serve --http --allow-remote: binding to 0.0.0.0:{port}\n  WARNING: anyone on the network can reach this server.\n  Bearer-token auth is REQUIRED and enforced on all /mcp/* routes (see stderr above for the token path if it was just generated).",
         );
         "0.0.0.0"
+    } else if auth_token.is_some() {
+        eprintln!(
+            "semantex mcp serve --http: binding to 127.0.0.1:{port} with bearer auth required (--require-auth or a token was supplied).",
+        );
+        "127.0.0.1"
     } else {
         "127.0.0.1"
     };
@@ -609,7 +817,7 @@ pub async fn run_http_server<B: Backend>(
         .parse()
         .with_context(|| format!("invalid bind address {bind_host}:{port}"))?;
 
-    let app = build_router(backend);
+    let app = build_router_with_auth(backend, auth_token);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
@@ -624,10 +832,22 @@ pub async fn run_http_server<B: Backend>(
     Ok(())
 }
 
-/// Build the axum `Router`. Exposed for tests so they can drive the handlers
-/// directly via `tower::ServiceExt`.
+/// Build the axum `Router` with auth disabled. Exposed for tests so they can
+/// drive the handlers directly via `tower::ServiceExt`. Production code
+/// should go through [`run_http_server`], which calls
+/// [`build_router_with_auth`] with the resolved token.
 pub fn build_router<B: Backend>(backend: Arc<B>) -> Router {
-    let state = AppState { backend };
+    build_router_with_auth(backend, None)
+}
+
+/// Build the axum `Router`, enforcing bearer auth on `/mcp/*` (POST and SSE
+/// `/events` routes alike) when `auth_token` is `Some`. `/healthz` is never
+/// gated.
+pub fn build_router_with_auth<B: Backend>(backend: Arc<B>, auth_token: Option<String>) -> Router {
+    let state = AppState {
+        backend,
+        auth_token: auth_token.map(Arc::from),
+    };
     Router::new()
         .route("/healthz", get(healthz))
         .route("/mcp/", post(mcp_default_post))
@@ -655,12 +875,22 @@ async fn unknown_route() -> impl IntoResponse {
 
 async fn mcp_default_post<B: Backend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(resp) = check_bearer_auth(&headers, state.auth_token.as_deref()) {
+        return resp;
+    }
     mcp_dispatch(state.backend, Toolset::All, body).await
 }
 
-async fn mcp_default_events() -> impl IntoResponse {
+async fn mcp_default_events<B: Backend>(
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = check_bearer_auth(&headers, state.auth_token.as_deref()) {
+        return resp;
+    }
     // Minimal SSE: open the stream, send an immediate `event: hello` so the
     // client knows the channel is alive, then keep-alive. Full notification
     // forwarding requires backend changes; documented in coordination_request.md.
@@ -673,25 +903,32 @@ async fn mcp_default_events() -> impl IntoResponse {
         ],
         body,
     )
+        .into_response()
 }
 
 async fn mcp_post<B: Backend>(
     State(state): State<AppState<B>>,
+    headers: HeaderMap,
     Path(toolset_str): Path<String>,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(resp) = check_bearer_auth(&headers, state.auth_token.as_deref()) {
+        return resp;
+    }
     let Some(toolset) = Toolset::parse(&toolset_str) else {
         return unknown_toolset(&toolset_str).into_response();
     };
-    mcp_dispatch(state.backend, toolset, body)
-        .await
-        .into_response()
+    mcp_dispatch(state.backend, toolset, body).await
 }
 
 async fn mcp_events<B: Backend>(
-    State(_state): State<AppState<B>>,
+    State(state): State<AppState<B>>,
+    headers: HeaderMap,
     Path(toolset_str): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(resp) = check_bearer_auth(&headers, state.auth_token.as_deref()) {
+        return resp;
+    }
     let Some(toolset) = Toolset::parse(&toolset_str) else {
         return unknown_toolset(&toolset_str).into_response();
     };
@@ -883,6 +1120,44 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// Like `post_json`, but optionally attaches an `Authorization: Bearer
+    /// <token>` header.
+    async fn post_json_auth(
+        app: Router,
+        path: &str,
+        body: Value,
+        bearer: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let req = builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    /// GET a route, optionally with a bearer token. Used to exercise the SSE
+    /// endpoints and `/healthz`.
+    async fn get_with_auth(app: Router, path: &str, bearer: Option<&str>) -> StatusCode {
+        let mut builder = Request::builder().method(Method::GET).uri(path);
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let req = builder.body(Body::empty()).unwrap();
         app.oneshot(req).await.unwrap().status()
     }
 
@@ -1344,5 +1619,305 @@ mod tests {
             "respawn rate limit should reject the {}'th call",
             MAX_RESPAWNS_PER_WINDOW + 1
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bearer-token auth (Wave 0 contract section C)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Serializes tests that mutate the process-global `SEMANTEX_HTTP_TOKEN`
+    /// env var, so they can't interfere with each other when the test binary
+    /// runs them concurrently.
+    static AUTH_TEST_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[test]
+    fn constant_time_eq_matches_equal() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_mismatch_same_length() {
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_length() {
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    #[test]
+    fn constant_time_eq_empty_equal() {
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Precedence: `--auth-token` flag wins over everything else, even when
+    /// `SEMANTEX_HTTP_TOKEN` is also set.
+    #[tokio::test]
+    async fn token_precedence_cli_flag_wins_over_env() {
+        let _guard = AUTH_TEST_ENV_LOCK.lock().await;
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK; no other test reads/writes
+        // SEMANTEX_HTTP_TOKEN concurrently.
+        unsafe { std::env::set_var("SEMANTEX_HTTP_TOKEN", "env-token") };
+        let cfg = AuthConfig {
+            cli_token: Some("flag-token".to_string()),
+            require_auth: false,
+        };
+        let resolved = cfg.resolve(false).unwrap();
+        unsafe { std::env::remove_var("SEMANTEX_HTTP_TOKEN") };
+        assert_eq!(resolved.as_deref(), Some("flag-token"));
+    }
+
+    /// Precedence: with no CLI flag, `SEMANTEX_HTTP_TOKEN` is used.
+    #[tokio::test]
+    async fn token_precedence_env_used_when_no_flag() {
+        let _guard = AUTH_TEST_ENV_LOCK.lock().await;
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK.
+        unsafe { std::env::set_var("SEMANTEX_HTTP_TOKEN", "env-only-token") };
+        let cfg = AuthConfig {
+            cli_token: None,
+            require_auth: false,
+        };
+        let resolved = cfg.resolve(false).unwrap();
+        unsafe { std::env::remove_var("SEMANTEX_HTTP_TOKEN") };
+        assert_eq!(resolved.as_deref(), Some("env-only-token"));
+    }
+
+    /// On loopback with no flag, no env, and no `--require-auth`, auth stays
+    /// off entirely (today's behavior is preserved).
+    #[tokio::test]
+    async fn loopback_default_no_auth_requested() {
+        let _guard = AUTH_TEST_ENV_LOCK.lock().await;
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK.
+        unsafe { std::env::remove_var("SEMANTEX_HTTP_TOKEN") };
+        let cfg = AuthConfig {
+            cli_token: None,
+            require_auth: false,
+        };
+        let resolved = cfg.resolve(false).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// `--require-auth` on loopback with no explicit token falls through to
+    /// the auto-generated persisted token. `SEMANTEX_HOME` redirects the
+    /// token path into a tempdir so the test never touches the real
+    /// `~/.semantex/http_token`.
+    #[tokio::test]
+    async fn require_auth_on_loopback_falls_back_to_generated_token() {
+        let _guard = AUTH_TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SEMANTEX_HTTP_TOKEN");
+            std::env::set_var("SEMANTEX_HOME", dir.path());
+        }
+        let cfg = AuthConfig {
+            cli_token: None,
+            require_auth: true,
+        };
+        let resolved = cfg.resolve(false);
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK.
+        unsafe { std::env::remove_var("SEMANTEX_HOME") };
+        let token = resolved.unwrap().expect("require-auth must yield a token");
+        assert_eq!(token.len(), GENERATED_TOKEN_BYTES * 2);
+        assert!(
+            dir.path().join("http_token").exists(),
+            "token must be persisted under SEMANTEX_HOME"
+        );
+    }
+
+    /// `--allow-remote` always wants auth, even with no flag/env — this is
+    /// the "REQUIRED whenever --allow-remote" contract requirement.
+    #[tokio::test]
+    async fn allow_remote_always_wants_auth() {
+        let _guard = AUTH_TEST_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("SEMANTEX_HTTP_TOKEN");
+            std::env::set_var("SEMANTEX_HOME", dir.path());
+        }
+        let cfg = AuthConfig {
+            cli_token: None,
+            require_auth: false,
+        };
+        let resolved = cfg.resolve(true);
+        // SAFETY: guarded by AUTH_TEST_ENV_LOCK.
+        unsafe { std::env::remove_var("SEMANTEX_HOME") };
+        // `resolve` must never return `Ok(None)` when `allow_remote` is true:
+        // with a writable home it generates + persists a token.
+        let token = resolved.unwrap();
+        assert!(token.is_some(), "remote must never resolve to no-auth");
+    }
+
+    /// The auto-generate-then-persist path: first call generates and writes
+    /// a 64-hex-char token to the path; a second call reuses the same
+    /// persisted value instead of generating a new one.
+    #[tokio::test]
+    async fn persisted_token_generated_then_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http_token");
+        assert!(!path.exists());
+
+        let first = load_or_generate_persisted_token(&path).unwrap();
+        assert_eq!(first.len(), GENERATED_TOKEN_BYTES * 2, "64 hex chars");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "token file must be 0600");
+        }
+
+        let second = load_or_generate_persisted_token(&path).unwrap();
+        assert_eq!(first, second, "second call must reuse the persisted token");
+    }
+
+    /// Two independent generations (different paths) must not collide.
+    #[tokio::test]
+    async fn generated_tokens_are_random() {
+        let a = generate_token_hex();
+        let b = generate_token_hex();
+        assert_ne!(a, b);
+    }
+
+    // ── axum-level auth enforcement tests ──────────────────────────────────
+
+    /// `/healthz` never requires auth, even when the router was built with a
+    /// token configured.
+    #[tokio::test]
+    async fn healthz_never_requires_auth() {
+        let backend = fake_backend_with(vec![]);
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let status = get_with_auth(app, "/healthz", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// POST `/mcp/all` with no auth configured (router built via the plain
+    /// `build_router`, i.e. loopback default) succeeds without a token —
+    /// preserves today's open-by-default loopback behavior.
+    #[tokio::test]
+    async fn mcp_post_no_auth_configured_is_open() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router(backend);
+        let (status, _) = post_json_auth(
+            app,
+            "/mcp/all",
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// POST `/mcp/all` with auth configured and no `Authorization` header
+    /// gets 401 + `WWW-Authenticate: Bearer`.
+    #[tokio::test]
+    async fn mcp_post_missing_token_returns_401_with_challenge() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp/all")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(
+                    &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+    }
+
+    /// POST `/mcp/all` with a wrong bearer token gets 401.
+    #[tokio::test]
+    async fn mcp_post_wrong_token_returns_401() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let (status, _) = post_json_auth(
+            app,
+            "/mcp/all",
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            Some("wrong"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// POST `/mcp/all` with the correct bearer token succeeds.
+    #[tokio::test]
+    async fn mcp_post_correct_token_returns_200() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let (status, body) = post_json_auth(
+            app,
+            "/mcp/all",
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["tools"].as_array().unwrap().len(),
+            full_tool_set().len()
+        );
+    }
+
+    /// The default-alias POST route (`/mcp/`) enforces auth the same way.
+    #[tokio::test]
+    async fn mcp_default_post_requires_auth_when_configured() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let (status, _) = post_json_auth(
+            app,
+            "/mcp/",
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// SSE endpoint (`GET /mcp/{toolset}/events`) requires auth just like
+    /// POST, when configured.
+    #[tokio::test]
+    async fn sse_events_requires_auth_when_configured() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let missing = get_with_auth(app.clone(), "/mcp/all/events", None).await;
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+        let ok = get_with_auth(app, "/mcp/all/events", Some("secret")).await;
+        assert_eq!(ok, StatusCode::OK);
+    }
+
+    /// The default-alias SSE route (`GET /mcp/`) also requires auth.
+    #[tokio::test]
+    async fn sse_default_events_requires_auth_when_configured() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router_with_auth(backend, Some("secret".to_string()));
+        let missing = get_with_auth(app.clone(), "/mcp/", None).await;
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+        let ok = get_with_auth(app, "/mcp/", Some("secret")).await;
+        assert_eq!(ok, StatusCode::OK);
+    }
+
+    /// SSE endpoint with no auth configured (loopback default) is open, same
+    /// as POST.
+    #[tokio::test]
+    async fn sse_events_no_auth_configured_is_open() {
+        let backend = fake_backend_with(full_tool_set());
+        let app = build_router(backend);
+        let status = get_with_auth(app, "/mcp/all/events", None).await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

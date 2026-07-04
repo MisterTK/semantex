@@ -4,6 +4,7 @@ pub mod file_classifier;
 pub mod gate;
 pub mod global_graph;
 pub mod hnsw_index;
+pub mod layout;
 pub mod page_rank;
 pub mod pattern_catalog;
 pub mod registry;
