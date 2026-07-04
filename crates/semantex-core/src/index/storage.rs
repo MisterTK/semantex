@@ -1157,6 +1157,103 @@ impl ChunkStore {
             symbol_defs_count: symbol_defs_count as usize,
         })
     }
+
+    // ── v13 docs-scaffold helpers (Wave 2, additive — no existing method
+    // signatures touched) ─────────────────────────────────────────────
+
+    /// Get files that import `file_path` — the reverse of
+    /// `get_module_edges_for_file` (which returns what a file imports, not
+    /// who imports it). Used by the `semantex_docs_context` module scaffold
+    /// to report both directions of the import graph for one file.
+    pub fn get_importers_of_file(&self, file_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT importer_path FROM module_edges WHERE imported_path = ?1")?;
+        let rows = stmt
+            .query_map(params![file_path], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get call-graph edges whose caller chunk lives in `file_path` — i.e.
+    /// calls this file's code makes (outgoing). Returns
+    /// `(caller_chunk_id, callee_name, callee_chunk_id)`; `callee_chunk_id`
+    /// is `None` when the callee hasn't been resolved to a chunk.
+    #[allow(clippy::similar_names)]
+    pub fn get_call_edges_from_file(
+        &self,
+        file_path: &str,
+    ) -> Result<Vec<(u64, String, Option<u64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cg.caller_chunk_id, cg.callee_name, cg.callee_chunk_id \
+             FROM call_graph cg \
+             JOIN chunks c ON c.id = cg.caller_chunk_id \
+             WHERE c.file_path = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![file_path], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get call-graph edges whose callee chunk lives in `file_path` — i.e.
+    /// calls made *into* this file's code from elsewhere (incoming). Returns
+    /// `(caller_chunk_id, callee_chunk_id)`; the caller's file/symbol is
+    /// resolved by the caller of this method via `get_chunks`.
+    pub fn get_call_edges_into_file(&self, file_path: &str) -> Result<Vec<(u64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cg.caller_chunk_id, cg.callee_chunk_id \
+             FROM call_graph cg \
+             JOIN chunks c ON c.id = cg.callee_chunk_id \
+             WHERE c.file_path = ?1 AND cg.callee_chunk_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![file_path], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Chunk count per file, for the overview docs scaffold's language/file
+    /// stats. One grouped query instead of N per-file lookups.
+    pub fn get_chunk_counts_by_file(&self) -> Result<HashMap<String, usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, COUNT(*) FROM chunks GROUP BY file_path")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (path, count) = r?;
+            out.insert(path, count);
+        }
+        Ok(out)
+    }
+
+    /// Symbol-definition count per file, for the overview docs scaffold's
+    /// module inventory. One grouped query instead of N per-file lookups.
+    pub fn get_symbol_counts_by_file(&self) -> Result<HashMap<String, usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, COUNT(*) FROM symbol_defs GROUP BY file_path")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (path, count) = r?;
+            out.insert(path, count);
+        }
+        Ok(out)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
