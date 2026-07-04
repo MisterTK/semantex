@@ -1,4 +1,5 @@
 pub mod architecture;
+pub mod branches;
 pub mod builder;
 pub mod file_classifier;
 pub mod gate;

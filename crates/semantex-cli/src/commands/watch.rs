@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use semantex_core::config::SemantexConfig;
 use semantex_core::file::watcher::FileWatcher;
+use semantex_core::index::branches;
+use semantex_core::index::layout;
 use semantex_core::index::updater::IndexUpdater;
 use semantex_core::search::hybrid::HybridSearcher;
 use semantex_core::server::listener::Listener;
@@ -9,6 +11,45 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Run branch-switch detection/reconciliation, printing a note when a switch
+/// was found. Cheap no-op when the branch hasn't changed (`Unchanged`) or
+/// there's no prior recorded branch (`FirstBuild`) — safe to call before
+/// every re-index in the watch loop, not just the initial one.
+fn reconcile_branch_switch(project_path: &Path) {
+    match branches::detect_and_handle_branch_switch(project_path) {
+        Ok(branches::BranchSwitchAction::Restored {
+            from_branch_key,
+            to_branch_key,
+        }) => {
+            println!(
+                "{} branch switch {} -> {}: restored existing index snapshot",
+                "->".cyan(),
+                from_branch_key,
+                to_branch_key
+            );
+        }
+        Ok(branches::BranchSwitchAction::SnapshottedOutgoing {
+            from_branch_key,
+            to_branch_key,
+        }) => {
+            println!(
+                "{} branch switch {} -> {}: snapshotted outgoing branch",
+                "->".cyan(),
+                from_branch_key,
+                to_branch_key
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "  {} Branch switch check failed: {}",
+                "Warning:".yellow(),
+                e
+            );
+        }
+    }
+}
 
 pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
     let project_path = path
@@ -25,8 +66,10 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
 
     // Do an initial index
     println!("{}", "Running initial index...".dimmed());
+    reconcile_branch_switch(&project_path);
     match IndexUpdater::update(&project_path, config) {
         Ok(stats) => {
+            branches::record_branch_indexed(&project_path);
             println!(
                 "  Initial index: {} files, {} chunks",
                 stats.files_indexed, stats.chunks_created
@@ -100,9 +143,21 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
     }
     println!();
 
-    // Start watching
+    // Start watching. Also watch the resolved git HEAD file (which for a
+    // linked worktree lives outside project_path, so the recursive watch
+    // above wouldn't see it) so a branch switch that touches no tracked
+    // file (e.g. `git switch -c` from an identical tree) still triggers a
+    // wake-up — see `reconcile_branch_switch`.
     let mut watcher = FileWatcher::new()?;
     let rx = watcher.watch(&project_path)?;
+    if let Some(head_file) = layout::git_head_file(&project_path)
+        && let Err(e) = watcher.watch_additional(&head_file, false)
+    {
+        tracing::debug!(
+            "Could not watch git HEAD file ({}): {e}",
+            head_file.display()
+        );
+    }
 
     while let Ok(changed_paths) = rx.recv() {
         if shutdown.load(Ordering::Relaxed) {
@@ -115,8 +170,14 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
             println!("   {}", p.display().to_string().dimmed());
         }
 
+        // Cheap on every iteration; only does real work when HEAD has
+        // actually moved to a different branch since the root was last
+        // synced (see module doc / `branches::detect_and_handle_branch_switch`).
+        reconcile_branch_switch(&project_path);
+
         match IndexUpdater::update(&project_path, config) {
             Ok(stats) => {
+                branches::record_branch_indexed(&project_path);
                 println!(
                     "   {} Re-indexed {} files, {} chunks in {:.1}s",
                     "OK".green(),

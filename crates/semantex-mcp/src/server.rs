@@ -6,6 +6,7 @@ use crate::protocol::{
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use semantex_core::config::SemantexConfig;
+use semantex_core::index::branches;
 use semantex_core::index::builder::IndexBuilder;
 use semantex_core::index::state::{self, IndexState};
 use semantex_core::index::storage::ChunkStore;
@@ -466,7 +467,18 @@ impl McpServer {
                 // `detect_state_fast` stays schema-only to keep the warm path
                 // sub-microsecond; this is its session-level backstop).
                 let idx_state = state::detect_for_config(&cwd, &self.config);
-                if idx_state == IndexState::NotIndexed || idx_state == IndexState::Stale {
+                // Wave 2: `detect_for_config` is schema/embedder-only — it has no
+                // opinion on branches, so a `git switch` since the index was last
+                // built looks like `Ready` to it even though the root now needs
+                // reconciling. `branch_switch_pending` is a cheap read-only check
+                // (two small file reads); force the background index in that case
+                // too, so `spawn_background_index` gets a chance to run the
+                // restore-or-snapshot handling before rebuilding.
+                let branch_switched = branches::branch_switch_pending(&cwd);
+                if idx_state == IndexState::NotIndexed
+                    || idx_state == IndexState::Stale
+                    || branch_switched
+                {
                     self.spawn_background_index(&cwd);
                 }
             }
@@ -576,6 +588,15 @@ impl McpServer {
         let config = self.config.clone();
         let states = Arc::clone(&self.index_states);
         std::thread::spawn(move || {
+            // Wave 2: reconcile a branch switch BEFORE building — restores an
+            // existing snapshot for the new branch, or snapshots the outgoing
+            // branch, so the build below only re-indexes actual drift instead
+            // of the whole tree. Best-effort: log-and-continue on failure, the
+            // build itself is still safe to attempt either way.
+            if let Err(e) = branches::detect_and_handle_branch_switch(&canonical) {
+                tracing::warn!(err = %e, "Branch switch check failed (continuing with build)");
+            }
+
             tracing::info!(path = %canonical.display(), "Background indexing started");
             match IndexBuilder::new(&config).and_then(|b| b.build(&canonical)) {
                 Ok(stats) => {
@@ -585,6 +606,7 @@ impl McpServer {
                         secs = stats.duration.as_secs_f64(),
                         "Background indexing completed"
                     );
+                    branches::record_branch_indexed(&canonical);
                     states.lock().insert(canonical, IndexingStatus::Ready);
                 }
                 Err(e) => {
@@ -1597,10 +1619,55 @@ impl McpServer {
             ""
         };
 
+        let branches_str = Self::branches_detail(&canonical);
+
         format!(
-            "{display}\n  State: {state_label}{refresh_note}\n  Age:   {age_str}\n  Files: {}\n  Chunks: {}\n  Model: {}",
+            "{display}\n  State: {state_label}{refresh_note}\n  Age:   {age_str}\n  Files: {}\n  Chunks: {}\n  Model: {}{branches_str}",
             meta.file_count, meta.chunk_count, meta.embedding_model
         )
+    }
+
+    /// Wave 2: render the registry's tracked branches for `canonical`, if
+    /// any — appended (not restructuring) to `repo_status_detail`'s existing
+    /// output so anything scraping the prior fields stays unaffected.
+    fn branches_detail(canonical: &Path) -> String {
+        use std::fmt::Write as _;
+
+        let Some(entry) = registry::read_all_v2()
+            .projects
+            .into_iter()
+            .find(|p| p.path == canonical)
+        else {
+            return String::new();
+        };
+        if entry.branches.is_empty() {
+            return String::new();
+        }
+
+        let current_key = semantex_core::index::layout::current_branch_key(canonical);
+        let mut branches = entry.branches;
+        branches.sort_by(|a, b| b.last_indexed_ts.cmp(&a.last_indexed_ts));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut out = String::from("\n  Branches:");
+        for b in &branches {
+            let marker = if b.branch_key == current_key {
+                " (current)"
+            } else {
+                ""
+            };
+            let age = if b.last_indexed_ts > 0 {
+                format_age((now - b.last_indexed_ts).max(0) as u64)
+            } else {
+                "unknown".to_string()
+            };
+            let _ = write!(out, "\n    {}{marker}: indexed {age} ago", b.branch);
+        }
+        out
     }
 
     // -------------------------------------------------------------------------
