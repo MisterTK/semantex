@@ -6,12 +6,19 @@ use semantex_core::config::SemantexConfig;
 /// HTTP transport instead, which exposes the same JSON-RPC surface on a TCP
 /// listener. `toolset` selects which tool bundle to expose for stdio:
 /// `core` (4), `structural` (5), or `all` (13, default).
+///
+/// `auth_token` and `require_auth` are HTTP-only (see `--auth-token` /
+/// `--require-auth`); they are ignored for stdio. Auth is REQUIRED whenever
+/// `allow_remote` is set — see `semantex_mcp::http_transport::AuthConfig`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &SemantexConfig,
     http: bool,
     port: u16,
     allow_remote: bool,
     toolset: &str,
+    auth_token: Option<String>,
+    require_auth: bool,
 ) -> Result<()> {
     #[cfg(feature = "mcp")]
     {
@@ -25,25 +32,40 @@ pub fn run(
                 // child becomes the single source of truth for tool filtering
                 // (`server.rs::tools_for_toolset`). The HTTP-level filter in
                 // `http_transport.rs` is kept as defense-in-depth.
-                return run_http(port, allow_remote, toolset);
+                return run_http(port, allow_remote, toolset, auth_token, require_auth);
             }
             #[cfg(not(feature = "http"))]
             {
-                let _ = (port, allow_remote, config, toolset);
+                let _ = (
+                    port,
+                    allow_remote,
+                    config,
+                    toolset,
+                    auth_token,
+                    require_auth,
+                );
                 anyhow::bail!(
                     "HTTP MCP transport not compiled in. Build semantex-mcp with --features http",
                 );
             }
         }
 
-        let _ = (port, allow_remote);
+        let _ = (port, allow_remote, auth_token, require_auth);
         let server = semantex_mcp::McpServer::with_toolset(config.clone(), toolset);
         server.run()
     }
 
     #[cfg(not(feature = "mcp"))]
     {
-        let _ = (config, http, port, allow_remote, toolset);
+        let _ = (
+            config,
+            http,
+            port,
+            allow_remote,
+            toolset,
+            auth_token,
+            require_auth,
+        );
         anyhow::bail!("MCP support not compiled in. Build with --features mcp")
     }
 }
@@ -57,7 +79,13 @@ fn validate_toolset(toolset: &str) -> Result<()> {
 }
 
 #[cfg(all(feature = "mcp", feature = "http"))]
-fn run_http(port: u16, allow_remote: bool, toolset: &str) -> Result<()> {
+fn run_http(
+    port: u16,
+    allow_remote: bool,
+    toolset: &str,
+    auth_token: Option<String>,
+    require_auth: bool,
+) -> Result<()> {
     use std::sync::Arc;
     // Persist the toolset as `Option<String>`: `None` means default ("all").
     // The child subprocess gets `--toolset <name>` only when explicitly set.
@@ -65,6 +93,11 @@ fn run_http(port: u16, allow_remote: bool, toolset: &str) -> Result<()> {
         None
     } else {
         Some(toolset.to_string())
+    };
+
+    let auth = semantex_mcp::http_transport::AuthConfig {
+        cli_token: auth_token,
+        require_auth,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -75,7 +108,7 @@ fn run_http(port: u16, allow_remote: bool, toolset: &str) -> Result<()> {
         let backend = Arc::new(
             semantex_mcp::http_transport::SubprocessBackend::new_with_toolset(bin, child_toolset),
         );
-        semantex_mcp::http_transport::run_http_server(port, allow_remote, backend).await
+        semantex_mcp::http_transport::run_http_server(port, allow_remote, auth, backend).await
     })
 }
 
