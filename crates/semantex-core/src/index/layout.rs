@@ -53,7 +53,7 @@
 //! sidecar, `indexes/<branch_key>/branch.json` ([`BranchMeta`]).
 
 use crate::types::IndexMeta;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -91,6 +91,17 @@ pub struct BranchMeta {
     pub head_commit: Option<String>,
 }
 
+// Root-level sidecar (Wave 2, `<project>/.semantex/branch.json`) recording
+// which branch the container root's LIVE content currently belongs to —
+// as opposed to the (possibly stale) snapshots sitting in
+// `indexes/<branch_key>/`. This is the source of truth
+// `crate::index::branches::detect_and_handle_branch_switch` compares
+// against `current_branch_key` to notice a `git switch`/`checkout` since
+// the root was last synced. Written by `mirror_into_branch_dir` (same
+// `BranchMeta` shape/content as the per-branch sidecar, just also kept at
+// the root) so the two never disagree. See `root_branch_meta_path` /
+// `read_root_branch_meta` below.
+
 // ── Path helpers ───────────────────────────────────────────────────────────
 
 /// `<project>/.semantex/` — the top-level container. Unchanged from
@@ -122,6 +133,33 @@ pub fn memory_db_path(project_root: &Path) -> PathBuf {
 /// `<project>/.semantex/meta.json` (top-level, v13 [`ProjectMeta`] shape).
 pub fn project_meta_path(project_root: &Path) -> PathBuf {
     container_dir(project_root).join("meta.json")
+}
+
+/// `<project>/.semantex/branch.json` — see [`BranchMeta`]'s root-sidecar doc.
+pub fn root_branch_meta_path(project_root: &Path) -> PathBuf {
+    container_dir(project_root).join("branch.json")
+}
+
+/// Read the root's recorded branch identity, if any. `None` means either a
+/// brand-new project (nothing synced yet) or a pre-Wave-2 `.semantex/` that
+/// predates this sidecar — either way, callers should treat that as "no
+/// switch to reconcile" rather than an error.
+pub fn read_root_branch_meta(project_root: &Path) -> Option<BranchMeta> {
+    let content = std::fs::read_to_string(root_branch_meta_path(project_root)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Read the branch identity sidecar of a saved snapshot
+/// (`indexes/<branch_key>/branch.json`), if present. Used by the
+/// branch-switch handling to decide whether an outgoing branch's snapshot is
+/// already current (same `head_commit` as the root's sidecar) and must NOT
+/// be overwritten by a possibly-contaminated root (a build for the NEW
+/// branch that failed midway leaves hybrid root content with the OLD
+/// branch's sidecar still in place).
+pub fn read_branch_dir_meta(project_root: &Path, branch_key: &str) -> Option<BranchMeta> {
+    let path = branch_index_dir(project_root, branch_key).join("branch.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 // ── branch_key derivation ───────────────────────────────────────────────────
@@ -190,6 +228,17 @@ fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
         });
     }
     None
+}
+
+/// The actual `HEAD` file to watch for branch-switch detection (Wave 2's
+/// `semantex watch`). NOT necessarily `<project_root>/.git/HEAD` — for a
+/// linked worktree, `.git` is a `gitdir:` pointer file and the real `HEAD`
+/// lives in the main repo's `.git/worktrees/<name>/HEAD`, which is OUTSIDE
+/// `project_root` entirely and would never be seen by a recursive watch of
+/// the project directory. `None` for a non-git directory (nothing to
+/// watch).
+pub fn git_head_file(project_root: &Path) -> Option<PathBuf> {
+    resolve_git_dir(project_root).map(|d| d.join("HEAD"))
 }
 
 /// Resolve the branch name HEAD currently points to. Returns `None` for a
@@ -423,14 +472,43 @@ fn snapshot_sqlite_db(src: &Path, dst: &Path) -> Result<()> {
 /// This is deliberately NOT a destructive move: the root stays the live,
 /// authoritative copy that every existing (non-owned) reader depends on —
 /// see the module doc for why.
+///
+/// Stamps the branch identity sidecar (branch name, `branch_key`,
+/// head_commit) from the CURRENT git HEAD — correct for every existing call
+/// site, which always passes `current_branch_key(project_root)` for
+/// `branch_key` too, so the two never disagree. [`mirror_root_as`] is the
+/// identity-parameterized core for the one caller (Wave 2's branch-switch
+/// handling) that needs to snapshot the OUTGOING branch's root content — by
+/// the time that runs, HEAD has already moved, so deriving identity from
+/// HEAD would stamp the sidecar with the wrong (new) branch name.
 pub fn mirror_into_branch_dir(project_root: &Path, branch_key: &str) -> Result<()> {
+    let branch_meta = BranchMeta {
+        branch: current_branch_name(project_root),
+        branch_key: branch_key.to_string(),
+        head_commit: resolve_git_head_commit(project_root),
+    };
+    mirror_root_as(project_root, &branch_meta)
+}
+
+/// Identity-parameterized core of [`mirror_into_branch_dir`] — snapshots the
+/// container root's current index content into `indexes/<branch_meta.branch_key>/`,
+/// stamping the sidecar (both there and at the root) with `branch_meta`
+/// verbatim rather than re-deriving it from the current git HEAD. See
+/// [`mirror_into_branch_dir`]'s doc for why that distinction matters.
+pub fn mirror_root_as(project_root: &Path, branch_meta: &BranchMeta) -> Result<()> {
     let container = container_dir(project_root);
     if !container.join("chunks.db").exists() {
         return Ok(());
     }
 
+    let branch_key = branch_meta.branch_key.as_str();
     let branch_dir = branch_index_dir(project_root, branch_key);
-    let tmp_dir = indexes_root(project_root).join(format!("{branch_key}.tmp-mirror"));
+    // Pid-suffixed so two processes racing to mirror the same branch never
+    // stomp each other's half-built tmp dir (same idiom as
+    // `registry::save_registry_to`). Orphans from crashed processes are
+    // swept by `cleanup_stale_tmp_artifacts` under the index lock.
+    let tmp_dir =
+        indexes_root(project_root).join(format!("{branch_key}.tmp-mirror.{}", std::process::id()));
     if tmp_dir.exists() {
         std::fs::remove_dir_all(&tmp_dir)?;
     }
@@ -463,22 +541,208 @@ pub fn mirror_into_branch_dir(project_root: &Path, branch_key: &str) -> Result<(
         hardlink_tree(&sparse_src, &tmp_dir.join("sparse"))?;
     }
 
+    // Branch identity sidecar (contract: per-index meta carries branch name +
+    // head_commit; kept out of the shared IndexMeta struct — see module doc).
+    // Written INTO the tmp dir BEFORE the swap so a crash can never leave a
+    // snapshot in place without its identity sidecar (an identity-less
+    // snapshot would be invisible to `read_branch_dir_meta` and wrongly
+    // re-mirrored over on the next branch switch).
+    let json = serde_json::to_string_pretty(branch_meta)?;
+    std::fs::write(tmp_dir.join("branch.json"), &json)?;
+
     if branch_dir.exists() {
         std::fs::remove_dir_all(&branch_dir)?;
     }
     std::fs::rename(&tmp_dir, &branch_dir)?;
 
-    // Branch identity sidecar (contract: per-index meta carries branch name +
-    // head_commit; kept out of the shared IndexMeta struct — see module doc).
-    let branch_meta = BranchMeta {
-        branch: current_branch_name(project_root),
-        branch_key: branch_key.to_string(),
-        head_commit: resolve_git_head_commit(project_root),
-    };
-    let json = serde_json::to_string_pretty(&branch_meta)?;
-    std::fs::write(branch_dir.join("branch.json"), json)?;
+    // Wave 2: also stamp the root sidecar so `read_root_branch_meta` always
+    // reflects which branch the LIVE `.semantex/` content currently belongs
+    // to — the signal `index::branches::detect_and_handle_branch_switch`
+    // compares against `current_branch_key` on every entry point.
+    std::fs::write(container.join("branch.json"), &json)?;
 
     Ok(())
+}
+
+/// Reverse of [`mirror_into_branch_dir`]: restore a previously-snapshotted
+/// `indexes/<branch_key>/` into the container root, making it the LIVE,
+/// authoritative index again. Used when a branch switch lands on a branch
+/// that already has a saved snapshot — restoring it first means the
+/// subsequent incremental build only has to catch drift since the snapshot
+/// was taken, instead of re-embedding the whole tree.
+///
+/// Same snapshot discipline as the forward direction, just inverted:
+/// `chunks.db` is re-snapshotted (never hard-linked — the restored root will
+/// immediately be written to in place by the next incremental build, and a
+/// hard link would let those writes leak backward into the branch dir's own
+/// mirror), `meta.json`/`models.toml`/`dense/**` are byte-copied, and
+/// `sparse/` (tantivy) is hard-linked (write-once/rename-replace, so mutating
+/// the restored root's tantivy dir later can never corrupt the branch dir's
+/// copy — same reasoning as the forward direction). Individual files are
+/// swapped into place via a tmp-then-rename so a crash mid-restore can never
+/// leave the root with a torn/partial file — at worst it's left with a mix
+/// of some already-restored and some still-old-branch files, all of them
+/// individually intact, and safe to retry.
+///
+/// No-op if `branch_key` has no snapshot yet (nothing to restore).
+///
+/// MUST be called with the exclusive `<project>/.semantex/.semantex.lock`
+/// held (the same lock `IndexBuilder::build` takes): readers use that lock
+/// as the "index is being mutated" signal (`state::detect` returns
+/// `Building` while it's held), and the WAL/SHM removal below is only safe
+/// when no live writer connection exists. The one production caller,
+/// [`crate::index::branches::detect_and_handle_branch_switch`], acquires it.
+pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Result<()> {
+    let branch_dir = branch_index_dir(project_root, branch_key);
+    if !branch_dir.join("chunks.db").exists() {
+        return Ok(());
+    }
+    let container = container_dir(project_root);
+    std::fs::create_dir_all(&container)?;
+
+    // All tmp names are pid-suffixed so two processes racing to restore never
+    // clobber each other's half-written files (same idiom as
+    // `registry::save_registry_to`); orphans from crashed processes are swept
+    // by `cleanup_stale_tmp_artifacts` under the index lock.
+    let pid = std::process::id();
+
+    // chunks.db: snapshot into a tmp file, then atomic rename over the root's.
+    let tmp_chunks =
+        indexes_root(project_root).join(format!("{branch_key}.chunks.tmp-restore.{pid}"));
+    if tmp_chunks.exists() {
+        std::fs::remove_file(&tmp_chunks)?;
+    }
+    snapshot_sqlite_db(&branch_dir.join("chunks.db"), &tmp_chunks)?;
+    std::fs::rename(&tmp_chunks, container.join("chunks.db"))?;
+
+    // The root's chunks.db is WAL-mode and long-lived connections are the
+    // norm (serve daemon, MCP cached searchers), so the OLD branch's
+    // `chunks.db-wal` / `chunks.db-shm` can survive the rename above. Left
+    // in place, the next connection would replay the old branch's WAL frames
+    // onto the NEW branch's freshly-restored db file — hybrid content or
+    // outright "database disk image is malformed". The caller holds the
+    // exclusive index lock here (see `branches::detect_and_handle_branch_switch`),
+    // so no live writer exists and dropping the sidecar files is safe.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = container.join(format!("chunks.db{suffix}"));
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "restore: failed to remove stale {} beside the restored chunks.db",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+
+    // meta.json / models.toml: plain copies, tmp-then-rename swapped in.
+    // When the snapshot LACKS one of these, remove the root's leftover copy
+    // rather than keeping the old branch's — a stale root `models.toml`
+    // could silently change embedder selection for the restored branch.
+    for name in ["meta.json", "models.toml"] {
+        let src = branch_dir.join(name);
+        let dst = container.join(name);
+        if !src.is_file() {
+            match std::fs::remove_file(&dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("restore: failed to remove leftover {}", dst.display())
+                    });
+                }
+            }
+            continue;
+        }
+        let tmp = indexes_root(project_root).join(format!("{branch_key}.{name}.tmp-restore.{pid}"));
+        std::fs::copy(&src, &tmp)?;
+        std::fs::rename(&tmp, dst)?;
+    }
+
+    // dense/**: rewritten in place by the builder — restore as a fresh copy,
+    // swapped in via a tmp dir + rename so readers never see a half-written
+    // dense/ directory.
+    let dense_dst = container.join("dense");
+    let dense_src = branch_dir.join("dense");
+    if dense_src.is_dir() {
+        let tmp_dense =
+            indexes_root(project_root).join(format!("{branch_key}.dense.tmp-restore.{pid}"));
+        if tmp_dense.exists() {
+            std::fs::remove_dir_all(&tmp_dense)?;
+        }
+        copy_tree(&dense_src, &tmp_dense)?;
+        if dense_dst.exists() {
+            std::fs::remove_dir_all(&dense_dst)?;
+        }
+        std::fs::rename(&tmp_dense, &dense_dst)?;
+    } else if dense_dst.exists() {
+        std::fs::remove_dir_all(&dense_dst)?;
+    }
+
+    // sparse/ (tantivy): hard-link-safe in this direction too (write-once
+    // segments + rename-replaced meta.json), same reasoning as the forward
+    // mirror — and it's the bulk of the index, so this keeps restores cheap.
+    let sparse_dst = container.join("sparse");
+    let sparse_src = branch_dir.join("sparse");
+    if sparse_src.is_dir() {
+        let tmp_sparse =
+            indexes_root(project_root).join(format!("{branch_key}.sparse.tmp-restore.{pid}"));
+        if tmp_sparse.exists() {
+            std::fs::remove_dir_all(&tmp_sparse)?;
+        }
+        hardlink_tree(&sparse_src, &tmp_sparse)?;
+        if sparse_dst.exists() {
+            std::fs::remove_dir_all(&sparse_dst)?;
+        }
+        std::fs::rename(&tmp_sparse, &sparse_dst)?;
+    } else if sparse_dst.exists() {
+        std::fs::remove_dir_all(&sparse_dst)?;
+    }
+
+    // Root sidecar now reflects the restored branch.
+    if let Ok(branch_meta_json) = std::fs::read_to_string(branch_dir.join("branch.json")) {
+        std::fs::write(container.join("branch.json"), branch_meta_json)?;
+    }
+
+    Ok(())
+}
+
+/// Best-effort sweep of orphaned in-flight artifacts (`*.tmp-mirror.*` /
+/// `*.tmp-restore.*` files and dirs) left in `indexes/` by a crashed
+/// mirror/restore. They are deliberately excluded from retention's eviction
+/// (a live process's tmp dir must never be GC'd as a "stale branch"), so
+/// without this sweep they would accumulate forever.
+///
+/// ONLY call while holding the exclusive `.semantex.lock` — every writer of
+/// these tmp names (mirror via the builder's lock, restore via
+/// `branches::detect_and_handle_branch_switch`'s lock) runs under it, so
+/// with the lock held, anything matching the pattern is guaranteed to be an
+/// orphan from a dead process, not another process's work in flight.
+pub fn cleanup_stale_tmp_artifacts(project_root: &Path) {
+    let indexes = indexes_root(project_root);
+    let Ok(entries) = std::fs::read_dir(&indexes) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.contains(".tmp-") {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => tracing::info!(path = %path.display(), "Removed orphaned tmp artifact"),
+            Err(e) => tracing::debug!(path = %path.display(), "Could not remove tmp artifact: {e}"),
+        }
+    }
 }
 
 /// Ensure the full v13 layout exists for `project_root`: migrate/refresh the
@@ -569,6 +833,33 @@ mod tests {
             current_branch_key(tmp.path()),
             branch_key_for_branch("feature/x")
         );
+    }
+
+    #[test]
+    fn git_head_file_resolves_in_main_repo_and_worktree() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        assert_eq!(
+            git_head_file(tmp.path()),
+            Some(tmp.path().join(".git").join("HEAD"))
+        );
+
+        // Non-git directory: nothing to watch.
+        let non_git = TempDir::new().unwrap();
+        assert_eq!(git_head_file(non_git.path()), None);
+
+        // Linked worktree: HEAD lives in the private worktree gitdir, NOT
+        // under project_root.
+        let real_git = tmp.path().join("real.git").join("worktrees").join("wt1");
+        std::fs::create_dir_all(&real_git).unwrap();
+        let worktree = tmp.path().join("worktree-dir");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", real_git.display()),
+        )
+        .unwrap();
+        assert_eq!(git_head_file(&worktree), Some(real_git.join("HEAD")));
     }
 
     #[test]
@@ -1034,5 +1325,150 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(main_dir.join("branch.json")).unwrap())
                 .unwrap();
         assert_eq!(main_meta.branch, "main");
+    }
+
+    /// Wave 2: `mirror_into_branch_dir` also stamps the ROOT-level
+    /// `branch.json` sidecar (`read_root_branch_meta`) — the signal
+    /// `index::branches::detect_and_handle_branch_switch` compares against
+    /// `current_branch_key` on every entry point.
+    #[test]
+    fn mirror_stamps_root_branch_sidecar() {
+        use crate::index::storage::ChunkStore;
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let container = container_dir(project);
+        std::fs::create_dir_all(&container).unwrap();
+
+        assert!(
+            read_root_branch_meta(project).is_none(),
+            "no root sidecar before anything is built"
+        );
+
+        let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+        let _ = store
+            .insert_chunk(
+                &Chunk {
+                    id: 0,
+                    file_path: PathBuf::from("src/a.rs"),
+                    start_line: 1,
+                    end_line: 1,
+                    content: "fn a() {}".to_string(),
+                    chunk_type: ChunkType::TextWindow { window_index: 0 },
+                },
+                1,
+                0,
+            )
+            .unwrap();
+        drop(store);
+        std::fs::write(
+            container.join("meta.json"),
+            serde_json::to_string(&sample_index_meta()).unwrap(),
+        )
+        .unwrap();
+
+        mirror_into_branch_dir(project, "somebranch-cafe1234").unwrap();
+        let root_meta = read_root_branch_meta(project).expect("root sidecar written");
+        assert_eq!(root_meta.branch_key, "somebranch-cafe1234");
+    }
+
+    /// `restore_branch_dir_into_root` is the reverse of
+    /// `mirror_into_branch_dir`: it must overwrite the root's chunks.db,
+    /// meta.json, dense/**, sparse/, and branch.json with the snapshot's
+    /// content, discarding whatever the root held before.
+    #[test]
+    fn restore_branch_dir_into_root_replaces_live_content() {
+        use crate::index::storage::ChunkStore;
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let container = container_dir(project);
+        std::fs::create_dir_all(container.join("dense").join("backend")).unwrap();
+
+        // Build + mirror branch "old" with its own content.
+        {
+            let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+            store
+                .insert_chunk(
+                    &Chunk {
+                        id: 0,
+                        file_path: PathBuf::from("src/old.rs"),
+                        start_line: 1,
+                        end_line: 1,
+                        content: "fn old_branch_fn() {}".to_string(),
+                        chunk_type: ChunkType::TextWindow { window_index: 0 },
+                    },
+                    1,
+                    0,
+                )
+                .unwrap();
+        }
+        std::fs::write(
+            container.join("meta.json"),
+            serde_json::to_string(&sample_index_meta()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            container.join("dense").join("backend").join("vectors.bin"),
+            b"old-vectors",
+        )
+        .unwrap();
+        mirror_into_branch_dir(project, "old-key11112222").unwrap();
+
+        // Now mutate the root to look like a DIFFERENT branch's content —
+        // simulating what an incremental build for the new branch would do.
+        std::fs::remove_file(container.join("chunks.db")).unwrap();
+        let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+        store
+            .insert_chunk(
+                &Chunk {
+                    id: 0,
+                    file_path: PathBuf::from("src/new.rs"),
+                    start_line: 1,
+                    end_line: 1,
+                    content: "fn new_branch_fn() {}".to_string(),
+                    chunk_type: ChunkType::TextWindow { window_index: 0 },
+                },
+                2,
+                0,
+            )
+            .unwrap();
+        drop(store);
+        std::fs::write(
+            container.join("dense").join("backend").join("vectors.bin"),
+            b"new-vectors-totally-different",
+        )
+        .unwrap();
+
+        // Restore "old" back into the root.
+        restore_branch_dir_into_root(project, "old-key11112222").unwrap();
+
+        let restored_store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+        // The root's chunks.db was replaced wholesale by the snapshot (not
+        // merged): exactly the old branch's one row, with its content —
+        // the "new" branch's row is gone even if ids happened to collide
+        // across the two fresh single-row DBs.
+        let ids = restored_store.get_all_chunk_ids().unwrap();
+        assert_eq!(ids.len(), 1, "restore must replace, not merge, chunks.db");
+        let restored = restored_store.get_chunk(ids[0]).unwrap();
+        assert_eq!(restored.content, "fn old_branch_fn() {}");
+        assert_eq!(
+            std::fs::read(container.join("dense").join("backend").join("vectors.bin")).unwrap(),
+            b"old-vectors"
+        );
+        let root_meta = read_root_branch_meta(project).unwrap();
+        assert_eq!(root_meta.branch_key, "old-key11112222");
+    }
+
+    /// Restoring a branch_key with no snapshot yet must be a safe no-op
+    /// (nothing to restore) rather than erroring or wiping the root.
+    #[test]
+    fn restore_of_nonexistent_branch_dir_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        restore_branch_dir_into_root(project, "never-existed-00000000").unwrap();
+        assert!(!branch_index_dir(project, "never-existed-00000000").exists());
     }
 }

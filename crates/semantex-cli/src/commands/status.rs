@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use semantex_core::config::SemantexConfig;
 use semantex_core::embedding::single_vector_model;
+use semantex_core::index::layout;
+use semantex_core::index::registry;
 use semantex_core::index::storage::ChunkStore;
 use semantex_core::types::IndexMeta;
 use std::path::Path;
@@ -112,6 +114,8 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
         println!("  Run 'semantex index {}' to build one.", path.display());
     }
 
+    print_branches_section(&project_path);
+
     println!();
     println!("{}", "Config:".bold());
     println!("  Max results:    {}", config.max_count);
@@ -129,4 +133,67 @@ pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Wave 2: list the branches the registry has tracked as indexed for this
+/// project (`branch`, `branch_key`, last-indexed age, current-or-not).
+/// Additive-only — printed after the existing `Index:` block so this stays
+/// backward compatible with anything scraping the earlier output.
+fn print_branches_section(project_path: &Path) {
+    let Some(entry) = registry::read_all_v2()
+        .projects
+        .into_iter()
+        .find(|p| p.path == project_path)
+    else {
+        return;
+    };
+    if entry.branches.is_empty() {
+        return;
+    }
+
+    let current_key = layout::current_branch_key(project_path);
+    let mut branches = entry.branches;
+    branches.sort_by(|a, b| b.last_indexed_ts.cmp(&a.last_indexed_ts));
+
+    println!();
+    println!("{}", "Branches:".bold());
+    for b in &branches {
+        let marker = if b.branch_key == current_key {
+            " (current)".green().to_string()
+        } else {
+            String::new()
+        };
+        let age = format_unix_ts_age(b.last_indexed_ts);
+        let commit = b
+            .head_commit
+            .as_deref()
+            .map_or_else(|| "unknown".to_string(), |c| c.chars().take(8).collect());
+        println!(
+            "  {}{}: indexed {} ago, commit {}",
+            b.branch, marker, age, commit
+        );
+    }
+}
+
+/// Render "N seconds/minutes/hours/days ago" from a Unix-seconds timestamp,
+/// reusing the same coarse buckets `state::index_age_secs`/`format_age`
+/// (semantex-mcp) already display elsewhere in this CLI's output.
+fn format_unix_ts_age(unix_ts: i64) -> String {
+    if unix_ts <= 0 {
+        return "unknown".to_string();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - unix_ts).max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }

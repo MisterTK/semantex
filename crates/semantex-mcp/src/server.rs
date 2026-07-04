@@ -6,6 +6,7 @@ use crate::protocol::{
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use semantex_core::config::SemantexConfig;
+use semantex_core::index::branches;
 use semantex_core::index::builder::IndexBuilder;
 use semantex_core::index::state::{self, IndexState};
 use semantex_core::index::storage::ChunkStore;
@@ -131,7 +132,10 @@ const IDLE_TIMEOUT_SECS: u64 = 120; // 2 minutes
 pub struct McpServer {
     config: SemantexConfig,
     /// LRU cache of `HybridSearcher` instances keyed by canonical index directory.
-    cache: Mutex<HashMap<PathBuf, Arc<CachedSearcher>>>,
+    /// `Arc` so the background-index thread can drop a project's entry when its
+    /// rebuild completes (S1: a cached searcher must not outlive a
+    /// branch-switch reconcile — it would keep serving the old branch's index).
+    cache: Arc<Mutex<HashMap<PathBuf, Arc<CachedSearcher>>>>,
     max_cached: usize,
     /// RSS limit in MB. When exceeded, all cached searchers are evicted.
     rss_limit_mb: u64,
@@ -238,7 +242,7 @@ impl McpServer {
 
         Self {
             config,
-            cache: Mutex::new(HashMap::new()),
+            cache: Arc::new(Mutex::new(HashMap::new())),
             max_cached,
             rss_limit_mb,
             index_states: Arc::new(Mutex::new(HashMap::new())),
@@ -520,7 +524,18 @@ impl McpServer {
                 // `detect_state_fast` stays schema-only to keep the warm path
                 // sub-microsecond; this is its session-level backstop).
                 let idx_state = state::detect_for_config(&cwd, &self.config);
-                if idx_state == IndexState::NotIndexed || idx_state == IndexState::Stale {
+                // Wave 2: `detect_for_config` is schema/embedder-only — it has no
+                // opinion on branches, so a `git switch` since the index was last
+                // built looks like `Ready` to it even though the root now needs
+                // reconciling. `branch_switch_pending` is a cheap read-only check
+                // (two small file reads); force the background index in that case
+                // too, so `spawn_background_index` gets a chance to run the
+                // restore-or-snapshot handling before rebuilding.
+                let branch_switched = branches::branch_switch_pending(&cwd);
+                if idx_state == IndexState::NotIndexed
+                    || idx_state == IndexState::Stale
+                    || branch_switched
+                {
                     self.spawn_background_index(&cwd);
                 }
             }
@@ -629,7 +644,18 @@ impl McpServer {
 
         let config = self.config.clone();
         let states = Arc::clone(&self.index_states);
+        let cache = Arc::clone(&self.cache);
         std::thread::spawn(move || {
+            // Wave 2: reconcile a branch switch BEFORE building — restores an
+            // existing snapshot for the new branch, or snapshots the outgoing
+            // branch, so the build below only re-indexes actual drift instead
+            // of the whole tree. Acquires the exclusive index lock internally
+            // for any mutation. Best-effort: log-and-continue on failure, the
+            // build itself is still safe to attempt either way.
+            if let Err(e) = branches::detect_and_handle_branch_switch(&canonical) {
+                tracing::warn!(err = %e, "Branch switch check failed (continuing with build)");
+            }
+
             tracing::info!(path = %canonical.display(), "Background indexing started");
             match IndexBuilder::new(&config).and_then(|b| b.build(&canonical)) {
                 Ok(stats) => {
@@ -639,6 +665,14 @@ impl McpServer {
                         secs = stats.duration.as_secs_f64(),
                         "Background indexing completed"
                     );
+                    branches::record_branch_indexed(&canonical);
+                    // S1: drop any cached searcher for this project so the
+                    // next search reopens against the just-rebuilt (possibly
+                    // branch-switched) index instead of serving the old
+                    // branch's content from a stale open handle.
+                    cache
+                        .lock()
+                        .remove(&SemantexConfig::project_index_dir(&canonical));
                     states.lock().insert(canonical, IndexingStatus::Ready);
                 }
                 Err(e) => {
@@ -701,6 +735,26 @@ impl McpServer {
         } else {
             state::detect(path)
         }
+    }
+
+    /// Per-search state check for the search-path tool handlers: exactly
+    /// [`Self::detect_state_fast`], plus the cheap (two small file reads)
+    /// [`branches::branch_switch_pending`] probe. Without it, a `git switch`
+    /// mid-session would go unnoticed until the next `initialize` or the
+    /// 1-hour age refresh — an actively-used cached searcher would keep
+    /// serving the OLD branch's results indefinitely. When a switch is
+    /// pending we kick off the background reconcile+rebuild, drop the stale
+    /// cached searcher, and report `Building` so the caller falls back to
+    /// ripgrep instead of answering from the wrong branch's index.
+    fn search_path_state(&self, path: &std::path::Path) -> IndexState {
+        let state = Self::detect_state_fast(path);
+        if state == IndexState::Ready && branches::branch_switch_pending(path) {
+            tracing::info!(path = %path.display(), "Branch switch pending — triggering reconcile before serving searches");
+            self.invalidate_cache(&SemantexConfig::project_index_dir(path));
+            self.spawn_background_index(path);
+            return IndexState::Building;
+        }
+        state
     }
 
     /// Trigger a background refresh if the index is older than `SEMANTEX_REFRESH_SECS`
@@ -1406,7 +1460,7 @@ impl McpServer {
 
         let path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
-        let idx_state = Self::detect_state_fast(&path);
+        let idx_state = self.search_path_state(&path);
         match idx_state {
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
@@ -1698,7 +1752,7 @@ impl McpServer {
 
         tracing::info!(query, path = %path.display(), max_results, rerank, grep_mode, "MCP search");
 
-        let idx_state = Self::detect_state_fast(&path);
+        let idx_state = self.search_path_state(&path);
         match idx_state {
             IndexState::Ready => {
                 self.maybe_trigger_refresh(&path);
@@ -2028,10 +2082,55 @@ impl McpServer {
             ""
         };
 
+        let branches_str = Self::branches_detail(&canonical);
+
         format!(
-            "{display}\n  State: {state_label}{refresh_note}\n  Age:   {age_str}\n  Files: {}\n  Chunks: {}\n  Model: {}",
+            "{display}\n  State: {state_label}{refresh_note}\n  Age:   {age_str}\n  Files: {}\n  Chunks: {}\n  Model: {}{branches_str}",
             meta.file_count, meta.chunk_count, meta.embedding_model
         )
+    }
+
+    /// Wave 2: render the registry's tracked branches for `canonical`, if
+    /// any — appended (not restructuring) to `repo_status_detail`'s existing
+    /// output so anything scraping the prior fields stays unaffected.
+    fn branches_detail(canonical: &Path) -> String {
+        use std::fmt::Write as _;
+
+        let Some(entry) = registry::read_all_v2()
+            .projects
+            .into_iter()
+            .find(|p| p.path == canonical)
+        else {
+            return String::new();
+        };
+        if entry.branches.is_empty() {
+            return String::new();
+        }
+
+        let current_key = semantex_core::index::layout::current_branch_key(canonical);
+        let mut branches = entry.branches;
+        branches.sort_by(|a, b| b.last_indexed_ts.cmp(&a.last_indexed_ts));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut out = String::from("\n  Branches:");
+        for b in &branches {
+            let marker = if b.branch_key == current_key {
+                " (current)"
+            } else {
+                ""
+            };
+            let age = if b.last_indexed_ts > 0 {
+                format_age((now - b.last_indexed_ts).max(0) as u64)
+            } else {
+                "unknown".to_string()
+            };
+            let _ = write!(out, "\n    {}{marker}: indexed {age} ago", b.branch);
+        }
+        out
     }
 
     // -------------------------------------------------------------------------
@@ -2176,7 +2275,7 @@ impl McpServer {
 
         tracing::info!(query, path = %path.display(), "MCP deep search");
 
-        let idx_state = Self::detect_state_fast(&path);
+        let idx_state = self.search_path_state(&path);
         match idx_state {
             IndexState::NotIndexed | IndexState::Stale => {
                 self.spawn_background_index(&path);
@@ -2957,9 +3056,14 @@ fn resolve_project_path(args: &serde_json::Value) -> Result<PathBuf> {
 }
 
 /// Gate every M1-M6 handler behind a warm-state-aware readiness check.
-/// Returns true iff the index is Ready (warm or detected).
+/// Returns true iff the index is Ready (warm or detected) AND the live root
+/// still belongs to the current git branch (S1: after a mid-session
+/// `git switch`, the structural tools must not answer from the old branch's
+/// index — every caller reacts to `false` by spawning the background
+/// reconcile+rebuild and returning a "building" message).
 fn require_index_ready(path: &Path) -> bool {
     McpServer::detect_state_fast(path) == IndexState::Ready
+        && !branches::branch_switch_pending(path)
 }
 
 /// Convert a list of chunks into a uniform graph-entry shape used by M2/M3.
@@ -3473,7 +3577,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 mod tests {
     use super::{
         DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
-        mode_to_route,
+        mode_to_route, require_index_ready,
     };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
@@ -4262,6 +4366,45 @@ mod tests {
             state,
             IndexState::Ready,
             "fast path should return Ready when sentinel is live and no rebuild lock is held"
+        );
+    }
+
+    /// S1 (Wave 2): a mid-session `git switch` must gate the structural
+    /// tools — `require_index_ready` returns false while the live root still
+    /// belongs to another branch, even though `detect_state_fast` says Ready
+    /// (its schema/lock checks have no opinion on branches).
+    #[test]
+    fn require_index_ready_is_false_while_branch_switch_pending() {
+        let (_dir, project) = build_minimal_index();
+
+        // Fake a git repo on branch "a" and record "a" as the root's branch.
+        let git = project.join(".git");
+        std::fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/a\n").unwrap();
+        std::fs::write(git.join("refs").join("heads").join("a"), "deadbeef\n").unwrap();
+        let root_meta = semantex_core::index::layout::BranchMeta {
+            branch: "a".to_string(),
+            branch_key: semantex_core::index::layout::branch_key_for_branch("a"),
+            head_commit: Some("deadbeef".to_string()),
+        };
+        std::fs::write(
+            project.join(".semantex").join("branch.json"),
+            serde_json::to_string(&root_meta).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            require_index_ready(&project),
+            "no switch pending: index is Ready and branch matches"
+        );
+
+        // HEAD moves to "b" — the root still holds "a"'s index, so the
+        // structural tools must refuse until the reconcile lands.
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/b\n").unwrap();
+        std::fs::write(git.join("refs").join("heads").join("b"), "cafebabe\n").unwrap();
+        assert!(
+            !require_index_ready(&project),
+            "branch switch pending: must not answer from the old branch's index"
         );
     }
 
