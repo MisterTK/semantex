@@ -35,8 +35,14 @@ use serde::{Deserialize, Serialize};
 use crate::chunking::structured_meta::DocTag;
 use crate::file::detector::FileType;
 use crate::index::architecture::{self, ArchBudget, budget_for_chunk_count};
+use crate::index::history;
 use crate::index::storage::ChunkStore;
 use crate::types::Chunk;
+
+/// Max recent repo-wide commits surfaced in [`OverviewScaffold::recent_changes`].
+const RECENT_CHANGES_LIMIT: usize = 10;
+/// Max commits per file surfaced in [`ModuleScaffold::commits_touching`].
+const COMMITS_TOUCHING_LIMIT: usize = 10;
 
 /// File:line provenance for a scaffold item, so the writing agent can verify
 /// every claim against the actual source before committing prose to markdown.
@@ -111,6 +117,13 @@ pub struct ModuleScaffold {
     pub imported_by: Vec<String>,
     pub calls_out: Vec<CallEdgeOut>,
     pub calls_in: Vec<CallEdgeIn>,
+    /// Commits that touched this file, most recent first (v13 Wave 2 —
+    /// history) — provenance candidates for the writing agent ("last
+    /// touched by <author> <age> ago: <subject>"). `None` (absent, not `[]`)
+    /// when `history.db` hasn't been populated yet — see
+    /// [`OverviewScaffold::recent_changes`] for why that distinction matters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commits_touching: Option<Vec<CommitScaffold>>,
 }
 
 /// God node in the overview scaffold — a serde-able mirror of
@@ -161,6 +174,30 @@ pub struct ModuleInventoryEntry {
     pub symbol_count: usize,
 }
 
+/// One commit, as surfaced in a docs scaffold (v13 Wave 2 — history).
+/// A serde-friendly compact mirror of `history::CommitInfo`, adding the
+/// human-friendly relative `age` string the writing agent (and every other
+/// history-derived rendering — the CLI table, the `semantex_agent` "recent
+/// changes" addendum) shows instead of a raw unix timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitScaffold {
+    pub hash: String,
+    pub author: String,
+    pub age: String,
+    pub subject: String,
+}
+
+impl From<history::CommitInfo> for CommitScaffold {
+    fn from(c: history::CommitInfo) -> Self {
+        Self {
+            age: history::humanize_age(c.ts),
+            hash: c.hash,
+            author: c.author,
+            subject: c.subject,
+        }
+    }
+}
+
 /// Repo-wide documentation scaffold — the `"overview"` scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverviewScaffold {
@@ -175,6 +212,12 @@ pub struct OverviewScaffold {
     pub module_inventory: Vec<ModuleInventoryEntry>,
     /// Aggregated per-language file/chunk counts.
     pub language_stats: Vec<LanguageStat>,
+    /// Most recent commits repo-wide (v13 Wave 2 — history). `None` (field
+    /// absent from the JSON, not an empty array) when `history.db` hasn't
+    /// been populated yet — an empty array would read as "this repo has no
+    /// history", which isn't the same claim as "history wasn't gathered".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_changes: Option<Vec<CommitScaffold>>,
 }
 
 /// Map a file path to a language label via extension detection. Returns
@@ -184,6 +227,20 @@ fn language_label(path: &Path) -> Option<String> {
         FileType::Unknown => None,
         ft => Some(format!("{ft:?}").to_lowercase()),
     }
+}
+
+/// Open `history.db` read-only, if it exists, alongside `db_path`
+/// (`<index_dir>/chunks.db` → `<index_dir>/history.db` — the two always
+/// live side by side; see `layout::history_db_path`/`project_index_dir`).
+/// `None` for a missing file OR a file that fails to open — either way, the
+/// caller's history fields stay absent rather than erroring the whole
+/// scaffold build over an auxiliary, best-effort signal.
+fn open_history_readonly(db_path: &Path) -> Option<rusqlite::Connection> {
+    let history_path = db_path.parent()?.join("history.db");
+    if !history_path.exists() {
+        return None;
+    }
+    rusqlite::Connection::open(&history_path).ok()
 }
 
 /// Hydrate a batch of chunk ids into a `chunk_id -> Chunk` map in one query.
@@ -329,6 +386,13 @@ pub fn build_overview_scaffold(store: &ChunkStore, db_path: &Path) -> Result<Ove
             .then_with(|| a.language.cmp(&b.language))
     });
 
+    // v13 Wave 2 — history: absent (not `[]`) unless history.db actually
+    // has commits to report (see `OverviewScaffold::recent_changes`'s doc).
+    let recent_changes = open_history_readonly(db_path)
+        .and_then(|conn| history::recent_commits(&conn, RECENT_CHANGES_LIMIT).ok())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.into_iter().map(CommitScaffold::from).collect());
+
     Ok(OverviewScaffold {
         total_files,
         total_chunks,
@@ -337,6 +401,7 @@ pub fn build_overview_scaffold(store: &ChunkStore, db_path: &Path) -> Result<Ove
         boundaries,
         module_inventory,
         language_stats,
+        recent_changes,
     })
 }
 
@@ -344,8 +409,16 @@ pub fn build_overview_scaffold(store: &ChunkStore, db_path: &Path) -> Result<Ove
 /// edges in/out, and call-graph edges in/out, all with file:line provenance.
 ///
 /// `module_path` must match the `file_path` stored in the index (the path
-/// relative to the project root, as recorded by the indexer).
-pub fn build_module_scaffold(store: &ChunkStore, module_path: &str) -> Result<ModuleScaffold> {
+/// relative to the project root, as recorded by the indexer). `db_path` is
+/// the `chunks.db` path (same one every other scaffold/tool caller already
+/// has); it's used only to locate the sibling `history.db` for the
+/// `commits_touching` field (v13 Wave 2 — history) — absent, not a probe
+/// error, if `history.db` doesn't exist yet.
+pub fn build_module_scaffold(
+    store: &ChunkStore,
+    db_path: &Path,
+    module_path: &str,
+) -> Result<ModuleScaffold> {
     let symbol_rows = store
         .get_symbol_defs_for_file(module_path)
         .with_context(|| format!("Failed to read symbol_defs for `{module_path}`"))?;
@@ -440,6 +513,15 @@ pub fn build_module_scaffold(store: &ChunkStore, module_path: &str) -> Result<Mo
         .ok()
         .map(|r| r.as_str().to_string());
 
+    // v13 Wave 2 — history: absent (not `[]`) unless history.db actually has
+    // commits for this file — see `ModuleScaffold::commits_touching`'s doc.
+    let commits_touching = open_history_readonly(db_path)
+        .and_then(|conn| {
+            history::commits_touching_file(&conn, module_path, COMMITS_TOUCHING_LIMIT).ok()
+        })
+        .filter(|v| !v.is_empty())
+        .map(|v| v.into_iter().map(CommitScaffold::from).collect());
+
     Ok(ModuleScaffold {
         path: module_path.to_string(),
         language,
@@ -449,6 +531,7 @@ pub fn build_module_scaffold(store: &ChunkStore, module_path: &str) -> Result<Mo
         imported_by,
         calls_out,
         calls_in,
+        commits_touching,
     })
 }
 
@@ -466,6 +549,16 @@ pub fn apply_module_budget(scaffold: &mut ModuleScaffold, budget_tokens: usize) 
         let size = serde_json::to_vec(&*scaffold).map(|v| v.len()).unwrap_or(0);
         if size <= approx_bytes {
             return;
+        }
+        // History provenance is a nice-to-have addition, not a claim in
+        // itself — trim it before anything the writing agent would actually
+        // cite in prose.
+        if let Some(commits) = scaffold.commits_touching.as_mut()
+            && commits.len() > 3
+        {
+            let keep = commits.len() / 2;
+            commits.truncate(keep.max(3));
+            continue;
         }
         if scaffold.calls_in.len() > 5 {
             let keep = scaffold.calls_in.len() / 2;
@@ -500,6 +593,14 @@ pub fn apply_overview_budget(scaffold: &mut OverviewScaffold, budget_tokens: usi
         let size = serde_json::to_vec(&*scaffold).map(|v| v.len()).unwrap_or(0);
         if size <= approx_bytes {
             return;
+        }
+        // History provenance trims first — same reasoning as `apply_module_budget`.
+        if let Some(changes) = scaffold.recent_changes.as_mut()
+            && changes.len() > 3
+        {
+            let keep = changes.len() / 2;
+            changes.truncate(keep.max(3));
+            continue;
         }
         if scaffold.module_inventory.len() > 20 {
             let keep = scaffold.module_inventory.len() / 2;
@@ -597,7 +698,7 @@ mod tests {
         let store = ChunkStore::open(&db_path).unwrap();
         seed_fixture(&store);
 
-        let scaffold = build_module_scaffold(&store, "src/lib.rs").unwrap();
+        let scaffold = build_module_scaffold(&store, &db_path, "src/lib.rs").unwrap();
         assert_eq!(scaffold.path, "src/lib.rs");
         assert_eq!(scaffold.symbols.len(), 1);
         assert_eq!(scaffold.symbols[0].name, "run");
@@ -626,7 +727,7 @@ mod tests {
         let store = ChunkStore::open(&db_path).unwrap();
         seed_fixture(&store);
 
-        let scaffold = build_module_scaffold(&store, "src/helper.rs").unwrap();
+        let scaffold = build_module_scaffold(&store, &db_path, "src/helper.rs").unwrap();
         assert_eq!(scaffold.symbols.len(), 1);
         assert_eq!(scaffold.symbols[0].name, "helper");
         assert_eq!(scaffold.imported_by, vec!["src/lib.rs".to_string()]);
@@ -642,10 +743,87 @@ mod tests {
         let store = ChunkStore::open(&db_path).unwrap();
         seed_fixture(&store);
 
-        let scaffold = build_module_scaffold(&store, "src/does_not_exist.rs").unwrap();
+        let scaffold = build_module_scaffold(&store, &db_path, "src/does_not_exist.rs").unwrap();
         assert!(scaffold.symbols.is_empty());
         assert!(scaffold.imports.is_empty());
         assert!(scaffold.imported_by.is_empty());
+    }
+
+    /// v13 Wave 2 (history): with no `history.db` sitting next to
+    /// `chunks.db`, both scaffolds' history fields must be `None` — absent
+    /// from the JSON, not `[]` (see each field's doc comment for why that
+    /// distinction is load-bearing).
+    #[test]
+    fn history_fields_absent_when_history_db_does_not_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+        seed_fixture(&store);
+
+        let overview = build_overview_scaffold(&store, &db_path).unwrap();
+        assert!(overview.recent_changes.is_none());
+        assert!(
+            !serde_json::to_string(&overview)
+                .unwrap()
+                .contains("recent_changes"),
+            "the field itself must be omitted, not serialized as null/[]"
+        );
+
+        let module = build_module_scaffold(&store, &db_path, "src/lib.rs").unwrap();
+        assert!(module.commits_touching.is_none());
+        assert!(
+            !serde_json::to_string(&module)
+                .unwrap()
+                .contains("commits_touching")
+        );
+    }
+
+    /// v13 Wave 2 (history): once `history.db` has commits, both scaffolds
+    /// surface them — repo-wide `recent_changes` on the overview, and
+    /// per-file `commits_touching` on the module scaffold (only for files
+    /// `file_commits` actually names).
+    #[test]
+    fn history_fields_present_when_history_db_populated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("chunks.db");
+        let store = ChunkStore::open(&db_path).unwrap();
+        seed_fixture(&store);
+
+        let history_path = tmp.path().join("history.db");
+        let history_conn = crate::index::layout::open_history_db(&history_path).unwrap();
+        history_conn
+            .execute(
+                "INSERT INTO commits (hash, author, ts, message) \
+                 VALUES ('deadbeef', 'Ada', 1700000000, 'Add helper()')",
+                [],
+            )
+            .unwrap();
+        history_conn
+            .execute(
+                "INSERT INTO file_commits (path, hash) VALUES ('src/lib.rs', 'deadbeef')",
+                [],
+            )
+            .unwrap();
+        drop(history_conn);
+
+        let overview = build_overview_scaffold(&store, &db_path).unwrap();
+        let recent = overview
+            .recent_changes
+            .expect("recent_changes must be present once history.db has commits");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].subject, "Add helper()");
+        assert_eq!(recent[0].author, "Ada");
+
+        let module = build_module_scaffold(&store, &db_path, "src/lib.rs").unwrap();
+        let touching = module
+            .commits_touching
+            .expect("commits_touching must be present for a file file_commits names");
+        assert_eq!(touching.len(), 1);
+        assert_eq!(touching[0].hash, "deadbeef");
+
+        // A file with no file_commits rows still gets `None`, not `[]`.
+        let untouched = build_module_scaffold(&store, &db_path, "src/helper.rs").unwrap();
+        assert!(untouched.commits_touching.is_none());
     }
 
     #[test]
@@ -740,6 +918,7 @@ mod tests {
             imported_by: vec![],
             calls_out: vec![],
             calls_in: vec![],
+            commits_touching: None,
         };
         let before = serde_json::to_vec(&scaffold).unwrap().len();
         apply_module_budget(&mut scaffold, 200); // ~800 bytes — much smaller than `before`
@@ -759,6 +938,7 @@ mod tests {
             imported_by: vec![],
             calls_out: vec![],
             calls_in: vec![],
+            commits_touching: None,
         };
         apply_module_budget(&mut scaffold, 0);
         assert!(scaffold.symbols.is_empty());

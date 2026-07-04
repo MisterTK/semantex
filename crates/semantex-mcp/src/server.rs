@@ -902,6 +902,10 @@ impl McpServer {
                                 {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}}
                             ]
+                        },
+                        "include_history": {
+                            "type": "boolean",
+                            "description": "Default false. When true, appends a compact 'Recent changes' section (author, age, commit subject) for hit files with recorded git history, on 'deep'/'analytical' routes only. Requires the index's history.db to be populated (git repos only)."
                         }
                     }
                 }),
@@ -1500,6 +1504,15 @@ impl McpServer {
             budget_for_format(response_format, budget)
         };
 
+        // v13 Wave 2 (history) — additive, default false: appends a compact
+        // "recent changes" line per unique hit file to Deep/Analytical
+        // responses when `history.db` has commits for that file. Off by
+        // default so existing callers see byte-identical output.
+        let include_history = args
+            .get("include_history")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
         // Run each query and collect formatted results.
         let mut parts: Vec<String> = Vec::with_capacity(queries.len());
         let mut all_hits: Vec<serde_json::Value> = Vec::new();
@@ -1521,7 +1534,14 @@ impl McpServer {
                     "lang": h.language,
                 }));
             }
-            parts.push(response.formatted);
+            let mut formatted = response.formatted;
+            if include_history
+                && matches!(response.route, AgentRoute::Deep | AgentRoute::Analytical)
+                && let Some(addendum) = history_addendum_for_hits(&path, &hits)
+            {
+                formatted.push_str(&addendum);
+            }
+            parts.push(formatted);
         }
 
         // Combine results.
@@ -3041,6 +3061,54 @@ impl McpServer {
     }
 }
 
+/// v13 Wave 2 (history): `semantex_agent`'s `include_history` addendum.
+///
+/// For up to 5 distinct hit files (in hit order), looks up the single most
+/// recent commit touching that file and renders one compact line —
+/// `- <file>: <subject> (<author>, <age>)`. Returns `None` (no addendum,
+/// not an empty one) when `history.db` doesn't exist yet or no hit's file
+/// has any recorded history — a silent, best-effort enrichment, never a
+/// reason to fail or alter a `semantex_agent` call.
+fn history_addendum_for_hits(
+    project_path: &Path,
+    hits: &[semantex_core::server::protocol::SearchResultItem],
+) -> Option<String> {
+    use semantex_core::index::{history, layout};
+
+    const MAX_FILES: usize = 5;
+    let db_path = layout::history_db_path(project_path);
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open(&db_path).ok()?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for h in hits {
+        if lines.len() >= MAX_FILES {
+            break;
+        }
+        if !seen.insert(h.file.clone()) {
+            continue;
+        }
+        let Ok(commits) = history::commits_touching_file(&conn, &h.file, 1) else {
+            continue;
+        };
+        let Some(c) = commits.first() else { continue };
+        lines.push(format!(
+            "- {}: {} ({}, {})",
+            h.file,
+            c.subject,
+            c.author,
+            history::humanize_age(c.ts)
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!("\n\n## Recent changes\n{}\n", lines.join("\n")))
+}
+
 // =============================================================================
 // Helpers for the new M1-M6 tools
 // =============================================================================
@@ -3577,7 +3645,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 mod tests {
     use super::{
         DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
-        mode_to_route, require_index_ready,
+        history_addendum_for_hits, mode_to_route, require_index_ready,
     };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
@@ -4898,6 +4966,106 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // v13 Wave 2 (history) — `include_history` addendum plumbing
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn sample_hit(file: &str) -> semantex_core::server::protocol::SearchResultItem {
+        semantex_core::server::protocol::SearchResultItem {
+            file: file.to_string(),
+            start_line: 1,
+            end_line: 5,
+            score: 0.9,
+            source: "dense".to_string(),
+            chunk_type: "ast_node".to_string(),
+            name: None,
+            language: None,
+            content: None,
+            kind: None,
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn history_addendum_none_when_history_db_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hits = vec![sample_hit("src/lib.rs")];
+        assert!(history_addendum_for_hits(tmp.path(), &hits).is_none());
+    }
+
+    #[test]
+    fn history_addendum_none_when_no_hit_file_has_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = semantex_core::index::layout::history_db_path(tmp.path());
+        let conn = semantex_core::index::layout::open_history_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO commits (hash, author, ts, message) VALUES ('h1', 'a', 1, 'm')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_commits (path, hash) VALUES ('src/other.rs', 'h1')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let hits = vec![sample_hit("src/lib.rs")];
+        assert!(history_addendum_for_hits(tmp.path(), &hits).is_none());
+    }
+
+    #[test]
+    fn history_addendum_renders_compact_line_per_unique_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = semantex_core::index::layout::history_db_path(tmp.path());
+        let conn = semantex_core::index::layout::open_history_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO commits (hash, author, ts, message) VALUES ('h1', 'Ada', 1700000000, 'Fix parser bug')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_commits (path, hash) VALUES ('src/lib.rs', 'h1')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Two hits from the same file must collapse into one line.
+        let hits = vec![sample_hit("src/lib.rs"), sample_hit("src/lib.rs")];
+        let addendum = history_addendum_for_hits(tmp.path(), &hits).expect("must render");
+        assert!(addendum.contains("## Recent changes"));
+        assert!(addendum.contains("src/lib.rs"));
+        assert!(addendum.contains("Fix parser bug"));
+        assert!(addendum.contains("Ada"));
+        assert_eq!(
+            addendum.matches("src/lib.rs").count(),
+            1,
+            "one hit line per unique file, not per hit"
+        );
+    }
+
+    #[test]
+    fn agent_include_history_default_false_and_schema_documented() {
+        // Default parsing: absent `include_history` must behave as `false`
+        // (parity with the same `unwrap_or(false)` pattern the schema-shape
+        // test below checks is exposed).
+        let args = serde_json::json!({"query": "x"});
+        assert!(
+            !args
+                .get("include_history")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        );
+        let args_true = serde_json::json!({"query": "x", "include_history": true});
+        assert!(
+            args_true
+                .get("include_history")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        );
+    }
+
     #[test]
     fn agent_tool_schema_shape_is_stable() {
         let t = McpServer::all_tools()
@@ -4915,6 +5083,7 @@ mod tests {
             "depth",
             "focus",
             "response_format",
+            "include_history",
         ] {
             assert!(props.contains_key(k), "agent must expose '{k}'");
         }

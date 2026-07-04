@@ -317,6 +317,22 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Show git commit history for a file, as recorded in the index's
+    /// `history.db` (v13 Wave 2). Read-only against whatever the last
+    /// `semantex index` build populated — run `semantex index` first if
+    /// history.db doesn't exist yet.
+    History {
+        /// File to show history for (repo-relative, matching the index).
+        file: String,
+
+        /// Project path (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+
+        /// Max commits to show (default: 20)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Generate per-platform skill files describing semantex's MCP tools.
     ///
     /// Emits one file per supported agent platform (Claude Code, Cursor, Codex,
@@ -465,6 +481,7 @@ where
                     | "install-opencode"
                     | "skills-generate"
                     | "llm-status"
+                    | "history"
             );
         }
     }
@@ -918,6 +935,10 @@ fn main() -> Result<()> {
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
         Some(Commands::Validate { path }) => commands::validate::run(&path),
+        Some(Commands::History { file, path, limit }) => {
+            telemetry::track("history");
+            commands::history::run(&file, &path, limit)
+        }
         Some(Commands::SkillsGenerate {
             out,
             platform,
@@ -1217,6 +1238,9 @@ mod arg_peek_tests {
         assert!(!command_wants_onnxruntime(["download-models"])); // provisions itself
         assert!(!command_wants_onnxruntime(["install-claude-code"]));
         assert!(!command_wants_onnxruntime(["connect"]));
+        // v13 Wave 2: `history` is a read-only query over history.db — no
+        // embedder needed.
+        assert!(!command_wants_onnxruntime(["history"]));
         // Bare invocation / pure flags (help/version): no download.
         assert!(!command_wants_onnxruntime(Vec::<&str>::new()));
         assert!(!command_wants_onnxruntime(["--version"]));
