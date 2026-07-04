@@ -564,6 +564,98 @@ pub fn all_tools() -> Vec<ToolMetadata> {
             mutates: false,
             live: true,
         },
+        // ---- v13 Wave 2 — project memory ----
+        ToolMetadata {
+            name: "semantex_memory_save",
+            title: "Save Project Memory Note",
+            description: concat!(
+                "Save a short note to durable project memory — persists across sessions in ",
+                "`.semantex/memory.db`, independent of the code index. Use for decisions, gotchas, or ",
+                "conventions discovered that aren't recoverable by searching the code. Do NOT use for ",
+                "anything derivable by reading or searching the code."
+            ),
+            when_to_use: &[
+                "You just figured out a non-obvious design decision, gotcha, or convention worth remembering.",
+                "A task-specific follow-up needs to survive to a later session.",
+            ],
+            args: &[
+                ToolArg {
+                    name: "content",
+                    ty: "string",
+                    required: true,
+                    description: "The note text. Keep it short and self-contained.",
+                },
+                ToolArg {
+                    name: "scope",
+                    ty: "string",
+                    required: false,
+                    description: "Freeform scope key (default \"global\"). Suggested: \"global\", \"file:<rel_path>\", \"module:<dir>\", \"task:<slug>\".",
+                },
+                ToolArg {
+                    name: "tags",
+                    ty: "array<string>",
+                    required: false,
+                    description: "Optional freeform tags for this note.",
+                },
+                ToolArg {
+                    name: "path",
+                    ty: "string",
+                    required: false,
+                    description: "Project path (defaults to current working directory).",
+                },
+            ],
+            examples: &[ToolExample {
+                label: "Record a gotcha discovered while working on a module",
+                args_json: r#"{"content": "memory.db writes must go through MemoryStore, not raw SQL", "scope": "module:index", "tags": ["gotcha"]}"#,
+            }],
+            mutates: true,
+            live: true,
+        },
+        ToolMetadata {
+            name: "semantex_memory_recall",
+            title: "Recall Project Memory Notes",
+            description: concat!(
+                "Recall notes previously saved with semantex_memory_save, ranked best-match-first. Use ",
+                "at the start of a task to check whether relevant context was already recorded. Falls ",
+                "back to listing the most recent notes when `query` is omitted."
+            ),
+            when_to_use: &[
+                "Starting a task and checking for prior decisions/gotchas before rediscovering them.",
+                "Before making a decision that might already have recorded context.",
+            ],
+            args: &[
+                ToolArg {
+                    name: "query",
+                    ty: "string",
+                    required: false,
+                    description: "Free text to rank notes by relevance against. Omit to list the most recent notes.",
+                },
+                ToolArg {
+                    name: "scope",
+                    ty: "string",
+                    required: false,
+                    description: "Restrict to notes saved under this exact scope key.",
+                },
+                ToolArg {
+                    name: "limit",
+                    ty: "integer",
+                    required: false,
+                    description: "Max notes to return (default 5, clamped to [1, 50]).",
+                },
+                ToolArg {
+                    name: "path",
+                    ty: "string",
+                    required: false,
+                    description: "Project path (defaults to current working directory).",
+                },
+            ],
+            examples: &[ToolExample {
+                label: "Check for prior notes about a module before editing it",
+                args_json: r#"{"query": "caching invalidation", "scope": "module:index"}"#,
+            }],
+            mutates: false,
+            live: true,
+        },
     ]
 }
 

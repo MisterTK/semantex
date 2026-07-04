@@ -517,6 +517,14 @@ pub fn mirror_root_as(project_root: &Path, branch_meta: &BranchMeta) -> Result<(
     // chunks.db: SQLite snapshot — includes un-checkpointed WAL content and
     // detaches the mirror from future in-place page writes (see
     // `snapshot_sqlite_db`). NEVER hard-link a live SQLite db.
+    //
+    // history.db (and memory.db) are deliberately NOT part of the mirror:
+    // both are repo-GLOBAL container-root files, not per-branch index state.
+    // history.db in particular is an incrementally-accumulated view of the
+    // repo's git log — git itself is the ever-present source of truth and
+    // `index::history::populate_history` is idempotent/incremental, so a
+    // snapshot protects nothing while a restore could replace a richer root
+    // with a poorer snapshot. Branch switches must leave it untouched.
     snapshot_sqlite_db(&container.join("chunks.db"), &tmp_dir.join("chunks.db"))?;
 
     // meta.json / models.toml: rewritten in place by `fs::write` on later
@@ -638,6 +646,11 @@ pub fn restore_branch_dir_into_root(project_root: &Path, branch_key: &str) -> Re
             }
         }
     }
+
+    // history.db / memory.db: intentionally NOT restored — they're
+    // repo-global container-root files excluded from the per-branch mirror
+    // (see the matching note in `mirror_root_as`), so a branch switch must
+    // leave whatever the root has accumulated fully intact.
 
     // meta.json / models.toml: plain copies, tmp-then-rename swapped in.
     // When the snapshot LACKS one of these, remove the root's leftover copy
@@ -1470,5 +1483,82 @@ mod tests {
         let project = tmp.path();
         restore_branch_dir_into_root(project, "never-existed-00000000").unwrap();
         assert!(!branch_index_dir(project, "never-existed-00000000").exists());
+    }
+
+    /// v13 Wave 2 (history, adversarial-review design change): `history.db`
+    /// is repo-GLOBAL — like `memory.db`, it must be EXCLUDED from branch
+    /// snapshots entirely. A mirror must not copy it into the branch dir,
+    /// and a restore must leave whatever the root has accumulated fully
+    /// intact (git is the source of truth; `history::populate_history` is
+    /// idempotent/incremental, so snapshots protect nothing).
+    #[test]
+    fn history_db_is_repo_global_excluded_from_mirror_and_restore() {
+        use crate::index::storage::ChunkStore;
+        use crate::types::{Chunk, ChunkType};
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let container = container_dir(project);
+        std::fs::create_dir_all(&container).unwrap();
+
+        {
+            let store = ChunkStore::open(&container.join("chunks.db")).unwrap();
+            store
+                .insert_chunk(
+                    &Chunk {
+                        id: 0,
+                        file_path: PathBuf::from("src/a.rs"),
+                        start_line: 1,
+                        end_line: 1,
+                        content: "fn a() {}".to_string(),
+                        chunk_type: ChunkType::TextWindow { window_index: 0 },
+                    },
+                    1,
+                    0,
+                )
+                .unwrap();
+        }
+        {
+            let history = open_history_db(&container.join("history.db")).unwrap();
+            history
+                .execute(
+                    "INSERT INTO commits (hash, author, ts, message) VALUES ('h1', 'a', 1, 'm')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Mirror: history.db must NOT appear in the branch snapshot.
+        mirror_into_branch_dir(project, "histbranch-dddd3333").unwrap();
+        let mirror = branch_index_dir(project, "histbranch-dddd3333");
+        assert!(mirror.join("chunks.db").exists());
+        assert!(
+            !mirror.join("history.db").exists(),
+            "history.db is repo-global and must be excluded from branch mirrors"
+        );
+
+        // Root accumulates MORE history after the mirror (simulating builds
+        // on another branch adding commits to the shared log).
+        {
+            let root_history = open_history_db(&container.join("history.db")).unwrap();
+            root_history
+                .execute(
+                    "INSERT INTO commits (hash, author, ts, message) VALUES ('h2', 'b', 2, 'm2')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Restore (branch switch back): the root's richer history.db must
+        // survive completely untouched.
+        restore_branch_dir_into_root(project, "histbranch-dddd3333").unwrap();
+        let root_history = open_history_db(&container.join("history.db")).unwrap();
+        let count: i64 = root_history
+            .query_row("SELECT COUNT(*) FROM commits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "branch switches must leave the repo-global history.db untouched"
+        );
     }
 }

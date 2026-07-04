@@ -156,6 +156,27 @@ multiplies context O(N²) and gives worse results than one merged query.
 Use `semantex_search` or `semantex_deep` only when you need raw JSON for programmatic
 processing. For all human-readable results, use `semantex_agent`.
 
+## Project memory: use sparingly and purposefully
+
+`semantex_memory_save` / `semantex_memory_recall` persist short notes in the project's
+`.semantex/memory.db`, across sessions and branch switches. This is for things search
+*can't* recover — not a substitute for it.
+
+**Save a note when** you land on something that took real effort to figure out and isn't
+written down anywhere: a design decision and its rationale, a gotcha/footgun you hit, a
+non-obvious convention the team follows, or a task-specific follow-up. One or two sentences,
+tagged with a `scope` (`"global"`, `"file:<rel_path>"`, `"module:<dir>"`, `"task:<slug>"`).
+
+**Don't save a note** for anything you could re-derive by calling `semantex_agent` again —
+"function X calls Y", a file's location, a signature. That's what the index is for, and it's
+always fresher than a note. Don't save reflexively on every turn; the store is capped, and
+noise crowds out the notes worth keeping.
+
+**Recall before you decide, not after.** At the start of a task (or before making a call that
+prior work might already have settled), one `semantex_memory_recall` with a short `query` is
+cheap insurance against re-litigating a decision that's already recorded. If it returns
+nothing, that's a real signal — fall back to `semantex_agent`, don't assume the answer.
+
 ## Fallbacks (last resort)
 
 - **Grep**: exact regex on file content only — no semantic understanding
