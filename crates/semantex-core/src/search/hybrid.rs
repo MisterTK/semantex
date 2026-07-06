@@ -488,7 +488,13 @@ impl HybridSearcher {
                     let safe_query = sanitize_tantivy_query(&effective_text);
                     let mut results = sparse
                         .search(&safe_query, retrieval_candidates)
-                        .unwrap_or_default();
+                        .unwrap_or_else(|e| {
+                            // Lenient-parse fallback inside `search` makes this
+                            // near-unreachable; if it fires, the BM25 channel is
+                            // silently dark for this query — say so loudly.
+                            tracing::warn!(error = %e, "Sparse channel failed; hybrid running without BM25");
+                            Vec::new()
+                        });
                     tracing::debug!(
                         results_count = results.len(),
                         duration_ms = sparse_start.elapsed().as_millis() as u64,
@@ -582,7 +588,10 @@ impl HybridSearcher {
                     let safe = sanitize_tantivy_query(text);
                     let r = sparse
                         .search(&safe, retrieval_candidates)
-                        .unwrap_or_default();
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "Expanded-sparse channel failed");
+                            Vec::new()
+                        });
                     tracing::debug!(
                         expanded_sparse_count = r.len(),
                         "Exp4Fuse: expanded-sparse channel complete"
@@ -1359,7 +1368,10 @@ impl HybridSearcher {
                 if let Some(ref sparse) = self.sparse {
                     let safe_query = sanitize_tantivy_query(&query.text);
                     let sparse_start = std::time::Instant::now();
-                    let results = sparse.search(&safe_query, fetch_limit).unwrap_or_default();
+                    let results = sparse.search(&safe_query, fetch_limit).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Grep-mode sparse search failed");
+                        Vec::new()
+                    });
                     tracing::debug!(
                         results_count = results.len(),
                         duration_ms = sparse_start.elapsed().as_millis() as u64,

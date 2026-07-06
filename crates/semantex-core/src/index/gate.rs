@@ -86,8 +86,15 @@ const MAX_WAIT: Duration = Duration::from_hours(1);
 /// *block* indexing entirely. `log_waiting` is invoked at most once, the first
 /// time we have to wait, so the CLI can tell the user why it's pausing.
 pub fn acquire(log_waiting: impl FnOnce()) -> Option<BuildSlot> {
-    let dir = slots_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    acquire_in(&slots_dir(), log_waiting)
+}
+
+/// [`acquire`] against an explicit slots directory. Split out so tests can run
+/// against a private tempdir: the production directory is machine-global by
+/// design, which made the lock-lifecycle test racy under `cargo test --all`
+/// (any concurrently running test binary doing a real build holds slot-0).
+fn acquire_in(dir: &std::path::Path, log_waiting: impl FnOnce()) -> Option<BuildSlot> {
+    if std::fs::create_dir_all(dir).is_err() {
         return None;
     }
     // Open every slot file ONCE, then re-probe these handles with `try_lock` on
@@ -156,9 +163,13 @@ mod tests {
     fn slot_is_held_until_dropped_then_reusable() {
         let _g = ENV_GUARD.lock().unwrap();
         unsafe { std::env::set_var(ENV_MAX_BUILDS, "1") };
-        let slot_path = slots_dir().join("slot-0.lock");
+        // Private tempdir: the production slots dir is machine-global, and a
+        // concurrently running test binary's real build holding slot-0 made
+        // this test flaky on shared CI runners.
+        let dir = tempfile::tempdir().unwrap();
+        let slot_path = dir.path().join("slot-0.lock");
 
-        let first = acquire(|| {});
+        let first = acquire_in(dir.path(), || {});
         assert!(first.is_some(), "first acquire should get the only slot");
 
         // A fresh handle to the same slot must observe it locked while held.
