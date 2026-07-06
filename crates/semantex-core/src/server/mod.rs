@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod handler;
 pub mod listener;
 pub mod protocol;
@@ -7,6 +8,7 @@ mod tests;
 use crate::config::SemantexConfig;
 use crate::search::hybrid::HybridSearcher;
 use anyhow::{Context, Result};
+use cache::SearcherCache;
 use listener::Listener;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -120,11 +122,23 @@ impl SemantexServer {
             .context("Failed to open search index")?;
         tracing::info!("Search index loaded");
 
+        // Wave 2 batch 2: the daemon no longer pins this ONE searcher for its
+        // whole lifetime. `SearcherCache::seeded` reuses the instance we just
+        // paid to open (so startup still fails fast + warms exactly as
+        // before) as the FIRST entry of a small LRU that `Listener` consults
+        // per request — see `server::cache` for the branch-reconcile +
+        // staleness-reload hook this unlocks.
+        let cache = Arc::new(SearcherCache::seeded(
+            self.config.clone(),
+            &self.project_path,
+            searcher,
+        ));
+
         // Start listening, injecting the LLM backend (if any) into the listener
         // so per-request handlers can chain it into AgentPipeline::with_llm.
-        let listener = Listener::bind(
+        let listener = Listener::bind_with_cache(
             &self.port_file_path(),
-            searcher,
+            cache,
             self.project_path.clone(),
             self.idle_timeout,
             self.shutdown.clone(),
