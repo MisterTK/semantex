@@ -10,6 +10,18 @@ Embedder selection -> SEMANTEX_EMBEDDER env var (lateon-colbert | coderank-137m)
 Canonical per integration §4 D-env-knob; SEMANTEX_DENSE_BACKEND is a kept-live
 deprecated alias. All runs add: --json --no-content -m <k>.
 
+The `rerank` ablation ALSO sets SEMANTEX_RERANKER=on in the subprocess env
+(see `_build_env`) — the CLI's `--rerank` flag alone is not sufficient: it is
+off-by-default at TWO independent gates (config.rerank/query.use_rerank from
+`--rerank`, and the SEMANTEX_RERANKER master switch that guards model-weight
+loading), and this client must satisfy both or the rerank stage silently
+no-ops. Because SEMANTEX_RERANKER is read once at daemon-process spawn time,
+not per request, a caller measuring the `rerank` ablation must
+`reset_daemon()` first if a daemon from an earlier (non-rerank) arm may
+already be running — see `swe_loc_runner.run_instance`. First use downloads
+the cross-encoder model weights (network required); subsequent runs are
+cached.
+
 Forced-route mode (route-stress eval): pass `route=<name>` to `search(...)` to
 measure a SPECIFIC retrieval route instead of the default hybrid search. The
 client then invokes `semantex agent <query> --route <name> --json-hits`, which
@@ -132,7 +144,7 @@ class SemantexClient:
             query,
         ]
 
-    def _build_env(self) -> dict:
+    def _build_env(self, *, rerank: bool = False) -> dict:
         env = os.environ.copy()
         env["SEMANTEX_QUIET_LIMITS"] = "1"
         # Canonical A/B measurement config: adaptive result sizing OFF. Adaptive
@@ -146,6 +158,36 @@ class SemantexClient:
         if self.embedder:
             # Canonical embedder selector (integration §4 D-env-knob).
             env["SEMANTEX_EMBEDDER"] = self.embedder
+        if rerank:
+            # TWO independent gates must both be true, and neither is carried by
+            # the `--rerank` CLI flag alone when a request goes through the
+            # daemon (confirmed empirically — see rerank-experiment.md):
+            #
+            # 1. SEMANTEX_RERANKER=on — the master switch RerankerEngine::
+            #    from_config checks before it will construct a reranker or
+            #    download weights at all (S3 off-by-default safety contract;
+            #    search/fastembed_reranker.rs::reranker_enabled).
+            # 2. SEMANTEX_RERANK=1 — sets `SemantexConfig.rerank` on whichever
+            #    process actually EVALUATES `query.use_rerank && self.config.
+            #    rerank` (hybrid.rs). For a daemon-served query this is the
+            #    DAEMON's own config, loaded independently at ITS spawn time —
+            #    NOT the short-lived CLI client process's config (the client's
+            #    `--rerank` flag only sets the per-query `use_rerank` field
+            #    forwarded over the wire; the daemon is auto-spawned with just
+            #    `serve <path>`, no `--rerank`, so its static config.rerank
+            #    stays false, and `use_rerank && config.rerank` short-circuits
+            #    false, WITHOUT even attempting to load the reranker — no
+            #    error, no weight download, just silently identical to
+            #    `hybrid`) unless this env var is also set.
+            #
+            # Both are read once at process spawn time (never per-request), so
+            # the caller (swe_loc_runner) must force a fresh daemon
+            # (reset_daemon) before the first rerank-ablation query — an
+            # already-running daemon spawned by an earlier arm fixed its env
+            # before these flags existed. setdefault so an explicit caller
+            # override still wins.
+            env.setdefault("SEMANTEX_RERANKER", "on")
+            env.setdefault("SEMANTEX_RERANK", "1")
         return env
 
     def reset_daemon(self) -> None:
@@ -195,7 +237,7 @@ class SemantexClient:
         else:
             args = self._build_args(query, ablation=ablation, k=k, with_content=with_content)
             failure_label = "search"
-        return self._run(args, failure_label, query_id)
+        return self._run(args, failure_label, query_id, rerank=(ablation == "rerank"))
 
     def search_agent_auto(self, query_id: str, query: str) -> RankedResult:
         """Run `agent --json-hits` with NO forced route: the engine's own
@@ -212,14 +254,16 @@ class SemantexClient:
         args = [self.binary, "agent", "--json-hits", "--", query]
         return self._run(args, "agent --json-hits (auto-routed)", query_id)
 
-    def _run(self, args: list[str], failure_label: str, query_id: str) -> RankedResult:
+    def _run(
+        self, args: list[str], failure_label: str, query_id: str, *, rerank: bool = False
+    ) -> RankedResult:
         proc = subprocess.run(
             args,
             cwd=self.corpus_dir,
             capture_output=True,
             text=True,
             timeout=self.timeout_secs,
-            env=self._build_env(),
+            env=self._build_env(rerank=rerank),
         )
         if proc.returncode != 0:
             raise RuntimeError(

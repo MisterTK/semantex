@@ -1,4 +1,7 @@
-results/
+results/*
+# Exception: the rerank on/off-by-default experiment's committed methodology
+# + numbers (raw per-run JSON/instance dirs stay ignored).
+!results/rerank-experiment.md
 *.egg-info/
 __pycache__/
 .pytest_cache/

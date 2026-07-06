@@ -3,7 +3,8 @@ import math
 import pytest
 
 from relevance_harness.metrics import (
-    acc_at_k, average_precision, mean_average_precision, mrr_at_k, ndcg_at_k, recall_at_k,
+    acc_at_k, average_precision, mean_average_precision, mrr_at_k, ndcg_at_k, percentile,
+    recall_at_k,
 )
 
 
@@ -78,3 +79,26 @@ def test_map_averages_average_precision():
     assert mean_average_precision([[1, 0], [0, 0, 1]], n_relevant=[1, 1]) == pytest.approx(
         (ap1 + ap2) / 2
     )
+
+
+def test_percentile_empty_is_zero():
+    assert percentile([], 50) == 0.0
+
+
+def test_percentile_single_value():
+    assert percentile([42.0], 95) == pytest.approx(42.0)
+
+
+def test_percentile_p50_matches_median_odd_count():
+    assert percentile([1.0, 2.0, 3.0], 50) == pytest.approx(2.0)
+
+
+def test_percentile_linear_interpolation():
+    # rank = (4-1) * 0.95 = 2.85 -> interpolate between index 2 (30) and 3 (40)
+    assert percentile([10.0, 20.0, 30.0, 40.0], 95) == pytest.approx(38.5)
+
+
+def test_percentile_p0_and_p100_are_min_and_max():
+    values = [5.0, 1.0, 9.0, 3.0]
+    assert percentile(values, 0) == pytest.approx(1.0)
+    assert percentile(values, 100) == pytest.approx(9.0)
