@@ -1,6 +1,6 @@
 use crate::search::code_tokenizer::CodeTokenizer;
 use crate::types::ScoredChunkId;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -187,9 +187,32 @@ impl SparseIndex {
         let mut query_parser =
             QueryParser::for_index(&self.index, vec![self.content_field, self.path_field]);
         query_parser.set_field_boost(self.path_field, 2.0);
-        let query = query_parser
-            .parse_query(query)
-            .with_context(|| "Failed to parse query".to_string())?;
+        // Strict parse first (identical behavior for well-formed queries). Real-world
+        // query text — GitHub issue bodies, agent prompts — routinely contains
+        // fragments the strict grammar rejects even after escaping (`<!-- -->`
+        // markdown comments, dangling `AND`/`OR`, `IN [`). Those used to bubble an
+        // Err that callers swallowed into an empty result set, silently disabling
+        // the BM25 channel. Fall back to tantivy's lenient parser, which drops the
+        // unparseable fragments and keeps the valid terms.
+        let query = match query_parser.parse_query(query) {
+            Ok(q) => q,
+            Err(strict_err) => {
+                // Pure-punctuation queries (no indexable token at all) lenient-parse
+                // to an empty boolean query, which tantivy scores as match-ALL —
+                // noise injected into fusion. An empty channel is the honest answer.
+                if !query.chars().any(char::is_alphanumeric) {
+                    tracing::debug!(%strict_err, "Query has no indexable tokens; sparse channel empty");
+                    return Ok(Vec::new());
+                }
+                let (lenient, errors) = query_parser.parse_query_lenient(query);
+                tracing::debug!(
+                    %strict_err,
+                    lenient_errors = errors.len(),
+                    "Strict tantivy parse failed; using lenient parse"
+                );
+                lenient
+            }
+        };
 
         // tantivy 0.26: `TopDocs::with_limit` returns a `TopDocs`, not a `Collector`.
         // Call `.order_by_score()` to obtain a Collector emitting `(Score, DocAddress)`
@@ -452,5 +475,88 @@ mod tests {
             !hits_retry.contains(&2),
             "stemmer off: 'retry' must NOT match doc 2 ('retries'), got {hits_retry:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hostile_query_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Regression net for the silent-BM25-disable bug found by the rerank
+    /// experiment: real-world query text (GitHub issue bodies, agent prompts)
+    /// contains fragments tantivy's strict grammar rejects even after
+    /// `sanitize_tantivy_query` escaping. `search` must degrade to a lenient
+    /// parse and still match on the valid terms — never return an Err that
+    /// callers fold into an empty channel.
+    fn hostile_corpus(path: &Path) -> SparseIndex {
+        let index = SparseIndex::create(path, true).expect("create");
+        {
+            let mut writer = index.writer().expect("writer");
+            writer
+                .add_document(1, "retry handler markdown comment flag", "a.rs")
+                .expect("add");
+            writer.commit().expect("commit");
+        }
+        index.reload().expect("reload");
+        index
+    }
+
+    /// Mirrors `hybrid::sanitize_tantivy_query` so this module exercises the
+    /// exact byte stream the production call sites send.
+    fn sanitize(q: &str) -> String {
+        let special = [
+            '+', '-', '&', '|', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':',
+            '\\', '/',
+        ];
+        let mut s = String::with_capacity(q.len());
+        for ch in q.chars() {
+            if special.contains(&ch) {
+                s.push('\\');
+            }
+            s.push(ch);
+        }
+        s
+    }
+
+    #[test]
+    fn hostile_queries_still_match_valid_terms() {
+        let dir = tempdir().expect("tempdir");
+        let index = hostile_corpus(dir.path());
+        // Each entry previously ERRORED through the strict parser (verified by
+        // probe) or exercises a nearby hostile shape; all contain the token
+        // "retry" or "markdown"/"comment" and must return the document.
+        let hostile = [
+            "<!-- markdown comment -->",
+            "retry AND",
+            "IN [retry",
+            "--flag retry",
+            "retry \"unbalanced",
+            "((retry",
+            "retry -handler",
+            "*retry",
+        ];
+        for raw in hostile {
+            let hits = index
+                .search(&sanitize(raw), 10)
+                .unwrap_or_else(|e| panic!("search must not error for {raw:?}: {e}"));
+            assert!(
+                !hits.is_empty(),
+                "hostile query {raw:?} must still match via lenient parse"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_queries_unaffected() {
+        let dir = tempdir().expect("tempdir");
+        let index = hostile_corpus(dir.path());
+        let hits = index.search("retry handler", 10).expect("plain query");
+        assert_eq!(hits.len(), 1);
+        // Total garbage with no valid terms: lenient parse yields no terms -> empty, not Err.
+        let hits = index
+            .search(&sanitize("<!-- -->"), 10)
+            .expect("no-term query must not error");
+        assert!(hits.is_empty());
     }
 }
