@@ -93,10 +93,35 @@ pub(crate) fn prefix_document(d: &str) -> &str {
 fn query_threads() -> usize {
     crate::config::env_usize("SEMANTEX_ORT_THREADS", 4)
 }
+/// Pure decision logic for the indexing thread-count default, split out from
+/// [`index_threads`] so it's testable without touching the real
+/// `index::gate::max_concurrent_builds()` (which reads process-global env
+/// vars shared with `gate`'s own tests — calling it directly from a parallel
+/// test run would race).
+///
+/// `cores / 2` (clamped `[2, 8]`) — UNLESS `max_concurrent_builds` is `<= 1`
+/// (this box can only ever run ONE full build at a time, RAM-limited: see
+/// `index::gate::max_concurrent_builds`), in which case there is no sibling
+/// build to share cores with, so ALL cores are used instead (still clamped
+/// `[2, 8]`). On bigger boxes where several builds could genuinely run at
+/// once, the conservative half-the-cores split is kept so one build doesn't
+/// starve a sibling build's slot. See `embedding::colbert::index_ort_threads`
+/// (same formula, ColBERT path) and `index::gate`'s module doc for the
+/// concurrency design this mirrors.
+fn default_index_threads(cores: usize, max_concurrent_builds: usize) -> usize {
+    if max_concurrent_builds <= 1 {
+        cores.clamp(2, 8)
+    } else {
+        (cores / 2).clamp(2, 8)
+    }
+}
+
 /// Indexing-tuned ORT intra-op threads (throughput-bound; gated by index::gate).
+/// See [`default_index_threads`] for the default policy.
 fn index_threads() -> usize {
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", (cores / 2).clamp(2, 8))
+    let default = default_index_threads(cores, crate::index::gate::max_concurrent_builds());
+    crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", default)
 }
 
 /// Lazy single-vector encoder. The ONNX session is built on first encode
@@ -333,6 +358,25 @@ impl SingleVectorEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_index_threads_uses_all_cores_when_only_one_build_slot_exists() {
+        // A box that can only ever run one full build at a time (RAM-limited)
+        // has no sibling build to leave cores for — use them all (clamped).
+        assert_eq!(default_index_threads(4, 1), 4);
+        assert_eq!(default_index_threads(2, 1), 2, "clamped to floor of 2");
+        assert_eq!(default_index_threads(16, 1), 8, "clamped to ceiling of 8");
+        assert_eq!(default_index_threads(1, 1), 2, "clamped to floor of 2");
+    }
+
+    #[test]
+    fn default_index_threads_halves_cores_when_multiple_build_slots_exist() {
+        // Bigger boxes where several builds could run at once keep the
+        // conservative half-the-cores split (unchanged legacy behaviour).
+        assert_eq!(default_index_threads(8, 2), 4);
+        assert_eq!(default_index_threads(32, 4), 8, "clamped to ceiling of 8");
+        assert_eq!(default_index_threads(4, 2), 2, "clamped to floor of 2");
+    }
 
     #[test]
     fn l2_normalize_unit_length() {

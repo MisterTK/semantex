@@ -180,7 +180,18 @@ pub const ABSOLUTE_FLOOR_MB: u64 = 1024;
 /// Absolute ceiling: even on huge servers, don't claim more than this without
 /// an explicit override. Prevents one daemon from leaving no headroom for other
 /// processes on shared boxes.
+///
+/// This bounds [`soft_rss_limit_mb`] (the **RSS** budget) only. The kernel
+/// `RLIMIT_AS` cap (see [`kernel_rss_cap_bytes`]) uses its own, much larger
+/// ceiling ([`KERNEL_AS_CEILING_MB`]) — see that function's doc for why the
+/// two must not share a ceiling.
 pub const ABSOLUTE_CEILING_MB: u64 = 12 * 1024;
+
+/// Absolute ceiling for the kernel `RLIMIT_AS` (address-space) cap — separate
+/// from, and much larger than, [`ABSOLUTE_CEILING_MB`] (the RSS budget's
+/// ceiling). See [`kernel_rss_cap_bytes`] for why address space and resident
+/// memory are different quantities and must not share a ceiling.
+pub const KERNEL_AS_CEILING_MB: u64 = 96 * 1024;
 
 /// Returns the soft RSS limit in MB, honoring `SEMANTEX_MAX_RSS_MB` if set,
 /// otherwise computing a safe default from system RAM.
@@ -203,21 +214,75 @@ pub fn soft_rss_limit_mb() -> u64 {
 
 /// Returns the kernel `RLIMIT_AS` (address space) cap in bytes.
 ///
-/// Default: 75% of system RAM, clamped to `[ABSOLUTE_FLOOR_MB,
-/// 2 × ABSOLUTE_CEILING_MB]`. The kernel cap is intentionally higher than
-/// the application-level soft cap so the app cap fires first with a clean
-/// error message; the kernel cap is the last-resort failsafe.
+/// # `RLIMIT_AS` bounds *virtual address space*, not resident memory
+///
+/// `RLIMIT_AS` is enforced by the kernel on every `mmap()`/`brk()` a process
+/// makes, against the size of its *virtual* address space — memory it has
+/// reserved, whether or not those pages are ever touched (resident). RSS
+/// (what [`current_rss_mb`] measures, and what [`soft_rss_limit_mb`] budgets)
+/// counts only pages actually resident in physical memory. The two are NOT
+/// interchangeable, and for this codebase's allocator/workload combination
+/// they diverge a lot:
+///
+///   * `mimalloc` (the global allocator, see `register_purge_fn`) reserves
+///     address space in large segments ahead of demand and does not always
+///     release the *reservation* back to the OS even after `mi_collect`
+///     returns the *pages* — so long-lived processes can carry substantially
+///     more virtual address space than their live heap.
+///   * ONNX Runtime's per-session arena, `next-plaid`'s `MmapIndex` (memory-
+///     mapped on-disk PLAID files), and the tokenizer's mapped model files
+///     all reserve address space up front, some of it far exceeding what's
+///     ever resident.
+///
+/// Empirically (E2E verification, full self-index: 344 files / 4665 chunks
+/// on a 16 GB / 4-core box): actual peak RSS was ~9.5 GB, safely inside a
+/// 16 GB box, while the OLD formula here (75% of RAM, ≈ 11.7 GB on that box)
+/// still made the kernel cap fire first — `RLIMIT_AS` was exhausted by
+/// virtual reservations well before RSS came anywhere near physical
+/// exhaustion, aborting a build that never put the host at risk. That is the
+/// same failure mode a previous team saw independently on a rerank
+/// experiment: `RLIMIT_AS` exhausted at ~7.9 GB *actual RSS* because of
+/// mimalloc's virtual-arena behavior.
+///
+/// # This function's answer: make the kernel cap a genuine last resort
+///
+/// The **real, meaningful budget is [`soft_rss_limit_mb`]** — it polls true
+/// RSS at hot-path checkpoints (indexer batches, MCP loops) and returns a
+/// clean, actionable error (escalating to `abort()` after repeated
+/// overshoots). The kernel `RLIMIT_AS` cap is a coarser backstop for the
+/// window a poll can't see (a single huge allocation/library call with no
+/// checkpoint inside it — e.g. `next-plaid`'s one-shot `update_or_create`).
+/// Because address space routinely runs several× actual RSS for this binary,
+/// the kernel cap must sit far above the RSS budget or it becomes the
+/// dominant, wrong-metric failure mode instead of a genuine safety net.
+///
+/// Default: `4×` system RAM (or `4×` the user's explicit
+/// `SEMANTEX_MAX_RSS_MB`), clamped to `[ABSOLUTE_FLOOR_MB,
+/// KERNEL_AS_CEILING_MB]`. `RLIMIT_AS` is a virtual-space limit, not a
+/// promise of physical memory — the kernel's own overcommit accounting (and
+/// the RSS soft cap above) still govern actual physical usage, so a large
+/// address-space allowance here costs nothing on a host that never reserves
+/// it.
 pub fn kernel_rss_cap_bytes() -> u64 {
+    /// Multiplier applied to the RSS budget (env override or RAM-derived
+    /// default) to get the address-space cap. See doc above for why this
+    /// must be well above 1×.
+    const AS_HEADROOM_MULTIPLIER: u64 = 4;
+
     if let Ok(env) = std::env::var("SEMANTEX_MAX_RSS_MB")
         && let Ok(n) = env.trim().parse::<u64>()
         && n > 0
     {
-        // Honour user override; give 1.5× headroom so the soft cap can fire
-        // before the kernel kills us.
-        return (n * 3 / 2) * 1024 * 1024;
+        // Honour the user's explicit RSS budget; give generous address-space
+        // headroom above it (see doc) rather than the tight 1.5× this used
+        // to apply, which reproduced the same false-abort failure mode for
+        // callers who set an explicit cap.
+        return (n * AS_HEADROOM_MULTIPLIER).clamp(ABSOLUTE_FLOOR_MB, KERNEL_AS_CEILING_MB)
+            * 1024
+            * 1024;
     }
     let detected = system_ram_mb().unwrap_or(4 * 1024);
-    let mb = (detected * 3 / 4).clamp(ABSOLUTE_FLOOR_MB, 2 * ABSOLUTE_CEILING_MB);
+    let mb = (detected * AS_HEADROOM_MULTIPLIER).clamp(ABSOLUTE_FLOOR_MB, KERNEL_AS_CEILING_MB);
     mb * 1024 * 1024
 }
 
@@ -416,10 +481,54 @@ mod cap_tests {
             "kernel cap {kernel_bytes} bytes < soft cap {soft_bytes} bytes — soft cap would never fire"
         );
 
-        // (3) Explicit override → exact value, kernel cap is 1.5× the soft cap.
+        // (2b) Default (no override, RAM-derived) kernel cap must clear the
+        // OLD formula's ceiling (75% of RAM) by a wide margin on THIS host —
+        // this is the actual regression: the old cap was the exact ~11.7 GB
+        // figure that aborted a legitimate 9.5 GB-peak build on a 16 GB box.
+        if let Some(ram_mb) = system_ram_mb() {
+            let old_formula_bytes =
+                (ram_mb * 3 / 4).clamp(ABSOLUTE_FLOOR_MB, 2 * 12 * 1024) * 1024 * 1024;
+            assert!(
+                kernel_bytes > old_formula_bytes,
+                "new default kernel cap {kernel_bytes} bytes must exceed the old, too-tight \
+                 formula's {old_formula_bytes} bytes on a {ram_mb} MB host"
+            );
+        }
+
+        // (3) Explicit override → exact value, kernel cap is 4× the soft cap
+        // (generous address-space headroom — see `kernel_rss_cap_bytes` doc
+        // for why AS and RSS are different quantities that diverge a lot for
+        // this allocator/workload).
         unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "2000") };
         assert_eq!(soft_rss_limit_mb(), 2000);
-        assert_eq!(kernel_rss_cap_bytes(), 3000 * 1024 * 1024);
+        assert_eq!(kernel_rss_cap_bytes(), 8000 * 1024 * 1024);
+
+        // (3b) Regression test for the launch-blocking abort this fix
+        // addresses: a build whose actual RSS sits comfortably under an
+        // explicit budget (e.g. 9.5 GB peak RSS under a 10 GB budget) must
+        // not have its virtual-address-space headroom clamped down near that
+        // same figure — the OLD 1.5× multiplier gave only 15 GB of AS for a
+        // 10 GB RSS budget, which mimalloc's virtual-arena overhead could
+        // (and did, per the E2E verification) exhaust well before physical
+        // memory was ever at risk. The new 4× multiplier must clear that bar.
+        unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "10000") };
+        let kernel_bytes_10g = kernel_rss_cap_bytes();
+        assert!(
+            kernel_bytes_10g >= 30_000 * 1024 * 1024,
+            "kernel AS cap {kernel_bytes_10g} bytes gives too little headroom over a 10 GB \
+             RSS budget — mimalloc/ORT/mmap virtual-address overhead needs more than the old \
+             1.5x multiplier provided"
+        );
+
+        // (3c) The AS cap must still be bounded (not literally unbounded) —
+        // an absurdly large `SEMANTEX_MAX_RSS_MB` clamps to `KERNEL_AS_CEILING_MB`
+        // rather than requesting a multi-petabyte `setrlimit`.
+        unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "1000000") };
+        assert_eq!(
+            kernel_rss_cap_bytes(),
+            KERNEL_AS_CEILING_MB * 1024 * 1024,
+            "an extreme override must clamp to KERNEL_AS_CEILING_MB, not multiply unbounded"
+        );
 
         // (4) `=0` disables the soft cap; kernel cap returns to its default.
         unsafe { std::env::set_var("SEMANTEX_MAX_RSS_MB", "0") };
