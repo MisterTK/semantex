@@ -23,7 +23,9 @@ use std::time::Instant;
 
 use semantex_core::index::registry;
 
-/// Default toolset bundle: exposes the full surface (all 14 tools).
+/// Default toolset bundle: exposes the full `all_tools()` surface (10 tools).
+/// `structural` is a separate 5-tool bundle, not a subset of `all` — see
+/// [`McpServer::tools_for_toolset`].
 pub const DEFAULT_TOOLSET: &str = "all";
 
 /// Valid toolset names: `core`, `structural`, `all`.
@@ -801,11 +803,15 @@ impl McpServer {
 
     /// Return the list of tool definitions for the given toolset bundle.
     ///
-    /// Bundles (per spec I3):
-    /// - `core`: 4 tools — `semantex_search`, `semantex_deep`, `semantex_agent`, `semantex_symbol`.
+    /// Bundles (measured against the current 10-tool `all_tools()` catalog):
+    /// - `core`: 3 tools — `semantex_search`, `semantex_deep`, `semantex_agent`
+    ///   (the minimum chat-bot surface).
     /// - `structural`: 5 tools — `semantex_symbol`, `semantex_callers`, `semantex_callees`,
-    ///   `semantex_implementations`, `semantex_architecture`.
-    /// - `all` (default): every tool registered with the server (14 total).
+    ///   `semantex_implementations`, `semantex_architecture` (the M1-M6 graph-navigation
+    ///   tools hidden from `all` post-Phase-3; see [`Self::structural_tools`]). NOT a
+    ///   subset of `all` — these tool defs live nowhere in `all_tools()`, so `structural`
+    ///   is its own bundle, not a filter over `all`.
+    /// - `all` (default): every tool registered with the server (10 total).
     ///
     /// Unknown toolset names fall back to `all` so callers (e.g. W7's HTTP
     /// transport) cannot accidentally lock themselves out of the surface.
@@ -813,27 +819,34 @@ impl McpServer {
     /// the JSON-RPC layer.
     #[must_use]
     pub fn tools_for_toolset(&self, toolset: &str) -> Vec<Tool> {
-        let all = Self::all_tools();
-        // Phase 3: M1-M6 are no longer in `all_tools()` (the visible surface
-        // is the v0.2 set: 7 tools). The historical `core` and `structural`
-        // names are preserved so existing CLI / HTTP routes don't 404; both
-        // return what's visible. `core` further narrows to the search-facing
-        // subset (search, deep, agent) for clients that want the minimum
-        // chat-bot surface.
-        let allow: &[&str] = match toolset {
-            "core" => &["semantex_search", "semantex_deep", "semantex_agent"],
-            // `structural` is preserved as an alias; M1-M6 are no longer
-            // visible, so it returns the agent-facing tools only.
-            _ => return all,
-        };
-        let allow_set: HashSet<&str> = allow.iter().copied().collect();
-        all.into_iter()
-            .filter(|t| allow_set.contains(t.name.as_str()))
-            .collect()
+        match toolset {
+            "core" => {
+                let allow_set: HashSet<&str> =
+                    ["semantex_search", "semantex_deep", "semantex_agent"]
+                        .into_iter()
+                        .collect();
+                Self::all_tools()
+                    .into_iter()
+                    .filter(|t| allow_set.contains(t.name.as_str()))
+                    .collect()
+            }
+            // Phase 3 hid M1-M6 from the default `all` surface (measured
+            // +76pp CCB regression from agents chaining them additively —
+            // see the NOTE above `semantex_docs_context` registration below).
+            // That hide was about the DEFAULT surface, not about deleting the
+            // tools: a caller that explicitly opts into `--toolset structural`
+            // is asking for exactly this bundle, not stumbling into it, so it
+            // stays exempt from the regression this hide guards against.
+            "structural" => Self::structural_tools(),
+            _ => Self::all_tools(),
+        }
     }
 
-    /// Build the full tool catalog (all 14 tools). Single source of truth used
-    /// by both `tools/list` (filtered by toolset) and `tool_call` (dispatch).
+    /// Build the full tool catalog for the default `all` bundle (10 tools).
+    /// Single source of truth used by both `tools/list` (via
+    /// `tools_for_toolset("all")` / any unrecognized name) and `tool_call`
+    /// dispatch. Does NOT include the `structural` bundle's 5 tools — see
+    /// [`Self::structural_tools`] and [`Self::tools_for_toolset`].
     #[allow(clippy::too_many_lines)]
     fn all_tools() -> Vec<Tool> {
         vec![
@@ -1130,7 +1143,8 @@ impl McpServer {
                 annotations: Some(ToolAnnotations::read_only("Deep Code Search")),
             },
             // -------------------------------------------------------------
-            // NOTE — Phase-3 surface restriction (2026-05-25).
+            // NOTE — Phase-3 surface restriction (2026-05-25), updated
+            // 2026-07-06 (E2E Wave 3) to match actual dispatch behavior.
             //
             // The six M1-M6 structural tools (semantex_symbol, _callers,
             // _callees, _implementations, _examples, _architecture) shipped
@@ -1142,18 +1156,27 @@ impl McpServer {
             // tools in sequence to gather what semantex_deep returned in
             // one call in v0.2.
             //
-            // Fix: M1-M6 are hidden from `tools/list`. Their handler
-            // bodies remain on McpServer and are still reachable via the
-            // dispatch in handle_tool_call (so older clients that learned
-            // the names from v0.3.0 continue to work — JSON-RPC method
-            // name resolution doesn't depend on tools/list advertisement)
-            // and via the existing internal `Structural` route inside
-            // `semantex_agent` (see `search/agent.rs::handle_structural`),
-            // which already covers callers/callees/imports/type-refs in
-            // a single graph-walk call.
+            // Fix: M1-M6 (minus `semantex_examples`) are dropped from
+            // `all_tools()` / `tools/list`'s default `all` bundle and moved to
+            // `Self::structural_tools()`, surfaced only under the explicit
+            // `--toolset structural` bundle (see `tools_for_toolset`). Their
+            // handler bodies never moved off `McpServer`.
             //
-            // External surface returns to the v0.2 set: 7 tools, with
-            // `semantex_agent` as the unconditional entry point.
+            // IMPORTANT — this is NOT "still reachable regardless of
+            // toolset" back-compat: `handle_tool_call` gates every dispatch
+            // on `tools_for_toolset(&self.toolset)` membership (added after
+            // this note was first written), so calling e.g. `semantex_symbol`
+            // while running under the default `all` toolset is rejected with
+            // "not available in toolset 'all'". A v0.3.0 client that learned
+            // these names needs `--toolset structural` to reach them again.
+            // `semantex_agent`'s internal `Structural` route (see
+            // `search/agent.rs::handle_structural`) remains the
+            // always-available path that covers callers/callees/imports/
+            // type-refs in a single graph-walk call, with no toolset
+            // dependency.
+            //
+            // Default (`all`) surface: the 10 tools currently registered
+            // below, with `semantex_agent` as the unconditional entry point.
             // -------------------------------------------------------------
             // -------------------------------------------------------------
             // v13 Wave 2 — semantex_docs_context.
@@ -1313,6 +1336,227 @@ impl McpServer {
                 }),
                 output_schema: None,
                 annotations: Some(ToolAnnotations::read_only("Recall Project Memory Notes")),
+            },
+        ]
+    }
+
+    /// Build the 5-tool `structural` bundle: `semantex_symbol`, `_callers`,
+    /// `_callees`, `_implementations`, `_architecture` (M1-M4 + M6; M5
+    /// `semantex_examples` was never part of the historical `structural`
+    /// allow-list and stays unlisted under any toolset name).
+    ///
+    /// These are the same Tool definitions `all_tools()` carried pre-Phase-3
+    /// (restored verbatim from git history — their handler bodies never left
+    /// `McpServer`, only the `tools/list` advertisement did), now surfaced
+    /// ONLY when a caller explicitly requests `--toolset structural` rather
+    /// than unconditionally in `all`. That's the distinction that matters for
+    /// the CCB regression Phase 3 fixed: it was agents encountering these
+    /// tools by default and chaining them additively, not a caller
+    /// deliberately opting into the structural-navigation bundle.
+    #[allow(clippy::too_many_lines)]
+    fn structural_tools() -> Vec<Tool> {
+        vec![
+            Tool {
+                name: "semantex_symbol".into(),
+                title: Some("Exact Symbol Lookup".into()),
+                description: concat!(
+                    "Exact symbol lookup backed by the indexed symbol table. ",
+                    "One call returns the symbol's location, signature, docstring, ",
+                    "semantic role, and the count of callers/callees. ",
+                    "Replaces 3-5 grep+read iterations for a single named symbol. ",
+                    "Use when you know the symbol name; use semantex_search for ",
+                    "fuzzy / natural-language queries."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Symbol name to look up (case-sensitive)" },
+                        "kind": { "type": "string", "description": "Optional kind filter (function, method, class, struct, enum, interface, trait)" },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["name"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "matches": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "location": { "type": "object" },
+                                    "signature": { "type": "string" },
+                                    "docstring": { "type": "string" },
+                                    "semantic_role": { "type": "string" },
+                                    "callers_count": { "type": "integer" },
+                                    "callees_count": { "type": "integer" },
+                                    "confidence": { "type": "string" }
+                                },
+                                "required": ["location"]
+                            }
+                        }
+                    },
+                    "required": ["matches"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Exact Symbol Lookup")),
+            },
+            Tool {
+                name: "semantex_callers".into(),
+                title: Some("Reverse Call Graph".into()),
+                description: concat!(
+                    "Reverse call-graph walk: list all chunks that call a given symbol. ",
+                    "Default depth=1 (direct callers); depth=2 also includes callers-of-callers. ",
+                    "Replaces 5-15 grep iterations when finding usages of an API. ",
+                    "Returns one entry per caller with location, signature, and edge_kind."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol name to find callers of" },
+                        "depth": { "type": "integer", "description": "Walk depth: 1 (direct) or 2 (transitive). Default 1.", "default": 1 },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["symbol"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "callers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "caller_location": { "type": "object" },
+                                    "caller_signature": { "type": "string" },
+                                    "edge_kind": { "type": "string" }
+                                },
+                                "required": ["caller_location", "edge_kind"]
+                            }
+                        }
+                    },
+                    "required": ["callers"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Reverse Call Graph")),
+            },
+            Tool {
+                name: "semantex_callees".into(),
+                title: Some("Forward Call Graph".into()),
+                description: concat!(
+                    "Forward call-graph walk: list all symbols invoked by a given function. ",
+                    "Default depth=1 (direct callees); depth=2 also includes callees-of-callees. ",
+                    "Use when tracing what a function does. Same shape as semantex_callers ",
+                    "but outbound edges."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Symbol name to find callees of" },
+                        "depth": { "type": "integer", "description": "Walk depth: 1 (direct) or 2 (transitive). Default 1.", "default": 1 },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["symbol"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "callees": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "callee_location": { "type": "object" },
+                                    "callee_signature": { "type": "string" },
+                                    "edge_kind": { "type": "string" }
+                                },
+                                "required": ["callee_location", "edge_kind"]
+                            }
+                        }
+                    },
+                    "required": ["callees"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Forward Call Graph")),
+            },
+            Tool {
+                name: "semantex_implementations".into(),
+                title: Some("Trait/Interface Implementations".into()),
+                description: concat!(
+                    "Find all implementations of a trait, interface, or protocol. ",
+                    "Backed by the indexed type-hierarchy edges. ",
+                    "Returns one entry per impl with the impl location, concrete type, ",
+                    "and the list of method names physically defined inside the impl block ",
+                    "(`methods_defined_in_impl`). This is a strict subset of the trait's ",
+                    "methods — to compute true overrides, intersect this list against the ",
+                    "trait declaration via `semantex_symbol`."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "trait_or_interface": { "type": "string", "description": "Trait, interface, or abstract base class name" },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    },
+                    "required": ["trait_or_interface"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "implementations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "impl_location": { "type": "object" },
+                                    "type_name": { "type": "string" },
+                                    "methods_defined_in_impl": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Method names physically declared inside this impl block (queried from symbol_defs). NOT the trait's declared method set — intersect against the trait declaration to compute true overrides."
+                                    }
+                                },
+                                "required": ["impl_location", "type_name"]
+                            }
+                        }
+                    },
+                    "required": ["implementations"]
+                })),
+                annotations: Some(ToolAnnotations::read_only("Trait/Interface Implementations")),
+            },
+            Tool {
+                name: "semantex_architecture".into(),
+                title: Some("Architectural Primer".into()),
+                description: concat!(
+                    "Session-start architectural primer for a codebase. ",
+                    "Returns a compact LLM-optimized JSON document with: ",
+                    "(1) god_nodes — the top symbols by PageRank centrality, ",
+                    "(2) communities — clusters of related chunks with entry points, ",
+                    "(3) boundaries — directory-level coupling counts. ",
+                    "One call gives an architectural overview without exploring the tree manually. ",
+                    "This is the single biggest context-window win for unfamiliar codebases."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "focus": {
+                            "type": "string",
+                            "enum": ["god_nodes", "communities", "boundaries"],
+                            "description": "Restrict output to one section. Omit for all three."
+                        },
+                        "path": { "type": "string", "description": "Project path (defaults to cwd)" }
+                    }
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "god_nodes": { "type": "array" },
+                        "communities": { "type": "array" },
+                        "boundaries": { "type": "array" }
+                    }
+                })),
+                annotations: Some(ToolAnnotations::read_only("Architectural Primer")),
             },
         ]
     }
@@ -1604,7 +1848,11 @@ impl McpServer {
         // v13 Wave 2 (history) — additive, default false: appends a compact
         // "recent changes" line per unique hit file to Deep/Analytical
         // responses when `history.db` has commits for that file. Off by
-        // default so existing callers see byte-identical output.
+        // default so existing callers see byte-identical output. On the Deep
+        // route `hits` is the synthesis's own cited sources (see
+        // `AgentPipeline::handle_deep` / `deep_source_to_hit`), not a generic
+        // search-hit list — Deep's answer is otherwise prose-only, so without
+        // that wiring this addendum could never fire there.
         let include_history = args
             .get("include_history")
             .and_then(serde_json::Value::as_bool)
@@ -3956,15 +4204,15 @@ mod tests {
     }
 
     #[test]
-    fn toolset_all_exposes_seven_visible_tools() {
+    fn toolset_all_exposes_ten_visible_tools() {
         // Phase 3 surface restriction: the M1-M6 structural tools that
         // shipped in v0.3 caused a measured +76pp regression in agent CCB
-        // vs v0.2. They're hidden from tools/list (the *visible* surface).
-        // Their handler dispatch remains in handle_tool_call for backward
-        // compat with clients that learned the names from v0.3.0.
+        // vs v0.2. They're hidden from the *default* `all` bundle's
+        // tools/list (moved to their own `structural` bundle — see
+        // `toolset_structural_exposes_five_m1_m6_tools` below).
         //
         // v13 Wave 2 adds `semantex_docs_context` as a genuinely new visible
-        // tool (not one of the suppressed M1-M6), plus `semantex_memory_save`
+        // tool (not one of the moved M1-M6), plus `semantex_memory_save`
         // / `semantex_memory_recall` (also new, also visible), so the count
         // is now 10.
         let server = make_server("all");
@@ -3991,7 +4239,7 @@ mod tests {
         ] {
             assert!(names.contains(required), "missing visible tool {required}");
         }
-        // M1-M6 must NOT be visible.
+        // M1-M6 must NOT be visible under the default `all` bundle.
         for hidden in &[
             "semantex_symbol",
             "semantex_callers",
@@ -4002,7 +4250,7 @@ mod tests {
         ] {
             assert!(
                 !names.contains(hidden),
-                "M1-M6 tool {hidden} should be hidden post-Phase-3"
+                "M1-M6 tool {hidden} should not be in the default 'all' bundle post-Phase-3"
             );
         }
     }
@@ -4011,7 +4259,7 @@ mod tests {
     fn toolset_core_exposes_three_search_tools() {
         // Post-Phase-3 `core` is the minimum chat-bot surface: agent + the
         // two structured-JSON variants. Chat-only clients pick this; richer
-        // clients pick `all` (7) for the diagnostic tools.
+        // clients pick `all` (10) for the diagnostic tools.
         let server = make_server("core");
         let tools = server.tools_for_toolset("core");
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -4022,18 +4270,39 @@ mod tests {
     }
 
     #[test]
-    fn toolset_structural_is_alias_for_all_post_phase_3() {
-        // `structural` historically meant "M1-M6 only". Now that those are
-        // hidden, we preserve the name as an alias for `all` so existing
-        // CLI / HTTP routes don't 404.
+    fn toolset_structural_exposes_five_m1_m6_tools() {
+        // `structural` is its own bundle (M1-M4 + M6; M5 `semantex_examples`
+        // was never in the historical allow-list), NOT a filter over `all` —
+        // these 5 Tool defs live in `structural_tools()`, not `all_tools()`.
+        // A caller must explicitly opt into `--toolset structural` to see
+        // them; the default `all` bundle never does (that's what Phase 3
+        // fixed — see `toolset_all_exposes_ten_visible_tools`).
         let server = make_server("structural");
         let tools = server.tools_for_toolset("structural");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             tools.len(),
-            10,
-            "structural toolset is now an alias for all (M1-M6 hidden, v13 docs_context \
-             + memory_save/recall added)"
+            5,
+            "structural bundle must have exactly 5 tools: {names:?}"
         );
+        for required in &[
+            "semantex_symbol",
+            "semantex_callers",
+            "semantex_callees",
+            "semantex_implementations",
+            "semantex_architecture",
+        ] {
+            assert!(
+                names.contains(required),
+                "structural bundle missing {required}"
+            );
+        }
+        assert!(
+            !names.contains(&"semantex_examples"),
+            "semantex_examples was never part of the structural bundle"
+        );
+        // Distinct from `all` — not an alias, an entirely separate bundle.
+        assert_ne!(tools.len(), server.tools_for_toolset("all").len());
     }
 
     #[test]
@@ -4046,10 +4315,42 @@ mod tests {
         assert_eq!(tools.len(), 10);
     }
 
-    // (Backward-compat dispatch for hidden M1-M6 is already proven by the
-    // existing `tool_symbol_finds_known_symbol`, `tool_callers_finds_caller`,
-    // etc. tests below — they call the McpServer methods directly, which is
-    // the same path `handle_tool_call` takes via its match arms.)
+    #[test]
+    fn m1_m6_tool_call_rejected_under_all_toolset_but_dispatchable_under_structural() {
+        // Reconciles the Phase-3 NOTE (above `semantex_docs_context`
+        // registration) with actual `handle_tool_call` behavior: the
+        // toolset-gating check added after that note was written means
+        // M1-M6 tool calls are NOT reachable "regardless of toolset" — they
+        // 404-equivalent under `all`/`core`, and only work under the
+        // explicit `structural` bundle.
+        let all_server = make_server("all");
+        let visible_all: std::collections::HashSet<String> = all_server
+            .tools_for_toolset("all")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !visible_all.contains("semantex_symbol"),
+            "semantex_symbol must not be dispatchable-by-discovery under 'all'"
+        );
+
+        let structural_server = make_server("structural");
+        let visible_structural: std::collections::HashSet<String> = structural_server
+            .tools_for_toolset("structural")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            visible_structural.contains("semantex_symbol"),
+            "semantex_symbol must be dispatchable under the explicit 'structural' toolset"
+        );
+    }
+
+    // (structural-toolset dispatch is proven end-to-end by the existing
+    // `tool_symbol_finds_known_symbol`, `tool_callers_finds_caller`, etc.
+    // tests below — they call the McpServer methods directly, the same path
+    // `handle_tool_call` takes via its match arms once the toolset gate
+    // above admits the tool name.)
 
     // ─────────────────────────────────────────────────────────────────────
     // M6 helper test — top_level_dir
@@ -4224,6 +4525,54 @@ mod tests {
         assert_eq!(m["location"]["file"].as_str(), Some("src/a.rs"));
         // bar calls foo, so callers_count should be >= 1
         assert!(m["callers_count"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn tool_symbol_dispatch_via_handle_tool_call_gated_by_toolset() {
+        // End-to-end proof (through `handle_tool_call`, the real JSON-RPC
+        // dispatch path — not the direct `tool_symbol` method call above)
+        // that `semantex_symbol` is reachable ONLY under the explicit
+        // `structural` toolset, and rejected under the default `all`.
+        let (_dir, project) = build_minimal_index();
+        let writer = super::NotificationWriter {
+            stdout: std::sync::Arc::new(parking_lot::Mutex::new(std::io::BufWriter::new(
+                std::io::stdout(),
+            ))),
+        };
+        let args = serde_json::json!({
+            "name": "semantex_symbol",
+            "arguments": {
+                "name": "foo",
+                "path": project.display().to_string(),
+            }
+        });
+
+        let structural_server = make_server("structural");
+        let ok_response =
+            structural_server.handle_tool_call(Some(serde_json::json!(1)), &args, &writer);
+        let ok_json = serde_json::to_value(&ok_response).unwrap();
+        let ok_result = &ok_json["result"];
+        assert_ne!(
+            ok_result["isError"].as_bool(),
+            Some(true),
+            "semantex_symbol must dispatch successfully under --toolset structural: {ok_result:?}"
+        );
+
+        let all_server = make_server("all");
+        let rejected_response =
+            all_server.handle_tool_call(Some(serde_json::json!(2)), &args, &writer);
+        let rejected_json = serde_json::to_value(&rejected_response).unwrap();
+        let rejected_result = &rejected_json["result"];
+        assert_eq!(
+            rejected_result["isError"].as_bool(),
+            Some(true),
+            "semantex_symbol must be rejected under the default --toolset all: {rejected_result:?}"
+        );
+        let text = rejected_result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("not available in toolset 'all'"),
+            "rejection message should name the active toolset: {text}"
+        );
     }
 
     #[test]
@@ -5433,8 +5782,8 @@ mod tests {
             "scope must be required"
         );
         // Visible in the default "all" toolset (no allowlist entry needed —
-        // tools_for_toolset returns everything for any toolset other than
-        // core/structural).
+        // tools_for_toolset returns all_tools() unfiltered for "all" and any
+        // unrecognized name; only "core" and "structural" narrow it).
         let server = make_server("all");
         let visible = server.tools_for_toolset("all");
         assert!(

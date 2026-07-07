@@ -56,16 +56,12 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 // ============================================================================
 
 /// Tool names that belong to the `core` toolset.
-/// NOTE: Kept in sync with `McpServer::tools_for_toolset("core")`. The HTTP
-/// dispatcher uses this list as a defense-in-depth filter — the child
+/// NOTE: Kept in sync with `McpServer::tools_for_toolset("core")` (3 tools —
+/// `semantex_symbol` is NOT in `core`; it's part of `structural` only). The
+/// HTTP dispatcher uses this list as a defense-in-depth filter — the child
 /// subprocess (when started with `--toolset core`) is the authoritative source
 /// of truth. See `SubprocessBackend::verify_child_toolset_alignment`.
-const CORE_TOOLS: &[&str] = &[
-    "semantex_search",
-    "semantex_deep",
-    "semantex_agent",
-    "semantex_symbol",
-];
+const CORE_TOOLS: &[&str] = &["semantex_search", "semantex_deep", "semantex_agent"];
 
 /// Tool names that belong to the `structural` toolset.
 const STRUCTURAL_TOOLS: &[&str] = &[
