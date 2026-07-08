@@ -19,7 +19,11 @@ pub enum Platform {
     Gemini,
     Copilot,
     OpenCode,
-    Windsurf,
+    /// Cognition rebranded Windsurf to "Devin Desktop" on 2026-06-02 and
+    /// EOL'd the old Cascade agent on 2026-07-01; `id()` now leads with the
+    /// current product name but `from_id` still accepts the legacy
+    /// `"windsurf"` alias so old docs/muscle-memory keep working.
+    DevinDesktop,
     Trae,
 }
 
@@ -32,7 +36,7 @@ impl Platform {
         Platform::Gemini,
         Platform::Copilot,
         Platform::OpenCode,
-        Platform::Windsurf,
+        Platform::DevinDesktop,
         Platform::Trae,
     ];
 
@@ -46,7 +50,7 @@ impl Platform {
             Platform::Gemini => "gemini",
             Platform::Copilot => "copilot",
             Platform::OpenCode => "opencode",
-            Platform::Windsurf => "windsurf",
+            Platform::DevinDesktop => "devin-desktop",
             Platform::Trae => "trae",
         }
     }
@@ -61,13 +65,17 @@ impl Platform {
             Platform::Gemini => "gemini/extension.json",
             Platform::Copilot => "copilot/settings.json.snippet",
             Platform::OpenCode => "opencode/.opencode.json",
-            Platform::Windsurf => "windsurf/windsurfrules.md",
+            Platform::DevinDesktop => "devin-desktop/semantex.md",
             Platform::Trae => "trae/trae-rules.md",
         }
     }
 
     /// Resolve a `--platform <id>` argument back to a [`Platform`].
+    /// `"windsurf"` is accepted as a deprecated alias for `"devin-desktop"`.
     pub fn from_id(id: &str) -> Option<Platform> {
+        if id == "windsurf" {
+            return Some(Platform::DevinDesktop);
+        }
         Self::ALL.iter().copied().find(|p| p.id() == id)
     }
 
@@ -81,7 +89,7 @@ impl Platform {
             Platform::Gemini => templates::gemini::render(tools),
             Platform::Copilot => templates::copilot::render(tools),
             Platform::OpenCode => templates::opencode::render(tools),
-            Platform::Windsurf => templates::windsurf::render(tools),
+            Platform::DevinDesktop => templates::devin_desktop::render(tools),
             Platform::Trae => templates::trae::render(tools),
         }
     }

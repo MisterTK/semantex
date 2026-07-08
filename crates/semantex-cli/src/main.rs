@@ -300,10 +300,64 @@ enum Commands {
         #[arg(long, value_enum)]
         scope: Option<commands::install::InstallScope>,
     },
-    /// Install Codex integration
+    /// Install Codex integration (`~/.codex/config.toml` + project `AGENTS.md`)
     InstallCodex,
-    /// Install OpenCode integration
-    InstallOpenCode,
+    /// Uninstall Codex integration
+    UninstallCodex,
+    /// Install OpenCode integration (`opencode.json` + `.opencode/semantex.md`)
+    InstallOpenCode {
+        /// Write to `~/.config/opencode/opencode.json` instead of the project-scoped `opencode.json`
+        #[arg(long)]
+        global: bool,
+    },
+    /// Uninstall OpenCode integration
+    UninstallOpenCode {
+        #[arg(long)]
+        global: bool,
+    },
+    /// Install Cursor integration (`.cursor/mcp.json` + `.cursor/rules/semantex.mdc`)
+    InstallCursor {
+        /// Write to `~/.cursor/mcp.json` instead of the project-scoped `.cursor/mcp.json`
+        #[arg(long)]
+        global: bool,
+    },
+    /// Uninstall Cursor integration
+    UninstallCursor {
+        #[arg(long)]
+        global: bool,
+    },
+    /// Install Devin Desktop / Windsurf integration. Windsurf was rebranded
+    /// "Devin Desktop" by Cognition on 2026-06-02; `install-windsurf` is
+    /// kept as a deprecated alias.
+    #[command(alias = "install-windsurf")]
+    InstallDevinDesktop,
+    /// Uninstall Devin Desktop / Windsurf integration
+    #[command(alias = "uninstall-windsurf")]
+    UninstallDevinDesktop,
+    /// Install Aider integration (`.aider.conf.yml` + `.aider/semantex.md`;
+    /// Aider has no native MCP support)
+    InstallAider,
+    /// Uninstall Aider integration
+    UninstallAider,
+    /// Install Trae integration (`.trae/mcp.json` + `.trae/skills/semantex/SKILL.md`)
+    InstallTrae,
+    /// Uninstall Trae integration
+    UninstallTrae,
+    /// Install GitHub Copilot integration (VS Code Copilot Chat + Copilot CLI)
+    InstallCopilot,
+    /// Uninstall GitHub Copilot integration
+    UninstallCopilot,
+    /// Install Gemini CLI integration (`.gemini/settings.json` + `GEMINI.md`)
+    InstallGemini {
+        /// Write to `~/.gemini/settings.json` instead of the project-scoped file
+        #[arg(long)]
+        global: bool,
+    },
+    /// Uninstall Gemini CLI integration
+    UninstallGemini {
+        #[arg(long)]
+        global: bool,
+    },
     /// Start persistent client (binary protocol, lower latency)
     Connect {
         /// Path to project (defaults to current directory)
@@ -337,7 +391,7 @@ enum Commands {
     /// Generate per-platform skill files describing semantex's MCP tools.
     ///
     /// Emits one file per supported agent platform (Claude Code, Cursor, Codex,
-    /// Aider, Gemini CLI, Copilot CLI, OpenCode, Windsurf, Trae) from a single
+    /// Aider, Gemini CLI, Copilot CLI, OpenCode, Devin Desktop/Windsurf, Trae) from a single
     /// canonical tool registry.
     SkillsGenerate {
         /// Output directory (default: ./.semantex-skills/)
@@ -479,7 +533,23 @@ where
                     | "disconnect"
                     | "install-claude-code"
                     | "install-codex"
-                    | "install-opencode"
+                    | "uninstall-codex"
+                    | "install-open-code"
+                    | "uninstall-open-code"
+                    | "install-cursor"
+                    | "uninstall-cursor"
+                    | "install-devin-desktop"
+                    | "install-windsurf"
+                    | "uninstall-devin-desktop"
+                    | "uninstall-windsurf"
+                    | "install-aider"
+                    | "uninstall-aider"
+                    | "install-trae"
+                    | "uninstall-trae"
+                    | "install-copilot"
+                    | "uninstall-copilot"
+                    | "install-gemini"
+                    | "uninstall-gemini"
                     | "skills-generate"
                     | "llm-status"
                     | "history"
@@ -777,7 +847,7 @@ fn main() -> Result<()> {
         return commands::install::install_claude_code(None);
     }
     if cli.install_opencode {
-        return commands::install::install_opencode();
+        return commands::install::install_opencode(false);
     }
     if cli.install_codex {
         return commands::install::install_codex();
@@ -957,9 +1027,65 @@ fn main() -> Result<()> {
             telemetry::track("install_codex");
             commands::install::install_codex()
         }
-        Some(Commands::InstallOpenCode) => {
+        Some(Commands::UninstallCodex) => {
+            telemetry::track("uninstall_codex");
+            commands::install::uninstall_codex()
+        }
+        Some(Commands::InstallOpenCode { global }) => {
             telemetry::track("install_opencode");
-            commands::install::install_opencode()
+            commands::install::install_opencode(global)
+        }
+        Some(Commands::UninstallOpenCode { global }) => {
+            telemetry::track("uninstall_opencode");
+            commands::install::uninstall_opencode(global)
+        }
+        Some(Commands::InstallCursor { global }) => {
+            telemetry::track("install_cursor");
+            commands::install::install_cursor(global)
+        }
+        Some(Commands::UninstallCursor { global }) => {
+            telemetry::track("uninstall_cursor");
+            commands::install::uninstall_cursor(global)
+        }
+        Some(Commands::InstallDevinDesktop) => {
+            telemetry::track("install_devin_desktop");
+            commands::install::install_devin_desktop()
+        }
+        Some(Commands::UninstallDevinDesktop) => {
+            telemetry::track("uninstall_devin_desktop");
+            commands::install::uninstall_devin_desktop()
+        }
+        Some(Commands::InstallAider) => {
+            telemetry::track("install_aider");
+            commands::install::install_aider()
+        }
+        Some(Commands::UninstallAider) => {
+            telemetry::track("uninstall_aider");
+            commands::install::uninstall_aider()
+        }
+        Some(Commands::InstallTrae) => {
+            telemetry::track("install_trae");
+            commands::install::install_trae()
+        }
+        Some(Commands::UninstallTrae) => {
+            telemetry::track("uninstall_trae");
+            commands::install::uninstall_trae()
+        }
+        Some(Commands::InstallCopilot) => {
+            telemetry::track("install_copilot");
+            commands::install::install_copilot()
+        }
+        Some(Commands::UninstallCopilot) => {
+            telemetry::track("uninstall_copilot");
+            commands::install::uninstall_copilot()
+        }
+        Some(Commands::InstallGemini { global }) => {
+            telemetry::track("install_gemini");
+            commands::install::install_gemini(global)
+        }
+        Some(Commands::UninstallGemini { global }) => {
+            telemetry::track("uninstall_gemini");
+            commands::install::uninstall_gemini(global)
         }
         Some(Commands::Connect { path }) => commands::connect::run(&path),
         Some(Commands::Disconnect) => commands::disconnect::run(),
@@ -1266,6 +1392,17 @@ mod arg_peek_tests {
         assert!(!command_wants_onnxruntime(["validate"]));
         assert!(!command_wants_onnxruntime(["download-models"])); // provisions itself
         assert!(!command_wants_onnxruntime(["install-claude-code"]));
+        assert!(!command_wants_onnxruntime(["install-cursor"]));
+        assert!(!command_wants_onnxruntime(["uninstall-cursor"]));
+        assert!(!command_wants_onnxruntime(["install-devin-desktop"]));
+        assert!(!command_wants_onnxruntime(["install-windsurf"])); // deprecated alias
+        assert!(!command_wants_onnxruntime(["install-aider"]));
+        assert!(!command_wants_onnxruntime(["install-trae"]));
+        assert!(!command_wants_onnxruntime(["install-copilot"]));
+        assert!(!command_wants_onnxruntime(["install-gemini"]));
+        assert!(!command_wants_onnxruntime(["uninstall-codex"]));
+        assert!(!command_wants_onnxruntime(["install-open-code"]));
+        assert!(!command_wants_onnxruntime(["uninstall-open-code"]));
         assert!(!command_wants_onnxruntime(["connect"]));
         // v13 Wave 2: `history` is a read-only query over history.db — no
         // embedder needed.

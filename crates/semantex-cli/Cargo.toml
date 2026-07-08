@@ -30,6 +30,8 @@ ureq = "3"
 
 # Used by `skills-generate` (YAML rendering and parse-validation of generated files).
 serde_yml = "0.0.12"
+# Used by `install-codex` (Codex CLI's MCP config is TOML, not JSON).
+toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

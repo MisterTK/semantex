@@ -35,9 +35,16 @@ pub fn render(tools: &[ToolMetadata]) -> String {
     serde_json::to_string_pretty(&snippet).expect("Copilot snippet serialises")
 }
 
+/// The section written into `.github/copilot-instructions.md` by
+/// `install-copilot` — an `## `-level heading so it nests as one owned
+/// section inside a file Copilot users may also hand-edit.
+pub(crate) fn render_body_md(tools: &[ToolMetadata]) -> String {
+    render_rules_md(tools)
+}
+
 fn render_rules_md(tools: &[ToolMetadata]) -> String {
     let mut out = String::new();
-    out.push_str("# semantex — semantic code search\n\n");
+    out.push_str("## semantex\n\n");
     out.push_str(SKILL_INTRO);
     out.push_str("\n\n");
     out.push_str(concat!(

@@ -28,6 +28,14 @@ pub fn render(tools: &[ToolMetadata]) -> String {
     serde_json::to_string_pretty(&config).expect("OpenCode config serialises")
 }
 
+/// The markdown body written to `.opencode/semantex.md` by `install-opencode`
+/// and referenced from `opencode.json`'s `instructions` array — separated
+/// from [`render`] so the real installer doesn't have to parse it back out
+/// of the JSON blob's `rules` key.
+pub(crate) fn render_body_md(tools: &[ToolMetadata]) -> String {
+    render_rules_md(tools)
+}
+
 fn render_rules_md(tools: &[ToolMetadata]) -> String {
     let mut out = String::new();
     out.push_str("# semantex — semantic code search\n\n");

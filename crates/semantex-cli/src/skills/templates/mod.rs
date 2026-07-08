@@ -10,10 +10,10 @@ pub mod claude_code;
 pub mod codex;
 pub mod copilot;
 pub mod cursor;
+pub mod devin_desktop;
 pub mod gemini;
 pub mod opencode;
 pub mod trae;
-pub mod windsurf;
 
 use crate::skills::tools::ToolMetadata;
 use std::fmt::Write;

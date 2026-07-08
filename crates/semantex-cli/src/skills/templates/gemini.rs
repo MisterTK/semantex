@@ -31,9 +31,16 @@ pub fn render(tools: &[ToolMetadata]) -> String {
     serde_json::to_string_pretty(&manifest).expect("Gemini manifest serialises")
 }
 
+/// The section written into `GEMINI.md` by `install-gemini` — an `## `-level
+/// heading so it nests as one owned section inside the hierarchical
+/// `GEMINI.md` file, which may have other hand-written content.
+pub(crate) fn render_body_md(tools: &[ToolMetadata]) -> String {
+    render_context_md(tools)
+}
+
 fn render_context_md(tools: &[ToolMetadata]) -> String {
     let mut out = String::new();
-    out.push_str("# semantex\n\n");
+    out.push_str("## semantex\n\n");
     out.push_str(SKILL_INTRO);
     out.push_str("\n\n");
     out.push_str(concat!(

@@ -52,6 +52,13 @@ pub fn render(tools: &[ToolMetadata]) -> String {
     out
 }
 
+/// The markdown body written to `.aider/semantex.md` by `install-aider` —
+/// separated from [`render`] so the real installer doesn't have to parse it
+/// back out of the YAML snippet's `_semantex_rules` key.
+pub(crate) fn render_body_md(tools: &[ToolMetadata]) -> String {
+    render_rules_md(tools)
+}
+
 fn render_rules_md(tools: &[ToolMetadata]) -> String {
     let mut out = String::new();
     out.push_str("# semantex — semantic code search rules for Aider\n\n");

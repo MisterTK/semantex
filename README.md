@@ -8,20 +8,34 @@ As of mid-2026, three things separate semantex from the rest of the semantic cod
 
 - **The only active tool doing local ColBERT late-interaction retrieval.** Most semantic code search tools use single-vector embeddings; semantex uses per-token MaxSim scoring (ColBERT/PLAID) — the retrieval method the field has converged on for precision — and runs it entirely on-device.
 - **The most self-contained implementation of that convergent architecture.** Single binary, no vector database, no embedding API, no API keys to provision or rotate. Your code and your queries never leave the machine.
-- **Adoption machinery, not just an engine.** Hooks and generated skill files for 9 agent platforms (Claude Code, Cursor, Codex, Aider, Gemini CLI, Copilot CLI, OpenCode, Windsurf, Trae) route agents to semantex automatically instead of relying on the agent to remember it exists.
+- **Adoption machinery, not just an engine.** In-place, idempotent installers — MCP registration plus hooks/rules/skill files, written directly to each platform's real config path, no copy-paste — for 9 agent platforms (Claude Code, Cursor, Codex, Aider, Gemini CLI, GitHub Copilot, OpenCode, Devin Desktop/Windsurf, Trae) route agents to semantex automatically instead of relying on the agent to remember it exists.
 
 See [How semantex compares](#how-semantex-compares) for an honest look at where it's ahead and where it isn't.
 
 ### Quick Start
 
-Install and add to your editor in under a minute:
+Two commands, whichever coding tool you use:
 
 ```bash
-# Install
 curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
-
-# Add to your editor's MCP config (Claude Code, Cursor, Windsurf, etc.)
+semantex install-claude-code   # or install-cursor / install-trae / install-copilot / install-gemini / install-devin-desktop
 ```
+
+Each `install-*` command registers the MCP server **and** writes the platform's rules/instructions/skill file directly to its real, in-place config location — nothing to copy-paste by hand. All idempotent (safe to re-run) and reversible (`semantex uninstall-*`).
+
+| Platform | Command | What it registers |
+|---|---|---|
+| **Claude Code** | `semantex install-claude-code` | MCP server + hooks + skill |
+| **Cursor** | `semantex install-cursor` | `.cursor/mcp.json` + `.cursor/rules/semantex.mdc` |
+| **Trae** | `semantex install-trae` | `.trae/mcp.json` + `.trae/skills/semantex/SKILL.md` |
+| **GitHub Copilot** (VS Code + CLI) | `semantex install-copilot` | `.vscode/mcp.json` + `~/.copilot/mcp-config.json` + `.github/copilot-instructions.md` |
+| **Gemini CLI** | `semantex install-gemini` | `.gemini/settings.json` + `GEMINI.md` |
+| **Devin Desktop** (formerly Windsurf) | `semantex install-devin-desktop` | `~/.codeium/windsurf/mcp_config.json` + `.devin/rules/semantex.md` |
+| **Aider** | `semantex install-aider` | `.aider.conf.yml` + `.aider/semantex.md` (Aider has no native MCP support) |
+| **Codex** | `semantex install-codex` | `~/.codex/config.toml` + `AGENTS.md` |
+| **OpenCode** | `semantex install-open-code` | `opencode.json` + `.opencode/semantex.md` |
+
+For any other MCP-capable editor without a dedicated `install-*` command, point it at:
 
 ```json
 {
@@ -36,9 +50,6 @@ curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh |
 
 | Editor | Where to add it |
 |--------|----------------|
-| **Claude Code** | `.mcp.json` in project root, or `~/.claude/settings.json` globally |
-| **Cursor** | `.cursor/mcp.json` in project root |
-| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
 | **Cline** | VS Code settings → Cline MCP Servers |
 | **Continue** | `~/.continue/config.json` under `mcpServers` |
 
@@ -121,7 +132,7 @@ No retrieval tool is right for every codebase or team. Here's how semantex compa
 Where semantex is behind, honestly:
 
 - **Symbol precision.** Serena's LSP backend gives exact go-to-definition/rename/refactor semantics across dozens of languages via real language servers. semantex's chunk-level retrieval finds the right region of code but doesn't do LSP-grade symbol operations — the two are complementary rather than competing, and some users run both.
-- **Mindshare and ecosystem breadth.** claude-context/Zilliz is better known and already integrates with more agent clients (Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, Windsurf, Augment, and others). semantex's own platform coverage (9 platforms, above) is comparable but newer and less established.
+- **Mindshare and ecosystem breadth.** claude-context/Zilliz is better known and already integrates with more agent clients (Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, Devin Desktop/Windsurf, Augment, and others). semantex's own platform coverage (9 platforms, above) is comparable but newer and less established.
 - **Below roughly 1,000 files, plain grep is often enough.** semantex's advantage grows with codebase size and query ambiguity; on small, well-organized repos the overhead of maintaining an index may not pay for itself.
 - **Team-shared indexing.** semantex v1 indexes per-machine (with first-class multi-branch switching and cross-repo federated search); cloud platforms offer team-shared indexes maintained server-side. A shared daemon covers the single-machine multi-client case, but there's no cross-machine index sync.
 
@@ -179,7 +190,7 @@ cd semantex && cargo install --path crates/semantex-cli
 
 ## Setup
 
-semantex is an [MCP server](https://modelcontextprotocol.io/) (MCP 2025-03-26). Add it to your editor's MCP configuration:
+semantex is an [MCP server](https://modelcontextprotocol.io/) (MCP 2025-03-26). Use the `install-*` command for your platform (registers the MCP server + writes its rules/instructions file, all in place — see the [Quick Start](#quick-start) table), or add it to your editor's MCP configuration by hand:
 
 ```json
 {
@@ -194,13 +205,16 @@ semantex is an [MCP server](https://modelcontextprotocol.io/) (MCP 2025-03-26). 
 
 | Editor | Config file |
 |--------|-------------|
-| **Claude Code** | `.mcp.json` in project root, or `~/.claude/settings.json` for global |
-| **Cursor** | `.cursor/mcp.json` in project root |
-| **Windsurf** | `~/.codeium/windsurf/mcp_config.json` |
+| **Claude Code** | `.mcp.json` in project root, or `~/.claude/settings.json` for global (`semantex install-claude-code`) |
+| **Cursor** | `.cursor/mcp.json` in project root (`semantex install-cursor`) |
+| **Devin Desktop** (formerly Windsurf) | `~/.codeium/windsurf/mcp_config.json` (`semantex install-devin-desktop`) |
+| **Trae** | `.trae/mcp.json` (`semantex install-trae`) |
+| **GitHub Copilot** | `.vscode/mcp.json` (VS Code) / `~/.copilot/mcp-config.json` (CLI) (`semantex install-copilot`) |
+| **Gemini CLI** | `.gemini/settings.json` (`semantex install-gemini`) |
 | **Cline** | VS Code settings → Cline MCP Servers |
 | **Continue** | `~/.continue/config.json` under `mcpServers` |
-| **Codex** | `semantex install-codex` |
-| **OpenCode** | `semantex install-open-code` |
+| **Codex** | `~/.codex/config.toml` (`semantex install-codex`) |
+| **OpenCode** | `opencode.json` (`semantex install-open-code`) |
 
 That's it. semantex auto-indexes your project on first search — no manual indexing step required.
 

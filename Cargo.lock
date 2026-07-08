@@ -4219,6 +4219,7 @@ dependencies = [
  "serde_yml",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ureq 3.2.0",
