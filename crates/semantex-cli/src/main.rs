@@ -275,8 +275,9 @@ enum Commands {
         #[arg(long, requires = "http")]
         allow_remote: bool,
 
-        /// Named toolset bundle to expose: `core` (4 tools), `structural` (5 tools),
-        /// or `all` (13 tools, default).
+        /// Named toolset bundle to expose: `core` (3 tools: search, deep, agent),
+        /// `structural` (5 tools: symbol, callers, callees, implementations,
+        /// architecture), or `all` (10 tools, default).
         #[arg(long, value_name = "NAME", default_value = "all")]
         toolset: String,
 

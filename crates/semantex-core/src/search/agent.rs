@@ -53,8 +53,12 @@ pub(crate) struct HandlerResult {
     fallback_used: bool,
     result_count: usize,
     /// Structured hits for item-list routes (semantic/exact/structural/exhaustive/
-    /// regex/file_pattern/analytical). Empty for synthesis routes (deep/architecture)
-    /// whose answer is prose-only. Surfaced to MCP `structuredContent` IN-PROCESS;
+    /// regex/file_pattern/analytical). Empty for synthesis routes (architecture/
+    /// feature_planning) whose answer is prose-only. `deep` is also prose-only,
+    /// but a directly-requested Deep route (not one of the other routes' internal
+    /// `handle_deep` fallback) is the one exception: its own cited sources are a
+    /// real file list, so `handle_deep` populates `hits` from them in that case —
+    /// see `deep_source_to_hit`. Surfaced to MCP `structuredContent` IN-PROCESS;
     /// NOT part of the wire `AgentResponse` (postcard protocol stays unchanged).
     hits: Vec<crate::server::protocol::SearchResultItem>,
     /// v0.5 Item 6: when the search's top result was `Confidence::Ambiguous`,
@@ -395,11 +399,29 @@ impl<'a> AgentPipeline<'a> {
             Ok(result) if !result.answer.is_empty() => {
                 let resp = deep_result_to_response(result);
                 let count = resp.sources.len();
+                // Deep's answer is prose-only, so (unlike the item-list routes)
+                // there is normally no structured hit list to surface — EXCEPT
+                // when this is a directly-requested Deep route (`is_fallback ==
+                // false`, the only caller being the top-level dispatch above).
+                // In that one case the synthesis's own cited sources ARE a
+                // real file list, so expose them as hits: this is what lets
+                // `include_history` (server.rs) find files to look up commit
+                // history for on the Deep route. Internal reuse of
+                // `handle_deep` as a fallback from Architecture/Exhaustive/
+                // FeaturePlanning/etc keeps the historical empty-hits
+                // behavior — those routes' own structured output, if any,
+                // comes from elsewhere, and populating hits here would leak
+                // `all_hits`/`structuredContent` into unrelated routes.
+                let hits = if is_fallback {
+                    Vec::new()
+                } else {
+                    resp.sources.iter().map(deep_source_to_hit).collect()
+                };
                 HandlerResult {
                     formatted: format_deep_results(&resp, budget),
                     fallback_used: is_fallback,
                     result_count: count,
-                    hits: Vec::new(),
+                    hits,
                     disambiguation: None,
                 }
             }
@@ -1053,6 +1075,30 @@ impl<'a> AgentPipeline<'a> {
     }
 }
 
+/// Convert one of Deep's cited sources into the same structured-hit shape
+/// item-list routes use, so a directly-requested Deep route's `hits` (see
+/// `handle_deep`) can feed `include_history` / MCP `structuredContent` like
+/// any other route. Deep doesn't track a per-source relevance score (only
+/// the file/line/name/kind provenance survives to `DeepSearchSource`), so
+/// `score` is `0.0` here rather than a fabricated number.
+fn deep_source_to_hit(
+    source: &crate::server::protocol::DeepSearchSource,
+) -> crate::server::protocol::SearchResultItem {
+    crate::server::protocol::SearchResultItem {
+        file: source.file.clone(),
+        start_line: source.start_line,
+        end_line: source.end_line,
+        score: 0.0,
+        source: "deep".to_string(),
+        chunk_type: source.kind.clone().unwrap_or_default(),
+        name: source.name.clone(),
+        language: None,
+        content: None,
+        kind: source.kind.clone(),
+        summary: None,
+    }
+}
+
 // --- v0.5 Item 6: confidence-driven disambiguation suggestions -------------
 
 /// Max number of runner-up entries surfaced in the disambiguation block.
@@ -1592,6 +1638,63 @@ mod tests {
             "Semantic route must surface structured hits"
         );
         assert!(hits.iter().all(|h| !h.file.is_empty()));
+    }
+
+    /// E2E Wave 3 fix: a directly-requested Deep route must surface structured
+    /// hits (the synthesis's own cited sources, or the semantic-fallback's
+    /// hits when the synthesis comes back empty on a tiny corpus) — this is
+    /// what makes `include_history` reachable on the Deep route in
+    /// `semantex-mcp/server.rs::tool_agent`, which looks up commit history for
+    /// hit files. Before the fix, `handle_deep` hardcoded `hits: Vec::new()`,
+    /// so the documented Deep|Analytical `include_history` gate could never
+    /// fire on Deep.
+    #[test]
+    fn handle_with_hits_returns_hits_for_direct_deep_route() {
+        let (_dir, searcher) = build_populated_searcher();
+        let pipeline =
+            AgentPipeline::new(&searcher, std::path::PathBuf::from("/tmp/deep-hits-test"));
+
+        let (resp, hits) = pipeline.handle_with_hits(&AgentRequest {
+            query: "how does authentication work".into(),
+            route: Some(AgentRoute::Deep),
+            budget: Some(12_000),
+            full_code: false,
+        });
+
+        assert_eq!(resp.route, AgentRoute::Deep);
+        assert!(!resp.formatted.is_empty());
+        assert!(
+            !hits.is_empty(),
+            "a directly-requested Deep route must yield structured hits \
+             (include_history depends on this)"
+        );
+        assert!(hits.iter().all(|h| !h.file.is_empty()));
+    }
+
+    /// `deep_source_to_hit` maps a Deep cited source into the shared
+    /// `SearchResultItem` shape: file/lines/name/kind carried over verbatim,
+    /// `source` tagged "deep", and `score` pinned to 0.0 (Deep tracks no
+    /// per-source relevance score — nothing is fabricated).
+    #[test]
+    fn deep_source_to_hit_maps_provenance_fields() {
+        let source = crate::server::protocol::DeepSearchSource {
+            file: "auth/login.rs".to_string(),
+            start_line: 3,
+            end_line: 17,
+            name: Some("authenticateUser".to_string()),
+            kind: Some("function".to_string()),
+        };
+        let hit = deep_source_to_hit(&source);
+        assert_eq!(hit.file, "auth/login.rs");
+        assert_eq!(hit.start_line, 3);
+        assert_eq!(hit.end_line, 17);
+        assert_eq!(hit.source, "deep");
+        assert_eq!(hit.name.as_deref(), Some("authenticateUser"));
+        assert_eq!(hit.kind.as_deref(), Some("function"));
+        assert_eq!(hit.chunk_type, "function");
+        assert!((hit.score - 0.0).abs() < f32::EPSILON);
+        assert!(hit.content.is_none());
+        assert!(hit.summary.is_none());
     }
 
     /// Integration: a query with `.disable_adaptive()` returns at least as many
