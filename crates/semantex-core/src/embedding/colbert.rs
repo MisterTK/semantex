@@ -28,14 +28,39 @@ pub type TokenEmbeddings = Array2<f32>;
 /// scratch) or to push throughput on large machines (larger = bigger GEMMs).
 const DEFAULT_ORT_BATCH: usize = 32;
 
+/// Pure decision logic for the indexing thread-count default, split out from
+/// [`index_ort_threads`] so it's testable without touching the real
+/// `index::gate::max_concurrent_builds()` (which reads process-global env
+/// vars shared with `gate`'s own tests — calling it directly from a parallel
+/// test run would race). Identical formula to
+/// `embedding::single_vector::default_index_threads`.
+fn default_index_threads(cores: usize, max_concurrent_builds: usize) -> usize {
+    if max_concurrent_builds <= 1 {
+        cores.clamp(2, 8)
+    } else {
+        (cores / 2).clamp(2, 8)
+    }
+}
+
 /// ORT intra-op thread count for the **indexing** path (see
 /// [`ColbertEmbedder::for_indexing`]). `SEMANTEX_INDEX_ORT_THREADS` overrides;
 /// otherwise `clamp(cores / 2, 2, 8)` — enough parallelism to finish a build
 /// quickly while leaving cores for the developer's foreground work. Bounded
 /// concurrency (the `index::gate` semaphore) keeps total memory in check.
+///
+/// EXCEPTION: when `index::gate::max_concurrent_builds()` reports this box
+/// can only ever run ONE full build at a time (RAM-limited — e.g. a 16 GB /
+/// 4-core box, `16 / 16 GB-per-build = 1` slot), there is by construction no
+/// sibling build to leave cores for, so the default uses ALL cores instead
+/// (still clamped `[2, 8]`). This is the common single-developer/first-index
+/// case; bigger boxes where several builds can run concurrently keep the
+/// half-the-cores split. Verified live on a 4-core box: without this
+/// exception the build used 2 real ORT threads for the whole encode phase
+/// (2 idle cores throughout, since only one build could ever be running).
 fn index_ort_threads() -> usize {
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", (cores / 2).clamp(2, 8))
+    let default = default_index_threads(cores, crate::index::gate::max_concurrent_builds());
+    crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", default)
 }
 
 /// ColBERT encoder wrapping LateOn-Code-edge via `next-plaid-onnx`.
@@ -305,6 +330,25 @@ impl ColbertEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_index_threads_uses_all_cores_when_only_one_build_slot_exists() {
+        // A box that can only ever run one full build at a time (RAM-limited)
+        // has no sibling build to leave cores for — use them all (clamped).
+        assert_eq!(default_index_threads(4, 1), 4);
+        assert_eq!(default_index_threads(2, 1), 2, "clamped to floor of 2");
+        assert_eq!(default_index_threads(16, 1), 8, "clamped to ceiling of 8");
+        assert_eq!(default_index_threads(1, 1), 2, "clamped to floor of 2");
+    }
+
+    #[test]
+    fn default_index_threads_halves_cores_when_multiple_build_slots_exist() {
+        // Bigger boxes where several builds could run at once keep the
+        // conservative half-the-cores split (unchanged legacy behaviour).
+        assert_eq!(default_index_threads(8, 2), 4);
+        assert_eq!(default_index_threads(32, 4), 8, "clamped to ceiling of 8");
+        assert_eq!(default_index_threads(4, 2), 2, "clamped to floor of 2");
+    }
 
     /// `ColbertEmbedder::new()` should not error or build the ONNX session when
     /// the model directory exists but the model files are missing/corrupt —

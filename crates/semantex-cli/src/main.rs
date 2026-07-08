@@ -527,14 +527,42 @@ fn find_ort_dylib() -> Option<&'static str> {
 /// running, which is real UB on platforms with strict env-var thread rules.
 /// Returns true when the requested subcommand is memory-heavy enough that
 /// we want to cap ORT threads aggressively. Currently: `mcp` (many parallel
-/// sessions, each loading the dense embedder), `index` (large batch encoding —
-/// verified to spike to 10 GB on a 2 k-chunk repo with 4 threads), `watch`
-/// (continuous incremental encoding).
+/// query sessions, each loading the dense embedder), `index` (see note
+/// below — largely vestigial today), `watch` (continuous incremental
+/// encoding, mostly query-shaped batches).
 ///
-/// On a 12-core machine, fastembed's default of "all cores" allocates
-/// ~1 GB of ORT inference workspace per thread on first encode. 1 thread
-/// keeps the encoding spike under 1 GB without meaningfully slowing
-/// large batch operations (encoding is bandwidth-bound, not compute-bound).
+/// # This does NOT bound a full index build's dominant thread/memory cost
+///
+/// `SEMANTEX_ORT_THREADS` (forced to `1` here) only feeds the QUERY-tuned
+/// embedder constructors (`SingleVectorEmbedder::new` /
+/// `ColbertEmbedder::new`, see `embedding::single_vector::query_threads`).
+/// A full `index` build uses the INDEXING-tuned constructors
+/// (`SingleVectorEmbedder::for_indexing` / `ColbertEmbedder::for_indexing`,
+/// see `embedding::colbert::index_ort_threads`), which read the
+/// independent `SEMANTEX_INDEX_ORT_THREADS` knob — unaffected by this
+/// function's env vars — and default to `embedding::colbert::default_index_threads`
+/// (real ORT intra-op threads: half the cores, or ALL of them when
+/// `index::gate::max_concurrent_builds()` says only one full build can run
+/// at a time) regardless of what this function decides. Measured live on a
+/// 4-core box (one build slot, so the "use all cores" branch applies): a
+/// full `index` build shows 4 actively-running ORT threads throughout the
+/// encode phase, NOT 1.
+///
+/// An EARLIER version of this comment claimed "1 thread keeps the encoding
+/// spike under 1 GB" for `index` specifically, and cited a "10 GB spike with
+/// 4 threads on a 2k-chunk repo" — both were measurements from before the
+/// `index::gate` build-slot design (which introduced the separate
+/// `for_indexing`/`SEMANTEX_INDEX_ORT_THREADS` path) and no longer describe
+/// what `index` actually does; ORT thread count is not the dominant memory
+/// driver for a full build. The dominant driver (E2E-verified, 344 files /
+/// 4665 chunks: ~9.5 GB peak RSS) is the dense backend's single-call
+/// index-build pass (see `crate::memory::kernel_rss_cap_bytes` for the
+/// address-space-vs-RSS accounting around that peak), not the number of ORT
+/// intra-op threads. `index` stays in this list because forcing
+/// `OMP_NUM_THREADS`/`MKL_NUM_THREADS`/etc. to 1 is still a reasonable
+/// default for the process as a whole (BLAS-backed CPU kernels a future
+/// dependency might introduce), it just isn't the thing actually keeping a
+/// build's memory down today.
 fn memory_constrained_mode_requested() -> bool {
     memory_constrained_from_args(std::env::args().skip(1))
 }

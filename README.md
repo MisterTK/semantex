@@ -310,6 +310,20 @@ semantex/
 - **Disk**: ~100MB for models + index storage
 - **Build**: Rust 1.91+ (if building from source)
 
+### First Index
+
+The first `semantex index` (or first search / MCP call, which auto-indexes) on
+a new project embeds every chunk of the codebase — CPU-bound, one-time work.
+Measured on a 16 GB / 4-core box: **314 files (~5 MB source, 4669 chunks)
+took ~11.4 minutes (684.8s)** end to end. Indexing scales with source size
+and available cores, not repo file count alone; expect low-single-digit
+minutes for small projects and longer for very large monorepos. Subsequent
+runs are incremental (only changed files re-embed) and are much faster.
+Peak memory during that same full build was ~9.6 GB RSS — comfortably
+inside a 16 GB machine's budget; semantex enforces a hard cap (see
+`SEMANTEX_MAX_RSS_MB` below) so a build can never take down the host, even
+on smaller machines.
+
 ## Development
 
 ```bash
@@ -321,9 +335,21 @@ cargo clippy --all             # Lint
 ### Environment Variables
 
 ```bash
-SEMANTEX_ORT_THREADS=4         # ONNX Runtime threads (default: 4)
-SEMANTEX_COREML=1              # CoreML acceleration on macOS
-SEMANTEX_MAX_RSS_MB=2048       # Daemon RSS limit in MB (default: 2048)
+SEMANTEX_ORT_THREADS=4           # ONNX Runtime threads for QUERIES (default: 4)
+SEMANTEX_INDEX_ORT_THREADS=8     # ONNX Runtime threads for a full INDEX BUILD
+                                  # (default: half the cores on a box that can run
+                                  # several full builds at once, ALL cores when it
+                                  # can only run one — clamped to [2, 8] either way)
+SEMANTEX_COREML=1                # CoreML acceleration on macOS
+SEMANTEX_MAX_RSS_MB=8192          # Soft RSS budget in MB — polled at build/search
+                                  # checkpoints (default: 50% of system RAM,
+                                  # clamped to [1024, 12288]; `0` disables it)
+SEMANTEX_NO_RLIMIT=1              # Skip the kernel setrlimit(RLIMIT_AS) failsafe
+                                  # (Linux only; useful in containers with their
+                                  # own cgroup memory limits)
+SEMANTEX_MAX_CONCURRENT_BUILDS=2  # Max full index builds allowed to run at once
+                                  # across all projects (default: system RAM / 16 GB,
+                                  # min 1)
 ```
 
 ## License
