@@ -8,7 +8,7 @@
 class Semantex < Formula
   desc "Semantic code search — hybrid ColBERT + BM25 retrieval engine"
   homepage "https://semantex.dev"
-  version "0.1.2"
+  version "1.0.0"
   license "Apache-2.0"
 
   on_macos do

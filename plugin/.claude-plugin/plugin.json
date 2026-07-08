@@ -1,6 +1,6 @@
 {
   "name": "semantex",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Semantic code search — finds code by meaning, not just keywords. Hybrid ColBERT + BM25 retrieval for 25+ languages.",
   "author": {
     "name": "semantex contributors"

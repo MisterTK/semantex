@@ -1,6 +1,6 @@
 # semantex — Semantic Code Search for AI Agents
 
-**Cut your agent's token usage by 40%, context burden by 67%, and tool calls by 55% — with zero quality loss.**
+**Cut your agent's cost by 65%, context burden by 39%, and tool calls by 51% — while *improving* answer quality.**
 
 semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loop AI agents fall into when exploring a codebase — the industry-default retrieval pattern, whose cognitive cost compounds quadratically with every extra tool call (see below). It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
 
@@ -82,20 +82,29 @@ Agent → semantex_deep "how does authentication work"
 
 Instead of the agent iteratively searching and reading, semantex does it internally — semantic search, graph expansion, content reading, and extractive summarization — and returns a pre-digested answer the agent can immediately act on.
 
-### Measured Impact (Benchmark: 10 agents, 5 real-world tasks, Sonnet 4.6)
+### Measured Impact (v1.0.0 engine — committed, reproducible runs)
+
+**Agent efficiency** — Claude Code agents answering 5 real-world questions on `pallets/flask`, built-in Grep/Glob/Read vs semantex, blind-judged:
 
 | Metric | With semantex | Without (Grep/Glob/Read) | Improvement |
 |---|---|---|---|
-| **Total tokens** | 212K | 355K | **-40%** |
-| **Cumulative context burden** | 2.2M | 6.8M | **-67%** |
-| **Tool calls** | 39 | 86 | **-55%** |
-| **Peak context size** | 42K avg | 71K avg | **-40%** |
-| **Wall-clock time** | 513s | 609s | **-16%** |
-| **Answer quality** | Comprehensive | Comprehensive | **Tie** |
+| **Cost (USD)** | $0.37 | $1.05 | **−65%** |
+| **Cumulative context burden** | 937K | 1.53M | **−39%** |
+| **Tool calls** | 15.0 | 30.4 | **−51%** |
+| **Peak context size** | 53K | 84K | **−36%** |
+| **Wall-clock time** | 116s | 254s | **−54%** |
+| **Answer quality** (blind judge, 1–5) | **4.80** | 3.80 | **higher, not tied** |
 
-The -40% token saving is the billing metric. The **-67% cumulative context burden** is the cognitive metric — how much the model actually had to attend to across all turns. Fewer turns × smaller context = quadratically less waste.
+**Retrieval quality** — SWE-bench-Verified file localization (find the file a real issue's fix touched), k=10:
 
-> Self-reported benchmark, run by the semantex team. Full methodology and per-question data available in the benchmark suite (`benchmarks/`).
+| | semantex (agent-routed) | semantex (hybrid) | ripgrep |
+|---|---|---|---|
+| **Acc@1** | **3/5** | 2/5 | 0/5 |
+| **MRR@10** | **0.600** | 0.522 | 0.095 |
+
+The cost saving is the billing metric. The **cumulative context burden** is the cognitive one — how much the model actually had to attend to across all turns. Fewer turns × smaller context = quadratically less waste.
+
+> Self-reported benchmarks, run by the semantex team on CPU-only hardware with small question sets — read them as directional, not definitive. Full methodology, per-question data, raw counts, and honest caveats: [`benchmarks/RESULTS-v1.md`](benchmarks/RESULTS-v1.md). Both suites are committed and reproducible from this repo.
 
 ## How semantex compares
 
@@ -114,7 +123,7 @@ Where semantex is behind, honestly:
 - **Symbol precision.** Serena's LSP backend gives exact go-to-definition/rename/refactor semantics across dozens of languages via real language servers. semantex's chunk-level retrieval finds the right region of code but doesn't do LSP-grade symbol operations — the two are complementary rather than competing, and some users run both.
 - **Mindshare and ecosystem breadth.** claude-context/Zilliz is better known and already integrates with more agent clients (Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, Windsurf, Augment, and others). semantex's own platform coverage (9 platforms, above) is comparable but newer and less established.
 - **Below roughly 1,000 files, plain grep is often enough.** semantex's advantage grows with codebase size and query ambiguity; on small, well-organized repos the overhead of maintaining an index may not pay for itself.
-- **Multi-branch and team indexing.** semantex indexes one branch at a time per project today; cloud platforms and some hybrid setups already offer cross-branch and team-shared indexing.
+- **Team-shared indexing.** semantex v1 indexes per-machine (with first-class multi-branch switching and cross-repo federated search); cloud platforms offer team-shared indexes maintained server-side. A shared daemon covers the single-machine multi-client case, but there's no cross-machine index sync.
 
 ## How It Works
 
