@@ -115,31 +115,34 @@ jobs:
     name: Publish to crates.io
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
       # Publish in dependency order: core → mcp → cli
       - name: Publish semantex-core
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         run: cargo publish -p semantex-core --no-verify
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - name: Publish semantex-mcp
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         run: cargo publish -p semantex-mcp --no-verify
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - name: Publish semantex-cli
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         run: cargo publish -p semantex-cli --no-verify
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   release:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -168,9 +171,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update Homebrew tap
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -204,9 +207,9 @@ jobs:
           git push
 
       - name: Update Scoop manifest
-        if: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
+        if: ${{ env.SCOOP_BUCKET_TOKEN != '' }}
         env:
-          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          GH_TOKEN: ${{ env.SCOOP_BUCKET_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -216,23 +219,19 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/MisterTK/scoop-semantex.git" bucket
           cd bucket
 
-          python3 - <<PYEOF
-          import json, sys
-          with open("bucket/semantex.json") as f:
-              m = json.load(f)
-          m["version"] = "${version}"
-          m["architecture"]["64bit"]["url"] = \
-              f"https://github.com/MisterTK/semantex/releases/download/v${version}/semantex-v${version}-x86_64-pc-windows-msvc.zip"
-          m["architecture"]["64bit"]["hash"] = "${sha}"
-          m["architecture"]["64bit"]["extract_dir"] = f"semantex-v${version}-x86_64-pc-windows-msvc"
-          with open("bucket/semantex.json", "w") as f:
-              json.dump(m, f, indent=4)
-              f.write("\n")
-          PYEOF
+          url="https://github.com/MisterTK/semantex/releases/download/v${version}/semantex-v${version}-x86_64-pc-windows-msvc.zip"
+          extract_dir="semantex-v${version}-x86_64-pc-windows-msvc"
+          jq --arg version "$version" --arg url "$url" --arg hash "$sha" --arg dir "$extract_dir" \
+            '.version = $version
+             | .architecture."64bit".url = $url
+             | .architecture."64bit".hash = $hash
+             | .architecture."64bit".extract_dir = $dir' \
+            semantex.json > semantex.json.tmp
+          mv semantex.json.tmp semantex.json
 
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
-          git add bucket/semantex.json
+          git add semantex.json
           git diff --staged --quiet || git commit -m "semantex ${version}"
           git push
 
