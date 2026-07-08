@@ -226,12 +226,12 @@ jobs:
              | .architecture."64bit".url = $url
              | .architecture."64bit".hash = $hash
              | .architecture."64bit".extract_dir = $dir' \
-            semantex.json > semantex.json.tmp
-          mv semantex.json.tmp semantex.json
+            bucket/semantex.json > bucket/semantex.json.tmp
+          mv bucket/semantex.json.tmp bucket/semantex.json
 
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
-          git add semantex.json
+          git add bucket/semantex.json
           git diff --staged --quiet || git commit -m "semantex ${version}"
           git push
 
