@@ -98,7 +98,14 @@ def run_instance(
     """
     corpus_dir = Path(corpus_dir)
     ensure_index(corpus_dir=corpus_dir, semantex_binary=semantex_binary)
-    client = SemantexClient(semantex_binary=semantex_binary, corpus_dir=str(corpus_dir))
+    # 300s (vs. the client's 120s default): on a CPU-constrained/contended host, a
+    # cold `rerank` call (fresh daemon spawn + cross-encoder ONNX session build from
+    # a ~2.2 GB model file, even when the weights are already cache-warm) measurably
+    # exceeds 120s and was observed to time out here — a false "error" for that arm,
+    # not a real engine failure. Scoped to this runner only (not the client default)
+    # since other callers' timeout needs aren't this benchmark's concern.
+    client = SemantexClient(semantex_binary=semantex_binary, corpus_dir=str(corpus_dir),
+                             timeout_secs=300)
     # Defeat stale-daemon reuse from a prior instance's run (config, incl. the
     # adaptive-sizing A/B lock, is cached at spawn time — see semantex_client
     # module docstring).

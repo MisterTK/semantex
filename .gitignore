@@ -50,6 +50,8 @@ CLAUDE.md
 # its results/three-way/ raw output stays ignored).
 !/benchmarks/three_way.py
 !/benchmarks/three_way_nudge.py
+# Exception: v1 benchmark-validation results writeup (committed report, not raw run data).
+!/benchmarks/RESULTS-v1.md
 /benches
 /bench_results
 /scripts
