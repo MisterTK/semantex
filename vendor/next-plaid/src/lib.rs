@@ -3,6 +3,8 @@
 //! This crate provides a pure Rust, CPU-only implementation of the PLAID algorithm
 //! for efficient multi-vector search (late interaction retrieval).
 
+use std::sync::OnceLock;
+
 // Link BLAS implementation when feature is enabled
 #[cfg(feature = "accelerate")]
 extern crate blas_src;
@@ -11,7 +13,7 @@ extern crate blas_src;
 extern crate openblas_src;
 
 pub mod codec;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "_cuda")]
 pub mod cuda;
 pub mod delete;
 pub mod embeddings;
@@ -42,7 +44,24 @@ pub use search::{QueryResult, SearchParameters};
 pub use text_search::FtsTokenizer;
 pub use update::UpdateConfig;
 
-#[cfg(feature = "cuda")]
+const DEFAULT_START_FROM_SCRATCH: usize = 999;
+
+fn parse_usize(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok()
+}
+
+pub fn default_start_from_scratch() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("INDEX_DEFAULT_START_FROM_SCRATCH")
+            .ok()
+            .as_deref()
+            .and_then(parse_usize)
+            .unwrap_or(DEFAULT_START_FROM_SCRATCH)
+    })
+}
+
+#[cfg(feature = "_cuda")]
 pub use cuda::{clear_cuda_broken, is_cuda_broken, mark_cuda_broken, CudaContext};
 
 /// Check if GPU-only mode is forced via environment variable.

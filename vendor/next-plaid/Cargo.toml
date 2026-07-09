@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "next-plaid"
-version = "1.3.1"
+version = "1.6.2"
 authors = ["Raphael Sourty, LightOn"]
 build = "build.rs"
 autolib = false
@@ -39,6 +39,7 @@ license = "Apache-2.0"
 repository = "https://github.com/lightonai/next-plaid"
 
 [features]
+_cuda = ["dep:cudarc"]
 accelerate = [
     "blas-src",
     "accelerate-src",
@@ -46,8 +47,14 @@ accelerate = [
     "fastkmeans-rs/accelerate",
 ]
 cuda = [
+    "_cuda",
     "fastkmeans-rs/cuda",
-    "dep:cudarc",
+    "cudarc/cuda-11080",
+]
+cuda-13 = [
+    "_cuda",
+    "fastkmeans-rs/cuda-13",
+    "cudarc/cuda-13000",
 ]
 default = []
 metal_gpu = ["fastkmeans-rs/metal_gpu"]
@@ -73,12 +80,24 @@ name = "filtering_integration"
 path = "tests/filtering_integration.rs"
 
 [[test]]
+name = "fts_delete_bench"
+path = "tests/fts_delete_bench.rs"
+
+[[test]]
 name = "fts_integration"
 path = "tests/fts_integration.rs"
 
 [[test]]
+name = "metadata_delete_bench"
+path = "tests/metadata_delete_bench.rs"
+
+[[test]]
 name = "metadata_sync_test"
 path = "tests/metadata_sync_test.rs"
+
+[[test]]
+name = "start_from_scratch_env_test"
+path = "tests/start_from_scratch_env_test.rs"
 
 [dependencies.accelerate-src]
 version = "0.3"
@@ -94,7 +113,6 @@ version = "1.5"
 [dependencies.cudarc]
 version = "0.19"
 features = [
-    "cuda-11080",
     "cublas",
     "dynamic-loading",
     "nvrtc",
@@ -102,8 +120,11 @@ features = [
 optional = true
 default-features = false
 
+[dependencies.fancy-regex]
+version = "0.13"
+
 [dependencies.fastkmeans-rs]
-version = "1.0.6"
+version = "1.0.8"
 
 [dependencies.fs2]
 version = "0.4"

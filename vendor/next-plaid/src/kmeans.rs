@@ -16,7 +16,7 @@ use crate::maxsim;
 
 pub use fastkmeans_rs::{kmeans_double_chunked, FastKMeans, KMeansConfig, KMeansError};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "_cuda")]
 pub use fastkmeans_rs::FastKMeansCuda;
 
 #[cfg(feature = "metal_gpu")]
@@ -66,7 +66,7 @@ pub fn default_config(num_centroids: usize) -> KMeansConfig {
         max_points_per_centroid: Some(256),
         chunk_size_data: 4_096, // PATCHED (semantex): 51_200->4_096 bounds the per-rayon-chunk
         // k-means distance GEMM (chunk_size_data x chunk_size_centroids) from ~2.1GB to
-        // ~167MB. Peak RSS ~= rayon_threads x block; quality-neutral (pure compute tiling).
+        // a bounded size during index builds (26GB->9GB fix on 2k-chunk repos, commit d4930a9).
         chunk_size_centroids: 10_240,
         verbose: false,
     }
@@ -96,7 +96,7 @@ fn compute_centroids_cpu(
 /// # Returns
 ///
 /// The centroids array of shape `[num_centroids, dim]`
-#[cfg(not(any(feature = "cuda", feature = "metal_gpu")))]
+#[cfg(not(any(feature = "_cuda", feature = "metal_gpu")))]
 pub fn compute_centroids(
     embeddings: &ArrayView2<f32>,
     num_centroids: usize,
@@ -108,7 +108,7 @@ pub fn compute_centroids(
 }
 
 /// Compute centroids from a set of embeddings using CUDA (or CPU if force_cpu is true or CUDA fails).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "_cuda")]
 pub fn compute_centroids(
     embeddings: &ArrayView2<f32>,
     num_centroids: usize,
@@ -158,7 +158,7 @@ pub fn compute_centroids(
 }
 
 /// Compute centroids from a set of embeddings using Metal GPU (or CPU if force_cpu is true).
-#[cfg(all(feature = "metal_gpu", not(feature = "cuda")))]
+#[cfg(all(feature = "metal_gpu", not(feature = "_cuda")))]
 pub fn compute_centroids(
     embeddings: &ArrayView2<f32>,
     num_centroids: usize,
@@ -326,13 +326,13 @@ pub fn compute_kmeans(
         max_points_per_centroid: Some(config.max_points_per_centroid),
         chunk_size_data: 4_096, // PATCHED (semantex): 51_200->4_096 bounds the per-rayon-chunk
         // k-means distance GEMM (chunk_size_data x chunk_size_centroids) from ~2.1GB to
-        // ~167MB. Peak RSS ~= rayon_threads x block; quality-neutral (pure compute tiling).
+        // a bounded size during index builds (26GB->9GB fix on 2k-chunk repos, commit d4930a9).
         chunk_size_centroids: 10_240,
         verbose: false,
     };
 
     // Run k-means (CPU implementation)
-    #[cfg(not(any(feature = "cuda", feature = "metal_gpu")))]
+    #[cfg(not(any(feature = "_cuda", feature = "metal_gpu")))]
     let centroids = {
         let mut kmeans = FastKMeans::with_config(kmeans_config);
         kmeans
@@ -346,7 +346,7 @@ pub fn compute_kmeans(
     };
 
     // Run k-means (CUDA with automatic CPU fallback, catching panics)
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "_cuda")]
     let centroids = if config.force_cpu || crate::cuda::is_cuda_broken() {
         // Use CPU if force_cpu is set or CUDA has been determined to be broken
         // Use kmeans_double_chunked directly to avoid FastKMeans::train() which
@@ -390,7 +390,7 @@ pub fn compute_kmeans(
     };
 
     // Run k-means (Metal GPU with CPU fallback when force_cpu is true)
-    #[cfg(all(feature = "metal_gpu", not(feature = "cuda")))]
+    #[cfg(all(feature = "metal_gpu", not(feature = "_cuda")))]
     let centroids = if config.force_cpu {
         let mut kmeans = FastKMeans::with_config(kmeans_config);
         kmeans
