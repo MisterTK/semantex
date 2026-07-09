@@ -24,6 +24,12 @@ $arch = if ([System.Environment]::Is64BitOperatingSystem) {
 $target = "$arch-pc-windows-msvc"
 Info "Platform" $target
 
+# Snapshot whatever `semantex` currently resolves to, before we touch PATH or
+# install anything. If something else is still ahead of it after we install
+# (e.g. a previous `cargo install semantex-cli`), we warn below instead of
+# silently reporting success while the old binary keeps running.
+$existingCmd = Get-Command semantex -ErrorAction SilentlyContinue
+
 # Determine version
 if ($env:SEMANTEX_VERSION) {
     $version = $env:SEMANTEX_VERSION
@@ -90,6 +96,17 @@ foreach ($dll in $dlls) {
     Info "Copied" $dll.Name
 }
 
+# Warn if an older semantex earlier on PATH will keep shadowing this install
+# (e.g. a previous `cargo install semantex-cli`, or a stale copy elsewhere).
+if ($existingCmd -and $existingCmd.Source -ne $binDst) {
+    $shadowVersion = try { ((& $existingCmd.Source --version) -split '\s+')[1] } catch { "unknown" }
+    Write-Host ""
+    Write-Host "  warning: an older semantex is still first on PATH and will shadow this install:" -ForegroundColor Yellow
+    Write-Host "           $($existingCmd.Source) (version $shadowVersion)"
+    Write-Host "           Fix: remove it (e.g. 'cargo uninstall semantex-cli' if installed via cargo,"
+    Write-Host "           or delete that file), or move $installDir earlier in PATH, then open a new terminal."
+}
+
 # Telemetry: report install event (respects SEMANTEX_NO_TELEMETRY and DO_NOT_TRACK)
 $noTelemetry = $env:SEMANTEX_NO_TELEMETRY -or $env:DO_NOT_TRACK -eq "1" -or $env:CI
 if (-not $noTelemetry) {
@@ -142,7 +159,7 @@ Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 Write-Host ""
 Info "Done!" "semantex $version is ready"
 Write-Host ""
-try { & semantex --version } catch { }
+try { & $binDst --version } catch { }
 Write-Host ""
 Write-Host "  Next: install into your AI coding tool:"
 Write-Host "    semantex install-claude-code   # Claude Code"

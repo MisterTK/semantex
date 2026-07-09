@@ -33,6 +33,12 @@ esac
 target="${arch}-${os}"
 info "Platform" "${target}"
 
+# Snapshot whatever `semantex` currently resolves to, before we touch PATH or
+# install anything. If something else is still ahead of it after we install
+# (e.g. a previous `cargo install semantex-cli`), we warn below instead of
+# silently reporting success while the old binary keeps running.
+preexisting_semantex=$(command -v semantex 2>/dev/null || true)
+
 # Determine latest version
 if [ -n "${SEMANTEX_VERSION:-}" ]; then
   version="$SEMANTEX_VERSION"
@@ -101,6 +107,19 @@ if [ -n "$dylib_src" ]; then
   ${USE_SUDO} cp "$dylib_src" "$INSTALL_DIR/"
 fi
 
+# Warn if an older semantex earlier on PATH will keep shadowing this install
+# (e.g. a previous `cargo install semantex-cli`, or a stale copy elsewhere).
+installed_bin="${INSTALL_DIR}/semantex"
+if [ -n "$preexisting_semantex" ] && [ "$preexisting_semantex" != "$installed_bin" ]; then
+  shadow_version=$("$preexisting_semantex" --version 2>/dev/null | awk '{print $2}')
+  echo ""
+  printf '  \033[1;33mwarning:\033[0m an older semantex is still first on your PATH and will shadow this install:\n'
+  printf '           %s (version %s)\n' "$preexisting_semantex" "${shadow_version:-unknown}"
+  echo "           Fix: remove it (e.g. \`cargo uninstall semantex-cli\` if installed via cargo,"
+  echo "           or \`rm ${preexisting_semantex}\`), or move ${INSTALL_DIR} earlier in PATH,"
+  echo "           then open a new shell."
+fi
+
 # Ensure INSTALL_DIR is in PATH (only needed for ~/.local/bin fallback)
 if [ "$INSTALL_DIR" != "/usr/local/bin" ]; then
   shell_rc=""
@@ -154,7 +173,7 @@ send_telemetry
 echo ""
 info "Done!" "semantex ${version} is ready"
 echo ""
-semantex --version
+"$installed_bin" --version
 echo ""
 echo "  Next: install into your AI coding tool:"
 echo "    semantex install-claude-code   # Claude Code"
