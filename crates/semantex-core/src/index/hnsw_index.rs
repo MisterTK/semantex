@@ -134,6 +134,14 @@ pub struct Int8VectorStore {
     pub scales: Vec<f32>,
     pub vectors: Vec<Vec<i8>>,
     pub chunk_ids: Vec<u64>,
+    /// Row `i` is logically deleted (tombstoned) when `true`; its bytes are
+    /// left in place on disk and in RAM — never removed by compaction. A
+    /// `tombstoned` vec SHORTER than `chunk_ids` (any pre-existing
+    /// construction of this struct without the field, e.g. `..Default::default()`
+    /// in a test) is treated as "nothing tombstoned" for every row past its
+    /// end — see `is_tombstoned`.
+    #[serde(default)]
+    pub tombstoned: Vec<bool>,
 }
 
 impl Int8VectorStore {
@@ -147,7 +155,27 @@ impl Int8VectorStore {
         self.vectors.push(q);
         self.scales.push(scale);
         self.chunk_ids.push(chunk_id);
+        self.tombstoned.push(false);
         idx
+    }
+
+    /// Row `i` is excluded from search/graph-build when tombstoned. A `.get()`
+    /// (not direct indexing) so a `tombstoned` vec shorter than `chunk_ids`
+    /// (any pre-existing store construction without this field) is treated as
+    /// "nothing tombstoned" — every pre-tombstone-field construction of this
+    /// struct keeps behaving exactly as it did before this field existed.
+    fn is_tombstoned(&self, i: usize) -> bool {
+        self.tombstoned.get(i).copied().unwrap_or(false)
+    }
+
+    /// Count of rows NOT tombstoned — the true "searchable" size. Used for the
+    /// HNSW-vs-brute-force threshold and the empty-store short-circuit, so a
+    /// heavily-deleted store degrades based on what's actually live, not the
+    /// raw on-disk row count.
+    fn live_count(&self) -> usize {
+        (0..self.chunk_ids.len())
+            .filter(|&i| !self.is_tombstoned(i))
+            .count()
     }
 
     /// Dequantize store row `i` back to f32. (Stored rows were L2-normalized
@@ -177,6 +205,7 @@ impl Int8VectorStore {
             .vectors
             .iter()
             .enumerate()
+            .filter(|(i, _)| !self.is_tombstoned(*i))
             .map(|(i, v)| (i, dot_i8(&q8, v)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -224,6 +253,7 @@ impl Int8VectorStore {
             .chunk_ids
             .iter()
             .enumerate()
+            .filter(|(i, _)| !self.is_tombstoned(*i))
             .map(|(i, &id)| (id, i))
             .collect();
         chunk_ids
@@ -264,13 +294,20 @@ impl HnswDenseIndex {
     /// vectors), or return `None` for a small store (brute-force path). The
     /// graph value at row `i` is the store row index `i`.
     fn build_graph(store: &Int8VectorStore, params: HnswParams) -> Option<HnswGraph> {
-        if store.len() < hnsw_min_vectors() {
+        if store.live_count() < hnsw_min_vectors() {
             return None;
         }
-        let points: Vec<HnswPoint> = (0..store.len())
-            .map(|i| HnswPoint(store.dequant_row(i)))
+        let live: Vec<usize> = (0..store.len())
+            .filter(|&i| !store.is_tombstoned(i))
             .collect();
-        let values: Vec<usize> = (0..store.len()).collect();
+        let points: Vec<HnswPoint> = live
+            .iter()
+            .map(|&i| HnswPoint(store.dequant_row(i)))
+            .collect();
+        // Graph VALUE is the store row index, so a search hit maps straight
+        // back to `store` without a second lookup — tombstoned rows are
+        // simply never in `live`, so they can never be returned by a search.
+        let values: Vec<usize> = live;
         let graph = Builder::default()
             .ef_construction(params.ef_construction.max(1))
             .ef_search(Self::baked_ef_search(params))
@@ -298,7 +335,7 @@ impl HnswDenseIndex {
 
     /// Top-k search: ANN (if graph present) → fp32 rescore; else brute-force.
     fn search(&self, query: &[f32], k: usize) -> Vec<DenseHit> {
-        if self.store.len() == 0 {
+        if self.store.live_count() == 0 {
             return Vec::new();
         }
         let rescore_k = if self.params.rescore_k == 0 {
@@ -728,6 +765,7 @@ mod tests {
                 quantize_int8(&[0.0, 1.0]).0, // id 30
             ],
             chunk_ids: vec![10, 20, 30],
+            tombstoned: vec![false, false, false],
         };
         let q = vec![1.0f32, 0.0];
         let hits = store.brute_force(&q, 3, 0);
@@ -745,6 +783,7 @@ mod tests {
             scales: vec![],
             vectors: vec![],
             chunk_ids: vec![],
+            tombstoned: vec![],
         };
         assert!(store.brute_force(&[0.0, 0.0, 0.0, 0.0], 5, 0).is_empty());
     }
@@ -759,6 +798,7 @@ mod tests {
                 quantize_int8(&[0.8, 0.2, 0.0]).0,
             ],
             chunk_ids: vec![1, 2],
+            tombstoned: vec![false, false],
         };
         let q = vec![1.0f32, 0.0, 0.0];
         let hits = store.fp32_rescore(&q, &[0, 1], 2);
@@ -790,6 +830,7 @@ mod tests {
             scales: vec![s1, s2],
             vectors: vec![q1, q2],
             chunk_ids: vec![1, 2],
+            tombstoned: vec![false, false],
         };
         let mut query = vec![1.0f32, 0.028, 0.0];
         l2_normalize(&mut query);
@@ -983,6 +1024,89 @@ mod tests {
         assert_eq!(
             hnsw_hits, bf_hits,
             "HNSW (with fp32 rescore) must agree with brute-force on a tiny corpus"
+        );
+        unsafe {
+            std::env::remove_var("SEMANTEX_HNSW_MIN_VECTORS");
+        }
+    }
+
+    #[test]
+    fn tombstoned_row_is_excluded_from_brute_force() {
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        let (q2, s2) = quantize_int8(&[0.9, 0.1]);
+        store.push(1, q1, s1);
+        store.push(2, q2, s2);
+        assert_eq!(store.live_count(), 2);
+
+        store.tombstoned[0] = true;
+        assert_eq!(store.live_count(), 1);
+        assert!(store.is_tombstoned(0));
+        assert!(!store.is_tombstoned(1));
+
+        let hits = store.brute_force(&[1.0, 0.0], 5, 5);
+        assert_eq!(
+            hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![2],
+            "tombstoned row (chunk_id=1) must never be returned"
+        );
+    }
+
+    #[test]
+    fn tombstoned_row_is_excluded_from_vectors_for() {
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        let (q2, s2) = quantize_int8(&[0.0, 1.0]);
+        store.push(10, q1, s1);
+        store.push(20, q2, s2);
+        store.tombstoned[0] = true;
+
+        let got = store.vectors_for(&[10, 20]);
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![20],
+            "tombstoned chunk_id=10 must be skipped even when explicitly requested"
+        );
+    }
+
+    #[test]
+    fn build_graph_skips_tombstoned_rows_and_uses_live_count_for_threshold() {
+        unsafe {
+            std::env::set_var("SEMANTEX_HNSW_MIN_VECTORS", "4");
+        }
+        let mut store = Int8VectorStore {
+            dim: 4,
+            ..Default::default()
+        };
+        // 6 rows, tombstone 3 of them -> live_count = 3, below the threshold
+        // of 4, so no graph should build even though raw store.len() == 6.
+        for i in 0..6u64 {
+            let mut v = vec![
+                ((i * 7 % 11) as f32) - 5.0,
+                ((i * 13 % 11) as f32) - 5.0,
+                ((i * 17 % 11) as f32) - 5.0,
+                ((i * 19 % 11) as f32) - 5.0,
+            ];
+            l2_normalize(&mut v);
+            let (q, s) = quantize_int8(&v);
+            store.push(100 + i, q, s);
+        }
+        store.tombstoned[0] = true;
+        store.tombstoned[1] = true;
+        store.tombstoned[2] = true;
+        assert_eq!(store.live_count(), 3);
+
+        let graph = HnswDenseIndex::build_graph(&store, HnswParams::default());
+        assert!(
+            graph.is_none(),
+            "live_count (3) below the lowered threshold (4) must skip the graph, \
+             even though raw row count (6) is above it"
         );
         unsafe {
             std::env::remove_var("SEMANTEX_HNSW_MIN_VECTORS");
