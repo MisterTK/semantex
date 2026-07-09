@@ -4,11 +4,12 @@
 
 semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loop AI agents fall into when exploring a codebase — the industry-default retrieval pattern, whose cognitive cost compounds quadratically with every extra tool call (see below). It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
 
-As of mid-2026, three things separate semantex from the rest of the semantic code search field:
+As of the **v1.0.0** release, four things separate semantex from the rest of the semantic code search field:
 
 - **The only active tool doing local ColBERT late-interaction retrieval.** Most semantic code search tools use single-vector embeddings; semantex uses per-token MaxSim scoring (ColBERT/PLAID) — the retrieval method the field has converged on for precision — and runs it entirely on-device.
 - **The most self-contained implementation of that convergent architecture.** Single binary, no vector database, no embedding API, no API keys to provision or rotate. Your code and your queries never leave the machine.
-- **Adoption machinery, not just an engine.** In-place, idempotent installers — MCP registration plus hooks/rules/skill files, written directly to each platform's real config path, no copy-paste — for 9 agent platforms (Claude Code, Cursor, Codex, Aider, Gemini CLI, GitHub Copilot, OpenCode, Devin Desktop/Windsurf, Trae) route agents to semantex automatically instead of relying on the agent to remember it exists.
+- **Adoption machinery, not just an engine.** In-place, idempotent installers — MCP registration plus hooks/rules/skill files, written directly to each platform's real config path, no copy-paste — for **9 agent platforms** (Claude Code, Cursor, Codex, Aider, Gemini CLI, GitHub Copilot, OpenCode, Devin Desktop/Windsurf, Trae) route agents to semantex automatically instead of relying on the agent to remember it exists.
+- **A codebase-understanding platform, not just a search box.** Multi-branch indexing, cross-repo federated search, searchable git history, durable project memory, and deterministic doc scaffolding all ship in v1.0 — see [What's New](#whats-new-in-v10).
 
 See [How semantex compares](#how-semantex-compares) for an honest look at where it's ahead and where it isn't.
 
@@ -18,14 +19,14 @@ Two commands, whichever coding tool you use:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh | sh
-semantex install-claude-code   # or install-cursor / install-trae / install-copilot / install-gemini / install-devin-desktop
+semantex install-claude-code   # or install-cursor / install-trae / install-copilot / install-gemini / install-devin-desktop / install-aider / install-codex / install-open-code
 ```
 
 Each `install-*` command registers the MCP server **and** writes the platform's rules/instructions/skill file directly to its real, in-place config location — nothing to copy-paste by hand. All idempotent (safe to re-run) and reversible (`semantex uninstall-*`).
 
 | Platform | Command | What it registers |
 |---|---|---|
-| **Claude Code** | `semantex install-claude-code` | MCP server + hooks + skill |
+| **Claude Code** | `semantex install-claude-code` | MCP server + hooks (Grep/Read/Bash nudges) + skill |
 | **Cursor** | `semantex install-cursor` | `.cursor/mcp.json` + `.cursor/rules/semantex.mdc` |
 | **Trae** | `semantex install-trae` | `.trae/mcp.json` + `.trae/skills/semantex/SKILL.md` |
 | **GitHub Copilot** (VS Code + CLI) | `semantex install-copilot` | `.vscode/mcp.json` + `~/.copilot/mcp-config.json` + `.github/copilot-instructions.md` |
@@ -57,6 +58,21 @@ No manual indexing needed — semantex auto-indexes on first search.
 
 ---
 
+## What's New in v1.0
+
+v1.0 turns semantex from a search engine into a codebase-understanding platform. Everything below is real, shipped, and covered by tests — not a roadmap.
+
+- **Multi-branch indexing.** Branch switches are first-class: each branch gets its own index snapshot, restored and incrementally updated on checkout, so flipping back and forth re-embeds only what actually changed. Detected automatically at every entry point (CLI, `watch`, `serve`, MCP), git-worktree-aware. Snapshot retention is capped (`SEMANTEX_MAX_BRANCH_INDEXES`, default 5).
+- **Cross-repo federated search.** Pass `scope: "all"` (every project in your local registry) or a list of project names to `semantex_agent`/`semantex_search`, or `--scope` on the CLI, and one query fans out across every indexed repo with provenance-tagged, RRF-fused results. Repos that are stale or not ready are reported as skipped, never silently dropped.
+- **Git-history indexing.** Commit history is now a searchable dimension of the index — bounded incremental `git log` population (500 commits by default, `SEMANTEX_HISTORY_COMMITS`), opt-in blame (`SEMANTEX_HISTORY_BLAME=1`), full-text commit-message search, `semantex history <file>` on the CLI, and an `include_history` flag on agent queries that appends a "recent changes" section to the answer.
+- **Durable project memory.** `semantex_memory_save` / `semantex_memory_recall` let an agent persist decisions, gotchas, and conventions across sessions in `.semantex/memory.db` — independent of the code index, so it survives reindexing and branch switches.
+- **Deterministic docs scaffolding.** `semantex_docs_context` returns a structurally-complete scaffold (symbol inventory, call-graph edges, import edges, existing doc comments, file:line provenance) for a module or the whole repo. It does **not** call an LLM — it hands your agent the facts, and the `semantex-docs` skill guides it to write maintained prose into `semantex_docs/`.
+- **Multi-client, branch-aware daemon.** `semantex serve` is now thread-per-connection with graceful drain, a searcher cache keyed by `(project, branch)`, and staleness reload when the index is rebuilt out from under it — safe for several editors/agents to share one daemon on one machine.
+- **MCP HTTP transport with bearer-token auth.** `semantex mcp --http` can now be exposed beyond localhost (`--allow-remote`) only with a required bearer token (`--auth-token` / `SEMANTEX_HTTP_TOKEN`, or an auto-generated one persisted at `~/.semantex/http_token`), compared in constant time.
+- **Real installers for 9 agent platforms**, not just Claude Code — Cursor, Trae, GitHub Copilot, Gemini CLI, Devin Desktop/Windsurf, Aider, Codex, and OpenCode all get in-place, idempotent, reversible `install-*`/`uninstall-*` commands (see the Quick Start table).
+- **SQL AST chunking.** SQL is now parsed with real tree-sitter grammar rather than falling back to text chunking, bringing AST-aware language support to 25 languages.
+- **`semantex agent` CLI subcommand.** The same auto-routing intelligence behind the `semantex_agent` MCP tool, available as a standalone command for scripts, CI, and non-MCP agents — see [Standalone CLI](#standalone-cli).
+
 ## The Problem: Agents Waste Most of Their Tokens Searching
 
 When an AI coding agent needs to understand a codebase, it falls into a predictable pattern:
@@ -87,11 +103,11 @@ An agent making 20 tool calls doesn't process 20× the content of one call — i
 semantex collapses the search loop into a single tool call:
 
 ```
-Agent → semantex_deep "how does authentication work"
+Agent → semantex_agent "how does authentication work"
      ← Prose answer + source references           (1 call, done)
 ```
 
-Instead of the agent iteratively searching and reading, semantex does it internally — semantic search, graph expansion, content reading, and extractive summarization — and returns a pre-digested answer the agent can immediately act on.
+`semantex_agent` classifies the query — semantic, exact symbol, graph walk, deep synthesis, regex, or file glob — dispatches to the right internal strategy with fallbacks, and returns a ready-to-use answer. Instead of the agent iteratively searching and reading, semantex does it internally — hybrid search, graph expansion, content reading, and extractive summarization — and returns a pre-digested answer the agent can immediately act on.
 
 ### Measured Impact (v1.0.0 engine — committed, reproducible runs)
 
@@ -132,20 +148,19 @@ No retrieval tool is right for every codebase or team. Here's how semantex compa
 Where semantex is behind, honestly:
 
 - **Symbol precision.** Serena's LSP backend gives exact go-to-definition/rename/refactor semantics across dozens of languages via real language servers. semantex's chunk-level retrieval finds the right region of code but doesn't do LSP-grade symbol operations — the two are complementary rather than competing, and some users run both.
-- **Mindshare and ecosystem breadth.** claude-context/Zilliz is better known and already integrates with more agent clients (Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, Devin Desktop/Windsurf, Augment, and others). semantex's own platform coverage (9 platforms, above) is comparable but newer and less established.
+- **Mindshare and ecosystem breadth.** claude-context/Zilliz is better known and already integrates with more agent clients. semantex's own platform coverage (9 platforms, above) is comparable but newer and less established.
 - **Below roughly 1,000 files, plain grep is often enough.** semantex's advantage grows with codebase size and query ambiguity; on small, well-organized repos the overhead of maintaining an index may not pay for itself.
-- **Team-shared indexing.** semantex v1 indexes per-machine (with first-class multi-branch switching and cross-repo federated search); cloud platforms offer team-shared indexes maintained server-side. A shared daemon covers the single-machine multi-client case, but there's no cross-machine index sync.
+- **Team-shared indexing.** semantex indexes per-machine (with first-class multi-branch switching and cross-repo federated search); cloud platforms offer team-shared indexes maintained server-side. A shared daemon covers the single-machine multi-client case, but there's no cross-machine index sync.
 
 ## How It Works
 
-### For the Agent: Two Tools, Simple Routing
+### For the Agent: One Tool, Auto-Routed
 
 | Question type | Tool | What happens |
 |---|---|---|
-| *"How does auth work?"* | `semantex_deep` | Search→triage→graph expand→read→summarize. One call, complete answer. |
-| *"Find the Config struct"* | `semantex_search` | Ranked results with file, lines, score, snippet. |
+| *Anything* | `semantex_agent` | Classifies the query and dispatches: hybrid search, exact symbol lookup, callers/callees/imports graph walk, deep multi-source synthesis, regex, or file glob. One call, complete answer. |
 
-`semantex_deep` replaces 5-10 Grep→Read iterations. `semantex_search` replaces Grep→Glob for lookups.
+`semantex_agent` is the recommended entry point for essentially every code-search need — don't chain multiple `semantex_*` calls to assemble an answer; if a result is incomplete, refine the question and call it again. Power users who want structured JSON or explicit control over one stage of the pipeline can still call `semantex_search` (ranked hits) or `semantex_deep` (search→triage→graph-expand→read→summarize) directly.
 
 ### Under the Hood: Hybrid Search Pipeline
 
@@ -211,38 +226,67 @@ semantex is an [MCP server](https://modelcontextprotocol.io/) (MCP 2025-03-26). 
 | **Trae** | `.trae/mcp.json` (`semantex install-trae`) |
 | **GitHub Copilot** | `.vscode/mcp.json` (VS Code) / `~/.copilot/mcp-config.json` (CLI) (`semantex install-copilot`) |
 | **Gemini CLI** | `.gemini/settings.json` (`semantex install-gemini`) |
-| **Cline** | VS Code settings → Cline MCP Servers |
-| **Continue** | `~/.continue/config.json` under `mcpServers` |
+| **Aider** | `.aider.conf.yml` (`semantex install-aider`; no native MCP support, config-based) |
 | **Codex** | `~/.codex/config.toml` (`semantex install-codex`) |
 | **OpenCode** | `opencode.json` (`semantex install-open-code`) |
+| **Cline** | VS Code settings → Cline MCP Servers |
+| **Continue** | `~/.continue/config.json` under `mcpServers` |
 
 That's it. semantex auto-indexes your project on first search — no manual indexing step required.
 
 ### Tools
 
-5 tools, automatically discovered by your editor at startup:
+By default, semantex exposes **10 MCP tools**, discovered by your editor at startup:
 
 | Tool | Purpose |
 |------|---------|
-| `semantex_deep` | **Complex questions.** One call replaces 5-10 grep+read iterations. Returns prose answer with sources. |
-| `semantex_search` | Simple lookups: find definitions, list references, locate files. |
-| `semantex_index` | Trigger or rebuild the index for a project. |
-| `semantex_status` | Check index state (file count, chunk count, freshness). |
-| `semantex_health` | System health check (model status, cache stats). |
+| `semantex_agent` | **The recommended tool for almost everything.** Auto-classifies the query and routes to the right strategy — semantic, exact symbol, graph walk, deep synthesis, regex, or file glob. Supports `mode` overrides, multi-query batching, response-size `budget`, cross-repo `scope`, and `include_history`. |
+| `semantex_search` | Simple lookups: find definitions, list references, locate files. Ranked hits with file, lines, score, snippet. |
+| `semantex_deep` | Complex questions: search → triage → graph-expand → read → summarize into one prose answer with sources. |
+| `semantex_index` | Force a rebuild of the index (rarely needed — semantex auto-indexes on first search). |
+| `semantex_status` | Check index state: file count, chunk count, freshness. |
+| `semantex_health` | System health check (model availability, configuration). |
+| `semantex_validate` | Consistency checks: meta-DB sync, stale files, dense/sparse index integrity, graph consistency. |
+| `semantex_docs_context` | Deterministic documentation scaffold (symbol inventory, call graph, imports, provenance) for your agent to turn into `semantex_docs/*.md` prose. Zero LLM calls inside semantex itself. |
+| `semantex_memory_save` | Persist a durable note (decision, gotcha, convention) to `.semantex/memory.db`, independent of the code index. |
+| `semantex_memory_recall` | Recall previously saved notes, ranked by relevance or most-recent. |
 
-All read-only tools are annotated with `readOnlyHint: true` so editors that support [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-03-26/server/tools#annotations) can auto-approve them.
+A **5-tool `structural` bundle** — `semantex_symbol`, `semantex_callers`, `semantex_callees`, `semantex_implementations`, `semantex_architecture` — is available opt-in via `semantex mcp --toolset structural` (or `--toolset all` isn't needed; `semantex_agent`'s internal structural route already covers callers/callees/imports in one call). These are deliberately **not** in the default bundle: an earlier version exposed them by default and agents used them additively (calling 4-6 tools to reassemble what `semantex_deep` already returns in one call), measurably regressing efficiency. Use `--toolset core` for a minimal 3-tool surface (`semantex_search`, `semantex_deep`, `semantex_agent`) when a client's tool budget is tight.
 
 ### MCP Features
 
-- **Server instructions** — at initialization, semantex sends routing guidance to the LLM: use `deep` for complex questions, `search` for lookups
-- **Structured output** — `semantex_search` and `semantex_deep` return machine-readable JSON in `structuredContent` alongside text, so editors can render results natively
+- **Server instructions** — at initialization, semantex sends routing guidance to the LLM: prefer `semantex_agent` for almost everything
+- **Structured output** — tools return machine-readable JSON in `structuredContent` alongside text, so editors can render results natively
 - **Progress notifications** — `semantex_deep` sends phase-by-phase progress (searching, triaging, graph-expanding, reading, summarizing)
 - **Auto-indexing** — first search triggers background indexing; returns keyword (ripgrep) results immediately while the index builds
 - **Logging** — tool events emitted as MCP log notifications; clients can set level via `logging/setLevel`
+- **Toolset bundles** — `core` (3 tools), `structural` (5 tools, opt-in), `all` (10 tools, default) via `--toolset`
+- **HTTP transport with auth** — `semantex mcp --http` for network access; `--allow-remote` requires a bearer token (`--auth-token` or `SEMANTEX_HTTP_TOKEN`, else auto-generated and persisted at `~/.semantex/http_token`), checked in constant time
+- **Multi-client daemon** — one `semantex serve` process safely answers concurrent editors/agents, with a per-`(project, branch)` searcher cache and automatic reload if the index changes underneath it
 
 ## Standalone CLI
 
-semantex also works as a standalone CLI tool for terminal use, scripts, and CI:
+semantex also works as a standalone CLI tool for terminal use, scripts, and CI.
+
+### Intelligent routing (recommended)
+
+```bash
+# Auto-classified query — same routing logic as the MCP semantex_agent tool
+semantex agent "how does authentication work"
+
+# Force a retrieval route instead of auto-classifying
+semantex agent "ConnectionFactory" --route exact_symbol
+
+# Full source code blocks, larger response budget
+semantex agent "how does the daemon reconcile branches" --full --budget 20000
+
+# Fan out across every registered project
+semantex agent "rate limiting" --scope all
+```
+
+Routes: `semantic`, `deep`, `exact_symbol`, `structural`, `regex`, `analytical`, `exhaustive`, `file_pattern`, `architecture`, `feature_planning`.
+
+### Direct search flags
 
 ```bash
 # Search semantically (auto-indexes on first run)
@@ -262,6 +306,9 @@ semantex --peek "error handling middleware"
 
 # Batch multiple queries in one call
 semantex --refs "auth flow" "token validation" "session management"
+
+# Fan out across every registered project (or --scope name1,name2)
+semantex "rate limiting" --scope all
 ```
 
 ### More CLI Options
@@ -287,9 +334,30 @@ semantex --code-only "factory"      # Exclude docs/config
 semantex -m 20 "database"           # Max 20 results
 
 # Daemon
-semantex serve /path/to/project     # Start daemon (10ms warm search)
+semantex serve /path/to/project     # Start daemon (10ms warm search, multi-client)
 semantex stop /path/to/project      # Stop daemon
+semantex connect /path/to/project   # Persistent client (binary protocol, lower latency)
+semantex disconnect                 # Stop persistent client
 semantex watch /path/to/project     # Auto-reindex on file changes
+```
+
+### Repo intelligence
+
+```bash
+semantex history <file>             # Git history for a file (author, age, subject; --limit N)
+semantex validate                   # Index consistency check (meta-DB, stale files, dense/sparse, graph)
+semantex status                     # Index state: file/chunk counts, freshness
+semantex download-models            # Pre-fetch the ONNX models (otherwise fetched on first use)
+semantex skills-generate            # Emit per-platform skill files from the canonical tool registry
+```
+
+### MCP server
+
+```bash
+semantex mcp                                  # stdio transport (default)
+semantex mcp --http --port 5050               # HTTP transport, loopback only
+semantex mcp --http --toolset core            # Minimal 3-tool bundle
+semantex mcp --http --allow-remote --auth-token <TOKEN>  # network-exposed, auth required
 ```
 
 ## Supported Languages
@@ -305,8 +373,9 @@ semantex watch /path/to/project     # Auto-reindex on file changes
 ### Deep Search Pipeline
 
 ```
-Agent → semantex_deep "query"
+Agent → semantex_agent "query"
           │
+          ├─ Classify (semantic / exact symbol / structural / deep / regex / glob)
           ├─ Phase 1: Hybrid search (top-20 candidates)
           ├─ Phase 2: Triage (dedup, per-file cap, kind preference → top-8)
           ├─ Phase 3: Graph expansion (callers/callees/types, 1 hop → up to 12)
@@ -319,9 +388,9 @@ Agent → semantex_deep "query"
 ```
 semantex/
 ├── crates/
-│   ├── semantex-core/      # Search engine (indexing, search, embeddings, daemon)
+│   ├── semantex-core/      # Search engine (indexing, search, embeddings, daemon, history, memory)
 │   ├── semantex-cli/       # Command-line interface
-│   └── semantex-mcp/       # MCP server (5 tools over stdio)
+│   └── semantex-mcp/       # MCP server (stdio + HTTP transports)
 ├── benchmarks/              # Benchmark scripts and ground truth
 └── docs/                    # Architecture docs and benchmark data
 ```
@@ -345,7 +414,9 @@ runs are incremental (only changed files re-embed) and are much faster.
 Peak memory during that same full build was ~9.6 GB RSS — comfortably
 inside a 16 GB machine's budget; semantex enforces a hard cap (see
 `SEMANTEX_MAX_RSS_MB` below) so a build can never take down the host, even
-on smaller machines.
+on smaller machines. Switching branches doesn't repeat this cost: each
+branch keeps its own snapshot, restored and incrementally updated on
+checkout.
 
 ## Development
 
@@ -357,7 +428,10 @@ cargo clippy --all             # Lint
 
 ### Environment Variables
 
+The most commonly-needed knobs:
+
 ```bash
+# Resources
 SEMANTEX_ORT_THREADS=4           # ONNX Runtime threads for QUERIES (default: 4)
 SEMANTEX_INDEX_ORT_THREADS=8     # ONNX Runtime threads for a full INDEX BUILD
                                   # (default: half the cores on a box that can run
@@ -371,9 +445,28 @@ SEMANTEX_NO_RLIMIT=1              # Skip the kernel setrlimit(RLIMIT_AS) failsaf
                                   # (Linux only; useful in containers with their
                                   # own cgroup memory limits)
 SEMANTEX_MAX_CONCURRENT_BUILDS=2  # Max full index builds allowed to run at once
-                                  # across all projects (default: system RAM / 16 GB,
-                                  # min 1)
+                                  # across all projects (default: system RAM / 16 GB, min 1)
+
+# MCP response shaping (semantex_agent)
+SEMANTEX_MCP_BUDGET=12000         # Default response size budget in bytes (~3K tokens)
+SEMANTEX_MCP_FULL_CODE=0          # Include full source blocks by default (0/1)
+SEMANTEX_MCP_DEPTH=search         # Default depth when a query doesn't specify one
+
+# Git history (v1.0)
+SEMANTEX_HISTORY_COMMITS=500      # Commits to index per repo (bounded, incremental)
+SEMANTEX_HISTORY_BLAME=1          # Opt-in blame population (off by default — slower)
+
+# Multi-branch indexing (v1.0)
+SEMANTEX_MAX_BRANCH_INDEXES=5     # Per-project branch snapshot retention cap
+
+# MCP HTTP transport (v1.0)
+SEMANTEX_HTTP_TOKEN=<token>       # Bearer token for --http --allow-remote (else auto-generated)
+
+# Telemetry
+SEMANTEX_NO_TELEMETRY=1           # Opt out of anonymous usage telemetry
 ```
+
+Several other knobs exist for retrieval-tuning experiments (reranking, weighted RRF fusion, MMR diversity, graph centrality levers, adaptive result sizing, semantic query cache) — they ship **off by default** because the A/Bs that would justify flipping them on haven't shown a net win yet. See `crates/semantex-core/src/config.rs` and `docs/` for the full list if you want to experiment.
 
 ## License
 
