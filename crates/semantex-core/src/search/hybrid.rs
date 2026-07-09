@@ -4,7 +4,8 @@ use crate::index::storage::ChunkStore;
 use crate::search::SearchQuery;
 use crate::search::adaptive;
 use crate::search::dense_backend::{
-    DenseBackend, DenseBackendKind, resolve_active_dense_dir, verify_persisted_backend_matches,
+    DenseBackend, DenseBackendKind, dense_sentinel_file, resolve_active_dense_dir,
+    verify_persisted_backend_matches,
 };
 use crate::search::graph_propagation::GraphPropagationConfig;
 use crate::search::graph_stage;
@@ -134,7 +135,10 @@ impl HybridSearcher {
                 // plain layout (`dense/<backend>/`) for pre-versioned indexes.
                 let backend_dir =
                     resolve_active_dense_dir(index_dir, DenseBackendKind::CoderankHnsw);
-                if backend_dir.join("vectors.bin").exists() {
+                if backend_dir
+                    .join(dense_sentinel_file(DenseBackendKind::CoderankHnsw))
+                    .exists()
+                {
                     let params = HnswParams::resolve(
                         &config.hnsw_preset,
                         config.hnsw_ef_search,

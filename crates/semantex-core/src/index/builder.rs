@@ -1210,7 +1210,7 @@ mod tests {
 
     /// Building with the coderank-137m embedder (→ coderank-hnsw backend) writes
     /// the S8 VERSIONED dense dir (`.semantex/dense/coderank-hnsw/<fingerprint>/
-    /// vectors.bin`) plus the ACTIVE pointer naming that fingerprint, and records
+    /// index.bin`) plus the ACTIVE pointer naming that fingerprint, and records
     /// the model + dim + resolved backend in meta.json. The reader-side resolver
     /// `resolve_active_dense_dir` must land on that versioned dir. `#[ignore]` —
     /// needs the CodeRankEmbed model download.
@@ -1239,8 +1239,8 @@ mod tests {
         // The versioned dir for that fingerprint holds the store.
         let versioned = active_dense_dir(&index_dir, DenseBackendKind::CoderankHnsw, &fp);
         assert!(
-            versioned.join("vectors.bin").exists(),
-            "versioned vectors.bin must exist at {}",
+            versioned.join("index.bin").exists(),
+            "versioned index.bin must exist at {}",
             versioned.display()
         );
         // The reader-side resolver lands on the versioned dir.

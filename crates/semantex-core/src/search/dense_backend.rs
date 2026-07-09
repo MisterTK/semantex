@@ -71,12 +71,12 @@ pub fn active_dense_dir(index_dir: &Path, backend: DenseBackendKind, fingerprint
 }
 
 /// The per-backend "dense index present" sentinel file. coderank-hnsw writes
-/// `vectors.bin`. Its presence in a dense dir marks the store as built (else:
+/// `index.bin`. Its presence in a dense dir marks the store as built (else:
 /// rebuild). Owned by the seam so both the builder and the reader-side
 /// [`resolve_active_dense_dir`] agree on what "present" means per backend.
 pub fn dense_sentinel_file(backend: DenseBackendKind) -> &'static str {
     match backend {
-        DenseBackendKind::CoderankHnsw => "vectors.bin",
+        DenseBackendKind::CoderankHnsw => "index.bin",
         DenseBackendKind::ColbertPlaid => "plaid_mapping.bin",
     }
 }
