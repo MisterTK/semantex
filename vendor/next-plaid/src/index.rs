@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::ResidualCodec;
 use crate::error::{Error, Result};
 use crate::kmeans::{compute_kmeans, ComputeKmeansConfig};
-use crate::utils::{quantile, quantiles};
+use crate::utils::{atomic_write_file, quantile, quantiles};
 
 /// CPU implementation of fused compress_into_codes + residual computation.
 fn compress_and_residuals_cpu(
@@ -74,7 +74,7 @@ pub struct IndexConfig {
 }
 
 fn default_start_from_scratch() -> usize {
-    999
+    crate::default_start_from_scratch()
 }
 
 fn default_kmeans_niters() -> usize {
@@ -94,7 +94,7 @@ impl Default for IndexConfig {
             kmeans_niters: 4,
             max_points_per_centroid: 256,
             n_samples_kmeans: None,
-            start_from_scratch: 999,
+            start_from_scratch: crate::default_start_from_scratch(),
             force_cpu: false,
             fts_tokenizer: crate::text_search::FtsTokenizer::default(),
         }
@@ -296,7 +296,7 @@ pub fn encode_index_chunk(
     let doclens: Vec<i64> = embeddings.iter().map(|d| d.nrows() as i64).collect();
     let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "_cuda"))]
     let _ = force_cpu;
 
     let mut batch_embeddings = Array2::<f32>::zeros((total_tokens, embedding_dim));
@@ -310,7 +310,7 @@ pub fn encode_index_chunk(
     }
 
     let (batch_codes, batch_residuals) = {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "_cuda")]
         {
             let force_gpu = crate::is_force_gpu();
             if !force_cpu {
@@ -345,7 +345,7 @@ pub fn encode_index_chunk(
                 compress_and_residuals_cpu(&batch_embeddings, codec)
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "_cuda"))]
         {
             compress_and_residuals_cpu(&batch_embeddings, codec)
         }
@@ -392,30 +392,40 @@ pub fn write_index_from_encoded_chunks(
     };
 
     let centroids_path = index_dir.join("centroids.npy");
-    codec_artifacts
-        .codec
-        .centroids_view()
-        .to_owned()
-        .write_npy(File::create(&centroids_path)?)?;
-    codec_artifacts
-        .bucket_cutoffs
-        .write_npy(File::create(index_dir.join("bucket_cutoffs.npy"))?)?;
-    codec_artifacts
-        .bucket_weights
-        .write_npy(File::create(index_dir.join("bucket_weights.npy"))?)?;
-    codec_artifacts
-        .avg_res_per_dim
-        .write_npy(File::create(index_dir.join("avg_residual.npy"))?)?;
-    Array1::from_vec(vec![codec_artifacts.cluster_threshold])
-        .write_npy(File::create(index_dir.join("cluster_threshold.npy"))?)?;
+    atomic_write_file(&centroids_path, |file| {
+        codec_artifacts
+            .codec
+            .centroids_view()
+            .to_owned()
+            .write_npy(file)?;
+        Ok(())
+    })?;
+    atomic_write_file(&index_dir.join("bucket_cutoffs.npy"), |file| {
+        codec_artifacts.bucket_cutoffs.write_npy(file)?;
+        Ok(())
+    })?;
+    atomic_write_file(&index_dir.join("bucket_weights.npy"), |file| {
+        codec_artifacts.bucket_weights.write_npy(file)?;
+        Ok(())
+    })?;
+    atomic_write_file(&index_dir.join("avg_residual.npy"), |file| {
+        codec_artifacts.avg_res_per_dim.write_npy(file)?;
+        Ok(())
+    })?;
+    atomic_write_file(&index_dir.join("cluster_threshold.npy"), |file| {
+        Array1::from_vec(vec![codec_artifacts.cluster_threshold]).write_npy(file)?;
+        Ok(())
+    })?;
 
     let n_chunks = chunks.len();
     let plan = serde_json::json!({
         "nbits": config.nbits,
         "num_chunks": n_chunks,
     });
-    let mut plan_file = File::create(index_dir.join("plan.json"))?;
-    writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan)?)?;
+    atomic_write_file(&index_dir.join("plan.json"), |file| {
+        writeln!(file, "{}", serde_json::to_string_pretty(&plan)?)?;
+        Ok(())
+    })?;
 
     let mut all_codes: Vec<usize> = Vec::with_capacity(total_embeddings);
     let mut doc_lengths: Vec<i64> = Vec::with_capacity(num_documents);
@@ -429,24 +439,38 @@ pub fn write_index_from_encoded_chunks(
         };
         current_offset += chunk.codes.len();
 
-        serde_json::to_writer_pretty(
-            BufWriter::new(File::create(
-                index_dir.join(format!("{}.metadata.json", chunk_idx)),
-            )?),
-            &chunk_meta,
+        atomic_write_file(
+            &index_dir.join(format!("{}.metadata.json", chunk_idx)),
+            |file| {
+                let mut writer = BufWriter::new(file);
+                serde_json::to_writer_pretty(&mut writer, &chunk_meta)?;
+                writer.flush()?;
+                Ok(())
+            },
         )?;
-        serde_json::to_writer(
-            BufWriter::new(File::create(
-                index_dir.join(format!("doclens.{}.json", chunk_idx)),
-            )?),
-            &chunk.doclens,
+        atomic_write_file(
+            &index_dir.join(format!("doclens.{}.json", chunk_idx)),
+            |file| {
+                let mut writer = BufWriter::new(file);
+                serde_json::to_writer(&mut writer, &chunk.doclens)?;
+                writer.flush()?;
+                Ok(())
+            },
         )?;
-        chunk.codes.write_npy(File::create(
-            index_dir.join(format!("{}.codes.npy", chunk_idx)),
-        )?)?;
-        chunk.residuals.write_npy(File::create(
-            index_dir.join(format!("{}.residuals.npy", chunk_idx)),
-        )?)?;
+        atomic_write_file(
+            &index_dir.join(format!("{}.codes.npy", chunk_idx)),
+            |file| {
+                chunk.codes.write_npy(file)?;
+                Ok(())
+            },
+        )?;
+        atomic_write_file(
+            &index_dir.join(format!("{}.residuals.npy", chunk_idx)),
+            |file| {
+                chunk.residuals.write_npy(file)?;
+                Ok(())
+            },
+        )?;
 
         doc_lengths.extend_from_slice(&chunk.doclens);
         all_codes.extend(chunk.codes.iter().map(|&x| x as usize));
@@ -474,8 +498,14 @@ pub fn write_index_from_encoded_chunks(
         }
     }
 
-    Array1::from_vec(ivf_data).write_npy(File::create(index_dir.join("ivf.npy"))?)?;
-    Array1::from_vec(ivf_lengths).write_npy(File::create(index_dir.join("ivf_lengths.npy"))?)?;
+    atomic_write_file(&index_dir.join("ivf.npy"), |file| {
+        Array1::from_vec(ivf_data).write_npy(file)?;
+        Ok(())
+    })?;
+    atomic_write_file(&index_dir.join("ivf_lengths.npy"), |file| {
+        Array1::from_vec(ivf_lengths).write_npy(file)?;
+        Ok(())
+    })?;
 
     let metadata = Metadata {
         num_chunks: n_chunks,
@@ -487,10 +517,12 @@ pub fn write_index_from_encoded_chunks(
         embedding_dim,
         next_plaid_compatible: true,
     };
-    serde_json::to_writer_pretty(
-        BufWriter::new(File::create(index_dir.join("metadata.json"))?),
-        &metadata,
-    )?;
+    atomic_write_file(&index_dir.join("metadata.json"), |file| {
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &metadata)?;
+        writer.flush()?;
+        Ok(())
+    })?;
 
     Ok(metadata)
 }
@@ -637,22 +669,34 @@ pub fn create_index_files(
     use ndarray_npy::WriteNpyExt;
 
     let centroids_path = index_dir.join("centroids.npy");
-    codec
-        .centroids_view()
-        .to_owned()
-        .write_npy(File::create(&centroids_path)?)?;
+    atomic_write_file(&centroids_path, |file| {
+        codec.centroids_view().to_owned().write_npy(file)?;
+        Ok(())
+    })?;
 
     let cutoffs_path = index_dir.join("bucket_cutoffs.npy");
-    bucket_cutoffs.write_npy(File::create(&cutoffs_path)?)?;
+    atomic_write_file(&cutoffs_path, |file| {
+        bucket_cutoffs.write_npy(file)?;
+        Ok(())
+    })?;
 
     let weights_path = index_dir.join("bucket_weights.npy");
-    bucket_weights.write_npy(File::create(&weights_path)?)?;
+    atomic_write_file(&weights_path, |file| {
+        bucket_weights.write_npy(file)?;
+        Ok(())
+    })?;
 
     let avg_res_path = index_dir.join("avg_residual.npy");
-    avg_res_per_dim.write_npy(File::create(&avg_res_path)?)?;
+    atomic_write_file(&avg_res_path, |file| {
+        avg_res_per_dim.write_npy(file)?;
+        Ok(())
+    })?;
 
     let threshold_path = index_dir.join("cluster_threshold.npy");
-    Array1::from_vec(vec![cluster_threshold]).write_npy(File::create(&threshold_path)?)?;
+    atomic_write_file(&threshold_path, |file| {
+        Array1::from_vec(vec![cluster_threshold]).write_npy(file)?;
+        Ok(())
+    })?;
 
     // Process documents in chunks
     let n_chunks = (num_documents as f64 / config.batch_size as f64).ceil() as usize;
@@ -663,8 +707,10 @@ pub fn create_index_files(
         "nbits": config.nbits,
         "num_chunks": n_chunks,
     });
-    let mut plan_file = File::create(&plan_path)?;
-    writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan)?)?;
+    atomic_write_file(&plan_path, |file| {
+        writeln!(file, "{}", serde_json::to_string_pretty(&plan)?)?;
+        Ok(())
+    })?;
 
     let mut all_codes: Vec<usize> = Vec::with_capacity(total_embeddings);
     let mut doc_lengths: Vec<i64> = Vec::with_capacity(num_documents);
@@ -692,7 +738,7 @@ pub fn create_index_files(
         // BATCH: Compress embeddings and compute residuals
         // Try CUDA fused operation first, fall back to CPU (skip CUDA if force_cpu is set)
         let (batch_codes, batch_residuals) = {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "_cuda")]
             {
                 let force_gpu = crate::is_force_gpu();
                 if !config.force_cpu {
@@ -724,7 +770,7 @@ pub fn create_index_files(
                     compress_and_residuals_cpu(&batch_embeddings, &codec)
                 }
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "_cuda"))]
             {
                 compress_and_residuals_cpu(&batch_embeddings, &codec)
             }
@@ -747,20 +793,36 @@ pub fn create_index_files(
         };
 
         let chunk_meta_path = index_dir.join(format!("{}.metadata.json", chunk_idx));
-        serde_json::to_writer_pretty(BufWriter::new(File::create(&chunk_meta_path)?), &chunk_meta)?;
+        atomic_write_file(&chunk_meta_path, |file| {
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &chunk_meta)?;
+            writer.flush()?;
+            Ok(())
+        })?;
 
         // Save chunk doclens
         let doclens_path = index_dir.join(format!("doclens.{}.json", chunk_idx));
-        serde_json::to_writer(BufWriter::new(File::create(&doclens_path)?), &chunk_doclens)?;
+        atomic_write_file(&doclens_path, |file| {
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &chunk_doclens)?;
+            writer.flush()?;
+            Ok(())
+        })?;
 
         // Save chunk codes
         let chunk_codes_arr: Array1<i64> = batch_codes.iter().map(|&x| x as i64).collect();
         let codes_path = index_dir.join(format!("{}.codes.npy", chunk_idx));
-        chunk_codes_arr.write_npy(File::create(&codes_path)?)?;
+        atomic_write_file(&codes_path, |file| {
+            chunk_codes_arr.write_npy(file)?;
+            Ok(())
+        })?;
 
         // Save chunk residuals
         let residuals_path = index_dir.join(format!("{}.residuals.npy", chunk_idx));
-        batch_packed.write_npy(File::create(&residuals_path)?)?;
+        atomic_write_file(&residuals_path, |file| {
+            batch_packed.write_npy(file)?;
+            Ok(())
+        })?;
     }
 
     // Update chunk metadata with global offsets
@@ -776,7 +838,12 @@ pub fn create_index_files(
             current_offset += num_emb;
         }
 
-        serde_json::to_writer_pretty(BufWriter::new(File::create(&chunk_meta_path)?), &meta)?;
+        atomic_write_file(&chunk_meta_path, |file| {
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &meta)?;
+            writer.flush()?;
+            Ok(())
+        })?;
     }
 
     // Build IVF (Inverted File)
@@ -809,10 +876,16 @@ pub fn create_index_files(
     let ivf_lengths = Array1::from_vec(ivf_lengths);
 
     let ivf_path = index_dir.join("ivf.npy");
-    ivf.write_npy(File::create(&ivf_path)?)?;
+    atomic_write_file(&ivf_path, |file| {
+        ivf.write_npy(file)?;
+        Ok(())
+    })?;
 
     let ivf_lengths_path = index_dir.join("ivf_lengths.npy");
-    ivf_lengths.write_npy(File::create(&ivf_lengths_path)?)?;
+    atomic_write_file(&ivf_lengths_path, |file| {
+        ivf_lengths.write_npy(file)?;
+        Ok(())
+    })?;
 
     // Save global metadata
     let metadata = Metadata {
@@ -827,7 +900,12 @@ pub fn create_index_files(
     };
 
     let metadata_path = index_dir.join("metadata.json");
-    serde_json::to_writer_pretty(BufWriter::new(File::create(&metadata_path)?), &metadata)?;
+    atomic_write_file(&metadata_path, |file| {
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &metadata)?;
+        writer.flush()?;
+        Ok(())
+    })?;
 
     Ok(metadata)
 }
@@ -857,7 +935,7 @@ pub fn create_index_with_kmeans_files(
 
     // Pre-initialize CUDA if available (first init can take 10-20s due to driver initialization)
     // Skip if force_cpu is set to avoid unnecessary initialization overhead
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "_cuda")]
     if !config.force_cpu {
         if crate::is_force_gpu() {
             crate::cuda::get_global_context()
@@ -979,9 +1057,13 @@ impl MmapIndex {
             // Mark as compatible and save metadata
             metadata.next_plaid_compatible = true;
             let metadata_path = index_dir.join("metadata.json");
-            let file = File::create(&metadata_path)
-                .map_err(|e| Error::IndexLoad(format!("Failed to update metadata: {}", e)))?;
-            serde_json::to_writer_pretty(BufWriter::new(file), &metadata)?;
+            atomic_write_file(&metadata_path, |file| {
+                let mut writer = BufWriter::new(file);
+                serde_json::to_writer_pretty(&mut writer, &metadata)?;
+                writer.flush()?;
+                Ok(())
+            })
+            .map_err(|e| Error::IndexLoad(format!("Failed to update metadata: {}", e)))?;
             eprintln!("Metadata updated with next_plaid_compatible: true");
         }
 
@@ -1582,6 +1664,40 @@ impl MmapIndex {
         }
     }
 
+    /// Append embeddings to an existing index without loading the full MmapIndex.
+    ///
+    /// Faster than `update_or_create` for incremental updates because it does not
+    /// eagerly regenerate the merged code/residual files (628MB+ on large indices).
+    /// NOTE: this *defers* that cost rather than removing it — `update_index` clears
+    /// the merged files, and the next search/load lazily regenerates them. So an
+    /// `index`-only run (no search after) is fast, but the first search following an
+    /// update still pays the merge. Returns the doc IDs assigned to `embeddings`.
+    pub fn update_append(
+        embeddings: &[Array2<f32>],
+        index_path: &str,
+        update_config: &crate::update::UpdateConfig,
+    ) -> Result<Vec<i64>> {
+        use crate::codec::ResidualCodec;
+        use crate::update::update_index;
+
+        let index_dir = std::path::Path::new(index_path);
+        let metadata = Metadata::load_from_path(index_dir)?;
+        let codec = ResidualCodec::load_from_dir(index_dir)?;
+        let start_doc_id = metadata.num_documents as i64;
+        let num_new_docs = embeddings.len();
+
+        update_index(
+            embeddings,
+            index_path,
+            &codec,
+            Some(update_config.batch_size),
+            false,
+            update_config.force_cpu,
+        )?;
+
+        Ok((start_doc_id..start_doc_id + num_new_docs as i64).collect())
+    }
+
     /// Update an existing index or create a new one, with metadata and automatic
     /// FTS5 full-text indexing.
     ///
@@ -1688,6 +1804,7 @@ impl MmapIndex {
     /// The number of documents actually deleted
     pub fn delete_with_options(&mut self, doc_ids: &[i64], delete_metadata: bool) -> Result<usize> {
         let path = self.path.clone();
+        let old_num_documents = self.metadata.num_documents as i64;
 
         // Release mmap handles before deletion. delete_from_index calls
         // clear_merged_files which removes the memory-mapped merged files.
@@ -1702,9 +1819,35 @@ impl MmapIndex {
             let index_path = std::path::Path::new(&path);
             let db_path = index_path.join("metadata.db");
             if db_path.exists() {
+                // filtering::delete re-sequences the surviving _subset_ IDs. When the
+                // deleted IDs are exactly the tail of the ID space, every survivor
+                // keeps its ID, so the FTS5 rows for survivors stay aligned and only
+                // the deleted rows need removing — O(deleted) instead of the
+                // O(total documents) drop-and-rebuild.
+                let mut valid: Vec<i64> = doc_ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| id >= 0 && id < old_num_documents)
+                    .collect();
+                valid.sort_unstable();
+                valid.dedup();
+                let suffix_start = old_num_documents - valid.len() as i64;
+                let is_suffix_delete = valid.first().is_some_and(|&min| min >= suffix_start);
+
                 crate::filtering::delete(&path, doc_ids)?;
-                // Rebuild FTS5 index after metadata re-indexing
-                crate::text_search::rebuild(&path)?;
+                if crate::text_search::is_content_id_keyed(&path) {
+                    // FTS rowids are stable _content_id_ values, unaffected by
+                    // the _subset_ re-sequencing; filtering::delete removed the
+                    // deleted docs' FTS rows inside its own transaction.
+                } else if is_suffix_delete {
+                    crate::text_search::delete(&path, &valid)?;
+                } else {
+                    // Survivor IDs shifted; FTS5 rowids no longer match
+                    // METADATA. For split-schema DBs this rebuild also
+                    // migrates the FTS to the content-id keyed layout, so it
+                    // runs at most once per legacy index.
+                    crate::text_search::rebuild(&path)?;
+                }
             }
         }
 
@@ -1722,6 +1865,89 @@ mod tests {
         assert_eq!(config.nbits, 4);
         assert_eq!(config.batch_size, 50_000);
         assert_eq!(config.seed, Some(42));
+        assert_eq!(
+            config.start_from_scratch,
+            crate::default_start_from_scratch()
+        );
+    }
+
+    /// FTS5 must stay aligned with METADATA `_subset_` IDs after deletes.
+    /// Suffix deletes keep every survivor's ID, so only the deleted FTS rows
+    /// are removed (O(deleted)); any other delete shifts survivor IDs and
+    /// must fall back to the full rebuild.
+    #[test]
+    fn test_delete_keeps_fts_aligned() {
+        use ndarray::Array2;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let index_path = temp_dir.path().to_str().unwrap();
+
+        let mut embeddings: Vec<Array2<f32>> = Vec::new();
+        for i in 0..5 {
+            let mut doc = Array2::<f32>::zeros((5, 32));
+            for j in 0..5 {
+                for k in 0..32 {
+                    doc[[j, k]] = (i as f32 * 0.1) + (j as f32 * 0.01) + (k as f32 * 0.001);
+                }
+            }
+            for mut row in doc.rows_mut() {
+                let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    row.iter_mut().for_each(|x| *x /= norm);
+                }
+            }
+            embeddings.push(doc);
+        }
+
+        let config = IndexConfig {
+            nbits: 2,
+            batch_size: 50,
+            seed: Some(42),
+            kmeans_niters: 2,
+            max_points_per_centroid: 256,
+            n_samples_kmeans: None,
+            start_from_scratch: 999,
+            force_cpu: false,
+            ..Default::default()
+        };
+        let mut index = MmapIndex::create_with_kmeans(&embeddings, index_path, &config).unwrap();
+
+        let words = ["alpha", "bravo", "charlie", "delta", "echo"];
+        let metadata: Vec<serde_json::Value> = words
+            .iter()
+            .map(|w| serde_json::json!({ "text": w }))
+            .collect();
+        let doc_ids: Vec<i64> = (0..5).collect();
+        crate::filtering::create(index_path, &metadata, &doc_ids).unwrap();
+        crate::text_search::index(
+            index_path,
+            &metadata,
+            &doc_ids,
+            &crate::text_search::FtsTokenizer::default(),
+        )
+        .unwrap();
+
+        // Suffix delete: survivors 0..=2 keep their IDs; only rows 3 and 4
+        // leave the FTS index.
+        let deleted = index.delete_with_options(&[3, 4], true).unwrap();
+        assert_eq!(deleted, 2);
+        index.reload().unwrap();
+
+        let hits = crate::text_search::search(index_path, "charlie", 10).unwrap();
+        assert_eq!(hits.passage_ids, vec![2]);
+        let gone = crate::text_search::search(index_path, "delta", 10).unwrap();
+        assert!(gone.passage_ids.is_empty());
+
+        // Non-suffix delete: survivor IDs shift (bravo→0, charlie→1), so the
+        // FTS index must be rebuilt against the new numbering.
+        let deleted = index.delete_with_options(&[0], true).unwrap();
+        assert_eq!(deleted, 1);
+
+        let hits = crate::text_search::search(index_path, "charlie", 10).unwrap();
+        assert_eq!(hits.passage_ids, vec![1]);
+        let gone = crate::text_search::search(index_path, "alpha", 10).unwrap();
+        assert!(gone.passage_ids.is_empty());
     }
 
     #[test]

@@ -115,6 +115,20 @@ fn mean_pool_l2(tokens: &crate::embedding::colbert::TokenEmbeddings) -> Option<V
     Some(mean.iter().map(|&x| x / norm).collect())
 }
 
+/// Atomically write the postcard-encoded doc→chunk `mapping` to `path`: write a
+/// PID-suffixed temp file in the same directory, then rename (atomic on the
+/// same filesystem) — mirrors `dense_backend::write_active_pointer`'s pattern
+/// so a crash mid-write can never leave a torn `plaid_mapping.bin` for the
+/// next open to trip over.
+fn write_mapping_atomic(path: &Path, mapping: &[u64]) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp_path = dir.join(format!(".plaid_mapping.{}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, postcard::to_stdvec(mapping)?)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 /// Build-time `colbert-plaid` index builder. Owns the PLAID full-rebuild and
 /// incremental update logic lifted verbatim from `index/builder.rs` so the
 /// dense build path routes through `DenseIndexBuilder`.
@@ -247,8 +261,7 @@ impl ColbertPlaidIndexBuilder {
         drop(all_embeddings);
         crate::memory::purge_allocator();
 
-        let mapping_bytes = postcard::to_stdvec(&full_mapping)?;
-        std::fs::write(&self.mapping_path, mapping_bytes)?;
+        write_mapping_atomic(&self.mapping_path, &full_mapping)?;
         tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
         Ok(())
     }
@@ -311,7 +324,7 @@ impl ColbertPlaidIndexBuilder {
             }
         }
 
-        std::fs::write(&self.mapping_path, postcard::to_stdvec(&mapping)?)?;
+        write_mapping_atomic(&self.mapping_path, &mapping)?;
         Ok(())
     }
 }
@@ -388,7 +401,7 @@ impl DenseIndexBuilder for ColbertPlaidIndexBuilder {
                 *slot = DENSE_TOMBSTONE;
             }
         }
-        std::fs::write(&self.mapping_path, postcard::to_stdvec(&mapping)?)?;
+        write_mapping_atomic(&self.mapping_path, &mapping)?;
         Ok(())
     }
 
@@ -443,6 +456,28 @@ mod tests {
     /// `--ignored`); it builds a tiny synthetic repo (repo-agnostic tempdir,
     /// no hardcoded paths) and opens the colbert-plaid backend from the
     /// per-backend dense subdir.
+    #[test]
+    fn write_mapping_atomic_leaves_no_temp_file_and_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("plaid_mapping.bin");
+        let mapping: Vec<u64> = vec![10, 20, DENSE_TOMBSTONE, 30];
+        write_mapping_atomic(&path, &mapping).unwrap();
+
+        let back: Vec<u64> = postcard::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back, mapping);
+
+        // No leftover .tmp file in the directory after a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write must not leave a temp file behind: {leftovers:?}"
+        );
+    }
+
     #[test]
     #[ignore = "builds a PLAID index + loads the ColBERT model; run with --ignored"]
     fn embed_text_vector_returns_some_with_model_dim() {

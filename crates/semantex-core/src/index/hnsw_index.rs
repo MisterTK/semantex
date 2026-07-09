@@ -29,8 +29,23 @@ use std::path::{Path, PathBuf};
 /// avoids graph overhead on small repos). Overridable via `SEMANTEX_HNSW_MIN_VECTORS`.
 const HNSW_MIN_VECTORS_DEFAULT: usize = 2_000;
 
-/// On-disk file name for the int8 vector store + chunk_id map.
-const STORE_FILE: &str = "vectors.bin";
+/// On-disk file for the thin, atomically-rewritten sidecar: dim + chunk_ids +
+/// scales + tombstone flags. This is also the `dense_sentinel_file` for
+/// `coderank-hnsw` (see `dense_backend.rs`) — its presence means "store
+/// built". Named differently from the pre-split single-blob format
+/// (`vectors.bin`) so a pre-existing index built before this change is never
+/// misread: it simply reports "not present" and takes the same clean
+/// full-rebuild path every other on-disk format change already uses.
+const INDEX_FILE: &str = "index.bin";
+
+/// On-disk file for the heavy int8 payload: `count * dim` raw bytes, one
+/// `dim`-byte row per chunk in `INDEX_FILE`'s `chunk_ids` order (row `i` is
+/// `store.vecs` bytes `[i*dim, (i+1)*dim)`). Append-only: insert writes new
+/// rows at the end and never rewrites existing bytes; delete never touches
+/// this file — tombstoned rows' bytes are simply left in place, reclaimed
+/// only by a future full rebuild (mirrors next-plaid's own "no tombstone GC
+/// in this PR" deferral, v1.6.2 `f92e0c7`).
+const VECTORS_FILE: &str = "store.vecs";
 
 /// Streaming-build batch size: at most this many chunks' content is fetched +
 /// encoded at once, so only one batch's text is ever resident (the D6 build-RSS
@@ -134,6 +149,42 @@ pub struct Int8VectorStore {
     pub scales: Vec<f32>,
     pub vectors: Vec<Vec<i8>>,
     pub chunk_ids: Vec<u64>,
+    /// Row `i` is logically deleted (tombstoned) when `true`; its bytes are
+    /// left in place on disk and in RAM — never removed by compaction. A
+    /// `tombstoned` vec SHORTER than `chunk_ids` (any pre-existing
+    /// construction of this struct without the field, e.g. `..Default::default()`
+    /// in a test) is treated as "nothing tombstoned" for every row past its
+    /// end — see `is_tombstoned`.
+    #[serde(default)]
+    pub tombstoned: Vec<bool>,
+}
+
+/// The thin sidecar persisted at `INDEX_FILE`: everything about a store
+/// EXCEPT the heavy int8 payload, which lives separately in `VECTORS_FILE`.
+/// Rewriting this (a `postcard::to_stdvec` of a few `Vec<u64>`/`Vec<f32>`/
+/// `Vec<bool>`) costs roughly 13 bytes/row versus `VECTORS_FILE`'s ~768
+/// bytes/row for a real embedding dim — about 59x cheaper to rewrite in
+/// full, which is why insert/delete only ever touch this file. Mirrors
+/// next-plaid's own thin/fat METADATA split (v1.6.0, `df9d601`).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct StoreIndex {
+    dim: usize,
+    chunk_ids: Vec<u64>,
+    scales: Vec<f32>,
+    tombstoned: Vec<bool>,
+}
+
+/// Atomically rewrite `INDEX_FILE` in `dir`: write a PID-suffixed temp file in
+/// the same directory, then rename (atomic on the same filesystem) — mirrors
+/// `dense_backend::write_active_pointer`'s pattern so a crash mid-write can
+/// never leave a torn `index.bin` for the next load to trip over.
+fn write_index_atomic(dir: &Path, idx: &StoreIndex) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let final_path = dir.join(INDEX_FILE);
+    let tmp_path = dir.join(format!(".index.{}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, postcard::to_stdvec(idx)?)?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
 }
 
 impl Int8VectorStore {
@@ -147,7 +198,27 @@ impl Int8VectorStore {
         self.vectors.push(q);
         self.scales.push(scale);
         self.chunk_ids.push(chunk_id);
+        self.tombstoned.push(false);
         idx
+    }
+
+    /// Row `i` is excluded from search/graph-build when tombstoned. A `.get()`
+    /// (not direct indexing) so a `tombstoned` vec shorter than `chunk_ids`
+    /// (any pre-existing store construction without this field) is treated as
+    /// "nothing tombstoned" — every pre-tombstone-field construction of this
+    /// struct keeps behaving exactly as it did before this field existed.
+    fn is_tombstoned(&self, i: usize) -> bool {
+        self.tombstoned.get(i).copied().unwrap_or(false)
+    }
+
+    /// Count of rows NOT tombstoned — the true "searchable" size. Used for the
+    /// HNSW-vs-brute-force threshold and the empty-store short-circuit, so a
+    /// heavily-deleted store degrades based on what's actually live, not the
+    /// raw on-disk row count.
+    fn live_count(&self) -> usize {
+        (0..self.chunk_ids.len())
+            .filter(|&i| !self.is_tombstoned(i))
+            .count()
     }
 
     /// Dequantize store row `i` back to f32. (Stored rows were L2-normalized
@@ -177,6 +248,7 @@ impl Int8VectorStore {
             .vectors
             .iter()
             .enumerate()
+            .filter(|(i, _)| !self.is_tombstoned(*i))
             .map(|(i, v)| (i, dot_i8(&q8, v)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -224,6 +296,7 @@ impl Int8VectorStore {
             .chunk_ids
             .iter()
             .enumerate()
+            .filter(|(i, _)| !self.is_tombstoned(*i))
             .map(|(i, &id)| (id, i))
             .collect();
         chunk_ids
@@ -233,6 +306,133 @@ impl Int8VectorStore {
                 Some((*id, self.dequant_row(i)))
             })
             .collect()
+    }
+
+    /// Load just the thin sidecar (no int8 payload read at all) — what
+    /// insert/delete need, since neither has to touch the existing payload.
+    /// Missing file (fresh index) returns an empty index at `EMBEDDING_DIM`.
+    fn load_index_only(dir: &Path) -> Result<StoreIndex> {
+        match std::fs::read(dir.join(INDEX_FILE)) {
+            Ok(bytes) => Ok(postcard::from_bytes(&bytes)?),
+            Err(_) => Ok(StoreIndex {
+                dim: EMBEDDING_DIM,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Split-format load: read the thin sidecar, then only the payload bytes
+    /// it actually accounts for. A crash mid-append (see `append_split`)
+    /// leaves extra trailing bytes in `VECTORS_FILE` that `INDEX_FILE` never
+    /// counted — those are simply ignored here, which is what makes the
+    /// append+then-atomic-index-write ordering crash-safe.
+    fn load_split(dir: &Path) -> Result<Self> {
+        let idx = Self::load_index_only(dir)?;
+        let count = idx.chunk_ids.len();
+        let vectors: Vec<Vec<i8>> = if count == 0 {
+            Vec::new()
+        } else {
+            let bytes = std::fs::read(dir.join(VECTORS_FILE))?;
+            let need = count * idx.dim;
+            anyhow::ensure!(
+                bytes.len() >= need,
+                "coderank-hnsw {VECTORS_FILE} truncated: have {} bytes, need {need} for \
+                 {count} rows of dim {}",
+                bytes.len(),
+                idx.dim,
+            );
+            (0..count)
+                .map(|i| {
+                    let start = i * idx.dim;
+                    bytes[start..start + idx.dim]
+                        .iter()
+                        .map(|&b| b as i8)
+                        .collect()
+                })
+                .collect()
+        };
+        Ok(Self {
+            dim: idx.dim,
+            scales: idx.scales,
+            vectors,
+            chunk_ids: idx.chunk_ids,
+            tombstoned: idx.tombstoned,
+        })
+    }
+
+    fn to_index(&self) -> StoreIndex {
+        StoreIndex {
+            dim: self.dim,
+            chunk_ids: self.chunk_ids.clone(),
+            scales: self.scales.clone(),
+            tombstoned: self.tombstoned.clone(),
+        }
+    }
+
+    /// Fresh full write: truncates and rewrites BOTH files from the current
+    /// in-RAM store. Used by a full (re)build, where there is no existing
+    /// payload worth preserving incrementally.
+    fn save_split(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let mut payload = Vec::with_capacity(self.vectors.len() * self.dim);
+        for row in &self.vectors {
+            payload.extend(row.iter().map(|&b| b as u8));
+        }
+        std::fs::write(dir.join(VECTORS_FILE), &payload)?;
+        write_index_atomic(dir, &self.to_index())
+    }
+
+    /// Append `new_ids`/`new_scales`/`new_rows` (already quantized) to the
+    /// payload file, then atomically rewrite the thin index to include them.
+    /// Ordering is what makes this crash-safe: the payload append is flushed
+    /// to disk (`sync_data`) BEFORE the index is updated to reference it, so
+    /// a crash between the two leaves `INDEX_FILE` — the source of truth for
+    /// row count — unaware of the half-written tail; the next `load_split`
+    /// simply ignores those extra bytes.
+    fn append_split(
+        dir: &Path,
+        mut idx: StoreIndex,
+        new_ids: &[u64],
+        new_scales: &[f32],
+        new_rows: &[Vec<i8>],
+    ) -> Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(dir)?;
+        if !new_rows.is_empty() {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(VECTORS_FILE))?;
+            for row in new_rows {
+                let bytes: Vec<u8> = row.iter().map(|&b| b as u8).collect();
+                f.write_all(&bytes)?;
+            }
+            f.sync_data()?;
+        }
+        idx.chunk_ids.extend_from_slice(new_ids);
+        idx.scales.extend_from_slice(new_scales);
+        idx.tombstoned
+            .extend(std::iter::repeat_n(false, new_ids.len()));
+        write_index_atomic(dir, &idx)
+    }
+
+    /// Mark `remove` chunk ids as tombstoned. Touches ONLY the thin
+    /// `INDEX_FILE` — `VECTORS_FILE`'s bytes for those rows are left in place
+    /// (see `VECTORS_FILE`'s doc comment).
+    fn tombstone_split(
+        dir: &Path,
+        mut idx: StoreIndex,
+        remove: &std::collections::HashSet<u64>,
+    ) -> Result<()> {
+        while idx.tombstoned.len() < idx.chunk_ids.len() {
+            idx.tombstoned.push(false);
+        }
+        for i in 0..idx.chunk_ids.len() {
+            if remove.contains(&idx.chunk_ids[i]) {
+                idx.tombstoned[i] = true;
+            }
+        }
+        write_index_atomic(dir, &idx)
     }
 }
 
@@ -264,13 +464,20 @@ impl HnswDenseIndex {
     /// vectors), or return `None` for a small store (brute-force path). The
     /// graph value at row `i` is the store row index `i`.
     fn build_graph(store: &Int8VectorStore, params: HnswParams) -> Option<HnswGraph> {
-        if store.len() < hnsw_min_vectors() {
+        if store.live_count() < hnsw_min_vectors() {
             return None;
         }
-        let points: Vec<HnswPoint> = (0..store.len())
-            .map(|i| HnswPoint(store.dequant_row(i)))
+        let live: Vec<usize> = (0..store.len())
+            .filter(|&i| !store.is_tombstoned(i))
             .collect();
-        let values: Vec<usize> = (0..store.len()).collect();
+        let points: Vec<HnswPoint> = live
+            .iter()
+            .map(|&i| HnswPoint(store.dequant_row(i)))
+            .collect();
+        // Graph VALUE is the store row index, so a search hit maps straight
+        // back to `store` without a second lookup — tombstoned rows are
+        // simply never in `live`, so they can never be returned by a search.
+        let values: Vec<usize> = live;
         let graph = Builder::default()
             .ef_construction(params.ef_construction.max(1))
             .ef_search(Self::baked_ef_search(params))
@@ -279,8 +486,7 @@ impl HnswDenseIndex {
     }
 
     fn load(dir: &Path, params: HnswParams) -> Result<Self> {
-        let bytes = std::fs::read(dir.join(STORE_FILE))?;
-        let store: Int8VectorStore = postcard::from_bytes(&bytes)?;
+        let store = Int8VectorStore::load_split(dir)?;
         let graph = Self::build_graph(&store, params);
         Ok(Self {
             store,
@@ -291,14 +497,12 @@ impl HnswDenseIndex {
     }
 
     fn save(store: &Int8VectorStore, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join(STORE_FILE), postcard::to_stdvec(store)?)?;
-        Ok(())
+        store.save_split(dir)
     }
 
     /// Top-k search: ANN (if graph present) → fp32 rescore; else brute-force.
     fn search(&self, query: &[f32], k: usize) -> Vec<DenseHit> {
-        if self.store.len() == 0 {
+        if self.store.live_count() == 0 {
             return Vec::new();
         }
         let rescore_k = if self.params.rescore_k == 0 {
@@ -558,8 +762,11 @@ impl CoderankHnswIndexBuilder {
         Ok(())
     }
 
-    /// Incremental add of `chunk_ids`, streaming content via `fetch` (one batch
-    /// resident at a time). RSS-bounded counterpart to `insert`.
+    /// Incremental add of `chunk_ids`, streaming content via `fetch` (one
+    /// batch resident at a time). Encodes ONLY the new rows into a fresh
+    /// store, then appends them to the on-disk payload — the existing
+    /// payload is never re-read or rewritten (Item 2: a real incremental
+    /// path, not a full-store reload+rewrite).
     pub fn insert_streaming_ids<F>(&mut self, chunk_ids: &[u64], mut fetch: F) -> Result<()>
     where
         F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
@@ -568,21 +775,23 @@ impl CoderankHnswIndexBuilder {
             return Ok(());
         }
         let embedder = self.make_embedder()?;
-        self.store = self.load_existing_store();
+        // `self.store` holds ONLY the new rows for this call — never the
+        // existing on-disk payload.
+        self.store = Int8VectorStore {
+            dim: EMBEDDING_DIM,
+            ..Default::default()
+        };
         self.encode_streaming_ids(&embedder, chunk_ids, &mut fetch)?;
         let dir = self.dir.clone();
-        HnswDenseIndex::save(&self.store, &dir)?;
+        let idx = Int8VectorStore::load_index_only(&dir)?;
+        Int8VectorStore::append_split(
+            &dir,
+            idx,
+            &self.store.chunk_ids,
+            &self.store.scales,
+            &self.store.vectors,
+        )?;
         Ok(())
-    }
-
-    fn load_existing_store(&self) -> Int8VectorStore {
-        std::fs::read(self.dir.join(STORE_FILE))
-            .ok()
-            .and_then(|b| postcard::from_bytes::<Int8VectorStore>(&b).ok())
-            .unwrap_or_else(|| Int8VectorStore {
-                dim: EMBEDDING_DIM,
-                ..Default::default()
-            })
     }
 
     fn make_embedder(&self) -> Result<SingleVectorEmbedder> {
@@ -621,10 +830,20 @@ impl DenseIndexBuilder for CoderankHnswIndexBuilder {
             return Ok(());
         }
         let embedder = self.make_embedder()?;
-        self.store = self.load_existing_store();
+        self.store = Int8VectorStore {
+            dim: EMBEDDING_DIM,
+            ..Default::default()
+        };
         self.encode_into_store(&embedder, chunks)?;
         let dir = self.dir.clone();
-        HnswDenseIndex::save(&self.store, &dir)?;
+        let idx = Int8VectorStore::load_index_only(&dir)?;
+        Int8VectorStore::append_split(
+            &dir,
+            idx,
+            &self.store.chunk_ids,
+            &self.store.scales,
+            &self.store.vectors,
+        )?;
         Ok(())
     }
 
@@ -632,38 +851,151 @@ impl DenseIndexBuilder for CoderankHnswIndexBuilder {
         if chunk_ids.is_empty() {
             return Ok(());
         }
-        self.store = self.load_existing_store();
         let remove: std::collections::HashSet<u64> = chunk_ids.iter().copied().collect();
-        // Rebuild the store without the removed ids (compact; no tombstones —
-        // the HNSW graph is rebuilt on open from the compacted store).
-        let mut compact = Int8VectorStore {
-            dim: self.store.dim,
-            ..Default::default()
-        };
-        for i in 0..self.store.len() {
-            if remove.contains(&self.store.chunk_ids[i]) {
-                continue;
-            }
-            compact.push(
-                self.store.chunk_ids[i],
-                std::mem::take(&mut self.store.vectors[i]),
-                self.store.scales[i],
-            );
-        }
-        self.store = compact;
         let dir = self.dir.clone();
-        HnswDenseIndex::save(&self.store, &dir)?;
-        Ok(())
+        let idx = Int8VectorStore::load_index_only(&dir)?;
+        Int8VectorStore::tombstone_split(&dir, idx, &remove)
     }
 
-    fn persist(&self, dir: &Path) -> Result<()> {
-        HnswDenseIndex::save(&self.store, dir)
+    fn persist(&self, _dir: &Path) -> Result<()> {
+        // build/insert/delete all write eagerly (see their own bodies) —
+        // nothing extra to flush. Mirrors ColbertPlaidIndexBuilder::persist.
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_split_then_load_split_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = Int8VectorStore {
+            dim: 3,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[0.6, 0.8, 0.0]);
+        let (q2, s2) = quantize_int8(&[0.0, 0.6, 0.8]);
+        store.push(10, q1.clone(), s1);
+        store.push(20, q2.clone(), s2);
+
+        store.save_split(tmp.path()).unwrap();
+        assert!(tmp.path().join(INDEX_FILE).exists());
+        assert!(tmp.path().join(VECTORS_FILE).exists());
+
+        let back = Int8VectorStore::load_split(tmp.path()).unwrap();
+        assert_eq!(back.chunk_ids, vec![10, 20]);
+        assert_eq!(back.dim, 3);
+        assert_eq!(back.vectors, vec![q1.clone(), q2.clone()]);
+        assert_eq!(back.scales, vec![s1, s2]);
+        assert_eq!(back.tombstoned, vec![false, false]);
+    }
+
+    #[test]
+    fn append_split_adds_rows_without_touching_existing_ones() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        store.push(1, q1.clone(), s1);
+        store.save_split(tmp.path()).unwrap();
+
+        let idx = Int8VectorStore::load_index_only(tmp.path()).unwrap();
+        let (q2, s2) = quantize_int8(&[0.0, 1.0]);
+        Int8VectorStore::append_split(tmp.path(), idx, &[2], &[s2], &[q2.clone()]).unwrap();
+
+        let back = Int8VectorStore::load_split(tmp.path()).unwrap();
+        assert_eq!(back.chunk_ids, vec![1, 2]);
+        assert_eq!(back.vectors, vec![q1, q2]);
+        assert_eq!(back.tombstoned, vec![false, false]);
+    }
+
+    #[test]
+    fn tombstone_split_marks_flag_without_touching_vectors_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        let (q2, s2) = quantize_int8(&[0.0, 1.0]);
+        store.push(1, q1, s1);
+        store.push(2, q2, s2);
+        store.save_split(tmp.path()).unwrap();
+
+        let vectors_bytes_before = std::fs::read(tmp.path().join(VECTORS_FILE)).unwrap();
+
+        let idx = Int8VectorStore::load_index_only(tmp.path()).unwrap();
+        let remove: std::collections::HashSet<u64> = [1].into_iter().collect();
+        Int8VectorStore::tombstone_split(tmp.path(), idx, &remove).unwrap();
+
+        let vectors_bytes_after = std::fs::read(tmp.path().join(VECTORS_FILE)).unwrap();
+        assert_eq!(
+            vectors_bytes_before, vectors_bytes_after,
+            "tombstoning must never rewrite the vectors payload file"
+        );
+
+        let back = Int8VectorStore::load_split(tmp.path()).unwrap();
+        assert!(back.is_tombstoned(0));
+        assert!(!back.is_tombstoned(1));
+        assert_eq!(back.live_count(), 1);
+    }
+
+    #[test]
+    fn load_split_on_empty_store_does_not_require_vectors_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Int8VectorStore {
+            dim: 4,
+            ..Default::default()
+        };
+        store.save_split(tmp.path()).unwrap();
+        // An empty store may or may not write an empty VECTORS_FILE; either
+        // way, load must succeed without requiring it.
+        std::fs::remove_file(tmp.path().join(VECTORS_FILE)).ok();
+        let back = Int8VectorStore::load_split(tmp.path()).unwrap();
+        assert_eq!(back.chunk_ids.len(), 0);
+    }
+
+    #[test]
+    fn builder_insert_appends_without_rewriting_existing_payload_bytes() {
+        // Drives the split-format primitives the same way insert_streaming_ids
+        // does internally (this is a file-level contract test, not a full
+        // builder test — the real model isn't needed to assert it).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        store.push(1, q1, s1);
+        store.save_split(tmp.path()).unwrap();
+        let existing_bytes = std::fs::read(tmp.path().join(VECTORS_FILE)).unwrap();
+
+        // Simulate what insert_streaming_ids now does internally: load the
+        // thin index, append one new row.
+        let idx = Int8VectorStore::load_index_only(tmp.path()).unwrap();
+        let (q2, s2) = quantize_int8(&[0.0, 1.0]);
+        Int8VectorStore::append_split(tmp.path(), idx, &[2], &[s2], &[q2.clone()]).unwrap();
+
+        let new_bytes = std::fs::read(tmp.path().join(VECTORS_FILE)).unwrap();
+        assert!(
+            new_bytes.starts_with(&existing_bytes),
+            "insert must append after existing bytes, never rewrite them"
+        );
+        assert_eq!(new_bytes.len(), existing_bytes.len() + 2 /* dim */);
+    }
+
+    #[test]
+    fn dense_sentinel_file_is_index_bin_for_coderank_hnsw() {
+        use crate::search::dense_backend::{DenseBackendKind, dense_sentinel_file};
+        assert_eq!(
+            dense_sentinel_file(DenseBackendKind::CoderankHnsw),
+            "index.bin"
+        );
+    }
 
     #[test]
     fn preset_names_resolve() {
@@ -728,6 +1060,7 @@ mod tests {
                 quantize_int8(&[0.0, 1.0]).0, // id 30
             ],
             chunk_ids: vec![10, 20, 30],
+            tombstoned: vec![false, false, false],
         };
         let q = vec![1.0f32, 0.0];
         let hits = store.brute_force(&q, 3, 0);
@@ -745,6 +1078,7 @@ mod tests {
             scales: vec![],
             vectors: vec![],
             chunk_ids: vec![],
+            tombstoned: vec![],
         };
         assert!(store.brute_force(&[0.0, 0.0, 0.0, 0.0], 5, 0).is_empty());
     }
@@ -759,6 +1093,7 @@ mod tests {
                 quantize_int8(&[0.8, 0.2, 0.0]).0,
             ],
             chunk_ids: vec![1, 2],
+            tombstoned: vec![false, false],
         };
         let q = vec![1.0f32, 0.0, 0.0];
         let hits = store.fp32_rescore(&q, &[0, 1], 2);
@@ -790,6 +1125,7 @@ mod tests {
             scales: vec![s1, s2],
             vectors: vec![q1, q2],
             chunk_ids: vec![1, 2],
+            tombstoned: vec![false, false],
         };
         let mut query = vec![1.0f32, 0.028, 0.0];
         l2_normalize(&mut query);
@@ -818,7 +1154,8 @@ mod tests {
         let mut b = CoderankHnswIndexBuilder::new(tmp.path(), HnswParams::default());
         assert_eq!(DenseIndexBuilder::name(&b), "coderank-hnsw");
         b.build(&[]).unwrap();
-        assert!(!tmp.path().join("vectors.bin").exists());
+        assert!(!tmp.path().join(INDEX_FILE).exists());
+        assert!(!tmp.path().join(VECTORS_FILE).exists());
     }
 
     #[test]
@@ -845,11 +1182,7 @@ mod tests {
             dim: 4,
             ..Default::default()
         };
-        std::fs::write(
-            tmp.path().join("vectors.bin"),
-            postcard::to_stdvec(&store).unwrap(),
-        )
-        .unwrap();
+        store.save_split(tmp.path()).unwrap();
         let backend = CoderankHnswBackend::open_for_test(tmp.path());
         assert!(backend.positional_chunk_ids().is_none());
     }
@@ -983,6 +1316,89 @@ mod tests {
         assert_eq!(
             hnsw_hits, bf_hits,
             "HNSW (with fp32 rescore) must agree with brute-force on a tiny corpus"
+        );
+        unsafe {
+            std::env::remove_var("SEMANTEX_HNSW_MIN_VECTORS");
+        }
+    }
+
+    #[test]
+    fn tombstoned_row_is_excluded_from_brute_force() {
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        let (q2, s2) = quantize_int8(&[0.9, 0.1]);
+        store.push(1, q1, s1);
+        store.push(2, q2, s2);
+        assert_eq!(store.live_count(), 2);
+
+        store.tombstoned[0] = true;
+        assert_eq!(store.live_count(), 1);
+        assert!(store.is_tombstoned(0));
+        assert!(!store.is_tombstoned(1));
+
+        let hits = store.brute_force(&[1.0, 0.0], 5, 5);
+        assert_eq!(
+            hits.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![2],
+            "tombstoned row (chunk_id=1) must never be returned"
+        );
+    }
+
+    #[test]
+    fn tombstoned_row_is_excluded_from_vectors_for() {
+        let mut store = Int8VectorStore {
+            dim: 2,
+            ..Default::default()
+        };
+        let (q1, s1) = quantize_int8(&[1.0, 0.0]);
+        let (q2, s2) = quantize_int8(&[0.0, 1.0]);
+        store.push(10, q1, s1);
+        store.push(20, q2, s2);
+        store.tombstoned[0] = true;
+
+        let got = store.vectors_for(&[10, 20]);
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![20],
+            "tombstoned chunk_id=10 must be skipped even when explicitly requested"
+        );
+    }
+
+    #[test]
+    fn build_graph_skips_tombstoned_rows_and_uses_live_count_for_threshold() {
+        unsafe {
+            std::env::set_var("SEMANTEX_HNSW_MIN_VECTORS", "4");
+        }
+        let mut store = Int8VectorStore {
+            dim: 4,
+            ..Default::default()
+        };
+        // 6 rows, tombstone 3 of them -> live_count = 3, below the threshold
+        // of 4, so no graph should build even though raw store.len() == 6.
+        for i in 0..6u64 {
+            let mut v = vec![
+                ((i * 7 % 11) as f32) - 5.0,
+                ((i * 13 % 11) as f32) - 5.0,
+                ((i * 17 % 11) as f32) - 5.0,
+                ((i * 19 % 11) as f32) - 5.0,
+            ];
+            l2_normalize(&mut v);
+            let (q, s) = quantize_int8(&v);
+            store.push(100 + i, q, s);
+        }
+        store.tombstoned[0] = true;
+        store.tombstoned[1] = true;
+        store.tombstoned[2] = true;
+        assert_eq!(store.live_count(), 3);
+
+        let graph = HnswDenseIndex::build_graph(&store, HnswParams::default());
+        assert!(
+            graph.is_none(),
+            "live_count (3) below the lowered threshold (4) must skip the graph, \
+             even though raw row count (6) is above it"
         );
         unsafe {
             std::env::remove_var("SEMANTEX_HNSW_MIN_VECTORS");

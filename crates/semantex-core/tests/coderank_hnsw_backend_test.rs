@@ -139,7 +139,7 @@ fn coderank_hnsw_alias_selection_builds_and_searches() -> Result<()> {
     // The dense index must be written under the coderank-hnsw subdir.
     assert!(
         project
-            .join(".semantex/dense/coderank-hnsw/vectors.bin")
+            .join(".semantex/dense/coderank-hnsw/index.bin")
             .exists(),
         "alias selection must build the coderank-hnsw dense index"
     );
