@@ -221,10 +221,39 @@ jobs:
           cd tap
 
           sed -i "s/version \".*\"/version \"${version}\"/" Formula/semantex.rb
-          sed -i "s/AARCH64_APPLE_DARWIN_SHA256/${aarch64_darwin}/"  Formula/semantex.rb
-          sed -i "s/X86_64_APPLE_DARWIN_SHA256/${x86_64_darwin}/"    Formula/semantex.rb
-          sed -i "s/AARCH64_LINUX_SHA256/${aarch64_linux}/"           Formula/semantex.rb
-          sed -i "s/X86_64_LINUX_SHA256/${x86_64_linux}/"             Formula/semantex.rb
+
+          # Replace whatever sha256 value currently follows each platform's
+          # `url` line — NOT a one-time placeholder-token substitution. The
+          # placeholder-token approach (sed for a literal string like
+          # AARCH64_APPLE_DARWIN_SHA256) only matches once: the first release
+          # replaces the token with a real hash, and every release after that
+          # has nothing left to match, so the sed silently no-ops and the
+          # formula's checksums go stale forever while the release assets
+          # keep changing underneath it (confirmed broken this way in
+          # practice — `brew install` failed checksum verification because
+          # the pinned hash didn't match the actual asset). Matching by
+          # structural position (whichever sha256 line follows a given
+          # platform's url line) is idempotent: it works identically on the
+          # very first run and on every run after.
+          awk -v aarch64_darwin="$aarch64_darwin" \
+              -v x86_64_darwin="$x86_64_darwin" \
+              -v aarch64_linux="$aarch64_linux" \
+              -v x86_64_linux="$x86_64_linux" '
+            /aarch64-apple-darwin\.tar\.gz"/        { plat = "aarch64_darwin" }
+            /x86_64-apple-darwin\.tar\.gz"/         { plat = "x86_64_darwin" }
+            /aarch64-unknown-linux-gnu\.tar\.gz"/   { plat = "aarch64_linux" }
+            /x86_64-unknown-linux-gnu\.tar\.gz"/    { plat = "x86_64_linux" }
+            /sha256 "/ && plat != "" {
+              if (plat == "aarch64_darwin") { hash = aarch64_darwin }
+              else if (plat == "x86_64_darwin") { hash = x86_64_darwin }
+              else if (plat == "aarch64_linux") { hash = aarch64_linux }
+              else { hash = x86_64_linux }
+              sub(/sha256 "[^"]*"/, "sha256 \"" hash "\"")
+              plat = ""
+            }
+            { print }
+          ' Formula/semantex.rb > Formula/semantex.rb.new
+          mv Formula/semantex.rb.new Formula/semantex.rb
 
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
