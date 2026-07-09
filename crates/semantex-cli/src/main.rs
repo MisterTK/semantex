@@ -232,6 +232,10 @@ enum Commands {
         /// Path to index (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Index anyway if `path` looks like a multi-repo workspace
+        /// container (several sibling repos, no `.git` of its own)
+        #[arg(long)]
+        force: bool,
     },
     /// Watch for file changes and auto-reindex
     Watch {
@@ -300,6 +304,9 @@ enum Commands {
         #[arg(long, value_enum)]
         scope: Option<commands::install::InstallScope>,
     },
+    /// Uninstall Claude Code integration (hooks, skill, and MCP server
+    /// registration across every scope install-claude-code may have used)
+    UninstallClaudeCode,
     /// Install Codex integration (`~/.codex/config.toml` + project `AGENTS.md`)
     InstallCodex,
     /// Uninstall Codex integration
@@ -532,6 +539,7 @@ where
                     | "connect"
                     | "disconnect"
                     | "install-claude-code"
+                    | "uninstall-claude-code"
                     | "install-codex"
                     | "uninstall-codex"
                     | "install-open-code"
@@ -982,9 +990,9 @@ fn main() -> Result<()> {
     config.context_lines = cli.context;
 
     match cli.command {
-        Some(Commands::Index { path }) => {
+        Some(Commands::Index { path, force }) => {
             telemetry::track("index");
-            commands::index::run(&path, &config)
+            commands::index::run(&path, &config, force)
         }
         Some(Commands::Watch { path }) => {
             telemetry::track("watch");
@@ -1022,6 +1030,10 @@ fn main() -> Result<()> {
         Some(Commands::InstallClaudeCode { scope }) => {
             telemetry::track("install_claude_code");
             commands::install::install_claude_code(scope)
+        }
+        Some(Commands::UninstallClaudeCode) => {
+            telemetry::track("uninstall_claude_code");
+            commands::install::uninstall_claude_code()
         }
         Some(Commands::InstallCodex) => {
             telemetry::track("install_codex");

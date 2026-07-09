@@ -6,10 +6,29 @@ use semantex_core::index::builder::IndexBuilder;
 use semantex_core::index::registry;
 use std::path::Path;
 
-pub fn run(path: &Path, config: &SemantexConfig) -> Result<()> {
+pub fn run(path: &Path, config: &SemantexConfig, force: bool) -> Result<()> {
     let project_path = path
         .canonicalize()
         .with_context(|| format!("Invalid path: {}", path.display()))?;
+
+    if registry::is_system_temp_root(&project_path) {
+        anyhow::bail!(
+            "Refusing to index {} — it's the system temp directory, not a project. \
+             Every tool on the machine writes here, so it can never stay indexed. \
+             Index a specific subdirectory instead.",
+            project_path.display()
+        );
+    }
+
+    if !force && registry::is_likely_multi_repo_container(&project_path) {
+        anyhow::bail!(
+            "Refusing to index {} — it looks like a workspace containing several \
+             independent repos (no .git here, but multiple nested repos found), not \
+             a single project. Index each repo individually, or re-run with --force \
+             to index it anyway as one combined project.",
+            project_path.display()
+        );
+    }
 
     println!("{} {}", "Indexing".green().bold(), project_path.display());
 

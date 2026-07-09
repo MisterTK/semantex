@@ -561,26 +561,102 @@ pub fn uninstall_claude_code() -> Result<()> {
         let content = std::fs::read_to_string(settings_path)?;
         let mut settings: serde_json::Value = serde_json::from_str(&content)?;
 
-        let changed = if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut())
-        {
+        let mut changed = false;
+
+        if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
             let before = hooks.len();
             hooks.remove("SessionStart");
             hooks.remove("PreToolUse");
             hooks.remove("SessionEnd");
             hooks.remove("SubagentStart");
-            hooks.len() < before
-        } else {
-            false
-        };
+            changed |= hooks.len() < before;
+        }
+
+        // Reverse ensure_enabled_mcp: drop "semantex" from enabledMcpjsonServers
+        // (the Project-scope pre-approval register_mcp_server adds).
+        if let Some(arr) = settings
+            .get_mut("enabledMcpjsonServers")
+            .and_then(|v| v.as_array_mut())
+        {
+            let before = arr.len();
+            arr.retain(|v| v.as_str() != Some("semantex"));
+            changed |= arr.len() != before;
+        }
+
+        // Reverse ensure_tool_permissions: drop the semantex mcp__ tool
+        // entries register_mcp_server pre-approved.
+        if let Some(arr) = settings
+            .get_mut("permissions")
+            .and_then(|p| p.get_mut("allow"))
+            .and_then(|v| v.as_array_mut())
+        {
+            let before = arr.len();
+            arr.retain(|v| !v.as_str().is_some_and(|s| SEMANTEX_MCP_TOOLS.contains(&s)));
+            changed |= arr.len() != before;
+        }
 
         if changed {
             std::fs::write(settings_path, serde_json::to_string_pretty(&settings)?)?;
             eprintln!(
-                "  {} hooks removed from {}",
+                "  {} hooks/MCP permissions removed from {}",
                 "✓".green().bold(),
                 settings_path.display()
             );
             any_found = true;
+        }
+    }
+
+    // Reverse register_mcp_server (Project scope): repo-root .mcp.json.
+    if remove_mcp_entry(&cwd.join(".mcp.json"), "mcpServers")? {
+        eprintln!(
+            "  {} MCP server removed from {}",
+            "✓".green().bold(),
+            cwd.join(".mcp.json").display()
+        );
+        any_found = true;
+    }
+
+    // Reverse register_mcp_server (User + Local scopes): ~/.claude.json holds
+    // both the top-level mcpServers (User) and projects[<cwd>].mcpServers
+    // (Local). Same parse-or-skip + backup + atomic write as install uses —
+    // this file is too important to risk clobbering on a parse error.
+    match read_claude_json()? {
+        Some(mut root) => {
+            let mut changed = false;
+            if let Some(obj) = root.as_object_mut() {
+                if let Some(servers) = obj.get_mut("mcpServers").and_then(|s| s.as_object_mut())
+                    && servers.remove("semantex").is_some()
+                {
+                    changed = true;
+                }
+                let cwd_key = cwd.to_string_lossy().to_string();
+                if let Some(proj_servers) = obj
+                    .get_mut("projects")
+                    .and_then(|p| p.get_mut(&cwd_key))
+                    .and_then(|p| p.get_mut("mcpServers"))
+                    .and_then(|s| s.as_object_mut())
+                    && proj_servers.remove("semantex").is_some()
+                {
+                    changed = true;
+                }
+            }
+            if changed {
+                write_claude_json_atomic(&root)?;
+                eprintln!(
+                    "  {} MCP server removed from {}",
+                    "✓".green().bold(),
+                    claude_json_path().display()
+                );
+                any_found = true;
+            }
+        }
+        None => {
+            eprintln!(
+                "  {} {} is not valid JSON — leaving it untouched (never clobbering it). \
+                 If semantex was registered there, remove it by hand.",
+                "warning:".yellow().bold(),
+                claude_json_path().display()
+            );
         }
     }
 
@@ -602,7 +678,7 @@ pub fn uninstall_claude_code() -> Result<()> {
     }
 
     if !any_found {
-        eprintln!("No semantex hooks or skills found to remove.");
+        eprintln!("No semantex hooks, MCP registration, or skills found to remove.");
     }
 
     Ok(())

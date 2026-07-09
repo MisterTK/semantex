@@ -615,6 +615,19 @@ impl McpServer {
             Err(_) => path.to_path_buf(),
         };
 
+        // Every caller of this method is an unattended auto-index trigger
+        // (first tool use against a not-yet-indexed cwd) — never an explicit
+        // request. Refuse anything under a system temp root at any depth, so
+        // a session that happens to have opened in a throwaway scratch
+        // directory doesn't get it permanently tracked as a project.
+        if registry::is_under_system_temp_root(&canonical) {
+            self.index_states.lock().insert(
+                canonical,
+                IndexingStatus::Failed("Path is under the system temp directory".into()),
+            );
+            return;
+        }
+
         {
             let mut states = self.index_states.lock();
             if matches!(states.get(&canonical), Some(IndexingStatus::Building)) {
@@ -638,6 +651,24 @@ impl McpServer {
             self.index_states
                 .lock()
                 .insert(canonical, IndexingStatus::Failed("Memory pressure".into()));
+            return;
+        }
+
+        // Refuse to auto-index a directory that looks like a multi-repo
+        // workspace container (e.g. `~/dev` holding dozens of sibling
+        // checkouts) rather than a single project — the walker has no repo
+        // boundary, so this would silently flatten every nested repo into
+        // one undifferentiated build. An explicit `semantex index --force`
+        // remains available for anyone who genuinely wants that.
+        if registry::is_likely_multi_repo_container(&canonical) {
+            tracing::warn!(
+                path = %canonical.display(),
+                "Skipping auto-index — looks like a multi-repo workspace container, not a single project"
+            );
+            self.index_states.lock().insert(
+                canonical,
+                IndexingStatus::Failed("Looks like a multi-repo workspace container".into()),
+            );
             return;
         }
 

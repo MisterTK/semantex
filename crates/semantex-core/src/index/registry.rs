@@ -192,8 +192,111 @@ pub fn read_all_v2() -> RegistryV2 {
     load()
 }
 
+/// True if `path` is the OS temp root itself (`std::env::temp_dir()`, or the
+/// common Unix aliases `/tmp` / `/private/tmp`) — never a subdirectory under
+/// it. Every tool on the machine writes here continuously, so treating the
+/// bare root as a tracked "project" produces an index that's permanently
+/// stale: it fails every staleness check forever, which is exactly the
+/// unbounded-refresh loop [`retain`] and the session-hook spawn cap exist to
+/// stop. A genuine scratch repo *under* the temp root (a test fixture, a
+/// smoke-test clone) is unaffected — only the bare root is refused.
+pub fn is_system_temp_root(path: &Path) -> bool {
+    let mut candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+    candidates.dedup();
+    candidates.iter().any(|c| {
+        path == c || c.canonicalize().is_ok_and(|canon| canon == path)
+    })
+}
+
+/// True if `path` is the OS temp root OR anything underneath it — a scratch
+/// test fixture, a smoke-test clone, any depth.
+///
+/// This is the broader counterpart to [`is_system_temp_root`], deliberately
+/// scoped to *unattended* auto-indexing (the session-start hook's
+/// index-whatever-cwd-this-session-opened-in trigger, and the MCP server's
+/// index-on-first-tool-use trigger) — nobody asked for a throwaway scratch
+/// directory to become a permanently tracked project. It is intentionally
+/// NOT applied to the explicit `semantex index <path>` CLI command or to
+/// [`register`]/[`upsert_branch`] themselves: this project's own test and
+/// benchmark harnesses deliberately build indexes against corpora under
+/// `/tmp` (a scratch fixture, a cloned sample repo), and that's a real,
+/// intentional action a human or a script asked for — refusing it would
+/// break working infrastructure, not protect anyone. Any registry entry
+/// that *does* end up under a temp root through such a deliberate call
+/// self-heals via [`retain`] once the directory is gone.
+pub fn is_under_system_temp_root(path: &Path) -> bool {
+    let mut candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+    candidates.dedup();
+    candidates.iter().any(|c| {
+        path.starts_with(c) || c.canonicalize().is_ok_and(|canon| path.starts_with(canon))
+    })
+}
+
+/// Above this many immediate subdirectories with their own `.git`, a
+/// `.git`-less `path` looks like a multi-repo workspace container rather than
+/// a single project — see [`is_likely_multi_repo_container`].
+const MULTI_REPO_THRESHOLD: usize = 3;
+
+/// True if `path` looks like a container of multiple independent repos (a
+/// `~/dev`-style workspace folder holding dozens of separate checkouts)
+/// rather than a single project to index.
+///
+/// Criteria: `path` itself has no `.git`, AND at least
+/// [`MULTI_REPO_THRESHOLD`] of its *immediate* subdirectories do. The walker
+/// has no concept of a repo boundary — it would flatten every nested repo's
+/// files into one undifferentiated project, with no per-repo size cap, no
+/// way to search them individually, and (for a real multi-repo workspace) a
+/// single build spanning dozens of independent codebases at once.
+///
+/// A single repo containing git submodules is unaffected: submodules live
+/// several directories deep, not as `path`'s own immediate children, and
+/// `path` itself has a `.git` (submodule-containing repos return `false`
+/// immediately). A plain non-git project directory (no `.git` anywhere) also
+/// returns `false` — only having *several sibling repos* trips this, not
+/// merely lacking version control.
+pub fn is_likely_multi_repo_container(path: &Path) -> bool {
+    if path.join(".git").exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let nested_repo_count = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join(".git").exists())
+        .count();
+    nested_repo_count >= MULTI_REPO_THRESHOLD
+}
+
+/// Path-parameterized core of [`retain`].
+fn retain_at(path: &Path, mut keep: impl FnMut(&ProjectEntry) -> bool) -> usize {
+    let mut registry = load_from(path);
+    let before = registry.projects.len();
+    registry.projects.retain(|p| keep(p));
+    let removed = before - registry.projects.len();
+    if removed > 0 {
+        save_to(path, &registry);
+    }
+    removed
+}
+
+/// Drop registry entries for which `keep` returns `false`, persisting the
+/// result. Returns the number of entries removed (0 skips the write).
+///
+/// The registry only ever grows via [`register`]/[`upsert_branch`] — nothing
+/// previously removed a project once its directory was deleted or it turned
+/// out to be a redundant nested path within another registered repo. This is
+/// the self-healing counterpart, used by callers that periodically sweep the
+/// registry (e.g. the session-start hook) rather than any repo-specific logic.
+pub fn retain(keep: impl FnMut(&ProjectEntry) -> bool) -> usize {
+    retain_at(&registry_path(), keep)
+}
+
 /// Path-parameterized core of [`register`].
 fn register_at(path: &Path, canonical: &Path) {
+    if is_system_temp_root(canonical) {
+        return;
+    }
     let mut registry = load_from(path);
     if registry.projects.iter().any(|p| p.path == canonical) {
         return; // already registered
@@ -227,6 +330,9 @@ fn upsert_branch_at(
     head_commit: Option<String>,
     embedder_fingerprint: &str,
 ) {
+    if is_system_temp_root(canonical) {
+        return;
+    }
     let mut registry = load_from(path);
     let entry = if let Some(existing) = registry.projects.iter_mut().find(|p| p.path == canonical) {
         existing
@@ -327,6 +433,121 @@ mod tests {
         let entry = v2.projects.iter().find(|p| p.path == p1).unwrap();
         assert_eq!(entry.project_id, project_id_for_path(&p1));
         assert_eq!(entry.display_name, "project-one");
+    }
+
+    #[test]
+    fn multi_repo_container_true_above_threshold_when_root_has_no_git() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["repo-a", "repo-b", "repo-c"] {
+            std::fs::create_dir_all(tmp.path().join(name).join(".git")).unwrap();
+        }
+        assert!(is_likely_multi_repo_container(tmp.path()));
+    }
+
+    #[test]
+    fn multi_repo_container_false_below_threshold() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["repo-a", "repo-b"] {
+            std::fs::create_dir_all(tmp.path().join(name).join(".git")).unwrap();
+        }
+        assert!(!is_likely_multi_repo_container(tmp.path()));
+    }
+
+    #[test]
+    fn multi_repo_container_false_when_root_itself_is_a_repo() {
+        // A repo with several git submodules must not trip the guard.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        for name in ["sub-a", "sub-b", "sub-c"] {
+            std::fs::create_dir_all(tmp.path().join(name).join(".git")).unwrap();
+        }
+        assert!(!is_likely_multi_repo_container(tmp.path()));
+    }
+
+    #[test]
+    fn multi_repo_container_false_for_plain_non_git_directory() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        assert!(!is_likely_multi_repo_container(tmp.path()));
+    }
+
+    #[test]
+    fn is_system_temp_root_true_for_env_temp_dir_and_unix_aliases() {
+        assert!(is_system_temp_root(&std::env::temp_dir()));
+        assert!(is_system_temp_root(Path::new("/tmp")));
+        assert!(is_system_temp_root(Path::new("/private/tmp")));
+    }
+
+    #[test]
+    fn is_system_temp_root_false_for_a_subdirectory_or_unrelated_path() {
+        assert!(!is_system_temp_root(Path::new("/tmp/some-scratch-repo")));
+        assert!(!is_system_temp_root(Path::new("/Users/dev/my-project")));
+    }
+
+    #[test]
+    fn is_under_system_temp_root_true_for_root_and_any_depth_subdirectory() {
+        assert!(is_under_system_temp_root(Path::new("/tmp")));
+        assert!(is_under_system_temp_root(Path::new("/tmp/some-scratch-repo")));
+        assert!(is_under_system_temp_root(Path::new(
+            "/private/tmp/pytest-of-tk/pytest-1/tiny_corpus"
+        )));
+    }
+
+    #[test]
+    fn is_under_system_temp_root_false_for_unrelated_path() {
+        assert!(!is_under_system_temp_root(Path::new("/Users/dev/my-project")));
+    }
+
+    #[test]
+    fn register_at_refuses_the_system_temp_root() {
+        let (_tmp, reg) = tmp_registry();
+        register_at(&reg, &std::env::temp_dir());
+        assert!(load_from(&reg).projects.is_empty());
+    }
+
+    #[test]
+    fn upsert_branch_at_refuses_the_system_temp_root() {
+        let (_tmp, reg) = tmp_registry();
+        upsert_branch_at(
+            &reg,
+            &std::env::temp_dir(),
+            "main",
+            "main-abc",
+            1,
+            None,
+            "fp",
+        );
+        assert!(load_from(&reg).projects.is_empty());
+    }
+
+    #[test]
+    fn retain_removes_only_entries_the_predicate_rejects() {
+        let (_tmp, reg) = tmp_registry();
+
+        let p1 = PathBuf::from("/tmp/keep-me");
+        let p2 = PathBuf::from("/tmp/drop-me");
+        register_at(&reg, &p1);
+        register_at(&reg, &p2);
+
+        let removed = retain_at(&reg, |p| p.path != p2);
+        assert_eq!(removed, 1);
+
+        let all: Vec<PathBuf> = load_from(&reg).projects.into_iter().map(|p| p.path).collect();
+        assert_eq!(all, vec![p1]);
+    }
+
+    #[test]
+    fn retain_is_a_no_op_write_when_nothing_is_removed() {
+        let (_tmp, reg) = tmp_registry();
+
+        let p1 = PathBuf::from("/tmp/keep-me");
+        register_at(&reg, &p1);
+
+        let removed = retain_at(&reg, |_| true);
+        assert_eq!(removed, 0);
+
+        let all: Vec<PathBuf> = load_from(&reg).projects.into_iter().map(|p| p.path).collect();
+        assert_eq!(all, vec![p1]);
     }
 
     #[test]

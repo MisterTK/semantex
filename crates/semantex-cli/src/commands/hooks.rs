@@ -268,12 +268,50 @@ fn refresh_stale_registry_repos(current_dir: &std::path::Path) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600);
+    // Bounds how many background builds one hook invocation can kick off.
+    // Defaults to the build-slot gate's own concurrency limit — spawning more
+    // than that just queues raw OS processes for no benefit; the rest get
+    // picked up on a later session-hook run since staleness persists.
+    let max_spawns: usize = std::env::var("SEMANTEX_REFRESH_MAX_SPAWNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(semantex_core::index::gate::max_concurrent_builds);
 
-    for repo in registry::read_all() {
-        let canonical = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+    // Self-heal: a registry entry whose directory is gone (deleted repo,
+    // expired tmp dir from a benchmark/test run) can never become non-stale,
+    // so it would be refreshed — and spawn a doomed indexer — forever.
+    let removed = registry::retain(|p| p.path.is_dir());
+    if removed > 0 {
+        tracing::debug!(removed, "Session hook: pruned missing registry paths");
+    }
+
+    let mut repos = registry::read_all();
+    // Shortest path first, so a repo root is always considered "kept" before
+    // any of its own subdirectories — needed for the nesting check below.
+    repos.sort_by_key(|p| p.as_os_str().len());
+
+    let mut kept_roots: Vec<PathBuf> = Vec::new();
+    let mut spawned = 0usize;
+
+    for repo in repos {
+        let canonical = repo.canonicalize().unwrap_or(repo);
         if canonical == current_dir {
             continue; // already handled
         }
+        // Skip paths nested inside an already-kept registered project: a
+        // monorepo where every sub-crate got auto-registered (each `cd` into
+        // a subdirectory self-registers on first use) would otherwise fan out
+        // one background build per subdirectory for what the ancestor's
+        // index already covers.
+        if kept_roots.iter().any(|root| canonical.starts_with(root)) {
+            continue;
+        }
+        kept_roots.push(canonical.clone());
+
+        if spawned >= max_spawns {
+            continue; // deferred to a later session-hook run
+        }
+
         // S8: detect_for_config so an embedder change in any registered repo also
         // triggers a refresh. One config load per registered repo on the session
         // hook (not a hot loop); fall back to schema-only on a config error.
@@ -293,6 +331,7 @@ fn refresh_stale_registry_repos(current_dir: &std::path::Path) {
                 "Session hook: refreshing stale registry repo"
             );
             super::spawn_background_index(&canonical);
+            spawned += 1;
         }
     }
 }

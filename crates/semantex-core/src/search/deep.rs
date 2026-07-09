@@ -35,6 +35,13 @@ pub struct DeepSource {
     pub end_line: u32,
     pub name: Option<String>,
     pub kind: Option<String>,
+    /// The chunk's actual source text (`file[start_line..end_line]`). Carried
+    /// through so a direct Deep-route `semantex_agent` call can populate real
+    /// snippets in its structured hits instead of empty strings — a caller
+    /// that only surfaces `structuredContent` (not every MCP client renders
+    /// the parallel prose `answer` text) would otherwise see bare file:line
+    /// pointers with no code, defeating the point of "deep" as a route.
+    pub content: String,
     /// Item 8 (cross-source dedup): channel labels of duplicate entries that
     /// pointed at the same `(file, start_line, end_line)` and were collapsed
     /// into this kept entry. Populated only when at least one duplicate was
@@ -684,6 +691,7 @@ fn try_symbol_shortcut(
                 end_line: chunk.end_line,
                 name,
                 kind,
+                content: chunk.content.clone(),
                 also_matched_via: Vec::new(),
             }
         })
@@ -1051,6 +1059,7 @@ fn deep_search_inner(
                 end_line: chunk.end_line,
                 name,
                 kind,
+                content: chunk.content.clone(),
                 also_matched_via,
             }
         })
@@ -1520,6 +1529,7 @@ mod tests {
                 end_line: 30,
                 name: Some("getUserById".to_string()),
                 kind: Some("fn".to_string()),
+                content: "fn getUserById() {}".to_string(),
                 also_matched_via: Vec::new(),
             }],
             metrics: DeepMetrics {
@@ -1836,6 +1846,7 @@ mod tests {
             end_line: 30,
             name: Some("authenticate".to_string()),
             kind: Some("fn".to_string()),
+            content: "fn authenticate() {}".to_string(),
             also_matched_via: vec!["sparse".to_string(), "exact".to_string()],
         }];
         let answer = "Auth uses JWT.".to_string();
@@ -1855,6 +1866,7 @@ mod tests {
             end_line: 30,
             name: Some("authenticate".to_string()),
             kind: Some("fn".to_string()),
+            content: "fn authenticate() {}".to_string(),
             also_matched_via: Vec::new(),
         }];
         let answer = "Auth uses JWT.".to_string();
@@ -1874,6 +1886,7 @@ mod tests {
             end_line: 5,
             name: None,
             kind: None,
+            content: "fn a() {}".to_string(),
             also_matched_via: vec!["dense".to_string()],
         }];
         let out = append_dedup_footer(String::new(), &sources);

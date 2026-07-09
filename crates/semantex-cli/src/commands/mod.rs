@@ -33,7 +33,19 @@ pub(crate) fn self_exe() -> std::ffi::OsString {
 
 /// Spawn `semantex index <dir>` in a background process (fire-and-forget).
 /// Shared by hooks and search commands.
+///
+/// Every caller of this function is an *unattended* auto-index trigger (a
+/// session-start hook, or `semantex search` auto-building on first use) —
+/// never the explicit `semantex index <path>` command a human or a test
+/// harness runs on purpose. So this refuses anything under a system temp
+/// root at any depth: nobody asked for a throwaway scratch directory a
+/// session happened to open in to become a permanently tracked project. An
+/// explicit `semantex index /tmp/some-fixture` remains unaffected — that
+/// goes through [`crate::commands::index::run`] directly, not this function.
 pub(crate) fn spawn_background_index(project_path: &std::path::Path) {
+    if semantex_core::index::registry::is_under_system_temp_root(project_path) {
+        return;
+    }
     if let Err(e) = std::process::Command::new(self_exe())
         .arg("index")
         .arg(project_path)

@@ -397,8 +397,6 @@ impl<'a> AgentPipeline<'a> {
     fn handle_deep(&self, query: &str, budget: usize, is_fallback: bool) -> HandlerResult {
         match deep_search_module::deep_search(self.searcher, query, 20, true) {
             Ok(result) if !result.answer.is_empty() => {
-                let resp = deep_result_to_response(result);
-                let count = resp.sources.len();
                 // Deep's answer is prose-only, so (unlike the item-list routes)
                 // there is normally no structured hit list to surface — EXCEPT
                 // when this is a directly-requested Deep route (`is_fallback ==
@@ -412,11 +410,26 @@ impl<'a> AgentPipeline<'a> {
                 // behavior — those routes' own structured output, if any,
                 // comes from elsewhere, and populating hits here would leak
                 // `all_hits`/`structuredContent` into unrelated routes.
+                //
+                // Built from `result.sources` (the INTERNAL type, which
+                // carries real chunk content) BEFORE `deep_result_to_response`
+                // converts to the wire `DeepSearchSource` and drops it — the
+                // wire type intentionally stays thin so it's never at risk of
+                // a postcard binary-protocol compatibility break; hits are a
+                // separate, MCP-only surface with no such constraint.
+                let total = result.sources.len();
                 let hits = if is_fallback {
                     Vec::new()
                 } else {
-                    resp.sources.iter().map(deep_source_to_hit).collect()
+                    result
+                        .sources
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, s)| deep_source_to_hit(s, rank, total))
+                        .collect()
                 };
+                let resp = deep_result_to_response(result);
+                let count = resp.sources.len();
                 HandlerResult {
                     formatted: format_deep_results(&resp, budget),
                     fallback_used: is_fallback,
@@ -1078,22 +1091,44 @@ impl<'a> AgentPipeline<'a> {
 /// Convert one of Deep's cited sources into the same structured-hit shape
 /// item-list routes use, so a directly-requested Deep route's `hits` (see
 /// `handle_deep`) can feed `include_history` / MCP `structuredContent` like
-/// any other route. Deep doesn't track a per-source relevance score (only
-/// the file/line/name/kind provenance survives to `DeepSearchSource`), so
-/// `score` is `0.0` here rather than a fabricated number.
+/// any other route.
+///
+/// Takes the INTERNAL `search::deep::DeepSource` (not the wire
+/// `DeepSearchSource`) specifically so real chunk content survives into
+/// `content` — some MCP clients only surface `structuredContent` and never
+/// render the parallel prose `answer` text, so leaving these hits as empty
+/// pointers silently threw away the entire point of a "deep" query for that
+/// caller (confirmed independently on two different repos/sessions).
+///
+/// Deep sources aren't independently re-ranked here — there's no fused
+/// retrieval score once the synthesis pipeline has already selected and
+/// deduped them — so `score` reflects synthesis order (earlier = more
+/// central to the answer) on a 0.5–1.0 scale instead of a flat `0.0`, which
+/// downstream consumers could otherwise mistake for "no relevance data."
 fn deep_source_to_hit(
-    source: &crate::server::protocol::DeepSearchSource,
+    source: &crate::search::deep::DeepSource,
+    rank: usize,
+    total: usize,
 ) -> crate::server::protocol::SearchResultItem {
+    let score = if total == 0 {
+        0.0
+    } else {
+        1.0 - (rank as f32 / total as f32) * 0.5
+    };
     crate::server::protocol::SearchResultItem {
         file: source.file.clone(),
         start_line: source.start_line,
         end_line: source.end_line,
-        score: 0.0,
+        score,
         source: "deep".to_string(),
         chunk_type: source.kind.clone().unwrap_or_default(),
         name: source.name.clone(),
         language: None,
-        content: None,
+        content: if source.content.is_empty() {
+            None
+        } else {
+            Some(source.content.clone())
+        },
         kind: source.kind.clone(),
         summary: None,
     }
@@ -1677,14 +1712,16 @@ mod tests {
     /// per-source relevance score — nothing is fabricated).
     #[test]
     fn deep_source_to_hit_maps_provenance_fields() {
-        let source = crate::server::protocol::DeepSearchSource {
+        let source = crate::search::deep::DeepSource {
             file: "auth/login.rs".to_string(),
             start_line: 3,
             end_line: 17,
             name: Some("authenticateUser".to_string()),
             kind: Some("function".to_string()),
+            content: "fn authenticateUser() {}".to_string(),
+            also_matched_via: Vec::new(),
         };
-        let hit = deep_source_to_hit(&source);
+        let hit = deep_source_to_hit(&source, 0, 4);
         assert_eq!(hit.file, "auth/login.rs");
         assert_eq!(hit.start_line, 3);
         assert_eq!(hit.end_line, 17);
@@ -1692,9 +1729,43 @@ mod tests {
         assert_eq!(hit.name.as_deref(), Some("authenticateUser"));
         assert_eq!(hit.kind.as_deref(), Some("function"));
         assert_eq!(hit.chunk_type, "function");
-        assert!((hit.score - 0.0).abs() < f32::EPSILON);
-        assert!(hit.content.is_none());
+        assert_eq!(hit.content.as_deref(), Some("fn authenticateUser() {}"));
         assert!(hit.summary.is_none());
+    }
+
+    #[test]
+    fn deep_source_to_hit_score_descends_by_rank_never_hits_zero() {
+        // Rank 0 of N scores highest; later ranks score lower but never 0.0 —
+        // a flat 0.0 across every hit is indistinguishable from "no relevance
+        // data" to a caller inspecting `structuredContent` alone.
+        let source = crate::search::deep::DeepSource {
+            file: "a.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            name: None,
+            kind: None,
+            content: "fn a() {}".to_string(),
+            also_matched_via: Vec::new(),
+        };
+        let first = deep_source_to_hit(&source, 0, 4);
+        let last = deep_source_to_hit(&source, 3, 4);
+        assert!(first.score > last.score);
+        assert!(last.score > 0.0);
+    }
+
+    #[test]
+    fn deep_source_to_hit_empty_content_maps_to_none() {
+        let source = crate::search::deep::DeepSource {
+            file: "a.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            name: None,
+            kind: None,
+            content: String::new(),
+            also_matched_via: Vec::new(),
+        };
+        let hit = deep_source_to_hit(&source, 0, 1);
+        assert!(hit.content.is_none());
     }
 
     /// Integration: a query with `.disable_adaptive()` returns at least as many
