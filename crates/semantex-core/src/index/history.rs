@@ -84,6 +84,11 @@ const MAX_BODY_BYTES: usize = 4_000;
 // rows (adversarial-review fix #3 — the previous \x1e/\x1f separators were
 // injectable via a hostile commit message).
 
+/// Max commits expanded per `semantex_history` detail call — bounds the
+/// per-call `git show` subprocess fan-out (same discipline as
+/// [`MAX_BLAME_FILES`]). Excess shas are reported as skipped, not dropped.
+pub const MAX_DETAIL_COMMITS: usize = 10;
+
 /// Max files blamed per build when `SEMANTEX_HISTORY_BLAME=1` — caps the
 /// per-build `git blame` process fan-out (a 10k-file cold build must not
 /// spawn 10k subprocesses). Files beyond the cap are skipped with a warn;
@@ -404,6 +409,132 @@ fn parse_utc_date_to_ts(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86_400)
+}
+
+/// Full detail for one commit: metadata + files + live `git show` output.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitDetail {
+    pub hash: String,
+    pub author: String,
+    pub ts: i64,
+    pub subject: String,
+    pub body: String,
+    /// Paths from `file_commits` — empty when the commit predates the
+    /// captured window (the `stat` text still names every file).
+    pub files: Vec<String>,
+    /// `git show --stat` summary (per-file +/- counts), fetched live.
+    pub stat: String,
+    /// Unified diff, truncated to the caller's byte budget.
+    pub patch: String,
+    pub patch_truncated: bool,
+}
+
+/// Live per-commit detail. `sha` must be 7-40 hex chars — anything else
+/// (including flag-shaped strings) is rejected before git ever sees it.
+/// Metadata comes from `git show` itself (not the DB) so commits outside
+/// the captured history window still resolve; `files` comes from the DB
+/// and may be empty for such commits.
+pub fn commit_detail(
+    project_root: &Path,
+    conn: &Connection,
+    sha: &str,
+    patch_budget: usize,
+) -> Result<CommitDetail> {
+    let sha = sha.trim();
+    if sha.len() < 7 || sha.len() > 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid commit sha '{sha}' (need 7-40 hex chars)");
+    }
+
+    // Same NUL-separated 5-field format as `fetch_commit_metadata` (see the
+    // module-level separator note for why NUL and only NUL is injection-proof).
+    let meta = run_git(
+        project_root,
+        &[
+            "show",
+            "-s",
+            "--no-color",
+            "--pretty=format:%H%x00%an%x00%ct%x00%s%x00%b%x00",
+            sha,
+            "--",
+        ],
+    )?;
+    if !meta.status.success() {
+        anyhow::bail!(
+            "commit '{sha}' not found: {}",
+            String::from_utf8_lossy(&meta.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&meta.stdout);
+    let fields: Vec<&str> = text.split('\0').collect();
+    if fields.len() < 5 {
+        anyhow::bail!("unexpected `git show` output for '{sha}'");
+    }
+    let full_hash = fields[0].trim().to_string();
+    let ts: i64 = fields[2].trim().parse().unwrap_or(0);
+
+    let files = files_for_commit(conn, &full_hash).unwrap_or_default();
+
+    // `--format=` suppresses the commit header on both calls — we already
+    // have the metadata, these fetch only the stat table / diff body.
+    let stat_out = run_git(
+        project_root,
+        &[
+            "show",
+            "--stat",
+            "--no-color",
+            "--format=",
+            &full_hash,
+            "--",
+        ],
+    )?;
+    let stat = if stat_out.status.success() {
+        String::from_utf8_lossy(&stat_out.stdout).trim().to_string()
+    } else {
+        String::new()
+    };
+
+    let patch_out = run_git(
+        project_root,
+        &[
+            "show",
+            "--patch",
+            "--no-color",
+            "--format=",
+            &full_hash,
+            "--",
+        ],
+    )?;
+    let raw_patch = if patch_out.status.success() {
+        String::from_utf8_lossy(&patch_out.stdout).into_owned()
+    } else {
+        String::new()
+    };
+    let (patch, patch_truncated) = truncate_at_boundary(&raw_patch, patch_budget);
+
+    Ok(CommitDetail {
+        hash: full_hash,
+        author: fields[1].to_string(),
+        ts,
+        subject: fields[3].to_string(),
+        body: truncate_body(fields[4].trim()),
+        files,
+        stat,
+        patch,
+        patch_truncated,
+    })
+}
+
+/// Byte-bounded, char-boundary-safe truncation. Returns the (possibly
+/// shortened) string and whether truncation happened.
+fn truncate_at_boundary(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.trim_end().to_string(), false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1575,5 +1706,69 @@ author Real\n\
             Some(1_000_000_000)
         );
         assert_eq!(resolve_since_to_ts(tmp.path(), "no-such-ref-xyz"), None);
+    }
+
+    #[test]
+    fn commit_detail_returns_stat_files_and_patch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 2);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let head = recent_commits(&conn, 1).unwrap().remove(0);
+
+        let d = commit_detail(tmp.path(), &conn, &head.hash, 64 * 1024).unwrap();
+        assert_eq!(d.hash, head.hash);
+        assert_eq!(d.subject, "commit number 1");
+        assert_eq!(d.files, vec!["file1.txt".to_string()]);
+        assert!(d.stat.contains("file1.txt"), "stat: {}", d.stat);
+        assert!(d.patch.contains("+content 1"), "patch: {}", d.patch);
+        assert!(!d.patch_truncated);
+    }
+
+    #[test]
+    fn commit_detail_truncates_patch_to_budget() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let head = recent_commits(&conn, 1).unwrap().remove(0);
+
+        let d = commit_detail(tmp.path(), &conn, &head.hash, 10).unwrap();
+        assert!(d.patch_truncated);
+        assert!(d.patch.len() <= 10);
+    }
+
+    #[test]
+    fn commit_detail_short_prefix_resolves() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let head = recent_commits(&conn, 1).unwrap().remove(0);
+
+        let d = commit_detail(tmp.path(), &conn, &head.hash[..8], 4096).unwrap();
+        assert_eq!(
+            d.hash, head.hash,
+            "short prefix must resolve to the full hash"
+        );
+    }
+
+    #[test]
+    fn commit_detail_rejects_non_hex_or_flag_shas() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        let conn = open(tmp.path()).unwrap();
+        assert!(commit_detail(tmp.path(), &conn, "HEAD", 4096).is_err());
+        assert!(commit_detail(tmp.path(), &conn, "--stat", 4096).is_err());
+        assert!(commit_detail(tmp.path(), &conn, "abc", 4096).is_err()); // < 7 chars
+        assert!(
+            commit_detail(
+                tmp.path(),
+                &conn,
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                4096
+            )
+            .is_err()
+        ); // valid form, nonexistent commit
     }
 }
