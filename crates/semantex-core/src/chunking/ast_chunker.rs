@@ -1367,25 +1367,36 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         | "setter_signature"
         | "external"
         | "external_declaration"
-        | "create_function" => AstNodeKind::Function,
+        | "create_function"
+        // CMake (function_def/macro_def) and PowerShell (function_statement).
+        | "function_def"
+        | "macro_def"
+        | "function_statement" => AstNodeKind::Function,
         "method_definition"
         | "method_declaration"
         | "method"
         | "method_signature"
         | "constructor_signature" => AstNodeKind::Method,
-        "class_definition" | "class_declaration" | "class_specifier" | "class" => {
-            AstNodeKind::Class
-        }
+        // PowerShell's class_statement joins the shared Class arm.
+        "class_definition" | "class_declaration" | "class_specifier" | "class"
+        | "class_statement" => AstNodeKind::Class,
         // `create_table` (SQL): a table's columns are conceptually fields, so
-        // it maps to Struct like other languages' record types.
+        // it maps to Struct like other languages' record types. Protobuf's
+        // `message` joins for the same reason.
         "struct_item" | "struct_specifier" | "struct_declaration" | "record_declaration"
-        | "create_table" => AstNodeKind::Struct,
-        "enum_item" | "enum_declaration" | "enum_definition" => AstNodeKind::Enum,
+        | "create_table" | "message" => AstNodeKind::Struct,
+        // Protobuf's bare `enum` and GraphQL's `enum_type_definition` join
+        // the shared Enum arm.
+        "enum_item" | "enum_declaration" | "enum_definition" | "enum" | "enum_type_definition" => {
+            AstNodeKind::Enum
+        }
+        // GraphQL's interface_type_definition joins the shared Interface arm.
         "interface_declaration"
         | "trait_item"
         | "protocol_declaration"
         | "trait_definition"
-        | "trait_declaration" => AstNodeKind::Interface,
+        | "trait_declaration"
+        | "interface_type_definition" => AstNodeKind::Interface,
         "mod_item"
         | "module"
         | "mixin_declaration"
@@ -1405,7 +1416,11 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "type_alias" => AstNodeKind::Other("type_alias".to_string()),
         "type_definition" => AstNodeKind::Other("type_definition".to_string()),
         "impl_item" => AstNodeKind::Other("impl".to_string()),
-        "type_declaration" | "create_type" => AstNodeKind::Other("type".to_string()),
+        // GraphQL's object_type_definition ("type Foo { ... }") joins the
+        // shared "type" Other(_) arm.
+        "type_declaration" | "create_type" | "object_type_definition" => {
+            AstNodeKind::Other("type".to_string())
+        }
         "given_definition" => AstNodeKind::Other("given".to_string()),
         "extension_definition" => AstNodeKind::Other("extension".to_string()),
         // SQL DDL (tree-sitter-sequel): views/materialized views/indexes/etc.
@@ -1419,19 +1434,14 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "create_role" => AstNodeKind::Other("role".to_string()),
         "create_database" => AstNodeKind::Other("database".to_string()),
         "create_extension" => AstNodeKind::Other("extension_stmt".to_string()),
-        // Protobuf: a message is structurally a record (matches
-        // create_table -> Struct); enum maps directly; service has no
-        // clean AstNodeKind equivalent, stays Other(_) like SQL's
-        // view/index/trigger.
-        "message" => AstNodeKind::Struct,
-        "enum" => AstNodeKind::Enum,
+        // Protobuf's service and GraphQL's SDL/executable definitions besides
+        // interface/enum/object have no clean AstNodeKind equivalent, so they
+        // stay Other(_) with their own keyword, mirroring SQL's
+        // view/index/trigger precedent above. (message/enum/
+        // interface_type_definition/enum_type_definition/
+        // object_type_definition/function_def/macro_def/function_statement/
+        // class_statement are folded into the shared arms above instead.)
         "service" => AstNodeKind::Other("service".to_string()),
-        // GraphQL SDL/executable definitions: interface and enum have clean
-        // existing categories; the rest have no OOP equivalent and stay
-        // Other(_) with the GraphQL keyword, mirroring SQL's own precedent.
-        "interface_type_definition" => AstNodeKind::Interface,
-        "enum_type_definition" => AstNodeKind::Enum,
-        "object_type_definition" => AstNodeKind::Other("type".to_string()),
         "input_object_type_definition" => AstNodeKind::Other("input".to_string()),
         "union_type_definition" => AstNodeKind::Other("union".to_string()),
         "scalar_type_definition" => AstNodeKind::Other("scalar".to_string()),
@@ -1439,12 +1449,6 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "directive_definition" => AstNodeKind::Other("directive".to_string()),
         "operation_definition" => AstNodeKind::Other("operation".to_string()),
         "fragment_definition" => AstNodeKind::Other("fragment".to_string()),
-        // CMake function/macro definitions and PowerShell function/class
-        // statements use distinct literal kind strings from every existing
-        // Function/Class arm, so they need their own entries even though
-        // the categories already exist.
-        "function_def" | "macro_def" | "function_statement" => AstNodeKind::Function,
-        "class_statement" => AstNodeKind::Class,
         other => AstNodeKind::Other(other.to_string()),
     }
 }
