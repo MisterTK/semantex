@@ -133,7 +133,19 @@ impl Chunker for AstChunker {
             let node_text_str = &content[span.start_byte..span.end_byte];
             // tree-sitter rows are 0-based, Chunk lines are 1-based
             let start_line = span.start_row + 1;
-            let end_line = span.end_row + 1;
+            // A span whose end_position has column 0 ends exactly at the start of a
+            // row, meaning it does NOT include that row's content -- this happens for
+            // constructs that extend to true EOF with a trailing newline (e.g. INI's
+            // last section in a file). Every previously-supported grammar's definition
+            // nodes end mid-line (column > 0, brace/paren/semicolon-terminated), so
+            // this path was never exercised before INI's `section` node exposed it.
+            // Mirrors the same distinction `byte_offset_to_line`'s
+            // `content.len().saturating_sub(1)` caller already applies for gap chunks.
+            let end_line = if span.end_col == 0 {
+                span.end_row
+            } else {
+                span.end_row + 1
+            };
 
             if node_text_str.len() > max_node_chars {
                 // Split oversized AST nodes with sliding window.
@@ -229,6 +241,11 @@ struct AstSpan {
     end_byte: usize,
     start_row: usize,
     end_row: usize,
+    // Column of the span's end position. 0 means the span ends exactly at the
+    // start of `end_row` (no content on that row) -- see the `end_line`
+    // computation in `AstChunker::chunk()` for why this changes the 1-based
+    // line-number conversion.
+    end_col: usize,
     name: String,
     kind: AstNodeKind,
     meta: StructuredChunkMeta,
@@ -833,6 +850,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::GraphQl => Some(tree_sitter_graphql::LANGUAGE.into()),
         FileType::Starlark => Some(tree_sitter_starlark::LANGUAGE.into()),
         FileType::Cmake => Some(tree_sitter_cmake::LANGUAGE.into()),
+        FileType::Ini => Some(tree_sitter_ini::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -1005,6 +1023,7 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
         // (named "<anonymous>") rather than being excluded.
         FileType::Starlark => Some(&["function_definition", "call"]),
         FileType::Cmake => Some(&["function_def", "macro_def"]),
+        FileType::Ini => Some(&["section"]),
         _ => None,
     }
 }
@@ -1013,12 +1032,16 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
 /// only cover the declaration line — the body is a separate sibling `function_body`
 /// node. Walk forward through siblings to find and include it so that the full
 /// function implementation is captured in the chunk.
-fn extend_to_function_body(node: &Node) -> Option<(usize, usize)> {
+fn extend_to_function_body(node: &Node) -> Option<(usize, usize, usize)> {
     let mut cursor = node.next_sibling();
     while let Some(sib) = cursor {
         match sib.kind() {
             "function_body" => {
-                return Some((sib.end_byte(), sib.end_position().row));
+                return Some((
+                    sib.end_byte(),
+                    sib.end_position().row,
+                    sib.end_position().column,
+                ));
             }
             // Skip anonymous/punctuation siblings (whitespace tokens, "native" keyword, etc.)
             k if !sib.is_named() || k == "native" => {
@@ -1060,10 +1083,18 @@ fn collect_definitions(
             crate::chunking::semantic_role::classify_semantic_role(&meta, node_text);
 
         // Dart: signature nodes don't include the function body — extend span.
-        let (end_byte, end_row) = if DART_SIGNATURE_KINDS.contains(&node_kind) {
-            extend_to_function_body(&node).unwrap_or((node.end_byte(), node.end_position().row))
+        let (end_byte, end_row, end_col) = if DART_SIGNATURE_KINDS.contains(&node_kind) {
+            extend_to_function_body(&node).unwrap_or((
+                node.end_byte(),
+                node.end_position().row,
+                node.end_position().column,
+            ))
         } else {
-            (node.end_byte(), node.end_position().row)
+            (
+                node.end_byte(),
+                node.end_position().row,
+                node.end_position().column,
+            )
         };
 
         out.push(AstSpan {
@@ -1071,6 +1102,7 @@ fn collect_definitions(
             end_byte,
             start_row: node.start_position().row,
             end_row,
+            end_col,
             name,
             kind,
             meta,
@@ -3206,5 +3238,47 @@ endmacro()
             macro_,
             "should find enable_feature as a Function-kind AstNode"
         );
+    }
+
+    #[test]
+    fn test_ini_section_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r"[database]
+host = localhost
+port = 5432
+
+[cache]
+driver = redis
+";
+        let chunks = chunker.chunk(Path::new("app.ini"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "INI must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let database = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "[database]",
+            _ => false,
+        });
+        assert!(
+            database.is_some(),
+            "should find [database] as a named AstNode: {:?}",
+            ast_chunks
+                .iter()
+                .map(|c| c.symbol_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(database.unwrap().content.contains("host = localhost"));
+
+        let cache = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "[cache]",
+            _ => false,
+        });
+        assert!(cache, "should find [cache] as a named AstNode");
     }
 }
