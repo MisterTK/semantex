@@ -99,12 +99,25 @@ fi
 
 info "Installing" "${INSTALL_DIR}/semantex"
 ${USE_SUDO} mkdir -p "$INSTALL_DIR"
-${USE_SUDO} cp "$bin_src" "${INSTALL_DIR}/semantex"
-${USE_SUDO} chmod +x "${INSTALL_DIR}/semantex"
 
-# Copy dylib next to binary if present
+# Install via temp-file-then-rename, not an in-place overwrite of the target
+# path. A still-running daemon from a previous install (`semantex mcp` /
+# `semantex serve`) can hold the old binary's inode open; overwriting that
+# same inode's bytes in place leaves macOS's kernel code-signature trust
+# cache in a stale state, and it SIGKILLs (exit 137) every subsequent exec of
+# that path — even after the old process exits — until the vnode itself is
+# replaced. `mv` within the same directory swaps the inode atomically instead
+# of mutating it, sidestepping that entirely (and, as a bonus, means a
+# partial download never leaves a half-written binary at the final path).
+${USE_SUDO} cp "$bin_src" "${INSTALL_DIR}/semantex.new"
+${USE_SUDO} chmod +x "${INSTALL_DIR}/semantex.new"
+${USE_SUDO} mv -f "${INSTALL_DIR}/semantex.new" "${INSTALL_DIR}/semantex"
+
+# Copy dylib next to binary if present (same atomic-swap rationale as above)
 if [ -n "$dylib_src" ]; then
-  ${USE_SUDO} cp "$dylib_src" "$INSTALL_DIR/"
+  dylib_name=$(basename "$dylib_src")
+  ${USE_SUDO} cp "$dylib_src" "${INSTALL_DIR}/${dylib_name}.new"
+  ${USE_SUDO} mv -f "${INSTALL_DIR}/${dylib_name}.new" "${INSTALL_DIR}/${dylib_name}"
 fi
 
 # Warn if an older semantex earlier on PATH will keep shadowing this install
