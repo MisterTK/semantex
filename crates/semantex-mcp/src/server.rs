@@ -1416,7 +1416,7 @@ impl McpServer {
                         },
                         "budget": {
                             "type": "integer",
-                            "description": "Detail mode only: total patch-byte budget split across requested shas (default SEMANTEX_MCP_BUDGET, normally 12000)."
+                            "description": "Detail mode only: total patch-byte budget split across requested shas (default SEMANTEX_MCP_BUDGET, normally 12000); each commit is guaranteed at least ~1000 bytes of patch, so the total may exceed this budget when many commits are requested."
                         },
                         "path": {
                             "type": "string",
