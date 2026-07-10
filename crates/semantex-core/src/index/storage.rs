@@ -1344,8 +1344,9 @@ pub struct PrefetchOutcome {
 /// - SQLite chunk store (`chunks.db`)
 /// - Tantivy sparse index (`sparse/`)
 /// - Dense index — the coderank-hnsw vector store
-///   (`dense/coderank-hnsw/vectors.bin`); the HNSW graph itself is rebuilt in
-///   RAM on open from this file, so warming it warms the whole dense channel.
+///   (`dense/coderank-hnsw/{index.bin,store.vecs}`); the HNSW graph itself is
+///   rebuilt in RAM on open from these files, so warming them warms the whole
+///   dense channel.
 ///
 /// Each task touches its files via `std::fs::read` (or a directory walk for
 /// Tantivy); failures are recorded in [`PrefetchOutcome`] but never propagated
@@ -1366,8 +1367,9 @@ pub fn prefetch_index_files(index_dir: &Path) -> PrefetchOutcome {
     // fallback if meta is absent/unparseable), then S8-resolve the LIVE store dir
     // via the ACTIVE pointer (versioned dir), falling back to the legacy plain
     // layout for pre-versioned indexes. We warm the whole dense DIR (a missing
-    // dir just yields dense_ok=false) — this covers coderank's `vectors.bin` AND
-    // colbert-plaid's PLAID residual/codes/centroid files in one recursive touch.
+    // dir just yields dense_ok=false) — this covers coderank's `index.bin` +
+    // `store.vecs` AND colbert-plaid's PLAID residual/codes/centroid files in
+    // one recursive touch.
     let backend = std::fs::read_to_string(index_dir.join("meta.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<crate::types::IndexMeta>(&s).ok())
@@ -1505,7 +1507,7 @@ mod e8_storage_tests {
         std::fs::write(tmp.path().join("chunks.db"), b"fake").unwrap();
         let dense_dir = dense_subdir(tmp.path(), DenseBackendKind::CoderankHnsw);
         std::fs::create_dir_all(&dense_dir).unwrap();
-        std::fs::write(dense_dir.join("vectors.bin"), b"y").unwrap();
+        std::fs::write(dense_dir.join("index.bin"), b"y").unwrap();
         let outcome = prefetch_index_files(tmp.path());
         assert!(outcome.sqlite_ok);
         assert!(outcome.dense_ok);
@@ -1515,7 +1517,8 @@ mod e8_storage_tests {
     fn prefetch_warms_colbert_plaid_store_from_meta() {
         // The default backend is colbert-plaid: prefetch must read the persisted
         // backend from meta.json and warm the PLAID store dir (not coderank's
-        // vectors.bin, which won't exist). Regression guard for the cutover.
+        // index.bin/store.vecs, which won't exist). Regression guard for the
+        // cutover.
         use crate::search::dense_backend::{DenseBackendKind, dense_subdir};
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("chunks.db"), b"fake").unwrap();

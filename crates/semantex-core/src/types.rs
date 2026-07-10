@@ -232,8 +232,9 @@ impl IndexMeta {
     /// `Stale` (same mechanism as the v9→v10 `dense_backend` add).
     ///
     /// v11 (S2): the single-vector dense backend (`coderank-hnsw`) introduces a
-    /// new on-disk layout (`dense/coderank-hnsw/vectors.bin`). Bumping forces a
-    /// clean reindex so an old PLAID-only index isn't half-read by the new path.
+    /// new on-disk layout (`dense/coderank-hnsw/{index.bin,store.vecs}`). Bumping
+    /// forces a clean reindex so an old PLAID-only index isn't half-read by the
+    /// new path.
     ///
     /// v12 (D4): bumped when the ColBERT/PLAID dense backend was briefly removed
     /// (coderank-hnsw the sole backend), to force any straggler index stamped
@@ -339,7 +340,8 @@ mod tests {
     /// S1: schema bumped 9 → 10 to add the persisted `dense_backend` field.
     /// Older v9 indexes (which lack the field) become `Stale` and rebuild.
     /// S2: schema bumped 10 → 11 for the single-vector dense on-disk layout
-    /// (`dense/coderank-hnsw/vectors.bin`). Older indexes become `Stale`.
+    /// (`dense/coderank-hnsw/{index.bin,store.vecs}`). Older indexes become
+    /// `Stale`.
     /// D4: bumped 11 → 12 when the ColBERT/PLAID backend was removed; any
     /// straggler colbert-plaid index becomes `Stale` and rebuilds.
     /// Wave 0 spine: bumped 12 → 13 for storage layout v13 (per-branch index

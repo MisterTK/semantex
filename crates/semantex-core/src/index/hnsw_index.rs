@@ -7,8 +7,10 @@
 //! Persistence is our OWN int8 vector store (postcard) + chunk_id map; the HNSW
 //! graph is REBUILT in RAM from the store on open (instant-distance is a
 //! build-once index with no native insert/delete/persist — see S2 Spike 2 in
-//! `docs/superpowers/plans/2026-05-31-research-notes.md`). Delete compacts the
-//! store and re-persists; the graph rebuilds on the next open.
+//! `docs/superpowers/plans/2026-05-31-research-notes.md`). Delete tombstones
+//! affected rows in the thin sidecar (INDEX_FILE); VECTORS_FILE bytes are left
+//! in place — no compaction/GC (see VECTORS_FILE's doc comment) — and the
+//! graph rebuilds on the next open.
 //!
 //! Per S1 G5: `positional_chunk_ids()` returns `None` (no positional doc array),
 //! so the `hybrid.rs` file_filter subset path degrades to unfiltered dense +
@@ -905,7 +907,8 @@ mod tests {
 
         let idx = Int8VectorStore::load_index_only(tmp.path()).unwrap();
         let (q2, s2) = quantize_int8(&[0.0, 1.0]);
-        Int8VectorStore::append_split(tmp.path(), idx, &[2], &[s2], &[q2.clone()]).unwrap();
+        Int8VectorStore::append_split(tmp.path(), idx, &[2], &[s2], std::slice::from_ref(&q2))
+            .unwrap();
 
         let back = Int8VectorStore::load_split(tmp.path()).unwrap();
         assert_eq!(back.chunk_ids, vec![1, 2]);
@@ -978,7 +981,8 @@ mod tests {
         // thin index, append one new row.
         let idx = Int8VectorStore::load_index_only(tmp.path()).unwrap();
         let (q2, s2) = quantize_int8(&[0.0, 1.0]);
-        Int8VectorStore::append_split(tmp.path(), idx, &[2], &[s2], &[q2.clone()]).unwrap();
+        Int8VectorStore::append_split(tmp.path(), idx, &[2], &[s2], std::slice::from_ref(&q2))
+            .unwrap();
 
         let new_bytes = std::fs::read(tmp.path().join(VECTORS_FILE)).unwrap();
         assert!(

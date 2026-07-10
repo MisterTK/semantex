@@ -469,7 +469,7 @@ mod tests {
         // No leftover .tmp file in the directory after a successful write.
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(
