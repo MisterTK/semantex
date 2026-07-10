@@ -826,6 +826,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Vue => Some(tree_sitter_vue_next::LANGUAGE.into()),
         FileType::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         FileType::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
+        FileType::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -960,6 +961,9 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "create_database",
             "create_extension",
         ]),
+        // Both `function foo() {...}` and `foo() {...}` forms produce
+        // function_definition in tree-sitter-bash.
+        FileType::Bash => Some(&["function_definition"]),
         _ => None,
     }
 }
@@ -2769,5 +2773,87 @@ CREATE TRIGGER audit_trigger AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION
             classify_node_kind("class_declaration"),
             AstNodeKind::Class
         ));
+    }
+
+    /// Shared invariant check for the config-as-code language tests: every
+    /// chunk's line range must be in-bounds within `content`, and every
+    /// AstNode chunk must have a non-empty name. Adapted from
+    /// `lightonai/colgrep`'s `assert_extractor_invariants` test pattern
+    /// (`colgrep/src/parser/tests/common.rs`, Apache-2.0).
+    fn assert_ast_chunk_invariants(chunks: &[Chunk], content: &str) {
+        let total_lines = content.lines().count() as u32;
+        for chunk in chunks {
+            if let ChunkType::AstNode { name, .. } = &chunk.chunk_type {
+                assert!(!name.is_empty(), "AstNode chunk must have a non-empty name");
+            }
+            assert!(
+                chunk.start_line >= 1,
+                "start_line must be 1-based (>=1), got {}",
+                chunk.start_line
+            );
+            assert!(
+                chunk.start_line <= chunk.end_line,
+                "chunk start_line must not exceed end_line: {} > {}",
+                chunk.start_line,
+                chunk.end_line
+            );
+            assert!(
+                chunk.end_line <= total_lines,
+                "chunk end_line {} exceeds file length {} lines",
+                chunk.end_line,
+                total_lines
+            );
+        }
+    }
+
+    #[test]
+    fn test_bash_function_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"#!/usr/bin/env bash
+function greet() {
+    echo "Hello, $1!"
+}
+
+deploy() {
+    echo "Deploying..."
+    greet "world"
+}
+"#;
+        let chunks = chunker.chunk(Path::new("deploy.sh"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "Bash must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let greet = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "greet" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            greet.is_some(),
+            "should find greet() as a Function-kind AstNode"
+        );
+        assert!(
+            greet.unwrap().content.contains("Hello, $1"),
+            "greet chunk should contain its body"
+        );
+
+        let deploy = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "deploy" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            deploy,
+            "should find the bare `deploy() {{...}}` form as a Function-kind AstNode too"
+        );
     }
 }
