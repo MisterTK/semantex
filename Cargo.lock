@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "semantex-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4299,7 +4299,7 @@ dependencies = [
 
 [[package]]
 name = "semantex-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "semantex-mcp"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "axum",

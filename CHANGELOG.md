@@ -1,5 +1,68 @@
 # Changelog
 
+## v1.0.1 — 2026-07-10
+
+Incremental hardening + broader file-type coverage. No retrieval-quality or
+index-schema changes — safe to upgrade in place; the v1.0.0 benchmark numbers
+still hold.
+
+### Added
+
+- **Config-as-code AST chunking** — 9 new AST-chunked formats: Terraform/HCL,
+  Bash, PowerShell, Protobuf, GraphQL, Starlark/Bazel, CMake, Groovy, and INI.
+  Grammar choices and name-extraction logic ported from `lightonai/colgrep`
+  (Apache-2.0) where no generic identifier field existed for a grammar.
+  `CMakeLists.txt` and bare `BUILD`/`WORKSPACE`/`MODULE.bazel` filenames are
+  now detected without needing an extension.
+
+### Changed
+
+- **next-plaid 1.3.1 → 1.6.2** — inherits upstream's incremental-delete
+  performance work (IVF-patch delete, batched deletes, crash-safe atomic
+  writes) for the `colbert-plaid` dense backend. Verified the exact
+  `Colbert`/`MmapIndex` API surface this repo calls is unchanged across the
+  range; re-applied the vendored k-means memory patch (26 GB → 9 GB peak RSS)
+  on top of the new source.
+- **`coderank-hnsw` is now genuinely incremental on disk** — replaced the
+  single `vectors.bin` postcard blob with a split format: `index.bin` (ids,
+  scales, tombstone flags; atomic temp+rename) plus an append-only
+  `store.vecs` payload file. Insert appends only the new rows; delete only
+  flips a tombstone flag — neither reloads nor rewrites the existing vector
+  payload (previously O(index size) per mutation regardless of change size).
+  `Int8VectorStore` gained tombstone-aware deletion so brute-force search and
+  the HNSW-vs-brute-force threshold both respect deleted rows.
+- **`colbert-plaid` mapping writes are now atomic** — `plaid_mapping.bin` is
+  written via temp-file+rename on build/insert/delete, matching the existing
+  `dense_backend::write_active_pointer` pattern; a crash mid-write no longer
+  leaves a torn file the next open fails to deserialize.
+
+### Fixed
+
+- **PDF chunks were orphaned on incremental reindex.** The PDF chunker needs
+  the absolute file path to open the file itself (unlike AST/text chunkers,
+  which receive pre-read content + the repo-relative path), but that same
+  absolute path was being stamped onto every resulting `Chunk::file_path`.
+  Chunk-store lookups, deletion, and BM25 doc IDs all key on the relative
+  path, so a changed or deleted PDF left its old chunks behind forever
+  instead of being cleaned up on the next index.
+- **Homebrew tap updates were non-idempotent.** The release workflow replaced
+  literal placeholder tokens with real SHA-256 hashes via `sed`, which only
+  matches once — every release after the first silently no-op'd, leaving the
+  tap's pinned checksums stale while the actual release assets kept changing
+  underneath them (`brew install` would then fail checksum verification).
+  Replaced with a structural (position-based) match that's idempotent on
+  every run.
+- A latent off-by-one in the shared AST span→`end_line` conversion, exposed
+  by INI's EOF-terminated `section` nodes (a definition ending exactly at a
+  row boundary with no trailing content was counted as one line too long).
+  No-op for every previously-supported grammar, whose definition nodes all
+  end mid-line.
+- GraphQL `operation_definition` name extraction was hardcoding the literal
+  string `"operation"` instead of reading the actual `query`/`mutation`/
+  `subscription` keyword and optional name — a named query like
+  `query GetUser {...}` extracted as `"operation GetUser"` instead of
+  `"query GetUser"`.
+
 ## v1.0.0 — 2026-07-08
 
 First stable release. Everything below shipped since the v0.8 tag, developed and
