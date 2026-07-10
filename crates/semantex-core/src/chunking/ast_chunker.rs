@@ -64,7 +64,13 @@ impl Chunker for AstChunker {
         let truncated_imports: Vec<String> = file_imports.into_iter().take(8).collect();
 
         let mut ast_spans: Vec<AstSpan> = Vec::new();
-        collect_definitions(tree.root_node(), source, definition_kinds, &mut ast_spans);
+        collect_definitions(
+            tree.root_node(),
+            source,
+            definition_kinds,
+            &mut ast_spans,
+            file_type,
+        );
 
         // Strip type_refs from generated code (Dart codegen) — too noisy for cross-file resolution
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -987,11 +993,18 @@ const DART_SIGNATURE_KINDS: &[&str] =
     &["function_signature", "getter_signature", "setter_signature"];
 
 /// Recursively walk the AST and collect definition nodes with structured metadata.
-fn collect_definitions(node: Node, source: &[u8], kinds: &[&str], out: &mut Vec<AstSpan>) {
+fn collect_definitions(
+    node: Node,
+    source: &[u8],
+    kinds: &[&str],
+    out: &mut Vec<AstSpan>,
+    file_type: FileType,
+) {
     let node_kind = node.kind();
 
     if kinds.contains(&node_kind) {
-        let name = extract_name(&node, source).unwrap_or_else(|| "<anonymous>".to_string());
+        let name =
+            extract_name(&node, source, file_type).unwrap_or_else(|| "<anonymous>".to_string());
         let kind = classify_node_kind(node_kind);
         let node_text = ts_node_text(node, source);
         let mut meta = extract_structured_meta(node, source);
@@ -1024,13 +1037,243 @@ fn collect_definitions(node: Node, source: &[u8], kinds: &[&str], out: &mut Vec<
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
-            collect_definitions(child, source, kinds, out);
+            collect_definitions(child, source, kinds, out, file_type);
         }
     }
 }
 
-/// Try to extract a name from a definition node
-fn extract_name(node: &Node, source: &[u8]) -> Option<String> {
+/// HCL `block` nodes have no `name` field — the identifying header is the
+/// block type followed by its labels. tree-sitter-hcl parses a block as
+/// `identifier (string_lit | identifier)* block_start body block_end`, so the
+/// name is the leading identifier plus every label token that precedes the
+/// opening brace, e.g. `resource "aws_instance" "web"`, `variable "region"`,
+/// `terraform` (no labels). String labels keep their quotes (the raw
+/// `string_lit` text) so the name reads exactly as it appears in the source.
+/// Adapted from `lightonai/colgrep`'s `get_hcl_unit_name`
+/// (`colgrep/src/parser/ast.rs`, Apache-2.0).
+fn extract_hcl_block_name(node: &Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "block" {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "identifier" | "string_lit" => {
+                let text = &source[child.start_byte()..child.end_byte()];
+                let trimmed = String::from_utf8_lossy(text).trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+            }
+            "block_start" => break,
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Protobuf declarations carry their identifier in a dedicated child node
+/// (`message_name`/`enum_name`/`service_name`), not a `name` field. Keeps the
+/// declaration keyword in the name (`message Invoice`, `service Billing`) so
+/// results read like the source. Adapted from `lightonai/colgrep`'s
+/// `get_proto_unit_name` (Apache-2.0).
+fn extract_proto_name(node: &Node, source: &[u8]) -> Option<String> {
+    let keyword = node.kind();
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if matches!(child.kind(), "message_name" | "enum_name" | "service_name") {
+            let text = &source[child.start_byte()..child.end_byte()];
+            let name = String::from_utf8_lossy(text).trim().to_string();
+            if !name.is_empty() {
+                return Some(format!("{keyword} {name}"));
+            }
+        }
+    }
+    None
+}
+
+/// GraphQL definitions carry a `name` child (or `fragment_name` for
+/// fragments); prefixed with the definition keyword (`type User`,
+/// `enum Role`). `schema { ... }` has no name and is named by its keyword
+/// alone. Adapted from `lightonai/colgrep`'s `get_graphql_unit_name`
+/// (Apache-2.0).
+fn extract_graphql_name(node: &Node, source: &[u8]) -> Option<String> {
+    let keyword = match node.kind() {
+        "object_type_definition" => "type",
+        "interface_type_definition" => "interface",
+        "enum_type_definition" => "enum",
+        "input_object_type_definition" => "input",
+        "union_type_definition" => "union",
+        "scalar_type_definition" => "scalar",
+        "directive_definition" => "directive",
+        "operation_definition" => "operation",
+        "fragment_definition" => "fragment",
+        "schema_definition" => return Some("schema".to_string()),
+        _ => return None,
+    };
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if matches!(child.kind(), "name" | "fragment_name") {
+            let text = &source[child.start_byte()..child.end_byte()];
+            let name = String::from_utf8_lossy(text).trim().to_string();
+            if !name.is_empty() {
+                return Some(format!("{keyword} {name}"));
+            }
+        }
+    }
+    Some(keyword.to_string())
+}
+
+/// Starlark/Bazel target: a `call` whose argument list carries a
+/// `name = "..."` string kwarg, e.g. `cc_library(name = "mylib", ...)` ->
+/// `cc_library "mylib"`. Calls without such a kwarg (`glob(...)`,
+/// `select(...)`, nested calls) return `None` — `collect_definitions` falls
+/// back to `"<anonymous>"` for these rather than skipping them entirely
+/// (see the design doc's accepted-tradeoff note: this matches the existing
+/// `FileType::Elixir` behavior, which has the identical shape of problem
+/// with its own `["call"]`-based definition kind and no extra filtering).
+/// Adapted from `lightonai/colgrep`'s `get_starlark_unit_name` (Apache-2.0).
+fn extract_starlark_call_name(node: &Node, source: &[u8]) -> Option<String> {
+    let function = node.child_by_field_name("function")?;
+    let rule = String::from_utf8_lossy(&source[function.start_byte()..function.end_byte()])
+        .trim()
+        .to_string();
+    let args = node.child_by_field_name("arguments")?;
+    for i in 0..args.child_count() {
+        let Some(kwarg) = args.child(i as u32) else {
+            continue;
+        };
+        if kwarg.kind() != "keyword_argument" {
+            continue;
+        }
+        let Some(key) = kwarg.child_by_field_name("name") else {
+            continue;
+        };
+        let key_text = &source[key.start_byte()..key.end_byte()];
+        if key_text != b"name" {
+            continue;
+        }
+        let Some(value) = kwarg.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() != "string" {
+            continue;
+        }
+        let target =
+            String::from_utf8_lossy(&source[value.start_byte()..value.end_byte()]).to_string();
+        if rule.is_empty() || target.is_empty() {
+            return None;
+        }
+        return Some(format!("{rule} {target}"));
+    }
+    None
+}
+
+/// CMake function/macro definitions keep their name as the first argument of
+/// the opening command: `function(add_component name)` -> `add_component`.
+/// Adapted from `lightonai/colgrep`'s `get_cmake_unit_name` (Apache-2.0).
+fn extract_cmake_name(node: &Node, source: &[u8]) -> Option<String> {
+    for i in 0..node.child_count() {
+        let Some(command) = node.child(i as u32) else {
+            continue;
+        };
+        if !matches!(command.kind(), "function_command" | "macro_command") {
+            continue;
+        }
+        for j in 0..command.child_count() {
+            let Some(args) = command.child(j as u32) else {
+                continue;
+            };
+            if args.kind() != "argument_list" {
+                continue;
+            }
+            for k in 0..args.child_count() {
+                let Some(first) = args.child(k as u32) else {
+                    continue;
+                };
+                if first.kind() != "argument" {
+                    continue;
+                }
+                let text = &source[first.start_byte()..first.end_byte()];
+                let name = String::from_utf8_lossy(text).trim().to_string();
+                return if name.is_empty() { None } else { Some(name) };
+            }
+        }
+    }
+    None
+}
+
+/// INI `[section]` — keep the bracketed text as the name so it reads exactly
+/// as in the source. Adapted from `lightonai/colgrep`'s inline `Language::Ini`
+/// branch in `get_unit_name` (Apache-2.0).
+fn extract_ini_section_name(node: &Node, source: &[u8]) -> Option<String> {
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if child.kind() == "section_name" {
+            let text = &source[child.start_byte()..child.end_byte()];
+            let name = String::from_utf8_lossy(text).trim().to_string();
+            return if name.is_empty() { None } else { Some(name) };
+        }
+    }
+    None
+}
+
+/// PowerShell: `function_statement` carries a `function_name` child;
+/// `class_statement` a `simple_name` child. Neither is exposed as a named
+/// field. Adapted from `lightonai/colgrep`'s inline `Language::Powershell`
+/// branch in `get_unit_name` (Apache-2.0).
+fn extract_powershell_name(node: &Node, source: &[u8]) -> Option<String> {
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if matches!(child.kind(), "function_name" | "simple_name") {
+            let text = &source[child.start_byte()..child.end_byte()];
+            let name = String::from_utf8_lossy(text).to_string();
+            return if name.is_empty() { None } else { Some(name) };
+        }
+    }
+    None
+}
+
+/// Try to extract a name from a definition node.
+///
+/// `file_type` selects bespoke extraction for 7 config-as-code languages
+/// whose grammars expose no generic `name`/`identifier` field (Terraform,
+/// Protobuf, GraphQL, Starlark's `call` nodes specifically, CMake, INI,
+/// PowerShell — verified against `lightonai/colgrep`'s own per-language
+/// name extraction). This dispatch MUST happen before the generic fallback
+/// chain below: `FileType::Starlark`'s `function_definition` nodes and
+/// `FileType::Elixir`'s `call` nodes both still want the generic path (or,
+/// for Elixir, the existing canonical-kind fallback), and `node.kind() ==
+/// "call"` alone can't distinguish Starlark from Elixir — only `file_type` can.
+fn extract_name(node: &Node, source: &[u8], file_type: FileType) -> Option<String> {
+    match file_type {
+        FileType::Terraform => return extract_hcl_block_name(node, source),
+        FileType::Protobuf => return extract_proto_name(node, source),
+        FileType::GraphQl => return extract_graphql_name(node, source),
+        FileType::Starlark if node.kind() == "call" => {
+            return extract_starlark_call_name(node, source);
+        }
+        FileType::Cmake => return extract_cmake_name(node, source),
+        FileType::Ini => return extract_ini_section_name(node, source),
+        FileType::PowerShell => return extract_powershell_name(node, source),
+        _ => {}
+    }
+
     // Try common field names first
     for field in &["name", "identifier"] {
         if let Some(child) = node.child_by_field_name(field) {
@@ -2104,6 +2347,248 @@ CREATE TRIGGER audit_trigger AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION
             "Trigger name extraction must pick the trigger's own name (first \
              object_reference), not the referenced table/function: {:?}",
             ast_chunks.iter().map(|c| &c.chunk_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_extract_name_hcl_block_joins_type_and_labels() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_hcl::LANGUAGE.into())
+            .unwrap();
+        let source = br#"resource "aws_instance" "web" {
+  ami = "ami-123456"
+}"#;
+        let tree = parser.parse(source, None).unwrap();
+
+        // HCL structure is config_file -> body -> block
+        let root = tree.root_node();
+        let body = root.children(&mut root.walk()).next().unwrap();
+        let block = body
+            .children(&mut body.walk())
+            .find(|n| n.kind() == "block")
+            .expect("must find a block node");
+        assert_eq!(
+            extract_name(&block, source, FileType::Terraform),
+            Some(r#"resource "aws_instance" "web""#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_proto_message_and_service() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_proto::LANGUAGE.into())
+            .unwrap();
+        let source = b"message Invoice {\n  string id = 1;\n}\n\nservice Billing {\n}\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let message = root
+            .children(&mut root.walk())
+            .find(|n| n.kind() == "message")
+            .expect("must find a message node");
+        assert_eq!(
+            extract_name(&message, source, FileType::Protobuf),
+            Some("message Invoice".to_string())
+        );
+        let service = root
+            .children(&mut root.walk())
+            .find(|n| n.kind() == "service")
+            .expect("must find a service node");
+        assert_eq!(
+            extract_name(&service, source, FileType::Protobuf),
+            Some("service Billing".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_graphql_type_and_enum() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_graphql::LANGUAGE.into())
+            .unwrap();
+        let source = b"type User {\n  id: ID!\n}\n\nenum Role {\n  ADMIN\n}\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        // Search recursively for the GraphQL type definitions
+        let mut obj_type = None;
+        let mut enum_type = None;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "object_type_definition" && obj_type.is_none() {
+                obj_type = Some(node);
+            }
+            if node.kind() == "enum_type_definition" && enum_type.is_none() {
+                enum_type = Some(node);
+            }
+            if obj_type.is_some() && enum_type.is_some() {
+                break;
+            }
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        let obj_type = obj_type.expect("must find object_type_definition");
+        assert_eq!(
+            extract_name(&obj_type, source, FileType::GraphQl),
+            Some("type User".to_string())
+        );
+        let enum_type = enum_type.expect("must find enum_type_definition");
+        assert_eq!(
+            extract_name(&enum_type, source, FileType::GraphQl),
+            Some("enum Role".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_starlark_call_with_name_kwarg() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_starlark::LANGUAGE.into())
+            .unwrap();
+        let source = b"go_library(\n    name = \"mylib\",\n    srcs = [\"main.go\"],\n)\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        // Search recursively for call node
+        let mut call = None;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call" {
+                call = Some(node);
+                break;
+            }
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    stack.push(child);
+                }
+            }
+        }
+        let call = call.expect("must find a call node");
+        assert_eq!(
+            extract_name(&call, source, FileType::Starlark),
+            Some("go_library \"mylib\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_starlark_call_without_name_kwarg_is_none() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_starlark::LANGUAGE.into())
+            .unwrap();
+        let source = b"glob([\"*.go\"])\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        // Search recursively for call node
+        let mut call = None;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call" {
+                call = Some(node);
+                break;
+            }
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    stack.push(child);
+                }
+            }
+        }
+        let call = call.expect("must find a call node");
+        assert_eq!(extract_name(&call, source, FileType::Starlark), None);
+    }
+
+    #[test]
+    fn test_extract_name_cmake_function_and_macro() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cmake::LANGUAGE.into())
+            .unwrap();
+        let source = b"function(add_component name)\nendfunction()\n\nmacro(enable_feature feature_name)\nendmacro()\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let func_def = root
+            .children(&mut root.walk())
+            .find(|n| n.kind() == "function_def")
+            .expect("must find function_def");
+        assert_eq!(
+            extract_name(&func_def, source, FileType::Cmake),
+            Some("add_component".to_string())
+        );
+        let macro_def = root
+            .children(&mut root.walk())
+            .find(|n| n.kind() == "macro_def")
+            .expect("must find macro_def");
+        assert_eq!(
+            extract_name(&macro_def, source, FileType::Cmake),
+            Some("enable_feature".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_ini_section_keeps_brackets() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ini::LANGUAGE.into())
+            .unwrap();
+        let source = b"[database]\nhost = localhost\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let section = root
+            .children(&mut root.walk())
+            .find(|n| n.kind() == "section")
+            .expect("must find a section node");
+        assert_eq!(
+            extract_name(&section, source, FileType::Ini),
+            Some("[database]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_powershell_function_and_class() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_powershell::LANGUAGE.into())
+            .unwrap();
+        let source = b"function Get-Greeting {\n    return \"hi\"\n}\n\nclass Greeter {\n    [string]$Name\n}\n";
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        // Search recursively for function_statement and class_statement
+        let mut func = None;
+        let mut class = None;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_statement" && func.is_none() {
+                func = Some(node);
+            }
+            if node.kind() == "class_statement" && class.is_none() {
+                class = Some(node);
+            }
+            if func.is_some() && class.is_some() {
+                break;
+            }
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        let func = func.expect("must find function_statement");
+        assert_eq!(
+            extract_name(&func, source, FileType::PowerShell),
+            Some("Get-Greeting".to_string())
+        );
+        let class = class.expect("must find class_statement");
+        assert_eq!(
+            extract_name(&class, source, FileType::PowerShell),
+            Some("Greeter".to_string())
         );
     }
 }

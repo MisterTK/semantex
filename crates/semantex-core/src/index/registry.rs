@@ -201,11 +201,15 @@ pub fn read_all_v2() -> RegistryV2 {
 /// stop. A genuine scratch repo *under* the temp root (a test fixture, a
 /// smoke-test clone) is unaffected — only the bare root is refused.
 pub fn is_system_temp_root(path: &Path) -> bool {
-    let mut candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+    let mut candidates = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+    ];
     candidates.dedup();
-    candidates.iter().any(|c| {
-        path == c || c.canonicalize().is_ok_and(|canon| canon == path)
-    })
+    candidates
+        .iter()
+        .any(|c| path == c || c.canonicalize().is_ok_and(|canon| canon == path))
 }
 
 /// True if `path` is the OS temp root OR anything underneath it — a scratch
@@ -225,11 +229,15 @@ pub fn is_system_temp_root(path: &Path) -> bool {
 /// that *does* end up under a temp root through such a deliberate call
 /// self-heals via [`retain`] once the directory is gone.
 pub fn is_under_system_temp_root(path: &Path) -> bool {
-    let mut candidates = vec![std::env::temp_dir(), PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+    let mut candidates = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+    ];
     candidates.dedup();
-    candidates.iter().any(|c| {
-        path.starts_with(c) || c.canonicalize().is_ok_and(|canon| path.starts_with(canon))
-    })
+    candidates
+        .iter()
+        .any(|c| path.starts_with(c) || c.canonicalize().is_ok_and(|canon| path.starts_with(canon)))
 }
 
 /// Above this many immediate subdirectories with their own `.git`, a
@@ -487,7 +495,9 @@ mod tests {
     #[test]
     fn is_under_system_temp_root_true_for_root_and_any_depth_subdirectory() {
         assert!(is_under_system_temp_root(Path::new("/tmp")));
-        assert!(is_under_system_temp_root(Path::new("/tmp/some-scratch-repo")));
+        assert!(is_under_system_temp_root(Path::new(
+            "/tmp/some-scratch-repo"
+        )));
         assert!(is_under_system_temp_root(Path::new(
             "/private/tmp/pytest-of-tk/pytest-1/tiny_corpus"
         )));
@@ -495,7 +505,9 @@ mod tests {
 
     #[test]
     fn is_under_system_temp_root_false_for_unrelated_path() {
-        assert!(!is_under_system_temp_root(Path::new("/Users/dev/my-project")));
+        assert!(!is_under_system_temp_root(Path::new(
+            "/Users/dev/my-project"
+        )));
     }
 
     #[test]
@@ -532,7 +544,11 @@ mod tests {
         let removed = retain_at(&reg, |p| p.path != p2);
         assert_eq!(removed, 1);
 
-        let all: Vec<PathBuf> = load_from(&reg).projects.into_iter().map(|p| p.path).collect();
+        let all: Vec<PathBuf> = load_from(&reg)
+            .projects
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
         assert_eq!(all, vec![p1]);
     }
 
@@ -546,7 +562,11 @@ mod tests {
         let removed = retain_at(&reg, |_| true);
         assert_eq!(removed, 0);
 
-        let all: Vec<PathBuf> = load_from(&reg).projects.into_iter().map(|p| p.path).collect();
+        let all: Vec<PathBuf> = load_from(&reg)
+            .projects
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
         assert_eq!(all, vec![p1]);
     }
 
