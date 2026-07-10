@@ -262,6 +262,95 @@ pub fn search_commit_messages(
     Ok(rows)
 }
 
+/// Composable commit filters for the `semantex_history` surface. Every
+/// present field ANDs into the query; `Default` (all `None`, `limit: 0`)
+/// means "most recent commits" with the default limit of 20.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryFilter {
+    /// Strictly-greater-than committer-timestamp bound (`ts > since_ts`) —
+    /// "since tag X" for release notes must exclude the tagged commit itself.
+    pub since_ts: Option<i64>,
+    /// Case-insensitive author substring (SQLite LIKE).
+    pub author: Option<String>,
+    /// Exact repo-relative path, matched against `file_commits.path`.
+    pub file: Option<String>,
+    /// Free-text match over the stored commit message.
+    pub message_query: Option<String>,
+    /// Max rows returned; `0` means the default (20).
+    pub limit: usize,
+}
+
+/// Query commits with all of `filter`'s present fields ANDed together,
+/// most recent first.
+///
+/// A message-only filter delegates to [`search_commit_messages`] so it
+/// benefits from FTS5 when available; any composed filter uses a plain
+/// LIKE for the message term (recency ordering dominates anyway, and
+/// composing FTS MATCH with joins buys nothing here). LIKE wildcards in
+/// user input are stripped, mirroring `search_commit_messages`'s fallback.
+pub fn filter_commits(conn: &Connection, filter: &HistoryFilter) -> Result<Vec<CommitInfo>> {
+    let limit = if filter.limit == 0 { 20 } else { filter.limit };
+    if let Some(q) = &filter.message_query
+        && filter.since_ts.is_none()
+        && filter.author.is_none()
+        && filter.file.is_none()
+    {
+        return search_commit_messages(conn, q, limit);
+    }
+
+    let mut sql = String::from("SELECT DISTINCT c.hash, c.author, c.ts, c.message FROM commits c");
+    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if filter.file.is_some() {
+        sql.push_str(" JOIN file_commits f ON f.hash = c.hash");
+    }
+    sql.push_str(" WHERE 1=1");
+    if let Some(ts) = filter.since_ts {
+        sql.push_str(" AND c.ts > ?");
+        bound.push(Box::new(ts));
+    }
+    if let Some(author) = &filter.author {
+        sql.push_str(" AND c.author LIKE ?");
+        bound.push(Box::new(format!("%{}%", author.replace(['%', '_'], ""))));
+    }
+    if let Some(file) = &filter.file {
+        sql.push_str(" AND f.path = ?");
+        bound.push(Box::new(file.clone()));
+    }
+    if let Some(q) = &filter.message_query {
+        sql.push_str(" AND c.message LIKE ?");
+        bound.push(Box::new(format!("%{}%", q.replace(['%', '_'], ""))));
+    }
+    sql.push_str(" ORDER BY c.ts DESC, c.rowid DESC LIMIT ?");
+    bound.push(Box::new(limit as i64));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(refs), row_to_commit)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Repo-relative paths touched by `hash` (from `file_commits`), sorted.
+pub fn files_for_commit(conn: &Connection, hash: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM file_commits WHERE hash = ?1 ORDER BY path")?;
+    let rows = stmt
+        .query_map(params![hash], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Committer timestamp of the OLDEST captured commit, or `None` when the
+/// table is empty. Used to warn when a `since` selector predates the
+/// bounded capture window (see `history_commit_limit`).
+pub fn oldest_commit_ts(conn: &Connection) -> Option<i64> {
+    conn.query_row("SELECT MIN(ts) FROM commits", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Schema extensions owned by this module (spine owns commits/file_commits/
 // chunk_blame's own columns; everything below is additive).
@@ -1212,5 +1301,181 @@ author Real\n\
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, 2);
         assert_eq!(parsed[0].1, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    }
+
+    /// Commit `file` with `msg` at a controlled committer timestamp so
+    /// since-filter tests are deterministic (ts resolution is seconds).
+    fn commit_with_date(dir: &Path, file: &str, msg: &str, unix_ts: i64) {
+        std::fs::write(dir.join(file), msg).unwrap();
+        git(dir, &["add", "."]);
+        let date = format!("{unix_ts} +0000");
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_DATE", &date)
+            .args(["commit", "-q", "-m", msg])
+            .status()
+            .expect("git must be on PATH for these tests");
+        assert!(status.success(), "dated commit failed");
+    }
+
+    #[test]
+    fn filter_commits_since_ts_is_strictly_greater() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        commit_with_date(tmp.path(), "a.txt", "first", 1_000_000_000);
+        commit_with_date(tmp.path(), "b.txt", "second", 1_000_000_100);
+        commit_with_date(tmp.path(), "c.txt", "third", 1_000_000_200);
+        populate_history(tmp.path()).unwrap();
+
+        let conn = open(tmp.path()).unwrap();
+        let filter = HistoryFilter {
+            since_ts: Some(1_000_000_100),
+            limit: 10,
+            ..Default::default()
+        };
+        let hits = filter_commits(&conn, &filter).unwrap();
+        // Strictly greater: the ts==since_ts commit ("second") is excluded.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject, "third");
+    }
+
+    #[test]
+    fn filter_commits_composes_file_and_message() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 3); // messages "commit number 0..2", files file0..2.txt
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+
+        let hits = filter_commits(
+            &conn,
+            &HistoryFilter {
+                file: Some("file1.txt".into()),
+                message_query: Some("number".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject, "commit number 1");
+
+        let none = filter_commits(
+            &conn,
+            &HistoryFilter {
+                file: Some("file1.txt".into()),
+                message_query: Some("nonexistent-xyz".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn filter_commits_author_substring() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=Alice Wonder",
+                "commit",
+                "-q",
+                "-m",
+                "by alice",
+            ],
+        );
+        std::fs::write(tmp.path().join("b.txt"), "y").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=Bob Builder",
+                "commit",
+                "-q",
+                "-m",
+                "by bob",
+            ],
+        );
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+
+        let hits = filter_commits(
+            &conn,
+            &HistoryFilter {
+                author: Some("Alice".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].subject, "by alice");
+    }
+
+    #[test]
+    fn filter_commits_message_only_delegates_to_fts_search() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 3);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+
+        let via_filter = filter_commits(
+            &conn,
+            &HistoryFilter {
+                message_query: Some("number 2".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let via_search = search_commit_messages(&conn, "number 2", 10).unwrap();
+        assert_eq!(via_filter, via_search);
+        assert_eq!(via_filter.len(), 1);
+    }
+
+    #[test]
+    fn filter_commits_zero_limit_defaults_to_twenty() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 25);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let hits = filter_commits(&conn, &HistoryFilter::default()).unwrap();
+        assert_eq!(hits.len(), 20);
+    }
+
+    #[test]
+    fn files_for_commit_lists_touched_paths() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 2);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        let commits = recent_commits(&conn, 10).unwrap();
+        let files = files_for_commit(&conn, &commits[0].hash).unwrap();
+        assert_eq!(files, vec!["file1.txt".to_string()]);
+    }
+
+    #[test]
+    fn oldest_commit_ts_returns_min() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        commit_with_date(tmp.path(), "a.txt", "first", 1_000_000_000);
+        commit_with_date(tmp.path(), "b.txt", "second", 1_000_000_100);
+        populate_history(tmp.path()).unwrap();
+        let conn = open(tmp.path()).unwrap();
+        assert_eq!(oldest_commit_ts(&conn), Some(1_000_000_000));
     }
 }
