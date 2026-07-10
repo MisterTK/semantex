@@ -831,6 +831,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Terraform => Some(tree_sitter_hcl::LANGUAGE.into()),
         FileType::Protobuf => Some(tree_sitter_proto::LANGUAGE.into()),
         FileType::GraphQl => Some(tree_sitter_graphql::LANGUAGE.into()),
+        FileType::Starlark => Some(tree_sitter_starlark::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -996,6 +997,12 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "operation_definition",
             "fragment_definition",
         ]),
+        // Starlark is a Python dialect: `def` covers .bzl macro definitions;
+        // `call` covers BUILD-file rule invocations like
+        // `go_library(name = "x", ...)`. See extract_starlark_call_name
+        // (Task 3) for why anonymous/nested calls still produce a chunk
+        // (named "<anonymous>") rather than being excluded.
+        FileType::Starlark => Some(&["function_definition", "call"]),
         _ => None,
     }
 }
@@ -3095,5 +3102,61 @@ enum Role {
             "should find enum Role as an Enum-kind AstNode"
         );
         assert!(role_enum.unwrap().content.contains("MEMBER"));
+    }
+
+    #[test]
+    fn test_starlark_macro_and_rule_call_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"def my_macro(name, srcs):
+    native.cc_library(
+        name = name,
+        srcs = srcs,
+    )
+
+go_library(
+    name = "mylib",
+    srcs = ["main.go"],
+)
+"#;
+        let chunks = chunker.chunk(Path::new("rules.bzl"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "Starlark must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let macro_def = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "my_macro" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(macro_def, "should find my_macro as a Function-kind AstNode");
+
+        let rule_call = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == "go_library \"mylib\"",
+            _ => false,
+        });
+        assert!(
+            rule_call.is_some(),
+            "should find the top-level go_library(name = \"mylib\", ...) call named with its rule + target: {:?}",
+            ast_chunks
+                .iter()
+                .map(|c| c.symbol_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(rule_call.unwrap().content.contains("main.go"));
+
+        // The nested native.cc_library(name = name, ...) call inside
+        // my_macro's body has a `name` kwarg whose value is an identifier,
+        // not a string literal, so extract_starlark_call_name returns None
+        // for it and it becomes an "<anonymous>"-named chunk (the accepted
+        // Elixir-consistent tradeoff from the design doc) rather than being
+        // excluded. We don't assert on it beyond it not breaking the two
+        // named chunks above.
     }
 }

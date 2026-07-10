@@ -385,4 +385,13 @@ mod tests {
             assert_eq!(ft.language_name(), name);
         }
     }
+
+    #[test]
+    fn test_starlark_bare_filenames_are_ast_capable() {
+        for filename in ["BUILD", "BUILD.bazel", "WORKSPACE", "MODULE.bazel"] {
+            let ft = FileType::detect(Path::new(filename));
+            assert_eq!(ft, FileType::Starlark, "{filename} must detect as Starlark");
+            assert!(ft.supports_ast(), "{filename} must support AST chunking");
+        }
+    }
 }
