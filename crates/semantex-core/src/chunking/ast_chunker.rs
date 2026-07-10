@@ -829,6 +829,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
         FileType::Groovy => Some(tree_sitter_groovy::LANGUAGE.into()),
         FileType::Terraform => Some(tree_sitter_hcl::LANGUAGE.into()),
+        FileType::Protobuf => Some(tree_sitter_proto::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -976,6 +977,9 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
         // the block body (no nested node kind here is also in this list),
         // so attributes and nested blocks stay folded into the parent unit.
         FileType::Terraform => Some(&["block"]),
+        // Each message/enum/service is one unit; fields/enum values/rpcs
+        // stay folded inside (no nested node kind here is also in this list).
+        FileType::Protobuf => Some(&["message", "enum", "service"]),
         _ => None,
     }
 }
@@ -2976,5 +2980,55 @@ variable "region" {
             variable,
             "should find the variable block named with its label"
         );
+    }
+
+    #[test]
+    fn test_protobuf_message_and_service_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"syntax = "proto3";
+
+message Invoice {
+  string id = 1;
+  double amount = 2;
+}
+
+service Billing {
+  rpc GetInvoice (InvoiceRequest) returns (Invoice);
+}
+"#;
+        let chunks = chunker.chunk(Path::new("billing.proto"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "Protobuf must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let message = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "message Invoice" && matches!(kind, AstNodeKind::Struct)
+            }
+            _ => false,
+        });
+        assert!(
+            message.is_some(),
+            "should find message Invoice as a Struct-kind AstNode"
+        );
+        assert!(message.unwrap().content.contains("double amount"));
+
+        let service = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "service Billing" && matches!(kind, AstNodeKind::Other(s) if s == "service")
+            }
+            _ => false,
+        });
+        assert!(
+            service.is_some(),
+            "should find service Billing as an Other(\"service\")-kind AstNode"
+        );
+        assert!(service.unwrap().content.contains("GetInvoice"));
     }
 }
