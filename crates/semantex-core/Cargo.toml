@@ -189,6 +189,10 @@ criterion = { version = "0.8", features = ["html_reports"] }
 # Snapshot testing for the Phase-0 formatter regression net.
 # Dev-only: zero impact on the default (non-LLM) production build.
 insta = "1"
+# Builds well-formed PDF fixtures for the PDF incremental-reindex regression
+# test. Already in the tree transitively via pdf-extract (same resolved
+# version pinned here), so this adds no new tree weight.
+lopdf = "0.38"
 
 [[bench]]
 name = "simd_bench"

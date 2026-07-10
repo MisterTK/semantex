@@ -317,12 +317,25 @@ impl IndexBuilder {
                 pb.inc(1);
                 continue;
             };
-            let chunks: Vec<Chunk> = chunk_result?;
+            let mut chunks: Vec<Chunk> = chunk_result?;
 
             if chunks.is_empty() {
                 files_skipped += 1;
                 pb.inc(1);
                 continue;
+            }
+
+            // The PDF chunker is handed the absolute `file_path` (not
+            // `rel_path`) because it must open the file itself — unlike the
+            // AST/text chunkers, which chunk pre-read `content` and are handed
+            // `rel_path` directly — so it stamps every `Chunk::file_path` with
+            // that absolute path. Every chunk-store lookup (hash check,
+            // deletion, BM25 doc id) keys on `rel_path`; rewrite here so PDF
+            // chunks aren't orphaned on the next reindex.
+            if file_type == FileType::Pdf {
+                for chunk in &mut chunks {
+                    chunk.file_path = rel_path.to_path_buf();
+                }
             }
 
             changed_rel_paths.push(rel_path.to_path_buf());
