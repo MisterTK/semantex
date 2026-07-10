@@ -351,6 +351,61 @@ pub fn oldest_commit_ts(conn: &Connection) -> Option<i64> {
     .flatten()
 }
 
+/// Resolve a user-supplied `since` selector to a unix committer timestamp.
+/// Accepted forms, tried in order: a strict UTC calendar date `YYYY-MM-DD`
+/// (midnight UTC), then any git rev (tag, sha, branch, `HEAD~3`, ...).
+/// Returns `None` when neither resolves. Selectors starting with `-` are
+/// rejected outright so user input can never be parsed as a git flag.
+pub fn resolve_since_to_ts(project_root: &Path, since: &str) -> Option<i64> {
+    let s = since.trim();
+    if s.is_empty() || s.starts_with('-') {
+        return None;
+    }
+    if let Some(ts) = parse_utc_date_to_ts(s) {
+        return Some(ts);
+    }
+    let verify = run_git(
+        project_root,
+        &["rev-parse", "--verify", &format!("{s}^{{commit}}")],
+    )
+    .ok()?;
+    if !verify.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&verify.stdout).trim().to_string();
+    let show = run_git(project_root, &["show", "-s", "--format=%ct", &sha, "--"]).ok()?;
+    if !show.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&show.stdout).trim().parse().ok()
+}
+
+/// Strict `YYYY-MM-DD` → unix seconds at 00:00:00 UTC. Hand-rolled
+/// days-from-civil (Howard Hinnant's algorithm) — deliberately no chrono/
+/// time dependency for one conversion. Rejects out-of-range month/day
+/// components but does not validate month lengths (2026-02-31 resolves a
+/// few days into March — harmless for a lower-bound filter).
+fn parse_utc_date_to_ts(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y: i64 = s[0..4].parse().ok()?;
+    let m: i64 = s[5..7].parse().ok()?;
+    let d: i64 = s[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Schema extensions owned by this module (spine owns commits/file_commits/
 // chunk_blame's own columns; everything below is additive).
@@ -1477,5 +1532,48 @@ author Real\n\
         populate_history(tmp.path()).unwrap();
         let conn = open(tmp.path()).unwrap();
         assert_eq!(oldest_commit_ts(&conn), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn parse_utc_date_handles_known_values() {
+        assert_eq!(parse_utc_date_to_ts("1970-01-01"), Some(0));
+        assert_eq!(parse_utc_date_to_ts("2020-01-01"), Some(1_577_836_800));
+        assert_eq!(parse_utc_date_to_ts("2026-07-10"), Some(1_783_641_600));
+        assert_eq!(parse_utc_date_to_ts("2020-13-01"), None);
+        assert_eq!(parse_utc_date_to_ts("2020-00-10"), None);
+        assert_eq!(parse_utc_date_to_ts("not-a-date"), None);
+        assert_eq!(parse_utc_date_to_ts("2020-1-1"), None); // strict 10-char form
+    }
+
+    #[test]
+    fn resolve_since_rejects_flag_like_and_empty_input() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(resolve_since_to_ts(tmp.path(), "-n"), None);
+        assert_eq!(resolve_since_to_ts(tmp.path(), "--all"), None);
+        assert_eq!(resolve_since_to_ts(tmp.path(), "   "), None);
+    }
+
+    #[test]
+    fn resolve_since_tag_sha_and_garbage() {
+        let tmp = TempDir::new().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["config", "user.email", "test@example.com"]);
+        git(tmp.path(), &["config", "user.name", "Test User"]);
+        commit_with_date(tmp.path(), "a.txt", "first", 1_000_000_000);
+        git(tmp.path(), &["tag", "v1"]);
+        commit_with_date(tmp.path(), "b.txt", "second", 1_000_000_100);
+
+        assert_eq!(resolve_since_to_ts(tmp.path(), "v1"), Some(1_000_000_000));
+        // A date string resolves without touching git.
+        assert_eq!(
+            resolve_since_to_ts(tmp.path(), "2001-09-09"),
+            parse_utc_date_to_ts("2001-09-09")
+        );
+        // HEAD-relative revs work.
+        assert_eq!(
+            resolve_since_to_ts(tmp.path(), "HEAD~1"),
+            Some(1_000_000_000)
+        );
+        assert_eq!(resolve_since_to_ts(tmp.path(), "no-such-ref-xyz"), None);
     }
 }
