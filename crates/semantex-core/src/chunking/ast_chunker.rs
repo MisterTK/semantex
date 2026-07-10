@@ -832,6 +832,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Protobuf => Some(tree_sitter_proto::LANGUAGE.into()),
         FileType::GraphQl => Some(tree_sitter_graphql::LANGUAGE.into()),
         FileType::Starlark => Some(tree_sitter_starlark::LANGUAGE.into()),
+        FileType::Cmake => Some(tree_sitter_cmake::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -1003,6 +1004,7 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
         // (Task 3) for why anonymous/nested calls still produce a chunk
         // (named "<anonymous>") rather than being excluded.
         FileType::Starlark => Some(&["function_definition", "call"]),
+        FileType::Cmake => Some(&["function_def", "macro_def"]),
         _ => None,
     }
 }
@@ -3158,5 +3160,51 @@ go_library(
         // Elixir-consistent tradeoff from the design doc) rather than being
         // excluded. We don't assert on it beyond it not breaking the two
         // named chunks above.
+    }
+
+    #[test]
+    fn test_cmake_function_and_macro_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"function(add_component name)
+  message(STATUS "Adding component: ${name}")
+endfunction()
+
+macro(enable_feature feature_name)
+  set(FEATURE_${feature_name} ON)
+endmacro()
+"#;
+        let chunks = chunker.chunk(Path::new("CMakeLists.txt"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "CMake must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let func = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "add_component" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            func.is_some(),
+            "should find add_component as a Function-kind AstNode"
+        );
+        assert!(func.unwrap().content.contains("Adding component"));
+
+        let macro_ = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "enable_feature" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            macro_,
+            "should find enable_feature as a Function-kind AstNode"
+        );
     }
 }
