@@ -1285,10 +1285,7 @@ const OPENCODE_INSTRUCTIONS_PATH: &str = ".opencode/semantex.md";
 
 fn opencode_config_path(global: bool) -> PathBuf {
     if global {
-        dirs_home()
-            .join(".config")
-            .join("opencode")
-            .join("opencode.json")
+        dirs_home().join(".config").join("opencode").join("opencode.json")
     } else {
         PathBuf::from("opencode.json")
     }
@@ -1337,17 +1334,10 @@ pub fn install_opencode(global: bool) -> Result<()> {
     }
 
     write_json_pretty(&config_path, &config)?;
-    eprintln!(
-        "  {} MCP server → {}",
-        "✓".green().bold(),
-        config_path.display()
-    );
+    eprintln!("  {} MCP server → {}", "✓".green().bold(), config_path.display());
 
     let instructions_path = PathBuf::from(OPENCODE_INSTRUCTIONS_PATH);
-    write_text_file(
-        &instructions_path,
-        &templates::opencode::render_body_md(&all_tools()),
-    )?;
+    write_text_file(&instructions_path, &templates::opencode::render_body_md(&all_tools()))?;
     eprintln!(
         "  {} instructions → {}",
         "✓".green().bold(),
@@ -1372,7 +1362,8 @@ pub fn uninstall_opencode(global: bool) -> Result<()> {
             {
                 any = true;
             }
-            if let Some(instructions) = obj.get_mut("instructions").and_then(|v| v.as_array_mut()) {
+            if let Some(instructions) = obj.get_mut("instructions").and_then(|v| v.as_array_mut())
+            {
                 let before = instructions.len();
                 instructions.retain(|v| v.as_str() != Some(OPENCODE_INSTRUCTIONS_PATH));
                 if instructions.len() != before {
@@ -1440,10 +1431,7 @@ fn merge_toml_mcp_entry(root: &mut toml::Value, binary: &str) {
         *servers = toml::Value::Table(toml::value::Table::new());
     }
     let mut entry = toml::value::Table::new();
-    entry.insert(
-        "command".to_string(),
-        toml::Value::String(binary.to_string()),
-    );
+    entry.insert("command".to_string(), toml::Value::String(binary.to_string()));
     entry.insert(
         "args".to_string(),
         toml::Value::Array(vec![toml::Value::String("mcp".to_string())]),
@@ -1478,22 +1466,13 @@ pub fn install_codex() -> Result<()> {
     let mut config = read_toml_or_default(&config_path);
     merge_toml_mcp_entry(&mut config, binary);
     write_toml_pretty(&config_path, &config)?;
-    eprintln!(
-        "  {} MCP server → {}",
-        "✓".green().bold(),
-        config_path.display()
-    );
+    eprintln!("  {} MCP server → {}", "✓".green().bold(), config_path.display());
 
     let agents_path = codex_agents_path();
     let existing = std::fs::read_to_string(&agents_path).unwrap_or_default();
-    let updated =
-        replace_or_append_section(&existing, &templates::codex::render_body_md(&all_tools()));
+    let updated = replace_or_append_section(&existing, &templates::codex::render_body_md(&all_tools()));
     write_text_file(&agents_path, &updated)?;
-    eprintln!(
-        "  {} instructions → {}",
-        "✓".green().bold(),
-        agents_path.display()
-    );
+    eprintln!("  {} instructions → {}", "✓".green().bold(), agents_path.display());
 
     eprintln!(
         "\n{} semantex installed for Codex CLI. Restart to activate.",
