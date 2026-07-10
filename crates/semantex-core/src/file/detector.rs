@@ -34,12 +34,36 @@ pub enum FileType {
     Pdf,
     PlainText,
     Binary,
+    // Config-as-code formats.
+    Terraform,
+    Bash,
+    PowerShell,
+    Protobuf,
+    GraphQl,
+    Starlark,
+    Cmake,
+    Groovy,
+    Ini,
     Unknown,
 }
 
 impl FileType {
-    /// Detect file type from file path extension.
+    /// Detect file type from file path extension, or from a small set of
+    /// conventionally bare/ambiguous filenames checked first (e.g.
+    /// `CMakeLists.txt`, `BUILD`) — mirrors `lightonai/colgrep`'s
+    /// `detect_language()` (Apache-2.0), which checks filename before
+    /// falling through to the same extension match every other language uses.
     pub fn detect(path: &Path) -> Self {
+        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+            match filename.to_lowercase().as_str() {
+                "cmakelists.txt" => return FileType::Cmake,
+                "build" | "build.bazel" | "workspace" | "workspace.bazel" | "module.bazel" => {
+                    return FileType::Starlark;
+                }
+                _ => {}
+            }
+        }
+
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_lowercase(),
             None => return FileType::Unknown,
@@ -76,7 +100,16 @@ impl FileType {
             "yml" | "yaml" => FileType::Yaml,
             "json" => FileType::Json,
             "pdf" => FileType::Pdf,
-            "txt" | "log" | "cfg" | "ini" | "env" => FileType::PlainText,
+            "txt" | "log" | "cfg" | "env" => FileType::PlainText,
+            "tf" | "tfvars" | "hcl" => FileType::Terraform,
+            "sh" | "bash" | "zsh" => FileType::Bash,
+            "ps1" | "psm1" | "psd1" => FileType::PowerShell,
+            "proto" => FileType::Protobuf,
+            "graphql" | "gql" => FileType::GraphQl,
+            "bzl" | "star" => FileType::Starlark,
+            "cmake" => FileType::Cmake,
+            "groovy" | "gradle" => FileType::Groovy,
+            "ini" => FileType::Ini,
             _ => FileType::Unknown,
         }
     }
@@ -110,6 +143,15 @@ impl FileType {
                 | FileType::Vue
                 | FileType::Kotlin
                 | FileType::Sql
+                | FileType::Terraform
+                | FileType::Bash
+                | FileType::PowerShell
+                | FileType::Protobuf
+                | FileType::GraphQl
+                | FileType::Starlark
+                | FileType::Cmake
+                | FileType::Groovy
+                | FileType::Ini
         )
     }
 
@@ -153,6 +195,15 @@ impl FileType {
             FileType::Pdf => "pdf",
             FileType::PlainText => "plaintext",
             FileType::Binary => "binary",
+            FileType::Terraform => "terraform",
+            FileType::Bash => "bash",
+            FileType::PowerShell => "powershell",
+            FileType::Protobuf => "protobuf",
+            FileType::GraphQl => "graphql",
+            FileType::Starlark => "starlark",
+            FileType::Cmake => "cmake",
+            FileType::Groovy => "groovy",
+            FileType::Ini => "ini",
             FileType::Unknown => "unknown",
         }
     }
@@ -232,5 +283,106 @@ mod tests {
         assert_eq!(FileType::Rust.language_name(), "rust");
         assert_eq!(FileType::Cpp.language_name(), "cpp");
         assert_eq!(FileType::Unknown.language_name(), "unknown");
+    }
+
+    #[test]
+    fn test_detect_config_as_code_extensions() {
+        assert_eq!(FileType::detect(Path::new("main.tf")), FileType::Terraform);
+        assert_eq!(
+            FileType::detect(Path::new("vars.tfvars")),
+            FileType::Terraform
+        );
+        assert_eq!(
+            FileType::detect(Path::new("network.hcl")),
+            FileType::Terraform
+        );
+        assert_eq!(FileType::detect(Path::new("deploy.sh")), FileType::Bash);
+        assert_eq!(FileType::detect(Path::new("setup.bash")), FileType::Bash);
+        assert_eq!(FileType::detect(Path::new("profile.zsh")), FileType::Bash);
+        assert_eq!(
+            FileType::detect(Path::new("Install.ps1")),
+            FileType::PowerShell
+        );
+        assert_eq!(
+            FileType::detect(Path::new("Module.psm1")),
+            FileType::PowerShell
+        );
+        assert_eq!(FileType::detect(Path::new("api.proto")), FileType::Protobuf);
+        assert_eq!(
+            FileType::detect(Path::new("schema.graphql")),
+            FileType::GraphQl
+        );
+        assert_eq!(FileType::detect(Path::new("query.gql")), FileType::GraphQl);
+        assert_eq!(FileType::detect(Path::new("rules.bzl")), FileType::Starlark);
+        assert_eq!(FileType::detect(Path::new("defs.star")), FileType::Starlark);
+        assert_eq!(
+            FileType::detect(Path::new("modules.cmake")),
+            FileType::Cmake
+        );
+        assert_eq!(FileType::detect(Path::new("Task.groovy")), FileType::Groovy);
+        assert_eq!(
+            FileType::detect(Path::new("build.gradle")),
+            FileType::Groovy
+        );
+        assert_eq!(FileType::detect(Path::new("app.ini")), FileType::Ini);
+    }
+
+    #[test]
+    fn test_detect_config_as_code_bare_filenames() {
+        assert_eq!(
+            FileType::detect(Path::new("CMakeLists.txt")),
+            FileType::Cmake
+        );
+        assert_eq!(
+            FileType::detect(Path::new("modules/cmakelists.txt")),
+            FileType::Cmake,
+            "filename match must be case-insensitive"
+        );
+        assert_eq!(FileType::detect(Path::new("BUILD")), FileType::Starlark);
+        assert_eq!(
+            FileType::detect(Path::new("BUILD.bazel")),
+            FileType::Starlark
+        );
+        assert_eq!(FileType::detect(Path::new("WORKSPACE")), FileType::Starlark);
+        assert_eq!(
+            FileType::detect(Path::new("WORKSPACE.bazel")),
+            FileType::Starlark
+        );
+        assert_eq!(
+            FileType::detect(Path::new("MODULE.bazel")),
+            FileType::Starlark
+        );
+        // .cfg/.env stay on PlainText — only .ini gets structural parsing.
+        assert_eq!(
+            FileType::detect(Path::new("setup.cfg")),
+            FileType::PlainText
+        );
+        // NOTE: a bare `.env` dotfile has no extension per `Path::extension()`
+        // semantics (a filename starting with '.' and containing no other '.'
+        // yields None) — this was true before this task too, since the old
+        // "env" match arm was only ever reachable for e.g. `foo.env`, never a
+        // bare `.env`. Verified unchanged pre/post this task's edit; see
+        // task-2-report.md for the repro. Behaviorally moot in practice: the
+        // real file walker skips all hidden files before detect() ever runs.
+        assert_eq!(FileType::detect(Path::new(".env")), FileType::Unknown);
+    }
+
+    #[test]
+    fn test_config_as_code_supports_ast_and_language_name() {
+        for (ft, name) in [
+            (FileType::Terraform, "terraform"),
+            (FileType::Bash, "bash"),
+            (FileType::PowerShell, "powershell"),
+            (FileType::Protobuf, "protobuf"),
+            (FileType::GraphQl, "graphql"),
+            (FileType::Starlark, "starlark"),
+            (FileType::Cmake, "cmake"),
+            (FileType::Groovy, "groovy"),
+            (FileType::Ini, "ini"),
+        ] {
+            assert!(ft.supports_ast(), "{ft:?} must support AST chunking");
+            assert!(ft.is_text(), "{ft:?} must be a text file type");
+            assert_eq!(ft.language_name(), name);
+        }
     }
 }
