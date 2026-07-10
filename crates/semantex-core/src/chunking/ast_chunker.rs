@@ -1107,6 +1107,29 @@ fn extract_proto_name(node: &Node, source: &[u8]) -> Option<String> {
 /// alone. Adapted from `lightonai/colgrep`'s `get_graphql_unit_name`
 /// (Apache-2.0).
 fn extract_graphql_name(node: &Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "operation_definition" {
+        let mut op_type: Option<String> = None;
+        let mut name: Option<String> = None;
+        for i in 0..node.child_count() {
+            let Some(child) = node.child(i as u32) else {
+                continue;
+            };
+            if child.kind() == "operation_type" {
+                let text = &source[child.start_byte()..child.end_byte()];
+                op_type = Some(String::from_utf8_lossy(text).to_string());
+            } else if child.kind() == "name" {
+                let text = &source[child.start_byte()..child.end_byte()];
+                let n = String::from_utf8_lossy(text).trim().to_string();
+                if !n.is_empty() {
+                    name = Some(n);
+                }
+            }
+        }
+        return op_type.map(|kw| match name {
+            Some(n) => format!("{kw} {n}"),
+            None => kw,
+        });
+    }
     let keyword = match node.kind() {
         "object_type_definition" => "type",
         "interface_type_definition" => "interface",
@@ -1115,7 +1138,6 @@ fn extract_graphql_name(node: &Node, source: &[u8]) -> Option<String> {
         "union_type_definition" => "union",
         "scalar_type_definition" => "scalar",
         "directive_definition" => "directive",
-        "operation_definition" => "operation",
         "fragment_definition" => "fragment",
         "schema_definition" => return Some("schema".to_string()),
         _ => return None,
@@ -2441,6 +2463,49 @@ CREATE TRIGGER audit_trigger AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION
         assert_eq!(
             extract_name(&enum_type, source, FileType::GraphQl),
             Some("enum Role".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_graphql_named_and_anonymous_operations() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_graphql::LANGUAGE.into())
+            .unwrap();
+        let source = b"query GetUser {\n  user { id }\n}\n\nmutation {\n  createUser { id }\n}\n";
+        let tree = parser.parse(source, None).unwrap();
+        // operation_definition nodes may be nested (same discovery as the
+        // other GraphQL/Starlark/PowerShell tests) -- search the whole tree,
+        // not just direct root children.
+        let mut stack = vec![tree.root_node()];
+        let mut operations = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "operation_definition" {
+                operations.push(node);
+            }
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    stack.push(child);
+                }
+            }
+        }
+        assert_eq!(
+            operations.len(),
+            2,
+            "should find both operation_definition nodes"
+        );
+
+        let names: Vec<Option<String>> = operations
+            .iter()
+            .map(|n| extract_name(n, source, FileType::GraphQl))
+            .collect();
+        assert!(
+            names.contains(&Some("query GetUser".to_string())),
+            "named query must extract as 'query GetUser', got {names:?}"
+        );
+        assert!(
+            names.contains(&Some("mutation".to_string())),
+            "anonymous mutation must extract as bare 'mutation' (no name to append), got {names:?}"
         );
     }
 
