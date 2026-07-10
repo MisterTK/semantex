@@ -1368,6 +1368,109 @@ impl McpServer {
                 output_schema: None,
                 annotations: Some(ToolAnnotations::read_only("Recall Project Memory Notes")),
             },
+            Tool {
+                name: "semantex_history".into(),
+                title: Some("Git History".into()),
+                description: concat!(
+                    "Query the project's indexed git history: recent commits, commits since a ",
+                    "tag/sha/date, commits touching a file, full-text search over commit messages, ",
+                    "and per-commit detail with diffs. History refreshes incrementally from git on ",
+                    "every call, so results always reflect the repo's current HEAD (no reindex ",
+                    "needed after a pull). Use for release notes / changelogs ('since': tag or ",
+                    "YYYY-MM-DD), 'what changed recently?', and cross-repo dependency change ",
+                    "tracking (scope='all' or named projects). List mode returns one compact line ",
+                    "per commit; pass commits=[shas] for detail mode with --stat and a ",
+                    "budget-bounded patch (max 10 shas/call). NOT for searching code content — ",
+                    "use semantex_agent for that."
+                )
+                .into(),
+                input_schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "since": {
+                            "type": "string",
+                            "description": "Only commits AFTER this point (exclusive). Accepts a tag, sha, any git rev (e.g. HEAD~5), or a UTC date YYYY-MM-DD."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Full-text match over commit messages (FTS5 when available)."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Repo-relative path — only commits that touched it."
+                        },
+                        "author": {
+                            "type": "string",
+                            "description": "Author-name substring filter."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max commits per project (default 20).",
+                            "default": 20
+                        },
+                        "commits": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Detail mode: expand these shas (7-40 hex chars each) with full message, files, --stat, and a budget-bounded patch. Max 10 per call; excess reported as skipped. When present, the list-mode filters above are ignored."
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Detail mode only: total patch-byte budget split across requested shas (default SEMANTEX_MCP_BUDGET, normally 12000)."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Project path (defaults to current working directory)."
+                        },
+                        "scope": {
+                            "description": "Which repo(s). 'repo' (default) = only 'path'. 'all' = every project in the local semantex registry. Any other string is treated as comma-separated registered project names, and an array of names does the same — unmatched names are reported in 'skipped'. Cross-repo output is one time-ordered section per project (no fusion).",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}}
+                            ]
+                        }
+                    }
+                }),
+                output_schema: Some(serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "commits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "hash": { "type": "string" },
+                                    "author": { "type": "string" },
+                                    "ts": { "type": "integer" },
+                                    "age": { "type": "string" },
+                                    "subject": { "type": "string" },
+                                    "files": { "type": "array", "items": { "type": "string" } },
+                                    "body": { "type": "string" },
+                                    "stat": { "type": "string" },
+                                    "patch": { "type": "string" },
+                                    "patch_truncated": { "type": "boolean" }
+                                },
+                                "required": ["hash", "author", "ts", "subject"]
+                            }
+                        },
+                        "projects": {
+                            "type": "array",
+                            "description": "Cross-repo calls only: one entry per project section.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "project": { "type": "string" },
+                                    "commits": { "type": "array" }
+                                }
+                            }
+                        },
+                        "skipped": { "type": "array", "items": { "type": "string" } },
+                        "skipped_shas": { "type": "array", "items": { "type": "string" } }
+                    }
+                })),
+                annotations: Some(ToolAnnotations::read_only("Git History")),
+            },
         ]
     }
 
@@ -1662,6 +1765,7 @@ impl McpServer {
             "semantex_docs_context" => self.tool_docs_context(&arguments),
             "semantex_memory_save" => self.tool_memory_save(&arguments),
             "semantex_memory_recall" => self.tool_memory_recall(&arguments),
+            "semantex_history" => self.tool_history(&arguments),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 
@@ -3471,6 +3575,33 @@ impl McpServer {
             structured: Some(result.structured),
         })
     }
+
+    // -------------------------------------------------------------------------
+    // v13 Wave 2 — semantex_history
+    //
+    // First-class git-history queries (list + detail), single-repo here;
+    // `scope != repo` delegates to the federated path (Task 5).
+    // -------------------------------------------------------------------------
+
+    /// `semantex_history` — first-class git-history queries (list + detail),
+    /// single-repo here; `scope != repo` delegates to the federated path.
+    /// Works with or without a search index: history.db is populated on
+    /// demand and git is the source of truth.
+    #[allow(clippy::unused_self)]
+    #[tracing::instrument(skip(self, args), fields(tool = "history"))]
+    fn tool_history(&self, args: &serde_json::Value) -> Result<ToolOutput> {
+        let scope = Self::parse_scope(args);
+        if scope != semantex_core::search::federation::SearchScope::CurrentRepo {
+            anyhow::bail!("semantex_history cross-repo scope lands in the next commit");
+        }
+        let path = resolve_project_path(args)?;
+        let budget = args
+            .get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(self.mcp_defaults.budget, |v| v as usize);
+        let (text, structured) = history_for_project(&path, None, args, budget)?;
+        Ok(ToolOutput::text_with_structured(text, structured))
+    }
 }
 
 /// v13 Wave 2 (history): `semantex_agent`'s `include_history` addendum.
@@ -3522,6 +3653,184 @@ fn history_addendum_for_hits(
         return None;
     }
     Some(format!("\n\n## Recent changes\n{}\n", lines.join("\n")))
+}
+
+/// One project's `semantex_history` answer: (markdown text, structured JSON).
+/// `label` prefixes a `## [label]` section header on federated calls.
+///
+/// Refreshes history from git first (spec §2): `populate_history` is
+/// incremental and idempotent — a caught-up repo costs one `git rev-parse`.
+/// Deliberately does NOT take `.semantex.lock` (that would read as "index
+/// building" elsewhere); concurrent writers are safe via SQLite tx +
+/// INSERT OR IGNORE + the 5s busy timeout.
+fn history_for_project(
+    project_root: &std::path::Path,
+    label: Option<&str>,
+    args: &serde_json::Value,
+    budget: usize,
+) -> Result<(String, serde_json::Value)> {
+    use semantex_core::index::history;
+
+    if let Err(e) = history::populate_history(project_root) {
+        tracing::debug!(project = %project_root.display(), "history refresh skipped: {e}");
+    }
+    let header = label.map_or(String::new(), |l| format!("## [{l}]\n\n"));
+    if !history::has_history(project_root) {
+        let msg = format!(
+            "{header}No git history recorded for this project \
+             (not a git repository, zero commits, or `git` unavailable)."
+        );
+        return Ok((msg, serde_json::json!({ "commits": [] })));
+    }
+    let conn = history::open(project_root)?;
+
+    // ── Detail mode: `commits` param present ──────────────────────────
+    if let Some(shas) = args.get("commits").and_then(|v| v.as_array()) {
+        let requested: Vec<String> = shas
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect();
+        if requested.is_empty() {
+            anyhow::bail!("'commits' must be a non-empty array of sha strings");
+        }
+        let (take, skipped_shas) = if requested.len() > history::MAX_DETAIL_COMMITS {
+            requested.split_at(history::MAX_DETAIL_COMMITS)
+        } else {
+            (&requested[..], &[][..])
+        };
+        let per_commit_budget = (budget / take.len()).max(1_000);
+        let mut text = header;
+        let mut commits_json = Vec::new();
+        for sha in take {
+            match history::commit_detail(project_root, &conn, sha, per_commit_budget) {
+                Ok(d) => {
+                    let short: String = d.hash.chars().take(8).collect();
+                    text.push_str(&format!(
+                        "### {short} — {}\n{} · {}\n",
+                        d.subject,
+                        d.author,
+                        history::humanize_age(d.ts)
+                    ));
+                    if !d.body.is_empty() {
+                        text.push_str(&format!("\n{}\n", d.body));
+                    }
+                    if !d.stat.is_empty() {
+                        text.push_str(&format!("\n```\n{}\n```\n", d.stat));
+                    }
+                    if !d.patch.is_empty() {
+                        text.push_str(&format!("\n```diff\n{}\n```\n", d.patch));
+                        if d.patch_truncated {
+                            text.push_str("[diff truncated]\n");
+                        }
+                    }
+                    text.push('\n');
+                    commits_json.push(serde_json::json!({
+                        "hash": d.hash,
+                        "author": d.author,
+                        "ts": d.ts,
+                        "age": history::humanize_age(d.ts),
+                        "subject": d.subject,
+                        "body": d.body,
+                        "files": d.files,
+                        "stat": d.stat,
+                        "patch": d.patch,
+                        "patch_truncated": d.patch_truncated,
+                    }));
+                }
+                Err(e) => {
+                    text.push_str(&format!("### {sha}\n[error: {e}]\n\n"));
+                }
+            }
+        }
+        if !skipped_shas.is_empty() {
+            text.push_str(&format!(
+                "[{} sha(s) beyond the per-call cap of {} skipped: {}]\n",
+                skipped_shas.len(),
+                history::MAX_DETAIL_COMMITS,
+                skipped_shas.join(", ")
+            ));
+        }
+        return Ok((
+            text.trim_end().to_string(),
+            serde_json::json!({ "commits": commits_json, "skipped_shas": skipped_shas }),
+        ));
+    }
+
+    // ── List mode ──────────────────────────────────────────────────────
+    let mut filter = history::HistoryFilter {
+        since_ts: None,
+        author: args
+            .get("author")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        file: args
+            .get("file")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        message_query: args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        limit: args
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(20, |v| v as usize),
+    };
+    let mut window_note: Option<String> = None;
+    if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
+        let Some(ts) = history::resolve_since_to_ts(project_root, since) else {
+            anyhow::bail!(
+                "could not resolve since='{since}' \
+                 (accepted: YYYY-MM-DD, a tag, a sha, or any git rev)"
+            );
+        };
+        filter.since_ts = Some(ts);
+        if let Some(oldest) = history::oldest_commit_ts(&conn)
+            && ts < oldest
+        {
+            window_note = Some(format!(
+                "[note: the captured history window starts {} — commits between \
+                 '{since}' and that point are not recorded; raise \
+                 SEMANTEX_HISTORY_COMMITS (default 500) and reindex to widen it]",
+                history::humanize_age(oldest)
+            ));
+        }
+    }
+    let commits = history::filter_commits(&conn, &filter)?;
+    let mut text = header;
+    let mut commits_json = Vec::new();
+    if commits.is_empty() {
+        text.push_str("No commits matched.");
+    } else {
+        for c in &commits {
+            let files = history::files_for_commit(&conn, &c.hash).unwrap_or_default();
+            let short: String = c.hash.chars().take(8).collect();
+            text.push_str(&format!(
+                "{short}  {:>8}  {} — {} ({} file{})\n",
+                history::humanize_age(c.ts),
+                c.author,
+                c.subject,
+                files.len(),
+                if files.len() == 1 { "" } else { "s" }
+            ));
+            commits_json.push(serde_json::json!({
+                "hash": c.hash,
+                "author": c.author,
+                "ts": c.ts,
+                "age": history::humanize_age(c.ts),
+                "subject": c.subject,
+                "files": files,
+            }));
+        }
+    }
+    if let Some(note) = window_note {
+        text.push_str(&format!("\n{note}"));
+    }
+    Ok((
+        text.trim_end().to_string(),
+        serde_json::json!({ "commits": commits_json }),
+    ))
 }
 
 // =============================================================================
@@ -4235,7 +4544,7 @@ mod tests {
     }
 
     #[test]
-    fn toolset_all_exposes_ten_visible_tools() {
+    fn toolset_all_exposes_eleven_visible_tools() {
         // Phase 3 surface restriction: the M1-M6 structural tools that
         // shipped in v0.3 caused a measured +76pp regression in agent CCB
         // vs v0.2. They're hidden from the *default* `all` bundle's
@@ -4244,15 +4553,15 @@ mod tests {
         //
         // v13 Wave 2 adds `semantex_docs_context` as a genuinely new visible
         // tool (not one of the moved M1-M6), plus `semantex_memory_save`
-        // / `semantex_memory_recall` (also new, also visible), so the count
-        // is now 10.
+        // / `semantex_memory_recall` (also new, also visible), plus
+        // `semantex_history` (also new, also visible), so the count is now 11.
         let server = make_server("all");
         let tools = server.tools_for_toolset("all");
         assert_eq!(
             tools.len(),
-            10,
+            11,
             "toolset 'all' must expose the v0.2 set of 7 visible tools plus \
-             v13's semantex_docs_context and semantex_memory_save/recall, got {}",
+             v13's semantex_docs_context, semantex_memory_save/recall, and semantex_history, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -4267,6 +4576,7 @@ mod tests {
             "semantex_docs_context",
             "semantex_memory_save",
             "semantex_memory_recall",
+            "semantex_history",
         ] {
             assert!(names.contains(required), "missing visible tool {required}");
         }
@@ -4307,7 +4617,7 @@ mod tests {
         // these 5 Tool defs live in `structural_tools()`, not `all_tools()`.
         // A caller must explicitly opt into `--toolset structural` to see
         // them; the default `all` bundle never does (that's what Phase 3
-        // fixed — see `toolset_all_exposes_ten_visible_tools`).
+        // fixed — see `toolset_all_exposes_eleven_visible_tools`).
         let server = make_server("structural");
         let tools = server.tools_for_toolset("structural");
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -4342,8 +4652,8 @@ mod tests {
         assert_eq!(server.toolset(), "all");
         let tools = server.tools_for_toolset("nonsense");
         // Filter falls through to `all` (Phase 3: 7 visible tools + v13's
-        // semantex_docs_context + memory_save/recall = 10).
-        assert_eq!(tools.len(), 10);
+        // semantex_docs_context + memory_save/recall + semantex_history = 11).
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]
@@ -6103,6 +6413,143 @@ mod tests {
             text.contains("dispatch reachability check") || text.contains("memory note"),
             "recall text should reflect the saved note: {text}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // v13 Wave 2 (history) — semantex_history tool tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Scripted temp git repo for history-tool tests: `commits` = (file, message).
+    /// No semantex index is built — semantex_history must work without one.
+    fn scripted_git_repo(commits: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .expect("git must be on PATH");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        for (file, msg) in commits {
+            std::fs::write(dir.path().join(file), *msg).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", msg]);
+        }
+        dir
+    }
+
+    #[test]
+    fn tool_history_lists_recent_commits_without_an_index() {
+        let repo = scripted_git_repo(&[("a.rs", "add a"), ("b.rs", "add b"), ("c.rs", "add c")]);
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({ "path": repo.path().display().to_string() }))
+            .expect("tool_history");
+        let text = &out.text;
+        assert!(text.contains("add c"), "most recent commit missing: {text}");
+        assert!(text.contains("add a"));
+        let commits = out.structured.expect("structured")["commits"]
+            .as_array()
+            .expect("commits array")
+            .len();
+        assert_eq!(commits, 3);
+    }
+
+    #[test]
+    fn tool_history_non_git_dir_is_graceful() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({ "path": dir.path().display().to_string() }))
+            .expect("non-git dir must not error");
+        assert!(out.text.contains("No git history"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn tool_history_since_tag_excludes_tagged_commit() {
+        let repo = scripted_git_repo(&[("a.rs", "before tag")]);
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["tag", "v1"]);
+        // Ensure distinct timestamps for the two commits
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(repo.path().join("b.rs"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "after tag"]);
+
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({
+                "path": repo.path().display().to_string(),
+                "since": "v1",
+            }))
+            .expect("tool_history");
+        let text = &out.text;
+        assert!(text.contains("after tag"), "got: {text}");
+        assert!(
+            !text.contains("before tag"),
+            "tagged commit must be excluded: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_history_bad_since_is_an_error_with_accepted_forms() {
+        let repo = scripted_git_repo(&[("a.rs", "one")]);
+        let server = make_server("all");
+        match server.tool_history(&serde_json::json!({
+            "path": repo.path().display().to_string(),
+            "since": "definitely-not-a-ref",
+        })) {
+            Err(err) => assert!(
+                err.to_string().contains("could not resolve since"),
+                "actionable: {err}"
+            ),
+            Ok(_) => panic!("expected Err for unresolvable since, got Ok"),
+        }
+    }
+
+    #[test]
+    fn tool_history_detail_mode_returns_bounded_patch() {
+        let repo = scripted_git_repo(&[(
+            "a.rs",
+            "fn main() { /* a reasonably long line of content here */ }",
+        )]);
+        let server = make_server("all");
+        // Fetch the sha via list mode's structured output.
+        let list = server
+            .tool_history(&serde_json::json!({ "path": repo.path().display().to_string() }))
+            .unwrap();
+        let sha = list.structured.unwrap()["commits"][0]["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let out = server
+            .tool_history(&serde_json::json!({
+                "path": repo.path().display().to_string(),
+                "commits": [sha],
+                "budget": 1000,
+            }))
+            .expect("detail mode");
+        let s = out.structured.expect("structured");
+        let d = &s["commits"][0];
+        assert!(d["stat"].as_str().unwrap().contains("a.rs"));
+        assert!(d["patch"].as_str().unwrap().len() <= 1000);
+        assert!(out.text.contains("a.rs"));
     }
 }
 
