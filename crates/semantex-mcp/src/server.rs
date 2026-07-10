@@ -576,7 +576,13 @@ impl McpServer {
                 "Fall back to Grep ONLY for tiny mechanical regex sweeps, Glob ONLY for ",
                 "file-name patterns. All semantex tools are read-only and safe without ",
                 "user confirmation. The index is auto-built on first use; queries during ",
-                "the build return keyword results."
+                "the build return keyword results.",
+                "\n\n## Git history\n\n",
+                "Use `semantex_history` for commit-history questions: recent changes, ",
+                "commits since a tag/sha/date, commits touching a file, commit-message ",
+                "search, and per-commit diffs (`commits: [shas]`). Cross-repo via 'scope'. ",
+                "It refreshes from git on every call. It is NOT a code-search tool — code ",
+                "content questions still go to `semantex_agent`."
             ).into()),
         };
         JsonRpcResponse::success(
@@ -6374,8 +6380,9 @@ mod tests {
             "semantex_memory_recall must be readOnlyHint: true"
         );
 
-        // Additive: both come after semantex_docs_context in the list, and
-        // both are the last two entries (this workstream's own append point).
+        // Additive: both come after semantex_docs_context in the list.
+        // semantex_history was added after the memory tools, so memory_recall
+        // is now second-to-last and memory_save is third-to-last.
         let save_idx = tools
             .iter()
             .position(|t| t.name == "semantex_memory_save")
@@ -6386,12 +6393,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             recall_idx,
-            tools.len() - 1,
-            "semantex_memory_recall must be registered at the END of the tool list"
+            tools.len() - 2,
+            "semantex_memory_recall must be second-to-last (before semantex_history)"
         );
         assert_eq!(
             save_idx,
-            tools.len() - 2,
+            tools.len() - 3,
             "semantex_memory_save must immediately precede semantex_memory_recall"
         );
 

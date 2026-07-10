@@ -177,6 +177,20 @@ prior work might already have settled), one `semantex_memory_recall` with a shor
 cheap insurance against re-litigating a decision that's already recorded. If it returns
 nothing, that's a real signal — fall back to `semantex_agent`, don't assume the answer.
 
+## Git history: `semantex_history`
+
+For commit-history questions — NOT code content — use `semantex_history`:
+
+- "What changed recently?" → `{}` (recent commits, current repo)
+- Release notes / changelog since a tag → `{"since": "v1.0.0", "limit": 50}`
+- Changes across all indexed dependency repos → `{"since": "2026-07-03", "scope": "all"}`
+- Commits touching one file → `{"file": "src/router.rs"}`
+- Drill into specific commits with diffs → `{"commits": ["<sha>", ...]}` (max 10)
+
+History refreshes from git on every call — no reindex needed after `git pull`.
+One call per question; combine filters (`since` + `file` + `query` + `author`)
+instead of chaining calls. Code-content questions still go to `semantex_agent`.
+
 ## Fallbacks (last resort)
 
 - **Grep**: exact regex on file content only — no semantic understanding

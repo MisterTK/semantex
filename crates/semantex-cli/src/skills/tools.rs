@@ -656,6 +656,89 @@ pub fn all_tools() -> Vec<ToolMetadata> {
             mutates: false,
             live: true,
         },
+        ToolMetadata {
+            name: "semantex_history",
+            title: "Git History",
+            description: concat!(
+                "Query indexed git history: recent commits, commits since a tag/sha/date, ",
+                "commits touching a file, full-text search over commit messages, and ",
+                "per-commit detail with a budget-bounded diff. Refreshes incrementally from ",
+                "git on every call — results always reflect current HEAD. Cross-repo via ",
+                "'scope' for dependency change tracking. NOT for code content — use ",
+                "semantex_agent for that."
+            ),
+            when_to_use: &[
+                "Drafting release notes or a changelog since the last tag.",
+                "Checking what changed recently, in this repo or across all indexed dependency repos (scope='all').",
+                "Onboarding to an unfamiliar repo: recent change activity alongside code search.",
+            ],
+            args: &[
+                ToolArg {
+                    name: "since",
+                    ty: "string",
+                    required: false,
+                    description: "Only commits after this point: tag, sha, git rev, or YYYY-MM-DD.",
+                },
+                ToolArg {
+                    name: "query",
+                    ty: "string",
+                    required: false,
+                    description: "Full-text match over commit messages.",
+                },
+                ToolArg {
+                    name: "file",
+                    ty: "string",
+                    required: false,
+                    description: "Repo-relative path — only commits touching it.",
+                },
+                ToolArg {
+                    name: "author",
+                    ty: "string",
+                    required: false,
+                    description: "Author-name substring filter.",
+                },
+                ToolArg {
+                    name: "limit",
+                    ty: "integer",
+                    required: false,
+                    description: "Max commits per project (default 20).",
+                },
+                ToolArg {
+                    name: "commits",
+                    ty: "array<string>",
+                    required: false,
+                    description: "Detail mode: shas to expand with --stat and a bounded patch (max 10/call).",
+                },
+                ToolArg {
+                    name: "scope",
+                    ty: "string|array<string>",
+                    required: false,
+                    description: "'repo' (default), 'all', or registered project names for cross-repo history.",
+                },
+                ToolArg {
+                    name: "path",
+                    ty: "string",
+                    required: false,
+                    description: "Project path (defaults to current working directory).",
+                },
+            ],
+            examples: &[
+                ToolExample {
+                    label: "Release notes since the last tag",
+                    args_json: r#"{"since": "v1.0.0", "limit": 50}"#,
+                },
+                ToolExample {
+                    label: "What changed across all dependency repos this week",
+                    args_json: r#"{"since": "2026-07-03", "scope": "all"}"#,
+                },
+                ToolExample {
+                    label: "Drill into two commits with diffs",
+                    args_json: r#"{"commits": ["abc1234f", "def5678a"]}"#,
+                },
+            ],
+            mutates: false,
+            live: true,
+        },
     ]
 }
 
