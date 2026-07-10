@@ -830,6 +830,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Groovy => Some(tree_sitter_groovy::LANGUAGE.into()),
         FileType::Terraform => Some(tree_sitter_hcl::LANGUAGE.into()),
         FileType::Protobuf => Some(tree_sitter_proto::LANGUAGE.into()),
+        FileType::GraphQl => Some(tree_sitter_graphql::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -980,6 +981,21 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
         // Each message/enum/service is one unit; fields/enum values/rpcs
         // stay folded inside (no nested node kind here is also in this list).
         FileType::Protobuf => Some(&["message", "enum", "service"]),
+        // GraphQL type-system and executable definitions. The grammar nests
+        // them under definition -> type_system_definition -> type_definition,
+        // so we match the concrete leaf kinds the recursion reaches.
+        FileType::GraphQl => Some(&[
+            "object_type_definition",
+            "interface_type_definition",
+            "enum_type_definition",
+            "input_object_type_definition",
+            "union_type_definition",
+            "scalar_type_definition",
+            "schema_definition",
+            "directive_definition",
+            "operation_definition",
+            "fragment_definition",
+        ]),
         _ => None,
     }
 }
@@ -3030,5 +3046,54 @@ service Billing {
             "should find service Billing as an Other(\"service\")-kind AstNode"
         );
         assert!(service.unwrap().content.contains("GetInvoice"));
+    }
+
+    #[test]
+    fn test_graphql_type_and_enum_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r"type User {
+  id: ID!
+  name: String!
+}
+
+enum Role {
+  ADMIN
+  MEMBER
+}
+";
+        let chunks = chunker.chunk(Path::new("schema.graphql"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "GraphQL must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let user_type = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "type User" && matches!(kind, AstNodeKind::Other(s) if s == "type")
+            }
+            _ => false,
+        });
+        assert!(
+            user_type.is_some(),
+            "should find type User as an Other(\"type\")-kind AstNode"
+        );
+        assert!(user_type.unwrap().content.contains("name: String!"));
+
+        let role_enum = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "enum Role" && matches!(kind, AstNodeKind::Enum)
+            }
+            _ => false,
+        });
+        assert!(
+            role_enum.is_some(),
+            "should find enum Role as an Enum-kind AstNode"
+        );
+        assert!(role_enum.unwrap().content.contains("MEMBER"));
     }
 }
