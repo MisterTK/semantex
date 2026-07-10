@@ -851,6 +851,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Starlark => Some(tree_sitter_starlark::LANGUAGE.into()),
         FileType::Cmake => Some(tree_sitter_cmake::LANGUAGE.into()),
         FileType::Ini => Some(tree_sitter_ini::LANGUAGE.into()),
+        FileType::PowerShell => Some(tree_sitter_powershell::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -1024,6 +1025,7 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
         FileType::Starlark => Some(&["function_definition", "call"]),
         FileType::Cmake => Some(&["function_def", "macro_def"]),
         FileType::Ini => Some(&["section"]),
+        FileType::PowerShell => Some(&["function_statement", "class_statement"]),
         _ => None,
     }
 }
@@ -3280,5 +3282,49 @@ driver = redis
             _ => false,
         });
         assert!(cache, "should find [cache] as a named AstNode");
+    }
+
+    #[test]
+    fn test_powershell_function_and_class_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"function Get-Greeting {
+    param([string]$Name)
+    return "Hello, $Name!"
+}
+
+class Greeter {
+    [string]$Name
+}
+"#;
+        let chunks = chunker.chunk(Path::new("Install.ps1"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "PowerShell must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let func = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "Get-Greeting" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            func.is_some(),
+            "should find Get-Greeting as a Function-kind AstNode"
+        );
+        assert!(func.unwrap().content.contains("Hello, $Name"));
+
+        let class = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "Greeter" && matches!(kind, AstNodeKind::Class)
+            }
+            _ => false,
+        });
+        assert!(class, "should find Greeter as a Class-kind AstNode");
     }
 }
