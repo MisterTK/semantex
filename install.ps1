@@ -87,12 +87,27 @@ $binSrc = Join-Path $extractDir "semantex.exe"
 $binDst = Join-Path $installDir "semantex.exe"
 
 Info "Installing" $binDst
-Copy-Item $binSrc $binDst -Force
 
-# Copy ONNX Runtime DLL alongside the binary (needed for model inference)
+# Install via copy-to-temp-name + Move-Item, not a direct Copy-Item onto the
+# live path. Copy-Item needs write access to the destination's existing
+# bytes, which Windows denies with ERROR_SHARING_VIOLATION while semantex.exe
+# is running (e.g. a `semantex mcp` process backing an editor integration).
+# Move-Item only needs to replace the directory entry, which Windows allows
+# even for a running executable (the loader opens process images with
+# FILE_SHARE_DELETE) — the same rename-based swap used on macOS/Linux via
+# install.sh, and the standard Windows self-updater pattern.
+$binTmp = "$binDst.new"
+Copy-Item $binSrc $binTmp -Force
+Move-Item $binTmp $binDst -Force
+
+# Copy ONNX Runtime DLL alongside the binary (needed for model inference;
+# same temp+move rationale as the main binary above)
 $dlls = Get-ChildItem (Join-Path $extractDir "onnxruntime*.dll") -ErrorAction SilentlyContinue
 foreach ($dll in $dlls) {
-    Copy-Item $dll.FullName (Join-Path $installDir $dll.Name) -Force
+    $dllDst = Join-Path $installDir $dll.Name
+    $dllTmp = "$dllDst.new"
+    Copy-Item $dll.FullName $dllTmp -Force
+    Move-Item $dllTmp $dllDst -Force
     Info "Copied" $dll.Name
 }
 
