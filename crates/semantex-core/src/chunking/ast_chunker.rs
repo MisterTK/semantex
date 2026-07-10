@@ -1419,6 +1419,32 @@ fn classify_node_kind(kind: &str) -> AstNodeKind {
         "create_role" => AstNodeKind::Other("role".to_string()),
         "create_database" => AstNodeKind::Other("database".to_string()),
         "create_extension" => AstNodeKind::Other("extension_stmt".to_string()),
+        // Protobuf: a message is structurally a record (matches
+        // create_table -> Struct); enum maps directly; service has no
+        // clean AstNodeKind equivalent, stays Other(_) like SQL's
+        // view/index/trigger.
+        "message" => AstNodeKind::Struct,
+        "enum" => AstNodeKind::Enum,
+        "service" => AstNodeKind::Other("service".to_string()),
+        // GraphQL SDL/executable definitions: interface and enum have clean
+        // existing categories; the rest have no OOP equivalent and stay
+        // Other(_) with the GraphQL keyword, mirroring SQL's own precedent.
+        "interface_type_definition" => AstNodeKind::Interface,
+        "enum_type_definition" => AstNodeKind::Enum,
+        "object_type_definition" => AstNodeKind::Other("type".to_string()),
+        "input_object_type_definition" => AstNodeKind::Other("input".to_string()),
+        "union_type_definition" => AstNodeKind::Other("union".to_string()),
+        "scalar_type_definition" => AstNodeKind::Other("scalar".to_string()),
+        "schema_definition" => AstNodeKind::Other("schema".to_string()),
+        "directive_definition" => AstNodeKind::Other("directive".to_string()),
+        "operation_definition" => AstNodeKind::Other("operation".to_string()),
+        "fragment_definition" => AstNodeKind::Other("fragment".to_string()),
+        // CMake function/macro definitions and PowerShell function/class
+        // statements use distinct literal kind strings from every existing
+        // Function/Class arm, so they need their own entries even though
+        // the categories already exist.
+        "function_def" | "macro_def" | "function_statement" => AstNodeKind::Function,
+        "class_statement" => AstNodeKind::Class,
         other => AstNodeKind::Other(other.to_string()),
     }
 }
@@ -2655,5 +2681,89 @@ CREATE TRIGGER audit_trigger AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION
             extract_name(&class, source, FileType::PowerShell),
             Some("Greeter".to_string())
         );
+    }
+
+    #[test]
+    fn test_classify_node_kind_config_as_code() {
+        assert!(matches!(classify_node_kind("message"), AstNodeKind::Struct));
+        assert!(matches!(classify_node_kind("enum"), AstNodeKind::Enum));
+        assert!(matches!(classify_node_kind("service"), AstNodeKind::Other(s) if s == "service"));
+        assert!(matches!(
+            classify_node_kind("object_type_definition"),
+            AstNodeKind::Other(s) if s == "type"
+        ));
+        assert!(matches!(
+            classify_node_kind("interface_type_definition"),
+            AstNodeKind::Interface
+        ));
+        assert!(matches!(
+            classify_node_kind("enum_type_definition"),
+            AstNodeKind::Enum
+        ));
+        assert!(matches!(
+            classify_node_kind("input_object_type_definition"),
+            AstNodeKind::Other(s) if s == "input"
+        ));
+        assert!(matches!(
+            classify_node_kind("union_type_definition"),
+            AstNodeKind::Other(s) if s == "union"
+        ));
+        assert!(matches!(
+            classify_node_kind("scalar_type_definition"),
+            AstNodeKind::Other(s) if s == "scalar"
+        ));
+        assert!(matches!(
+            classify_node_kind("schema_definition"),
+            AstNodeKind::Other(s) if s == "schema"
+        ));
+        assert!(matches!(
+            classify_node_kind("directive_definition"),
+            AstNodeKind::Other(s) if s == "directive"
+        ));
+        assert!(matches!(
+            classify_node_kind("operation_definition"),
+            AstNodeKind::Other(s) if s == "operation"
+        ));
+        assert!(matches!(
+            classify_node_kind("fragment_definition"),
+            AstNodeKind::Other(s) if s == "fragment"
+        ));
+        assert!(matches!(
+            classify_node_kind("function_def"),
+            AstNodeKind::Function
+        ));
+        assert!(matches!(
+            classify_node_kind("macro_def"),
+            AstNodeKind::Function
+        ));
+        assert!(matches!(
+            classify_node_kind("function_statement"),
+            AstNodeKind::Function
+        ));
+        assert!(matches!(
+            classify_node_kind("class_statement"),
+            AstNodeKind::Class
+        ));
+        // Deliberately left as the generic fallback (no clean AstNodeKind
+        // equivalent, or — for Starlark's "call" — consistent with the
+        // existing unmapped FileType::Elixir "call" precedent):
+        assert!(matches!(classify_node_kind("block"), AstNodeKind::Other(s) if s == "block"));
+        assert!(matches!(classify_node_kind("section"), AstNodeKind::Other(s) if s == "section"));
+        assert!(matches!(classify_node_kind("call"), AstNodeKind::Other(s) if s == "call"));
+        // Bash's function_definition and Groovy's function_definition/
+        // method_declaration/class_declaration are exact-string matches to
+        // EXISTING arms shared with other languages — no new arms needed.
+        assert!(matches!(
+            classify_node_kind("function_definition"),
+            AstNodeKind::Function
+        ));
+        assert!(matches!(
+            classify_node_kind("method_declaration"),
+            AstNodeKind::Method
+        ));
+        assert!(matches!(
+            classify_node_kind("class_declaration"),
+            AstNodeKind::Class
+        ));
     }
 }
