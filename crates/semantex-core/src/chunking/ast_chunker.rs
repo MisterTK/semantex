@@ -827,6 +827,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         FileType::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
         FileType::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
+        FileType::Groovy => Some(tree_sitter_groovy::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -964,6 +965,11 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
         // Both `function foo() {...}` and `foo() {...}` forms produce
         // function_definition in tree-sitter-bash.
         FileType::Bash => Some(&["function_definition"]),
+        FileType::Groovy => Some(&[
+            "function_definition",
+            "method_declaration",
+            "class_declaration",
+        ]),
         _ => None,
     }
 }
@@ -2854,6 +2860,65 @@ deploy() {
         assert!(
             deploy,
             "should find the bare `deploy() {{...}}` form as a Function-kind AstNode too"
+        );
+    }
+
+    #[test]
+    fn test_groovy_class_method_and_function_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"class Greeter {
+    String greet(String name) {
+        return "Hello, ${name}!"
+    }
+}
+
+def standalone() {
+    println "standalone"
+}
+"#;
+        let chunks = chunker.chunk(Path::new("Task.groovy"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "Groovy must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        // Greeter's method_declaration is structurally nested inside its
+        // class_declaration span, so the existing outermost-wins dedup pass
+        // (ast_chunker.rs's overlap-removal, same as Java/C#/PHP/Kotlin/Scala)
+        // keeps only the Class chunk -- greet does NOT get its own separate
+        // Method chunk. We assert the whole method is still captured, just
+        // as part of Greeter's chunk content, not as a standalone chunk.
+        let class = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "Greeter" && matches!(kind, AstNodeKind::Class)
+            }
+            _ => false,
+        });
+        assert!(
+            class.is_some(),
+            "should find Greeter as a Class-kind AstNode"
+        );
+        assert!(
+            class.unwrap().content.contains("Hello, ${name}"),
+            "Greeter's chunk must contain its nested greet() method, even though \
+             greet doesn't get its own separate chunk (outermost-wins dedup)"
+        );
+
+        let func = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, kind, .. } => {
+                name == "standalone" && matches!(kind, AstNodeKind::Function)
+            }
+            _ => false,
+        });
+        assert!(
+            func,
+            "standalone() is not nested inside anything, so it must get its own \
+             Function-kind AstNode chunk (unaffected by the dedup pass)"
         );
     }
 }
