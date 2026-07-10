@@ -828,6 +828,7 @@ fn get_language(path: &Path, file_type: FileType) -> Option<Language> {
         FileType::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
         FileType::Bash => Some(tree_sitter_bash::LANGUAGE.into()),
         FileType::Groovy => Some(tree_sitter_groovy::LANGUAGE.into()),
+        FileType::Terraform => Some(tree_sitter_hcl::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -970,6 +971,11 @@ fn definition_node_kinds(file_type: FileType) -> Option<&'static [&'static str]>
             "method_declaration",
             "class_declaration",
         ]),
+        // Every resource/variable/module/data/provider/output/locals/
+        // terraform block is one unit; we deliberately don't recurse into
+        // the block body (no nested node kind here is also in this list),
+        // so attributes and nested blocks stay folded into the parent unit.
+        FileType::Terraform => Some(&["block"]),
         _ => None,
     }
 }
@@ -2919,6 +2925,56 @@ def standalone() {
             func,
             "standalone() is not nested inside anything, so it must get its own \
              Function-kind AstNode chunk (unaffected by the dedup pass)"
+        );
+    }
+
+    #[test]
+    fn test_terraform_block_chunking() {
+        let chunker = AstChunker::new(256, 64);
+        let content = r#"resource "aws_instance" "web" {
+  ami           = "ami-123456"
+  instance_type = "t2.micro"
+}
+
+variable "region" {
+  default = "us-east-1"
+}
+"#;
+        let chunks = chunker.chunk(Path::new("main.tf"), content).unwrap();
+        assert_ast_chunk_invariants(&chunks, content);
+        let ast_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .collect();
+        assert!(
+            !ast_chunks.is_empty(),
+            "Terraform must produce AstNode chunks, not fall back to text chunking"
+        );
+
+        let resource = ast_chunks.iter().find(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == r#"resource "aws_instance" "web""#,
+            _ => false,
+        });
+        assert!(
+            resource.is_some(),
+            "should find the resource block named with its type and labels: {:?}",
+            ast_chunks
+                .iter()
+                .map(|c| c.symbol_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            resource.unwrap().content.contains("ami-123456"),
+            "resource chunk must keep its attributes folded in (no recursion into the block body)"
+        );
+
+        let variable = ast_chunks.iter().any(|c| match &c.chunk_type {
+            ChunkType::AstNode { name, .. } => name == r#"variable "region""#,
+            _ => false,
+        });
+        assert!(
+            variable,
+            "should find the variable block named with its label"
         );
     }
 }
