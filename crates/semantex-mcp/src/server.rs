@@ -3592,7 +3592,13 @@ impl McpServer {
     fn tool_history(&self, args: &serde_json::Value) -> Result<ToolOutput> {
         let scope = Self::parse_scope(args);
         if scope != semantex_core::search::federation::SearchScope::CurrentRepo {
-            anyhow::bail!("semantex_history cross-repo scope lands in the next commit");
+            let registry_v2 = registry::read_all_v2();
+            let budget = args
+                .get("budget")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(self.mcp_defaults.budget, |v| v as usize);
+            let (text, structured) = history_federated(&registry_v2, &scope, args, budget)?;
+            return Ok(ToolOutput::text_with_structured(text, structured));
         }
         let path = resolve_project_path(args)?;
         let budget = args
@@ -3831,6 +3837,99 @@ fn history_for_project(
         text.trim_end().to_string(),
         serde_json::json!({ "commits": commits_json }),
     ))
+}
+
+/// Cross-repo `semantex_history`: one `## [project]` section per selected
+/// registry project, commits time-ordered WITHIN each section. No RRF —
+/// history is naturally per-repo, and interleaving unrelated repos' commit
+/// streams would only obscure them. Unmatched names and per-project errors
+/// land in `skipped` (mirrors `run_federated_search`'s skip semantics).
+fn history_federated(
+    registry: &semantex_core::index::registry::RegistryV2,
+    scope: &semantex_core::search::federation::SearchScope,
+    args: &serde_json::Value,
+    budget: usize,
+) -> Result<(String, serde_json::Value)> {
+    use semantex_core::search::federation::SearchScope;
+
+    let mut selected: Vec<&semantex_core::index::registry::ProjectEntry> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    match scope {
+        SearchScope::All => selected.extend(registry.projects.iter()),
+        SearchScope::Named(names) => {
+            for name in names {
+                match registry
+                    .projects
+                    .iter()
+                    .find(|p| history_project_matches(p, name))
+                {
+                    Some(p) => selected.push(p),
+                    None => skipped.push(format!("no registered project matched '{name}'")),
+                }
+            }
+        }
+        SearchScope::CurrentRepo => {
+            anyhow::bail!("history_federated must not be called with scope=repo")
+        }
+    }
+    // Two names can match one project — history it once.
+    {
+        let mut seen = std::collections::HashSet::new();
+        selected.retain(|p| seen.insert(p.path.clone()));
+    }
+    if selected.is_empty() {
+        let text = if skipped.is_empty() {
+            "registry has no projects — nothing to federate \
+             (build an index in a repo to register it)"
+                .to_string()
+        } else {
+            format!("no projects matched; skipped: {}", skipped.join("; "))
+        };
+        return Ok((
+            text,
+            serde_json::json!({ "projects": [], "skipped": skipped }),
+        ));
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut projects_json: Vec<serde_json::Value> = Vec::new();
+    for p in selected {
+        match history_for_project(&p.path, Some(&p.display_name), args, budget) {
+            Ok((text, structured)) => {
+                sections.push(text);
+                projects_json.push(serde_json::json!({
+                    "project": p.display_name,
+                    "commits": structured.get("commits").cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                }));
+            }
+            Err(e) => skipped.push(format!("{} ({e})", p.display_name)),
+        }
+    }
+    let mut text = sections.join("\n\n");
+    if !skipped.is_empty() {
+        text.push_str(&format!(
+            "\n\n[federation: skipped {}: {}]",
+            skipped.len(),
+            skipped.join(", ")
+        ));
+    }
+    Ok((
+        text,
+        serde_json::json!({ "projects": projects_json, "skipped": skipped }),
+    ))
+}
+
+/// Name matching for history federation: display name, full path, or the
+/// path's final component. (Local rather than reusing federation's private
+/// matcher — semantics kept deliberately identical; if federation's
+/// `project_matches_name` is ever made pub, swap this for it.)
+fn history_project_matches(p: &semantex_core::index::registry::ProjectEntry, name: &str) -> bool {
+    p.display_name == name
+        || p.path == std::path::Path::new(name)
+        || p.path
+            .file_name()
+            .is_some_and(|f| f == std::ffi::OsStr::new(name))
 }
 
 // =============================================================================
@@ -4369,7 +4468,7 @@ fn apply_focus(text: String, focus: Option<&str>) -> String {
 mod tests {
     use super::{
         DEFAULT_TOOLSET, McpAgentDefaults, McpServer, TOOLSETS, apply_focus, budget_for_format,
-        history_addendum_for_hits, mode_to_route, require_index_ready,
+        history_addendum_for_hits, history_federated, mode_to_route, require_index_ready,
     };
     use semantex_core::config::SemantexConfig;
     use semantex_core::index::architecture::top_level_dir;
@@ -6550,6 +6649,83 @@ mod tests {
         assert!(d["stat"].as_str().unwrap().contains("a.rs"));
         assert!(d["patch"].as_str().unwrap().len() <= 1000);
         assert!(out.text.contains("a.rs"));
+    }
+
+    /// In-memory registry pointing at real temp git repos — no SEMANTEX_HOME
+    /// mutation (which would race parallel unit tests; the code-search
+    /// federation suite needs a whole separate process for that).
+    fn registry_of(
+        entries: &[(&str, &std::path::Path)],
+    ) -> semantex_core::index::registry::RegistryV2 {
+        let mut reg = semantex_core::index::registry::RegistryV2::default();
+        for (name, path) in entries {
+            reg.projects
+                .push(semantex_core::index::registry::ProjectEntry {
+                    path: path.to_path_buf(),
+                    project_id: (*name).to_string(),
+                    display_name: (*name).to_string(),
+                    branches: vec![],
+                    embedder_fingerprint: String::new(),
+                });
+        }
+        reg
+    }
+
+    #[test]
+    fn history_federated_named_scope_sections_and_skipped() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let repo_b = scripted_git_repo(&[("b.rs", "beta commit")]);
+        let reg = registry_of(&[("proj-a", repo_a.path()), ("proj-b", repo_b.path())]);
+        let scope = semantex_core::search::federation::SearchScope::Named(vec![
+            "proj-a".to_string(),
+            "ghost".to_string(),
+        ]);
+
+        let (text, structured) =
+            history_federated(&reg, &scope, &serde_json::json!({}), 12_000).unwrap();
+        assert!(text.contains("## [proj-a]"), "got: {text}");
+        assert!(text.contains("alpha commit"));
+        assert!(
+            !text.contains("beta commit"),
+            "unnamed project must not appear"
+        );
+        assert!(
+            text.contains("ghost"),
+            "skipped name must be surfaced: {text}"
+        );
+        assert_eq!(structured["projects"].as_array().unwrap().len(), 1);
+        assert_eq!(structured["skipped"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn history_federated_all_scope_covers_every_project() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let repo_b = scripted_git_repo(&[("b.rs", "beta commit")]);
+        let reg = registry_of(&[("proj-a", repo_a.path()), ("proj-b", repo_b.path())]);
+
+        let (text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+        assert!(text.contains("alpha commit") && text.contains("beta commit"));
+        assert_eq!(structured["projects"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn history_federated_empty_registry_says_why() {
+        let reg = semantex_core::index::registry::RegistryV2::default();
+        let (text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+        assert!(text.contains("registry has no projects"), "got: {text}");
+        assert!(structured["projects"].as_array().unwrap().is_empty());
     }
 }
 
