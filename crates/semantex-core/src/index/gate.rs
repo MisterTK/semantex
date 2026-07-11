@@ -178,11 +178,24 @@ mod tests {
         drop(probe);
 
         drop(first);
+        // flock release-on-close is synchronous, but a concurrent test
+        // thread fork/exec-ing a child (git helpers, daemon spawns) can
+        // briefly inherit the open descriptor between fork and exec,
+        // keeping the lock alive a few extra ms under full-suite load —
+        // so poll briefly rather than asserting on the first probe.
+        // (Production is unaffected: `acquire` re-probes every 250ms.)
         let probe2 = File::create(&slot_path).unwrap();
-        assert!(
-            probe2.try_lock().is_ok(),
-            "slot should be free after the guard is dropped"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let freed = loop {
+            if probe2.try_lock().is_ok() {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(freed, "slot should be free after the guard is dropped");
         unsafe { std::env::remove_var(ENV_MAX_BUILDS) };
     }
 }
