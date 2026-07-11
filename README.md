@@ -64,7 +64,7 @@ v1.0 turns semantex from a search engine into a codebase-understanding platform.
 
 - **Multi-branch indexing.** Branch switches are first-class: each branch gets its own index snapshot, restored and incrementally updated on checkout, so flipping back and forth re-embeds only what actually changed. Detected automatically at every entry point (CLI, `watch`, `serve`, MCP), git-worktree-aware. Snapshot retention is capped (`SEMANTEX_MAX_BRANCH_INDEXES`, default 5).
 - **Cross-repo federated search.** Pass `scope: "all"` (every project in your local registry) or a list of project names to `semantex_agent`/`semantex_search`, or `--scope` on the CLI, and one query fans out across every indexed repo with provenance-tagged, RRF-fused results. Repos that are stale or not ready are reported as skipped, never silently dropped.
-- **Git-history indexing.** Commit history is now a searchable dimension of the index — bounded incremental `git log` population (500 commits by default, `SEMANTEX_HISTORY_COMMITS`), opt-in blame (`SEMANTEX_HISTORY_BLAME=1`), full-text commit-message search, `semantex history <file>` on the CLI, and an `include_history` flag on agent queries that appends a "recent changes" section to the answer.
+- **Git-history indexing.** Commit history is now a searchable dimension of the index — bounded incremental `git log` population (500 commits by default, `SEMANTEX_HISTORY_COMMITS`), opt-in blame (`SEMANTEX_HISTORY_BLAME=1`), full-text commit-message search, `semantex history <file>` on the CLI, a first-class `semantex_history` MCP tool (v1.0.2: list/filter commits, expand shas with budget-bounded diffs, cross-repo `scope`), and an `include_history` flag on agent queries that appends a "recent changes" section to the answer.
 - **Durable project memory.** `semantex_memory_save` / `semantex_memory_recall` let an agent persist decisions, gotchas, and conventions across sessions in `.semantex/memory.db` — independent of the code index, so it survives reindexing and branch switches.
 - **Deterministic docs scaffolding.** `semantex_docs_context` returns a structurally-complete scaffold (symbol inventory, call-graph edges, import edges, existing doc comments, file:line provenance) for a module or the whole repo. It does **not** call an LLM — it hands your agent the facts, and the `semantex-docs` skill guides it to write maintained prose into `semantex_docs/`.
 - **Multi-client, branch-aware daemon.** `semantex serve` is now thread-per-connection with graceful drain, a searcher cache keyed by `(project, branch)`, and staleness reload when the index is rebuilt out from under it — safe for several editors/agents to share one daemon on one machine.
@@ -236,7 +236,7 @@ That's it. semantex auto-indexes your project on first search — no manual inde
 
 ### Tools
 
-By default, semantex exposes **10 MCP tools**, discovered by your editor at startup:
+By default, semantex exposes **11 MCP tools**, discovered by your editor at startup:
 
 | Tool | Purpose |
 |------|---------|
@@ -250,6 +250,7 @@ By default, semantex exposes **10 MCP tools**, discovered by your editor at star
 | `semantex_docs_context` | Deterministic documentation scaffold (symbol inventory, call graph, imports, provenance) for your agent to turn into `semantex_docs/*.md` prose. Zero LLM calls inside semantex itself. |
 | `semantex_memory_save` | Persist a durable note (decision, gotcha, convention) to `.semantex/memory.db`, independent of the code index. |
 | `semantex_memory_recall` | Recall previously saved notes, ranked by relevance or most-recent. |
+| `semantex_history` | Git history, first-class: list/filter commits (`since` a tag, sha, or YYYY-MM-DD date; `author`; `file`; message `query`) or expand specific shas with full message, `--stat`, and a budget-bounded patch. Works cross-repo via `scope`, with or without a search index — refreshed incrementally from git on every call. |
 
 A **5-tool `structural` bundle** — `semantex_symbol`, `semantex_callers`, `semantex_callees`, `semantex_implementations`, `semantex_architecture` — is available opt-in via `semantex mcp --toolset structural` (or `--toolset all` isn't needed; `semantex_agent`'s internal structural route already covers callers/callees/imports in one call). These are deliberately **not** in the default bundle: an earlier version exposed them by default and agents used them additively (calling 4-6 tools to reassemble what `semantex_deep` already returns in one call), measurably regressing efficiency. Use `--toolset core` for a minimal 3-tool surface (`semantex_search`, `semantex_deep`, `semantex_agent`) when a client's tool budget is tight.
 
@@ -260,7 +261,7 @@ A **5-tool `structural` bundle** — `semantex_symbol`, `semantex_callers`, `sem
 - **Progress notifications** — `semantex_deep` sends phase-by-phase progress (searching, triaging, graph-expanding, reading, summarizing)
 - **Auto-indexing** — first search triggers background indexing; returns keyword (ripgrep) results immediately while the index builds
 - **Logging** — tool events emitted as MCP log notifications; clients can set level via `logging/setLevel`
-- **Toolset bundles** — `core` (3 tools), `structural` (5 tools, opt-in), `all` (10 tools, default) via `--toolset`
+- **Toolset bundles** — `core` (3 tools), `structural` (5 tools, opt-in), `all` (11 tools, default) via `--toolset`
 - **HTTP transport with auth** — `semantex mcp --http` for network access; `--allow-remote` requires a bearer token (`--auth-token` or `SEMANTEX_HTTP_TOKEN`, else auto-generated and persisted at `~/.semantex/http_token`), checked in constant time
 - **Multi-client daemon** — one `semantex serve` process safely answers concurrent editors/agents, with a per-`(project, branch)` searcher cache and automatic reload if the index changes underneath it
 

@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.0.2 — 2026-07-11
+
+Git history becomes a first-class MCP surface. No retrieval-quality or
+index-schema changes — safe to upgrade in place.
+
+### Added
+
+- **`semantex_history` MCP tool** — first-class git-history queries, in the
+  default toolset (now 11 tools):
+  - **List mode** — filter commits by `since` (a tag, sha, or `YYYY-MM-DD`
+    UTC date; any rev `git rev-parse` accepts), `author` (substring),
+    `file` (exact path), message `query` (FTS5 full-text), and `limit`
+    (default 20). Filters compose. When `since` predates the captured
+    history window, the response says so and names the
+    `SEMANTEX_HISTORY_COMMITS` knob (default 500).
+  - **Detail mode** — pass `commits: [shas]` (max 10 per call; excess
+    reported as skipped) to expand each sha with full message, changed
+    files, `--stat`, and a budget-bounded patch fetched live via
+    `git show`. The total `budget` (default `SEMANTEX_MCP_BUDGET`) is
+    split across the requested shas with a ~1000-byte floor per commit;
+    truncation is UTF-8-boundary-safe and flagged.
+  - **Cross-repo** — `scope: "all"` or a list of project names renders one
+    `## [project]` section per registered repo, commits time-ordered
+    within each section (no cross-repo interleaving). Unmatched names and
+    per-project errors land in `skipped`, never silently dropped; a sha
+    requested in detail mode degrades to a per-commit error line in repos
+    that don't contain it.
+  - History is refreshed incrementally from git on every call, so results
+    are always current. Works with or without a search index, and never
+    takes the index build lock.
+  - Input hardening: `since` and sha arguments are validated before ever
+    reaching git (leading-dash rejection, 7-40-hex-char shas), and all
+    `git log`/`git show` output is parsed via NUL separators.
+
+### Changed
+
+- `--toolset all` now exposes **11 tools** (was 10); the `core` and
+  `structural` bundles are unchanged. MCP server instructions, the plugin
+  skill, and `semantex skills` tool metadata all document the new tool.
+- `server.json` (MCP registry manifest) now advertises the complete tool
+  list — added the previously missing `semantex_docs_context`,
+  `semantex_memory_save`, `semantex_memory_recall`, and the new
+  `semantex_history`.
+
 ## v1.0.1 — 2026-07-10
 
 Incremental hardening + broader file-type coverage. No retrieval-quality or

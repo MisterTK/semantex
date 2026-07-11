@@ -3,7 +3,7 @@
   "name": "io.github.MisterTK/semantex",
   "title": "Semantex — Semantic Code Search",
   "description": "Fully local semantic code search: ColBERT dense + BM25 sparse + optional reranking, exposed as MCP tools.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "websiteUrl": "https://semantex.dev",
   "repository": {
     "url": "https://github.com/MisterTK/semantex",
@@ -14,7 +14,7 @@
     {
       "registryType": "oci",
       "identifier": "ghcr.io/mistertk/semantex",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "transport": {
         "type": "stdio"
       },
@@ -100,7 +100,11 @@
         "semantex_index",
         "semantex_status",
         "semantex_health",
-        "semantex_validate"
+        "semantex_validate",
+        "semantex_docs_context",
+        "semantex_memory_save",
+        "semantex_memory_recall",
+        "semantex_history"
       ]
     }
   }
