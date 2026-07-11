@@ -3597,20 +3597,16 @@ impl McpServer {
     #[tracing::instrument(skip(self, args), fields(tool = "history"))]
     fn tool_history(&self, args: &serde_json::Value) -> Result<ToolOutput> {
         let scope = Self::parse_scope(args);
-        if scope != semantex_core::search::federation::SearchScope::CurrentRepo {
-            let registry_v2 = registry::read_all_v2();
-            let budget = args
-                .get("budget")
-                .and_then(serde_json::Value::as_u64)
-                .map_or(self.mcp_defaults.budget, |v| v as usize);
-            let (text, structured) = history_federated(&registry_v2, &scope, args, budget)?;
-            return Ok(ToolOutput::text_with_structured(text, structured));
-        }
-        let path = resolve_project_path(args)?;
         let budget = args
             .get("budget")
             .and_then(serde_json::Value::as_u64)
             .map_or(self.mcp_defaults.budget, |v| v as usize);
+        if scope != semantex_core::search::federation::SearchScope::CurrentRepo {
+            let registry_v2 = registry::read_all_v2();
+            let (text, structured) = history_federated(&registry_v2, &scope, args, budget)?;
+            return Ok(ToolOutput::text_with_structured(text, structured));
+        }
+        let path = resolve_project_path(args)?;
         let (text, structured) = history_for_project(&path, None, args, budget)?;
         Ok(ToolOutput::text_with_structured(text, structured))
     }
@@ -3850,6 +3846,9 @@ fn history_for_project(
 /// history is naturally per-repo, and interleaving unrelated repos' commit
 /// streams would only obscure them. Unmatched names and per-project errors
 /// land in `skipped` (mirrors `run_federated_search`'s skip semantics).
+/// `args` passes through unchanged, so detail mode (`commits`) fans out
+/// too: the repo that owns a sha expands it, and every other repo renders
+/// a per-commit `[error: ...]` line instead of failing the whole call.
 fn history_federated(
     registry: &semantex_core::index::registry::RegistryV2,
     scope: &semantex_core::search::federation::SearchScope,
@@ -6578,24 +6577,33 @@ mod tests {
 
     #[test]
     fn tool_history_since_tag_excludes_tagged_commit() {
-        let repo = scripted_git_repo(&[("a.rs", "before tag")]);
-        let git = |args: &[&str]| {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(repo.path())
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+        // Commit timestamps are pinned a day apart via GIT_COMMITTER_DATE
+        // (instead of sleeping past %ct's 1-second resolution): `since`
+        // filters strictly-greater on the committer timestamp.
+        let repo = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str], date: &str| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .status()
+                .expect("git must be on PATH");
+            assert!(status.success(), "git {args:?} failed");
         };
-        git(&["tag", "v1"]);
-        // Ensure distinct timestamps for the two commits
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let tagged = "2026-01-01T00:00:00 +0000";
+        let after = "2026-01-02T00:00:00 +0000";
+        git(&["init", "-q"], tagged);
+        git(&["config", "user.email", "test@example.com"], tagged);
+        git(&["config", "user.name", "Test User"], tagged);
+        std::fs::write(repo.path().join("a.rs"), "before tag").unwrap();
+        git(&["add", "."], tagged);
+        git(&["commit", "-q", "-m", "before tag"], tagged);
+        git(&["tag", "v1"], tagged);
         std::fs::write(repo.path().join("b.rs"), "x").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "after tag"]);
+        git(&["add", "."], after);
+        git(&["commit", "-q", "-m", "after tag"], after);
 
         let server = make_server("all");
         let out = server
@@ -6719,6 +6727,67 @@ mod tests {
         .unwrap();
         assert!(text.contains("alpha commit") && text.contains("beta commit"));
         assert_eq!(structured["projects"].as_array().unwrap().len(), 2);
+    }
+
+    /// Detail mode fans out across repos: only one repo owns the sha, so
+    /// every other project must render a per-commit `[error: ...]` line —
+    /// not fail the whole call. Locks the passthrough in as intentional.
+    #[test]
+    fn history_federated_detail_mode_degrades_gracefully_across_repos() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let repo_b = scripted_git_repo(&[("b.rs", "beta commit")]);
+        let reg = registry_of(&[("proj-a", repo_a.path()), ("proj-b", repo_b.path())]);
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_a.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        let (text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({ "commits": [sha] }),
+            12_000,
+        )
+        .unwrap();
+        assert!(
+            text.contains("alpha commit"),
+            "owning repo must expand the sha: {text}"
+        );
+        assert!(
+            text.contains("[error:"),
+            "non-owning repo must degrade to a per-commit error line: {text}"
+        );
+        let projects = structured["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 2, "both projects report a section");
+        assert!(
+            structured["skipped"].as_array().unwrap().is_empty(),
+            "a missing sha is not a project-level skip"
+        );
+    }
+
+    /// Two scope names resolving to the same project (display name + full
+    /// path) must produce exactly one section, not a duplicate.
+    #[test]
+    fn history_federated_dedups_names_resolving_to_one_project() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let reg = registry_of(&[("proj-a", repo_a.path())]);
+        let scope = semantex_core::search::federation::SearchScope::Named(vec![
+            "proj-a".to_string(),
+            repo_a.path().display().to_string(),
+        ]);
+
+        let (text, structured) =
+            history_federated(&reg, &scope, &serde_json::json!({}), 12_000).unwrap();
+        assert_eq!(
+            text.matches("## [proj-a]").count(),
+            1,
+            "duplicate section: {text}"
+        );
+        assert_eq!(structured["projects"].as_array().unwrap().len(), 1);
+        assert!(structured["skipped"].as_array().unwrap().is_empty());
     }
 
     #[test]
