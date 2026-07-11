@@ -329,7 +329,7 @@ pub fn filter_commits(conn: &Connection, filter: &HistoryFilter) -> Result<Vec<C
     bound.push(Box::new(limit as i64));
 
     let mut stmt = conn.prepare(&sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(AsRef::as_ref).collect();
     let rows = stmt
         .query_map(rusqlite::params_from_iter(refs), row_to_commit)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -395,17 +395,17 @@ fn parse_utc_date_to_ts(s: &str) -> Option<i64> {
     if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return None;
     }
-    let y: i64 = s[0..4].parse().ok()?;
-    let m: i64 = s[5..7].parse().ok()?;
-    let d: i64 = s[8..10].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    let y_adj = if m <= 2 { y - 1 } else { y };
+    let y_adj = if month <= 2 { year - 1 } else { year };
     let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
     let yoe = y_adj - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86_400)

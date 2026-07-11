@@ -3678,6 +3678,7 @@ fn history_for_project(
     budget: usize,
 ) -> Result<(String, serde_json::Value)> {
     use semantex_core::index::history;
+    use std::fmt::Write as _;
 
     if let Err(e) = history::populate_history(project_root) {
         tracing::debug!(project = %project_root.display(), "history refresh skipped: {e}");
@@ -3714,20 +3715,21 @@ fn history_for_project(
             match history::commit_detail(project_root, &conn, sha, per_commit_budget) {
                 Ok(d) => {
                     let short: String = d.hash.chars().take(8).collect();
-                    text.push_str(&format!(
-                        "### {short} — {}\n{} · {}\n",
+                    let _ = writeln!(
+                        text,
+                        "### {short} — {}\n{} · {}",
                         d.subject,
                         d.author,
                         history::humanize_age(d.ts)
-                    ));
+                    );
                     if !d.body.is_empty() {
-                        text.push_str(&format!("\n{}\n", d.body));
+                        let _ = writeln!(text, "\n{}", d.body);
                     }
                     if !d.stat.is_empty() {
-                        text.push_str(&format!("\n```\n{}\n```\n", d.stat));
+                        let _ = writeln!(text, "\n```\n{}\n```", d.stat);
                     }
                     if !d.patch.is_empty() {
-                        text.push_str(&format!("\n```diff\n{}\n```\n", d.patch));
+                        let _ = writeln!(text, "\n```diff\n{}\n```", d.patch);
                         if d.patch_truncated {
                             text.push_str("[diff truncated]\n");
                         }
@@ -3747,17 +3749,18 @@ fn history_for_project(
                     }));
                 }
                 Err(e) => {
-                    text.push_str(&format!("### {sha}\n[error: {e}]\n\n"));
+                    let _ = writeln!(text, "### {sha}\n[error: {e}]\n");
                 }
             }
         }
         if !skipped_shas.is_empty() {
-            text.push_str(&format!(
-                "[{} sha(s) beyond the per-call cap of {} skipped: {}]\n",
+            let _ = writeln!(
+                text,
+                "[{} sha(s) beyond the per-call cap of {} skipped: {}]",
                 skipped_shas.len(),
                 history::MAX_DETAIL_COMMITS,
                 skipped_shas.join(", ")
-            ));
+            );
         }
         return Ok((
             text.trim_end().to_string(),
@@ -3814,14 +3817,15 @@ fn history_for_project(
         for c in &commits {
             let files = history::files_for_commit(&conn, &c.hash).unwrap_or_default();
             let short: String = c.hash.chars().take(8).collect();
-            text.push_str(&format!(
-                "{short}  {:>8}  {} — {} ({} file{})\n",
+            let _ = writeln!(
+                text,
+                "{short}  {:>8}  {} — {} ({} file{})",
                 history::humanize_age(c.ts),
                 c.author,
                 c.subject,
                 files.len(),
                 if files.len() == 1 { "" } else { "s" }
-            ));
+            );
             commits_json.push(serde_json::json!({
                 "hash": c.hash,
                 "author": c.author,
@@ -3833,7 +3837,7 @@ fn history_for_project(
         }
     }
     if let Some(note) = window_note {
-        text.push_str(&format!("\n{note}"));
+        let _ = write!(text, "\n{note}");
     }
     Ok((
         text.trim_end().to_string(),
@@ -3856,6 +3860,7 @@ fn history_federated(
     budget: usize,
 ) -> Result<(String, serde_json::Value)> {
     use semantex_core::search::federation::SearchScope;
+    use std::fmt::Write as _;
 
     let mut selected: Vec<&semantex_core::index::registry::ProjectEntry> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -3913,11 +3918,12 @@ fn history_federated(
     }
     let mut text = sections.join("\n\n");
     if !skipped.is_empty() {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "\n\n[federation: skipped {}: {}]",
             skipped.len(),
             skipped.join(", ")
-        ));
+        );
     }
     Ok((
         text,
