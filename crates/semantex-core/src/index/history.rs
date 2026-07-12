@@ -699,6 +699,86 @@ pub fn upstream_status(project_root: &Path) -> Option<UpstreamStatus> {
     })
 }
 
+/// The current branch's short name, or `None` for a detached HEAD or a
+/// non-git directory.
+pub fn current_branch(project_root: &Path) -> Option<String> {
+    let output = run_git(project_root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty() && name != "HEAD").then_some(name)
+}
+
+/// Cap on branches surfaced by [`other_branches`] per call — bounds the
+/// rendered output size, matching [`MAX_DETAIL_COMMITS`]'s discipline.
+pub const MAX_OTHER_BRANCHES: usize = 10;
+
+/// One local or remote-tracking branch other than the current one, for
+/// "is there a feature-branch answer to this that the current branch
+/// doesn't have yet" visibility.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BranchActivity {
+    pub name: String,
+    pub is_remote: bool,
+    pub ts: i64,
+    pub subject: String,
+}
+
+/// Local and remote-tracking branches other than `current_branch` and
+/// `upstream_ref` (already covered by [`upstream_status`]'s note), most
+/// recently active first. Best-effort: any git failure returns an empty
+/// list, matching the rest of this module's non-fatal discipline.
+pub fn other_branches(
+    project_root: &Path,
+    current_branch: Option<&str>,
+    upstream_ref: Option<&str>,
+    limit: usize,
+) -> Vec<BranchActivity> {
+    let output = match run_git(
+        project_root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/heads",
+            "refs/remotes",
+            "--format=%(refname)%00%(refname:short)%00%(committerdate:unix)%00%(subject)",
+        ],
+    ) {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.splitn(4, '\0');
+        let (Some(full_ref), Some(short), Some(ts_str), Some(subject)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if short.ends_with("/HEAD") {
+            continue; // symbolic remote HEAD pointer, not a real branch
+        }
+        if Some(short) == current_branch || Some(short) == upstream_ref {
+            continue;
+        }
+        let Ok(ts) = ts_str.parse::<i64>() else {
+            continue;
+        };
+        out.push(BranchActivity {
+            name: short.to_string(),
+            is_remote: full_ref.starts_with("refs/remotes/"),
+            ts,
+            subject: subject.to_string(),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
 /// `HEAD`'s commit sha, or `None` for a non-git directory, a repo with zero
 /// commits, or a missing `git` binary — all of which are "nothing to do"
 /// for history population, not errors.
@@ -1259,6 +1339,83 @@ mod tests {
         let status = upstream_status(local.path()).expect("upstream must resolve");
         assert_eq!(status.ahead, 1);
         assert_eq!(status.behind, 1);
+    }
+
+    #[test]
+    fn other_branches_empty_for_non_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        assert!(other_branches(tmp.path(), None, None, 10).is_empty());
+    }
+
+    #[test]
+    fn other_branches_lists_local_branches_excluding_current() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        git(tmp.path(), &["branch", "-M", "main"]);
+        git(tmp.path(), &["checkout", "-q", "-b", "feature-a"]);
+        commit_one_more(tmp.path(), "feature-a-commit");
+        git(tmp.path(), &["checkout", "-q", "main"]);
+
+        let branches = other_branches(tmp.path(), Some("main"), None, 10);
+        assert_eq!(branches.len(), 1, "got: {branches:?}");
+        assert_eq!(branches[0].name, "feature-a");
+        assert!(!branches[0].is_remote);
+        assert_eq!(branches[0].subject, "commit feature-a-commit");
+    }
+
+    #[test]
+    fn other_branches_excludes_own_upstream_and_includes_remote() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path(), 1);
+        git(upstream.path(), &["branch", "-M", "main"]);
+        git(upstream.path(), &["checkout", "-q", "-b", "feature-x"]);
+        commit_one_more(upstream.path(), "feature-x-commit");
+        git(upstream.path(), &["checkout", "-q", "main"]);
+
+        let local = clone_repo(upstream.path());
+        git(local.path(), &["fetch", "-q", "origin"]);
+
+        let branches = other_branches(local.path(), Some("main"), Some("origin/main"), 10);
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"origin/feature-x"), "got: {names:?}");
+        assert!(
+            !names.contains(&"origin/main"),
+            "own upstream must be excluded: {names:?}"
+        );
+        let remote_entry = branches
+            .iter()
+            .find(|b| b.name == "origin/feature-x")
+            .unwrap();
+        assert!(remote_entry.is_remote);
+    }
+
+    #[test]
+    fn other_branches_respects_limit() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        git(tmp.path(), &["branch", "-M", "main"]);
+        for name in ["feature-a", "feature-b", "feature-c"] {
+            git(tmp.path(), &["checkout", "-q", "-b", name, "main"]);
+            commit_one_more(tmp.path(), name);
+        }
+        git(tmp.path(), &["checkout", "-q", "main"]);
+
+        let branches = other_branches(tmp.path(), Some("main"), None, 2);
+        assert_eq!(branches.len(), 2, "got: {branches:?}");
+    }
+
+    #[test]
+    fn current_branch_none_for_non_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        assert!(current_branch(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn current_branch_returns_short_name() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        git(tmp.path(), &["branch", "-M", "main"]);
+        assert_eq!(current_branch(tmp.path()).as_deref(), Some("main"));
     }
 
     #[test]
