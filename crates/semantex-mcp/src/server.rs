@@ -1388,7 +1388,10 @@ impl McpServer {
                     "YYYY-MM-DD), 'what changed recently?', and cross-repo dependency change ",
                     "tracking (scope='all' or named projects). List mode returns one compact line ",
                     "per commit; pass commits=[shas] for detail mode with --stat and a ",
-                    "budget-bounded patch (max 10 shas/call). NOT for searching code content — ",
+                    "budget-bounded patch (max 10 shas/call). ",
+                    "Pass other_branches=true to also list other active local/remote branches — ",
+                    "useful when a feature isn't in the current branch yet. ",
+                    "NOT for searching code content — ",
                     "use semantex_agent for that."
                 )
                 .into(),
@@ -1436,6 +1439,10 @@ impl McpServer {
                                 {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}}
                             ]
+                        },
+                        "other_branches": {
+                            "type": "boolean",
+                            "description": "List mode only: also list other local/remote branches (excluding the current one and its own upstream), most recently active first, capped at 10. Not computed unless requested."
                         }
                     }
                 }),
@@ -1489,7 +1496,32 @@ impl McpServer {
                             }
                         },
                         "skipped": { "type": "array", "items": { "type": "string" } },
-                        "skipped_shas": { "type": "array", "items": { "type": "string" } }
+                        "skipped_shas": { "type": "array", "items": { "type": "string" } },
+                        "upstream": {
+                            "type": ["object", "null"],
+                            "description": "This local clone's ahead/behind status vs. its upstream tracking branch, or null if none is configured.",
+                            "properties": {
+                                "ref": { "type": "string" },
+                                "ahead": { "type": "integer" },
+                                "behind": { "type": "integer" },
+                                "fetch_ts": { "type": ["integer", "null"] },
+                                "fetch_age": { "type": ["string", "null"] }
+                            }
+                        },
+                        "other_branches": {
+                            "type": "array",
+                            "description": "Present only when the other_branches param was true.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "is_remote": { "type": "boolean" },
+                                    "ts": { "type": "integer" },
+                                    "age": { "type": "string" },
+                                    "subject": { "type": "string" }
+                                }
+                            }
+                        }
                     }
                 })),
                 annotations: Some(ToolAnnotations::read_only("Git History")),
@@ -3862,9 +3894,74 @@ fn history_for_project(
     if let Some(note) = window_note {
         let _ = write!(text, "\n{note}");
     }
+
+    // ── Upstream staleness (always computed; note only when behind > 0) ──
+    let upstream = history::upstream_status(project_root);
+    let upstream_json = upstream.as_ref().map_or(serde_json::Value::Null, |u| {
+        serde_json::json!({
+            "ref": u.upstream_ref,
+            "ahead": u.ahead,
+            "behind": u.behind,
+            "fetch_ts": u.fetch_ts,
+            "fetch_age": u.fetch_ts.map(history::humanize_age),
+        })
+    });
+    if let Some(u) = &upstream
+        && u.behind > 0
+    {
+        let _ = write!(
+            text,
+            "\n[local clone is {} commit{} behind {} ({}) — `git pull` for upstream-current state]",
+            u.behind,
+            if u.behind == 1 { "" } else { "s" },
+            u.upstream_ref,
+            u.fetch_ts.map_or("fetch time unknown".to_string(), |ts| format!(
+                "fetched {}",
+                history::humanize_age(ts)
+            )),
+        );
+    }
+
+    // ── Other-branch visibility (opt-in via `other_branches: true`) ──────
+    let mut other_branches_json = Vec::new();
+    if args.get("other_branches").and_then(serde_json::Value::as_bool) == Some(true) {
+        let current = history::current_branch(project_root);
+        let upstream_ref = upstream.as_ref().map(|u| u.upstream_ref.as_str());
+        let branches = history::other_branches(
+            project_root,
+            current.as_deref(),
+            upstream_ref,
+            history::MAX_OTHER_BRANCHES,
+        );
+        if !branches.is_empty() {
+            text.push_str("\n\nOther active branches:");
+            for b in &branches {
+                let _ = write!(
+                    text,
+                    "\n  {}{} ({}) — {}",
+                    b.name,
+                    if b.is_remote { " [remote]" } else { "" },
+                    history::humanize_age(b.ts),
+                    b.subject
+                );
+                other_branches_json.push(serde_json::json!({
+                    "name": b.name,
+                    "is_remote": b.is_remote,
+                    "ts": b.ts,
+                    "age": history::humanize_age(b.ts),
+                    "subject": b.subject,
+                }));
+            }
+        }
+    }
+
     Ok((
         text.trim_end().to_string(),
-        serde_json::json!({ "commits": commits_json }),
+        serde_json::json!({
+            "commits": commits_json,
+            "upstream": upstream_json,
+            "other_branches": other_branches_json
+        }),
     ))
 }
 
@@ -6695,6 +6792,128 @@ mod tests {
         assert!(d["stat"].as_str().unwrap().contains("a.rs"));
         assert!(d["patch"].as_str().unwrap().len() <= 1000);
         assert!(out.text.contains("a.rs"));
+    }
+
+    #[test]
+    fn tool_history_no_upstream_note_when_no_remote_configured() {
+        let repo = scripted_git_repo(&[("a.rs", "one")]);
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({ "path": repo.path().display().to_string() }))
+            .unwrap();
+        assert!(out.structured.unwrap()["upstream"].is_null());
+        assert!(!out.text.contains("behind"));
+    }
+
+    #[test]
+    fn tool_history_behind_note_appears_when_stale() {
+        let upstream = scripted_git_repo(&[("a.rs", "one"), ("b.rs", "two")]);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(upstream.path())
+            .args(["branch", "-M", "main"])
+            .status()
+            .unwrap();
+        let local = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                upstream.path().to_str().unwrap(),
+                local.path().to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+
+        std::fs::write(upstream.path().join("c.rs"), "three").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(upstream.path())
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(upstream.path())
+            .args(["commit", "-q", "-m", "three"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["fetch", "-q", "origin"])
+            .status()
+            .unwrap();
+
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({ "path": local.path().display().to_string() }))
+            .unwrap();
+        let s = out.structured.unwrap();
+        assert_eq!(s["upstream"]["behind"].as_u64(), Some(1));
+        assert!(out.text.contains("behind origin/main"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn tool_history_other_branches_is_opt_in() {
+        let repo = scripted_git_repo(&[("a.rs", "one")]);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["branch", "-M", "main"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["checkout", "-q", "-b", "feature-a"])
+            .status()
+            .unwrap();
+        std::fs::write(repo.path().join("b.rs"), "two").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["commit", "-q", "-m", "feature commit"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["checkout", "-q", "main"])
+            .status()
+            .unwrap();
+
+        let server = make_server("all");
+        let default_out = server
+            .tool_history(&serde_json::json!({ "path": repo.path().display().to_string() }))
+            .unwrap();
+        assert_eq!(
+            default_out.structured.unwrap()["other_branches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "other_branches must be empty unless explicitly requested"
+        );
+
+        let opt_in_out = server
+            .tool_history(&serde_json::json!({
+                "path": repo.path().display().to_string(),
+                "other_branches": true,
+            }))
+            .unwrap();
+        let branches = opt_in_out.structured.unwrap()["other_branches"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(branches.len(), 1, "got: {branches:?}");
+        assert_eq!(branches[0]["name"].as_str(), Some("feature-a"));
     }
 
     /// A sha that doesn't resolve must surface in structured `errors`, not
