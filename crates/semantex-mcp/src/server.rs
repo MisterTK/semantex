@@ -4007,6 +4007,27 @@ fn history_federated(
         let mut seen = std::collections::HashSet::new();
         selected.retain(|p| seen.insert(p.path.clone()));
     }
+    // scope=all only: a worktree's git history duplicates its parent repo's
+    // commit DAG, and a registered subdirectory of an already-selected repo
+    // duplicates its commits too — both would just render the same section
+    // twice under a different display name. Named scope is unaffected:
+    // naming a worktree or nested subdirectory explicitly is deliberate
+    // intent. The path-prefix dedup mirrors the technique
+    // `refresh_stale_registry_repos` (hooks.rs) already uses when deciding
+    // which repos to reindex — cheaper than a git-toplevel subprocess call.
+    if matches!(scope, SearchScope::All) {
+        selected.retain(|p| !p.is_worktree);
+        selected.sort_by_key(|p| p.path.as_os_str().len());
+        let mut kept_roots: Vec<std::path::PathBuf> = Vec::new();
+        selected.retain(|p| {
+            if kept_roots.iter().any(|root| p.path.starts_with(root)) {
+                false
+            } else {
+                kept_roots.push(p.path.clone());
+                true
+            }
+        });
+    }
     if selected.is_empty() {
         let text = if skipped.is_empty() {
             "registry has no projects — nothing to federate \
@@ -4032,6 +4053,10 @@ fn history_federated(
                     "commits": structured.get("commits").cloned()
                         .unwrap_or_else(|| serde_json::json!([])),
                     "errors": structured.get("errors").cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    "upstream": structured.get("upstream").cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "other_branches": structured.get("other_branches").cloned()
                         .unwrap_or_else(|| serde_json::json!([])),
                 }));
             }
@@ -7077,6 +7102,94 @@ mod tests {
         );
         assert_eq!(structured["projects"].as_array().unwrap().len(), 1);
         assert!(structured["skipped"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_federated_all_scope_excludes_worktrees() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let repo_b = scripted_git_repo(&[("b.rs", "beta commit")]);
+        let mut reg = registry_of(&[("proj-a", repo_a.path()), ("proj-b", repo_b.path())]);
+        reg.projects[1].is_worktree = true; // proj-b simulates a worktree registration
+
+        let (text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+        assert!(text.contains("alpha commit"));
+        assert!(
+            !text.contains("beta commit"),
+            "worktree project must be excluded from scope=all: {text}"
+        );
+        assert_eq!(structured["projects"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn history_federated_named_scope_still_finds_a_worktree() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let mut reg = registry_of(&[("proj-a", repo_a.path())]);
+        reg.projects[0].is_worktree = true;
+
+        let (text, _structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::Named(vec!["proj-a".to_string()]),
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+        assert!(
+            text.contains("alpha commit"),
+            "naming a worktree project explicitly must still resolve it: {text}"
+        );
+    }
+
+    #[test]
+    fn history_federated_all_scope_dedups_nested_registry_paths() {
+        let outer = scripted_git_repo(&[("a.rs", "outer commit")]);
+        let inner_path = outer.path().join("nested-crate");
+        std::fs::create_dir_all(&inner_path).unwrap();
+        let reg = registry_of(&[
+            ("outer-repo", outer.path()),
+            ("inner-crate", inner_path.as_path()),
+        ]);
+
+        let (text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+        let projects = structured["projects"].as_array().unwrap();
+        assert_eq!(
+            projects.len(),
+            1,
+            "nested registry path must be deduped in scope=all: {projects:?}"
+        );
+        assert_eq!(projects[0]["project"].as_str(), Some("outer-repo"));
+        assert!(text.contains("outer commit"));
+    }
+
+    #[test]
+    fn history_federated_propagates_upstream_and_other_branches_fields() {
+        let repo_a = scripted_git_repo(&[("a.rs", "alpha commit")]);
+        let reg = registry_of(&[("proj-a", repo_a.path())]);
+
+        let (_text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+        let projects = structured["projects"].as_array().unwrap();
+        assert!(projects[0]["upstream"].is_null(), "no remote configured");
+        assert_eq!(
+            projects[0]["other_branches"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[test]
