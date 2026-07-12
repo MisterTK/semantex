@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.0.3 — 2026-07-12
+
+`semantex_history` gains upstream-staleness and cross-branch visibility.
+No retrieval-quality or index-schema changes — safe to upgrade in place.
+
+### Added
+
+- **Upstream staleness detection** — list-mode `semantex_history` calls now
+  always report the local clone's ahead/behind count against its `@{u}`
+  tracking branch (`upstream` in structured output), with a `[local clone
+  is N commits behind ... — git pull for upstream-current state]` note in
+  the text when behind > 0. `None` for a detached HEAD or a branch with no
+  upstream configured.
+- **`other_branches` param (opt-in)** — list mode only; surfaces other
+  local and remote-tracking branches (excluding the current branch and its
+  own upstream), most recently active first, capped at 10. Reports how
+  many were skipped beyond the cap, and says so explicitly when none are
+  found.
+- **Worktree + nested-path dedup in `scope=all`** — cross-repo federation
+  now excludes registered worktree checkouts and dedups nested registry
+  paths (e.g. a subdirectory of an already-selected repo), so `scope=all`
+  no longer renders the same commit history twice under two names. Naming
+  a worktree or nested path explicitly via a named scope is unaffected.
+
+### Fixed
+
+- `scope=all`'s nested-path dedup silently reordered output sections by
+  path length instead of preserving registry order.
+- `other_branches` silently dropped branches beyond its 10-branch cap with
+  no indication; now reports a skipped count in both text and structured
+  output.
+- `other_branches: true` with zero results rendered no text at all,
+  indistinguishable from not having been requested; now says "No other
+  active branches."
+- Dropped dead `Serialize` derives on two internal history types whose
+  JSON was always hand-built.
+- `upsert_branch_at` computed a repo's worktree status twice on first
+  registration.
+
 ## v1.0.2 — 2026-07-11
 
 Git history becomes a first-class MCP surface. No retrieval-quality or
