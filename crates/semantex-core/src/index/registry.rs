@@ -417,6 +417,7 @@ fn upsert_branch_at(
         registry.projects.last_mut().expect("just pushed")
     };
     entry.embedder_fingerprint = embedder_fingerprint.to_string();
+    entry.is_worktree = is_worktree_checkout(canonical);
     if let Some(existing_branch) = entry
         .branches
         .iter_mut()
@@ -787,6 +788,71 @@ mod tests {
         let v2 = load_from(&reg);
         let entry = v2.projects.iter().find(|p| p.path == proj).unwrap();
         assert_eq!(entry.branches.len(), 2);
+    }
+
+    #[test]
+    fn upsert_branch_refreshes_is_worktree_for_existing_entries() {
+        let main_repo = TempDir::new().unwrap();
+        init_git_repo(main_repo.path());
+
+        let worktree_dir = TempDir::new().unwrap();
+        std::fs::remove_dir(worktree_dir.path()).unwrap();
+        git_test(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-z",
+                worktree_dir.path().to_str().unwrap(),
+            ],
+        );
+
+        let (_tmp, reg) = tmp_registry();
+        let worktree_canonical = worktree_dir.path().canonicalize().unwrap();
+
+        // Simulate a pre-is_worktree-feature registry entry: create entry with
+        // is_worktree forced to false.
+        let mut registry = RegistryV2 {
+            version: 2,
+            projects: vec![ProjectEntry {
+                path: worktree_canonical.clone(),
+                project_id: project_id_for_path(&worktree_canonical),
+                display_name: display_name_for_path(&worktree_canonical),
+                branches: Vec::new(),
+                embedder_fingerprint: String::new(),
+                is_worktree: false, // incorrectly stamped as false
+            }],
+        };
+        save_to(&reg, &registry);
+
+        // Verify the entry starts as false.
+        registry = load_from(&reg);
+        assert!(!registry.projects[0].is_worktree);
+
+        // Now call upsert_branch_at — the fix should re-detect and stamp true.
+        upsert_branch_at(
+            &reg,
+            &worktree_canonical,
+            "feature-z",
+            "feature-z-abc",
+            100,
+            None,
+            "fp",
+        );
+
+        // Reload and assert is_worktree was refreshed to true.
+        registry = load_from(&reg);
+        let entry = registry
+            .projects
+            .iter()
+            .find(|p| p.path == worktree_canonical)
+            .unwrap();
+        assert!(
+            entry.is_worktree,
+            "upsert_branch_at must re-detect is_worktree for existing entries"
+        );
     }
 
     #[test]

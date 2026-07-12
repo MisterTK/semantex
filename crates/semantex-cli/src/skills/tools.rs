@@ -728,7 +728,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                     name: "other_branches",
                     ty: "boolean",
                     required: false,
-                    description: "Also list other local/remote branches (excluding current + its upstream), most recently active first.",
+                    description: "List mode only: also list other local/remote branches (excluding current + its upstream), most recently active first.",
                 },
             ],
             examples: &[

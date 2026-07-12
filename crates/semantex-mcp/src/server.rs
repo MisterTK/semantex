@@ -1477,7 +1477,9 @@ impl McpServer {
                                 "properties": {
                                     "project": { "type": "string" },
                                     "commits": { "type": "array" },
-                                    "errors": { "type": "array" }
+                                    "errors": { "type": "array" },
+                                    "upstream": { "type": ["object", "null"], "description": "This project's ahead/behind status vs. its upstream tracking branch." },
+                                    "other_branches": { "type": "array", "description": "Other local/remote branches for this project." }
                                 }
                             }
                         },
@@ -1499,7 +1501,7 @@ impl McpServer {
                         "skipped_shas": { "type": "array", "items": { "type": "string" } },
                         "upstream": {
                             "type": ["object", "null"],
-                            "description": "This local clone's ahead/behind status vs. its upstream tracking branch, or null if none is configured.",
+                            "description": "List mode only: this local clone's ahead/behind status vs. its upstream tracking branch, or null if none is configured.",
                             "properties": {
                                 "ref": { "type": "string" },
                                 "ahead": { "type": "integer" },
