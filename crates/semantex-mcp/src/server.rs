@@ -1246,6 +1246,9 @@ impl McpServer {
                     "scope={\"module\": \"<path>\"} per file/directory you want to document in depth — ",
                     "write each to `semantex_docs/<module>.md`. Every scaffold item carries file:line ",
                     "provenance: cite it, and verify claims against the source before writing prose. ",
+                    "Module-scope imports/imported_by are project-internal only — external packages ",
+                    "and stdlib are never resolved to a path, so a short list means no other project ",
+                    "file depends on this one this way, not that the file has no dependencies. ",
                     "On repeat runs, diff the scaffold against the existing doc and update only drifted ",
                     "sections. See the `semantex-docs` Skill for the full workflow."
                 ).into(),

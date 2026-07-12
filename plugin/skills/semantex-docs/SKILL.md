@@ -60,7 +60,11 @@ This returns:
 - `symbols` — every function/method/class/etc. with signature, params, return type, existing
   `docstring` + `doc_tags` (already-written doc comments — **preserve and refresh these,
   don't discard them**), semantic role, and `provenance` (file:line)
-- `imports` / `imported_by` — the file-level dependency edges in both directions
+- `imports` / `imported_by` — the file-level dependency edges in both directions, **project-internal
+  only**: external packages, stdlib, and third-party dependencies are never resolved to a path and
+  never appear here. A short or empty list means "no *other project file* depends on this one this
+  way" — not "this file has no dependencies." Don't write "this file has no imports" from an empty
+  list; say what the scaffold actually shows (no internal import edges found) or omit the claim.
 - `calls_out` / `calls_in` — call-graph edges in both directions, resolved to file:line where
   the graph resolution succeeded (unresolved edges are still listed by name)
 

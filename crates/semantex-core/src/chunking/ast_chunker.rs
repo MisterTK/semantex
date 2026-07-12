@@ -53,15 +53,20 @@ impl Chunker for AstChunker {
 
         let source = content.as_bytes();
 
-        // Extract file-level imports (for attaching to chunks)
+        // Extract file-level imports (for attaching to chunks). No cap is
+        // applied here: many real files list external/stdlib imports before
+        // local ones (Go's stdlib-then-third-party convention, TS's
+        // external-before-internal convention, etc.), so truncating the raw
+        // list up front would silently discard exactly the resolvable
+        // (local) imports on any file with more than a handful of them.
+        // `import_resolver::resolve_import_path` (called later, in the
+        // indexer) is what actually filters unresolvable entries out.
         let language_name_str = file_type.language_name();
         let file_imports = crate::chunking::import_resolver::extract_imports(
             &tree.root_node(),
             source,
             language_name_str,
         );
-        // Keep up to 8 most relevant imports per chunk
-        let truncated_imports: Vec<String> = file_imports.into_iter().take(8).collect();
 
         let mut ast_spans: Vec<AstSpan> = Vec::new();
         collect_definitions(
@@ -99,7 +104,7 @@ impl Chunker for AstChunker {
 
         // Attach file-level imports to each span's metadata
         for span in &mut deduped {
-            span.meta.resolved_imports.clone_from(&truncated_imports);
+            span.meta.resolved_imports.clone_from(&file_imports);
         }
 
         let language_name = file_type.language_name().to_string();
@@ -1840,6 +1845,50 @@ fn hello() {
             .any(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }));
         assert!(has_text_window, "Should have TextWindow chunks for gaps");
         assert!(has_ast_node, "Should have AstNode chunks for functions");
+    }
+
+    #[test]
+    fn test_file_level_imports_not_truncated_before_resolution() {
+        // Files commonly list external/stdlib imports before local ones
+        // (Go's stdlib-then-third-party convention, TS's external-before-
+        // internal convention, etc.). Truncating the raw import list to the
+        // first 8 BEFORE resolution silently discards exactly the
+        // resolvable (local) imports whenever a file has more than 8
+        // imports and the local one isn't in the first 8 slots.
+        let chunker = AstChunker::new(256, 64);
+        let content = r"
+use std::a;
+use std::b;
+use std::c;
+use std::d;
+use std::e;
+use std::f;
+use std::g;
+use std::h;
+use crate::real_module;
+
+fn run() {}
+";
+        let chunks = chunker.chunk(Path::new("test.rs"), content).unwrap();
+        let ast_chunk = chunks
+            .iter()
+            .find(|c| matches!(c.chunk_type, ChunkType::AstNode { .. }))
+            .unwrap();
+        match &ast_chunk.chunk_type {
+            ChunkType::AstNode {
+                structured_meta: Some(meta),
+                ..
+            } => {
+                assert!(
+                    meta.resolved_imports
+                        .iter()
+                        .any(|i| i.contains("real_module")),
+                    "the 9th import (the only resolvable one) must survive extraction, got: {:?}",
+                    meta.resolved_imports
+                );
+            }
+            _ => panic!("expected AstNode with structured_meta"),
+        }
     }
 
     #[test]

@@ -21,9 +21,14 @@ pub fn extract_imports(root: &tree_sitter::Node, source: &[u8], language: &str) 
             "javascript" | "typescript" | "tsx" | "jsx" => {
                 kind == "import_statement" || kind == "import_declaration"
             }
-            "go" | "java" => kind == "import_declaration",
+            // Go handled separately below: its grouped `import (...)` form
+            // needs per-spec extraction, not the whole declaration's text.
+            "java" => kind == "import_declaration",
             "c" | "cpp" => kind == "preproc_include",
-            "dart" => kind == "import_directive" || kind == "export_directive",
+            // tree-sitter-dart-orchard wraps every import/export statement
+            // in a top-level `import_or_export` node — there is no
+            // `import_directive`/`export_directive` kind in this grammar.
+            "dart" => kind == "import_or_export",
             "c_sharp" => kind == "using_directive",
             _ => false,
         };
@@ -35,15 +40,33 @@ pub fn extract_imports(root: &tree_sitter::Node, source: &[u8], language: &str) 
             }
         }
 
-        // Go: individual import specs are nested inside import_declaration
+        // Go: a bare `import "foo"` has a single `import_spec` child of
+        // `import_declaration`; a grouped `import (...)` block instead has
+        // ONE `import_spec_list` child, which itself contains the
+        // individual `import_spec` nodes — one level deeper than the bare
+        // form. Recurse into `import_spec_list` to reach them, rather than
+        // grabbing its combined text as a single undifferentiated blob.
         if language == "go" && kind == "import_declaration" {
             let mut inner_cursor = child.walk();
             for inner in child.children(&mut inner_cursor) {
-                #[allow(clippy::collapsible_if)]
-                if inner.kind() == "import_spec" || inner.kind() == "import_spec_list" {
-                    if let Ok(text) = inner.utf8_text(source) {
-                        imports.push(text.to_string());
+                match inner.kind() {
+                    "import_spec" => {
+                        if let Ok(text) = inner.utf8_text(source) {
+                            imports.push(text.to_string());
+                        }
                     }
+                    "import_spec_list" => {
+                        let mut spec_cursor = inner.walk();
+                        for spec in inner.children(&mut spec_cursor) {
+                            #[allow(clippy::collapsible_if)]
+                            if spec.kind() == "import_spec" {
+                                if let Ok(text) = spec.utf8_text(source) {
+                                    imports.push(text.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -71,7 +94,7 @@ pub fn resolve_import_path(
         "go" => resolve_go_import(import_text, project_files),
         "java" => resolve_java_import(import_text, project_files),
         "c" | "cpp" => resolve_c_include(import_text, current_file, project_files),
-        "dart" => resolve_dart_import(import_text, project_files),
+        "dart" => resolve_dart_import(import_text, current_file, project_files),
         "c_sharp" => resolve_csharp_using(import_text, project_files),
         _ => None,
     }
@@ -110,11 +133,13 @@ fn resolve_rust_import(
     }
 
     if let Some(module_path) = path_part.strip_prefix("crate::") {
-        // Convention: Rust crate roots live under `src/`. This covers the vast
-        // majority of real-world crate layouts. Custom `[lib] path` settings in
-        // Cargo.toml are not detectable without parsing the manifest and are
-        // exceedingly rare, so we accept this default.
-        return resolve_rust_module_path(module_path, Path::new("src"), project_files);
+        // The crate root is the nearest ancestor `src/` directory of the
+        // *importing file*, not necessarily the project root's `src/` — a
+        // multi-crate Cargo workspace has one crate root per member (e.g.
+        // `crates/foo/src/`), and `crate::` is always relative to whichever
+        // crate the current file belongs to.
+        let crate_root = rust_crate_root(current_file)?;
+        return resolve_rust_module_path(module_path, &crate_root, project_files);
     }
 
     if let Some(module_path) = path_part.strip_prefix("self::") {
@@ -143,6 +168,26 @@ fn resolve_rust_import(
     }
 
     // External crate import -- not resolvable within the project
+    None
+}
+
+/// Find the crate root for `current_file`: the nearest ancestor path
+/// component literally named `src`. Cargo crate roots are always
+/// `<crate_dir>/src/`, whether the crate lives at the workspace root
+/// (`src/`) or nested under a workspace member (`crates/foo/src/`) — so this
+/// generalizes to both single-crate projects and multi-crate workspaces
+/// without needing to parse `Cargo.toml`. Returns `None` if no `src`
+/// ancestor exists (e.g. a workspace-root `examples/`/`tests`/`benches`
+/// file, which is its own crate root and wouldn't use `crate::` to refer to
+/// a library crate anyway).
+fn rust_crate_root(current_file: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in current_file.components() {
+        root.push(component);
+        if component.as_os_str() == "src" {
+            return Some(root);
+        }
+    }
     None
 }
 
@@ -283,6 +328,24 @@ fn resolve_js_import(
         return Some(resolved_base);
     }
 
+    // A specifier can already carry an explicit extension that doesn't match
+    // the real source file's extension — required by ESM/NodeNext-style
+    // TypeScript, where relative imports must say `./foo.js` even when the
+    // actual source is `foo.ts` (the compiler remaps the extension at build
+    // time). Swap a known JS-family (emit) extension for each possible
+    // source extension before falling back to the extension-less append
+    // logic below, which only handles specifiers with no extension at all.
+    if let Some(ext) = resolved_base.extension().and_then(|e| e.to_str())
+        && matches!(ext, "js" | "jsx" | "mjs" | "cjs")
+    {
+        for src_ext in ["ts", "tsx"] {
+            let candidate = resolved_base.with_extension(src_ext);
+            if project_files.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
     // With extensions (e.g. `./foo` -> `./foo.ts`)
     for ext in &extensions {
         let mut candidate = resolved_base.as_os_str().to_owned();
@@ -306,24 +369,33 @@ fn resolve_js_import(
 
 /// Resolve a Go import to a project-relative file path.
 ///
-/// Go uses package paths (e.g. `"mypackage/utils"`). We try to match them to
-/// directories or `.go` files within the project. Standard library and remote
-/// module paths (containing a dot in the first segment) are skipped.
+/// Go uses package paths (e.g. `"mypackage/utils"`). A project's own
+/// packages can appear either as a path relative to the module root
+/// (`"internal/auth"`) or, just as often, prefixed with the module's own
+/// full path (`"github.com/user/repo/internal/auth"`, when the importing
+/// repo's `go.mod` declares `module github.com/user/repo` — the dominant
+/// style for real-world Go projects, since Go has no relative-import form).
+/// Without parsing `go.mod` for the exact module path, we try progressively
+/// shorter suffixes of the specifier (longest/most-specific first) against
+/// real `.go`-containing directories in the project; stdlib imports (no
+/// slash at all) are skipped outright since they're never project-relative.
 fn resolve_go_import(import_text: &str, project_files: &HashSet<PathBuf>) -> Option<PathBuf> {
     // Extract the quoted import path
     let specifier = extract_js_specifier(import_text)?;
 
-    // Skip stdlib (no slash) and remote modules (first segment contains '.')
-    let first_segment = specifier.split('/').next().unwrap_or(specifier);
-    if !specifier.contains('/') || first_segment.contains('.') {
+    // Bare package name (no slash) -- always stdlib (e.g. "fmt", "os").
+    if !specifier.contains('/') {
         return None;
     }
 
-    // Try as a directory containing .go files (Go packages are directories)
-    let pkg_dir = PathBuf::from(specifier);
-    // Check if any project file lives in that directory
-    for pf in project_files {
-        if pf.starts_with(&pkg_dir) && pf.extension().is_some_and(|e| e == "go") {
+    let segments: Vec<&str> = specifier.split('/').collect();
+    for start in 0..segments.len() {
+        let suffix = segments[start..].join("/");
+        let pkg_dir = PathBuf::from(&suffix);
+        if project_files
+            .iter()
+            .any(|pf| pf.starts_with(&pkg_dir) && pf.extension().is_some_and(|e| e == "go"))
+        {
             return Some(pkg_dir);
         }
     }
@@ -414,9 +486,15 @@ fn resolve_c_include(
 
 /// Resolve a Dart import to a project-relative file path.
 ///
-/// Handles relative imports (`'../utils.dart'`) and package imports
-/// (`'package:myapp/utils.dart'`). `dart:` SDK imports are skipped.
-fn resolve_dart_import(import_text: &str, project_files: &HashSet<PathBuf>) -> Option<PathBuf> {
+/// Handles relative imports (`'exceptions.dart'`, `'../utils.dart'` —
+/// resolved against the importing file's own directory, the dominant Dart
+/// intra-package style) and package imports (`'package:myapp/utils.dart'`).
+/// `dart:` SDK imports are skipped.
+fn resolve_dart_import(
+    import_text: &str,
+    current_file: &Path,
+    project_files: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
     let specifier = extract_js_specifier(import_text)?;
 
     // Skip dart: SDK imports
@@ -435,8 +513,11 @@ fn resolve_dart_import(import_text: &str, project_files: &HashSet<PathBuf>) -> O
         return None;
     }
 
-    // Relative imports are not common but possible — treated as project-root-relative
-    let candidate = PathBuf::from(specifier);
+    // Relative import (bare filename or `../`-prefixed) — Dart has no
+    // root-relative local import form, so this is always resolved against
+    // the importing file's own directory.
+    let current_dir = current_file.parent()?;
+    let candidate = normalize_path(&current_dir.join(specifier));
     if project_files.contains(&candidate) {
         return Some(candidate);
     }
@@ -581,6 +662,20 @@ mod tests {
     }
 
     #[test]
+    fn test_rust_crate_import_workspace_crate_root() {
+        // Multi-crate Cargo workspace: the importing file's crate root is
+        // `crates/foo/src`, not the workspace root's top-level `src/`.
+        let files = make_file_set(&["crates/foo/src/config.rs"]);
+        let result = resolve_import_path(
+            "use crate::config::Config;",
+            "rust",
+            Path::new("crates/foo/src/main.rs"),
+            &files,
+        );
+        assert_eq!(result, Some(PathBuf::from("crates/foo/src/config.rs")));
+    }
+
+    #[test]
     fn test_rust_std_import_skipped() {
         let files = make_file_set(&["src/main.rs"]);
         let result = resolve_import_path(
@@ -715,6 +810,24 @@ mod tests {
     }
 
     #[test]
+    fn test_js_relative_import_explicit_js_extension_maps_to_ts_source() {
+        // Modern ESM/NodeNext-style TypeScript requires relative imports to
+        // carry an explicit `.js` specifier even when the real source file
+        // is `.ts` (the compiler rewrites the extension at build time, but
+        // the source specifier keeps `.js`). The specifier's existing
+        // extension must be stripped before trying replacement extensions,
+        // or this common, spec-required style never resolves.
+        let files = make_file_set(&["src/utils.ts"]);
+        let result = resolve_import_path(
+            "import { helper } from './utils.js';",
+            "typescript",
+            Path::new("src/main.ts"),
+            &files,
+        );
+        assert_eq!(result, Some(PathBuf::from("src/utils.ts")));
+    }
+
+    #[test]
     fn test_js_bare_specifier_skipped() {
         let files = make_file_set(&["src/main.ts"]);
         let result = resolve_import_path(
@@ -754,6 +867,32 @@ mod tests {
         assert_eq!(result, Some(PathBuf::from("src/chunking/text_chunker.rs")));
     }
 
+    #[test]
+    fn test_go_extract_imports_grouped_block_yields_individual_specs() {
+        // Grouped `import (...)` form nests `import_spec` nodes TWO levels
+        // inside `import_declaration` (via an intermediate
+        // `import_spec_list`), not one — a bare top-level scan finds only
+        // the `import_spec_list` container and grabs its whole text as one
+        // undifferentiated blob, never the individual import paths.
+        let source = b"package gin\n\nimport (\n\t\"errors\"\n\t\"fmt\"\n\n\t\"github.com/gin-gonic/gin/binding\"\n)\n\nfunc main() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let imports = extract_imports(&root, source, "go");
+        assert_eq!(
+            imports,
+            vec![
+                "\"errors\"".to_string(),
+                "\"fmt\"".to_string(),
+                "\"github.com/gin-gonic/gin/binding\"".to_string(),
+            ],
+            "expected one entry per individual import spec, got: {imports:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Go import resolution
     // -----------------------------------------------------------------------
@@ -771,6 +910,24 @@ mod tests {
         let files = make_file_set(&["main.go"]);
         let result = resolve_import_path("\"fmt\"", "go", Path::new("main.go"), &files);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_go_module_path_prefixed_self_import() {
+        // A Go module's own internal packages are imported via the module's
+        // full path, not a bare relative path — e.g. gin's go.mod declares
+        // `module github.com/gin-gonic/gin`, and gin imports its own
+        // `binding` package as "github.com/gin-gonic/gin/binding". The first
+        // path segment containing a dot must not be an automatic "external"
+        // signal, or every self-import in a domain-hosted module breaks.
+        let files = make_file_set(&["binding/binding.go"]);
+        let result = resolve_import_path(
+            "\"github.com/gin-gonic/gin/binding\"",
+            "go",
+            Path::new("context.go"),
+            &files,
+        );
+        assert_eq!(result, Some(PathBuf::from("binding")));
     }
 
     #[test]
@@ -864,6 +1021,32 @@ mod tests {
         assert_eq!(result, Some(PathBuf::from("include/mylib/types.h")));
     }
 
+    #[test]
+    fn test_dart_extract_imports_multi_line() {
+        // tree-sitter-dart-orchard wraps every import/export statement in a
+        // top-level `import_or_export` node (containing `library_import` or
+        // `library_export`) — not `import_directive`/`export_directive`,
+        // which don't exist in this grammar at all. The old check matched
+        // nothing, so Dart extraction always returned zero imports.
+        let source = b"import 'dart:async';\nimport 'package:collection/collection.dart';\nimport 'exceptions.dart';\n\nvoid main() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_dart_orchard::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let imports = extract_imports(&root, source, "dart");
+        assert_eq!(
+            imports,
+            vec![
+                "import 'dart:async';".to_string(),
+                "import 'package:collection/collection.dart';".to_string(),
+                "import 'exceptions.dart';".to_string(),
+            ],
+            "expected one entry per import statement, got: {imports:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Dart import resolution
     // -----------------------------------------------------------------------
@@ -878,6 +1061,22 @@ mod tests {
             &files,
         );
         assert_eq!(result, Some(PathBuf::from("lib/utils.dart")));
+    }
+
+    #[test]
+    fn test_dart_relative_import_same_directory() {
+        // The dominant Dart intra-package import style is a bare relative
+        // filename (no `package:` prefix), resolved against the importing
+        // file's own directory — e.g. lib/src/entrypoint.dart importing
+        // lib/src/exceptions.dart via `import 'exceptions.dart';`.
+        let files = make_file_set(&["lib/src/exceptions.dart"]);
+        let result = resolve_import_path(
+            "import 'exceptions.dart';",
+            "dart",
+            Path::new("lib/src/entrypoint.dart"),
+            &files,
+        );
+        assert_eq!(result, Some(PathBuf::from("lib/src/exceptions.dart")));
     }
 
     #[test]

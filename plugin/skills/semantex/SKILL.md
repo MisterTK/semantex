@@ -156,6 +156,16 @@ multiplies context O(N²) and gives worse results than one merged query.
 Use `semantex_search` or `semantex_deep` only when you need raw JSON for programmatic
 processing. For all human-readable results, use `semantex_agent`.
 
+## Documentation: `semantex-docs` skill
+
+Asked to document a codebase, write architecture docs, or keep `semantex_docs/*.md` in sync
+with code that changed? Use the **`semantex-docs`** skill (backed by the `semantex_docs_context`
+tool) instead of hand-rolling it here — it's a deterministic, zero-LLM scaffold (symbol
+inventory, call graph, import graph, file:line provenance) that *you* turn into prose, with a
+full overview → per-module → refresh workflow. Don't call `semantex_docs_context` directly
+without that skill loaded; it gives you the write/refresh/citation discipline the raw scaffold
+doesn't enforce on its own.
+
 ## Project memory: use sparingly and purposefully
 
 `semantex_memory_save` / `semantex_memory_recall` persist short notes in the project's

@@ -524,8 +524,9 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 "Deterministic documentation scaffold — NOT an LLM call, does not write prose. ",
                 "Returns structurally-complete data (symbol inventory, call-graph edges, import ",
                 "edges, existing doc-comment text, file:line provenance) for the calling agent to ",
-                "turn into maintained markdown docs. Pair with the `semantex-docs` skill for the ",
-                "full write/refresh workflow."
+                "turn into maintained markdown docs. Module-scope imports/imported_by are ",
+                "project-internal only — external packages and stdlib are never resolved. Pair ",
+                "with the `semantex-docs` skill for the full write/refresh workflow."
             ),
             when_to_use: &[
                 "Asked to document a codebase, write architecture docs, or generate a README.",
