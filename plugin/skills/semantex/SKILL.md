@@ -185,6 +185,7 @@ For commit-history questions — NOT code content — use `semantex_history`:
 - Release notes / changelog since a tag → `{"since": "v1.0.0", "limit": 50}`
 - Changes across all indexed dependency repos → `{"since": "2026-07-03", "scope": "all"}`
 - Commits touching one file → `{"file": "src/router.rs"}`
+- Is this feature in another branch yet? → `{"other_branches": true}` (lists other active local/remote branches)
 - Drill into specific commits with diffs → `{"commits": ["<sha>", ...]}` (max 10)
 
 History refreshes from git on every call — no reindex needed after `git pull`.

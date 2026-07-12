@@ -673,6 +673,7 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 "Checking what changed recently, in this repo or across all indexed dependency repos (scope='all').",
                 "Onboarding to an unfamiliar repo: recent change activity alongside code search.",
                 "Before answering 'what's new/latest' for someone else's repo: consider `git pull` first — this tool reads the local clone, never the network.",
+                "Looking for a feature that isn't in the current branch: pass other_branches=true to see if it's sitting in another branch, local or upstream.",
             ],
             args: &[
                 ToolArg {
@@ -722,6 +723,12 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                     ty: "string",
                     required: false,
                     description: "Project path (defaults to current working directory).",
+                },
+                ToolArg {
+                    name: "other_branches",
+                    ty: "boolean",
+                    required: false,
+                    description: "Also list other local/remote branches (excluding current + its upstream), most recently active first.",
                 },
             ],
             examples: &[
