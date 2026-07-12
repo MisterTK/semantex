@@ -628,6 +628,77 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<std::process::Output> {
         .context("failed to spawn `git`")
 }
 
+/// How far this local clone's `HEAD` has diverged from its upstream
+/// tracking branch (`@{u}`), and how stale that comparison itself might be.
+///
+/// Every check here is local: `@{u}` and `FETCH_HEAD` only move on an
+/// explicit `git fetch`/`pull`, never on their own — so `behind` can itself
+/// be stale. `fetch_ts` (the mtime of `FETCH_HEAD` under the repo's shared
+/// git dir, unix seconds) reports how old that comparison is; render it via
+/// [`humanize_age`] the same way commit timestamps already are, rather than
+/// presenting the ahead/behind counts as if they reflected live network
+/// state.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UpstreamStatus {
+    pub upstream_ref: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub fetch_ts: Option<i64>,
+}
+
+/// `None` for a detached HEAD or a branch with no upstream configured (both
+/// common — several real repos in production use have no `origin` at all).
+pub fn upstream_status(project_root: &Path) -> Option<UpstreamStatus> {
+    let output = run_git(
+        project_root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let upstream_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if upstream_ref.is_empty() {
+        return None;
+    }
+
+    let output = run_git(
+        project_root,
+        &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let counts = String::from_utf8_lossy(&output.stdout);
+    let mut parts = counts.split_whitespace();
+    let behind: usize = parts.next()?.parse().ok()?;
+    let ahead: usize = parts.next()?.parse().ok()?;
+
+    let fetch_ts = run_git(project_root, &["rev-parse", "--git-common-dir"])
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let dir = if Path::new(&dir).is_absolute() {
+                PathBuf::from(dir)
+            } else {
+                project_root.join(dir)
+            };
+            std::fs::metadata(dir.join("FETCH_HEAD")).ok()
+        })
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+
+    Some(UpstreamStatus {
+        upstream_ref,
+        ahead,
+        behind,
+        fetch_ts,
+    })
+}
+
 /// `HEAD`'s commit sha, or `None` for a non-git directory, a repo with zero
 /// commits, or a missing `git` binary — all of which are "nothing to do"
 /// for history population, not errors.
@@ -1104,6 +1175,90 @@ mod tests {
             git(dir, &["add", "."]);
             git(dir, &["commit", "-q", "-m", &format!("commit number {i}")]);
         }
+    }
+
+    /// Clone `src` into a fresh tempdir with a real `@{u}` upstream tracking
+    /// ref (git sets this up automatically for the branch checked out by
+    /// `clone`), and git identity configured so commits can be made in it.
+    fn clone_repo(src: &Path) -> TempDir {
+        let dest = TempDir::new().unwrap();
+        let status = StdCommand::new("git")
+            .args([
+                "clone",
+                "-q",
+                src.to_str().unwrap(),
+                dest.path().to_str().unwrap(),
+            ])
+            .status()
+            .expect("git must be on PATH for these tests");
+        assert!(status.success(), "git clone failed");
+        git(dest.path(), &["config", "user.email", "test@example.com"]);
+        git(dest.path(), &["config", "user.name", "Test User"]);
+        dest
+    }
+
+    /// One additional commit in `dir`, writing a uniquely-named file so
+    /// repeated calls across a test never collide.
+    fn commit_one_more(dir: &Path, label: &str) {
+        std::fs::write(dir.join(format!("{label}.txt")), label).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", &format!("commit {label}")]);
+    }
+
+    #[test]
+    fn upstream_status_none_without_a_remote() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path(), 1);
+        assert!(upstream_status(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn upstream_status_reports_behind_after_fetch() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path(), 2);
+        git(upstream.path(), &["branch", "-M", "main"]);
+        let local = clone_repo(upstream.path());
+
+        commit_one_more(upstream.path(), "third");
+        commit_one_more(upstream.path(), "fourth");
+        git(local.path(), &["fetch", "-q", "origin"]);
+
+        let status = upstream_status(local.path()).expect("upstream must resolve");
+        assert_eq!(status.upstream_ref, "origin/main");
+        assert_eq!(status.behind, 2);
+        assert_eq!(status.ahead, 0);
+        assert!(status.fetch_ts.is_some(), "FETCH_HEAD must exist after a fetch");
+    }
+
+    #[test]
+    fn upstream_status_reports_ahead_when_local_has_new_commits() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path(), 2);
+        git(upstream.path(), &["branch", "-M", "main"]);
+        let local = clone_repo(upstream.path());
+
+        commit_one_more(local.path(), "local-only-a");
+        commit_one_more(local.path(), "local-only-b");
+
+        let status = upstream_status(local.path()).expect("upstream must resolve");
+        assert_eq!(status.ahead, 2);
+        assert_eq!(status.behind, 0);
+    }
+
+    #[test]
+    fn upstream_status_reports_both_when_diverged() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path(), 2);
+        git(upstream.path(), &["branch", "-M", "main"]);
+        let local = clone_repo(upstream.path());
+
+        commit_one_more(upstream.path(), "upstream-only");
+        commit_one_more(local.path(), "local-only");
+        git(local.path(), &["fetch", "-q", "origin"]);
+
+        let status = upstream_status(local.path()).expect("upstream must resolve");
+        assert_eq!(status.ahead, 1);
+        assert_eq!(status.behind, 1);
     }
 
     #[test]
