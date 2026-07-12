@@ -3915,16 +3915,21 @@ fn history_for_project(
             u.behind,
             if u.behind == 1 { "" } else { "s" },
             u.upstream_ref,
-            u.fetch_ts.map_or("fetch time unknown".to_string(), |ts| format!(
-                "fetched {}",
-                history::humanize_age(ts)
-            )),
+            u.fetch_ts
+                .map_or("fetch time unknown".to_string(), |ts| format!(
+                    "fetched {}",
+                    history::humanize_age(ts)
+                )),
         );
     }
 
     // ── Other-branch visibility (opt-in via `other_branches: true`) ──────
     let mut other_branches_json = Vec::new();
-    if args.get("other_branches").and_then(serde_json::Value::as_bool) == Some(true) {
+    if args
+        .get("other_branches")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
         let current = history::current_branch(project_root);
         let upstream_ref = upstream.as_ref().map(|u| u.upstream_ref.as_str());
         let branches = history::other_branches(
@@ -7186,10 +7191,7 @@ mod tests {
         .unwrap();
         let projects = structured["projects"].as_array().unwrap();
         assert!(projects[0]["upstream"].is_null(), "no remote configured");
-        assert_eq!(
-            projects[0]["other_branches"].as_array().unwrap().len(),
-            0
-        );
+        assert_eq!(projects[0]["other_branches"].as_array().unwrap().len(), 0);
     }
 
     #[test]

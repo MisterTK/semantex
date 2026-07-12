@@ -904,7 +904,7 @@ mod tests {
                 display_name: id.into(),
                 branches: vec![],
                 embedder_fingerprint: String::new(),
-            is_worktree: false,
+                is_worktree: false,
             });
         }
 

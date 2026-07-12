@@ -1307,7 +1307,10 @@ mod tests {
         assert_eq!(status.upstream_ref, "origin/main");
         assert_eq!(status.behind, 2);
         assert_eq!(status.ahead, 0);
-        assert!(status.fetch_ts.is_some(), "FETCH_HEAD must exist after a fetch");
+        assert!(
+            status.fetch_ts.is_some(),
+            "FETCH_HEAD must exist after a fetch"
+        );
     }
 
     #[test]
