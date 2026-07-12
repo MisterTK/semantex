@@ -1510,7 +1510,7 @@ impl McpServer {
                         },
                         "other_branches": {
                             "type": "array",
-                            "description": "Present only when the other_branches param was true.",
+                            "description": "Other local/remote branches (excluding current + its upstream), most recent first. Empty unless the other_branches param was true.",
                             "items": {
                                 "type": "object",
                                 "properties": {
