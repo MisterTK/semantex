@@ -6941,6 +6941,20 @@ mod tests {
             ])
             .status()
             .unwrap();
+        // `clone` doesn't copy repo-local identity config (only global), and
+        // CI runners have no global git identity — commit fails without this.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap();
 
         std::fs::write(local.path().join("b.rs"), "two").unwrap();
         std::process::Command::new("git")
