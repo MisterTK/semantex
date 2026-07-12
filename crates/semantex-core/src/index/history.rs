@@ -638,7 +638,7 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<std::process::Output> {
 /// [`humanize_age`] the same way commit timestamps already are, rather than
 /// presenting the ahead/behind counts as if they reflected live network
 /// state.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UpstreamStatus {
     pub upstream_ref: String,
     pub ahead: usize,
@@ -717,7 +717,7 @@ pub const MAX_OTHER_BRANCHES: usize = 10;
 /// One local or remote-tracking branch other than the current one, for
 /// "is there a feature-branch answer to this that the current branch
 /// doesn't have yet" visibility.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BranchActivity {
     pub name: String,
     pub is_remote: bool,
@@ -727,14 +727,16 @@ pub struct BranchActivity {
 
 /// Local and remote-tracking branches other than `current_branch` and
 /// `upstream_ref` (already covered by [`upstream_status`]'s note), most
-/// recently active first. Best-effort: any git failure returns an empty
-/// list, matching the rest of this module's non-fatal discipline.
+/// recently active first, plus the total count of qualifying branches
+/// (before `limit` truncation) so callers can report how many were
+/// skipped. Best-effort: any git failure returns an empty list and a zero
+/// total, matching the rest of this module's non-fatal discipline.
 pub fn other_branches(
     project_root: &Path,
     current_branch: Option<&str>,
     upstream_ref: Option<&str>,
     limit: usize,
-) -> Vec<BranchActivity> {
+) -> (Vec<BranchActivity>, usize) {
     let output = match run_git(
         project_root,
         &[
@@ -746,10 +748,11 @@ pub fn other_branches(
         ],
     ) {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        _ => return (Vec::new(), 0),
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut out = Vec::new();
+    let mut total = 0usize;
     for line in stdout.lines() {
         let mut parts = line.splitn(4, '\0');
         let (Some(full_ref), Some(short), Some(ts_str), Some(subject)) =
@@ -766,17 +769,17 @@ pub fn other_branches(
         let Ok(ts) = ts_str.parse::<i64>() else {
             continue;
         };
-        out.push(BranchActivity {
-            name: short.to_string(),
-            is_remote: full_ref.starts_with("refs/remotes/"),
-            ts,
-            subject: subject.to_string(),
-        });
-        if out.len() >= limit {
-            break;
+        total += 1;
+        if out.len() < limit {
+            out.push(BranchActivity {
+                name: short.to_string(),
+                is_remote: full_ref.starts_with("refs/remotes/"),
+                ts,
+                subject: subject.to_string(),
+            });
         }
     }
-    out
+    (out, total)
 }
 
 /// `HEAD`'s commit sha, or `None` for a non-git directory, a repo with zero
@@ -1347,7 +1350,9 @@ mod tests {
     #[test]
     fn other_branches_empty_for_non_git_dir() {
         let tmp = TempDir::new().unwrap();
-        assert!(other_branches(tmp.path(), None, None, 10).is_empty());
+        let (branches, total) = other_branches(tmp.path(), None, None, 10);
+        assert!(branches.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[test]
@@ -1359,8 +1364,9 @@ mod tests {
         commit_one_more(tmp.path(), "feature-a-commit");
         git(tmp.path(), &["checkout", "-q", "main"]);
 
-        let branches = other_branches(tmp.path(), Some("main"), None, 10);
+        let (branches, total) = other_branches(tmp.path(), Some("main"), None, 10);
         assert_eq!(branches.len(), 1, "got: {branches:?}");
+        assert_eq!(total, 1);
         assert_eq!(branches[0].name, "feature-a");
         assert!(!branches[0].is_remote);
         assert_eq!(branches[0].subject, "commit feature-a-commit");
@@ -1378,7 +1384,8 @@ mod tests {
         let local = clone_repo(upstream.path());
         git(local.path(), &["fetch", "-q", "origin"]);
 
-        let branches = other_branches(local.path(), Some("main"), Some("origin/main"), 10);
+        let (branches, _total) =
+            other_branches(local.path(), Some("main"), Some("origin/main"), 10);
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"origin/feature-x"), "got: {names:?}");
         assert!(
@@ -1403,8 +1410,12 @@ mod tests {
         }
         git(tmp.path(), &["checkout", "-q", "main"]);
 
-        let branches = other_branches(tmp.path(), Some("main"), None, 2);
+        let (branches, total) = other_branches(tmp.path(), Some("main"), None, 2);
         assert_eq!(branches.len(), 2, "got: {branches:?}");
+        assert_eq!(
+            total, 3,
+            "total must count all qualifying branches, not just the truncated slice"
+        );
     }
 
     #[test]

@@ -412,7 +412,7 @@ fn upsert_branch_at(
             display_name: display_name_for_path(canonical),
             branches: Vec::new(),
             embedder_fingerprint: String::new(),
-            is_worktree: is_worktree_checkout(canonical),
+            is_worktree: false, // re-stamped unconditionally below, for both new and existing entries
         });
         registry.projects.last_mut().expect("just pushed")
     };

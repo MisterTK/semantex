@@ -1479,7 +1479,8 @@ impl McpServer {
                                     "commits": { "type": "array" },
                                     "errors": { "type": "array" },
                                     "upstream": { "type": ["object", "null"], "description": "This project's ahead/behind status vs. its upstream tracking branch." },
-                                    "other_branches": { "type": "array", "description": "Other local/remote branches for this project." }
+                                    "other_branches": { "type": "array", "description": "Other local/remote branches for this project." },
+                                    "other_branches_skipped": { "type": "integer", "description": "Count of qualifying branches beyond the per-call cap, not included in other_branches." }
                                 }
                             }
                         },
@@ -1523,6 +1524,10 @@ impl McpServer {
                                     "subject": { "type": "string" }
                                 }
                             }
+                        },
+                        "other_branches_skipped": {
+                            "type": "integer",
+                            "description": "Count of qualifying branches beyond MAX_OTHER_BRANCHES (10), not included in other_branches. 0 unless other_branches was true."
                         }
                     }
                 })),
@@ -3927,6 +3932,7 @@ fn history_for_project(
 
     // ── Other-branch visibility (opt-in via `other_branches: true`) ──────
     let mut other_branches_json = Vec::new();
+    let mut other_branches_skipped = 0usize;
     if args
         .get("other_branches")
         .and_then(serde_json::Value::as_bool)
@@ -3934,13 +3940,16 @@ fn history_for_project(
     {
         let current = history::current_branch(project_root);
         let upstream_ref = upstream.as_ref().map(|u| u.upstream_ref.as_str());
-        let branches = history::other_branches(
+        let (branches, total_branches) = history::other_branches(
             project_root,
             current.as_deref(),
             upstream_ref,
             history::MAX_OTHER_BRANCHES,
         );
-        if !branches.is_empty() {
+        other_branches_skipped = total_branches.saturating_sub(branches.len());
+        if branches.is_empty() {
+            text.push_str("\n\nNo other active branches.");
+        } else {
             text.push_str("\n\nOther active branches:");
             for b in &branches {
                 let _ = write!(
@@ -3959,6 +3968,18 @@ fn history_for_project(
                     "subject": b.subject,
                 }));
             }
+            if other_branches_skipped > 0 {
+                let _ = write!(
+                    text,
+                    "\n  [{other_branches_skipped} branch{} beyond the per-call cap of {} skipped]",
+                    if other_branches_skipped == 1 {
+                        ""
+                    } else {
+                        "es"
+                    },
+                    history::MAX_OTHER_BRANCHES
+                );
+            }
         }
     }
 
@@ -3967,7 +3988,8 @@ fn history_for_project(
         serde_json::json!({
             "commits": commits_json,
             "upstream": upstream_json,
-            "other_branches": other_branches_json
+            "other_branches": other_branches_json,
+            "other_branches_skipped": other_branches_skipped
         }),
     ))
 }
@@ -4024,16 +4046,24 @@ fn history_federated(
     // which repos to reindex — cheaper than a git-toplevel subprocess call.
     if matches!(scope, SearchScope::All) {
         selected.retain(|p| !p.is_worktree);
-        selected.sort_by_key(|p| p.path.as_os_str().len());
+        // Parent-before-child order is needed to detect nesting via
+        // `starts_with`, but that must only decide which paths survive —
+        // sorting `selected` itself would silently reorder unrelated
+        // sections by path length. Compute the survivor set on a
+        // length-sorted clone, then retain from the original, registry-order
+        // `selected`.
+        let mut by_len = selected.clone();
+        by_len.sort_by_key(|p| p.path.as_os_str().len());
         let mut kept_roots: Vec<std::path::PathBuf> = Vec::new();
-        selected.retain(|p| {
-            if kept_roots.iter().any(|root| p.path.starts_with(root)) {
-                false
-            } else {
+        let mut kept_paths: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        for p in &by_len {
+            if !kept_roots.iter().any(|root| p.path.starts_with(root)) {
                 kept_roots.push(p.path.clone());
-                true
+                kept_paths.insert(p.path.clone());
             }
-        });
+        }
+        selected.retain(|p| kept_paths.contains(&p.path));
     }
     if selected.is_empty() {
         let text = if skipped.is_empty() {
@@ -4065,6 +4095,8 @@ fn history_federated(
                         .unwrap_or(serde_json::Value::Null),
                     "other_branches": structured.get("other_branches").cloned()
                         .unwrap_or_else(|| serde_json::json!([])),
+                    "other_branches_skipped": structured.get("other_branches_skipped").cloned()
+                        .unwrap_or_else(|| serde_json::json!(0)),
                 }));
             }
             Err(e) => skipped.push(format!("{} ({e})", p.display_name)),
@@ -6886,6 +6918,126 @@ mod tests {
         assert!(out.text.contains("behind origin/main"), "got: {}", out.text);
     }
 
+    /// Core-level tests already cover `upstream_status`'s ahead/behind
+    /// counting; this exercises the same case through the full MCP
+    /// `tool_history` path, since `behind` had MCP-level coverage but
+    /// `ahead` didn't.
+    #[test]
+    fn tool_history_reports_ahead_through_tool_path() {
+        let upstream = scripted_git_repo(&[("a.rs", "one")]);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(upstream.path())
+            .args(["branch", "-M", "main"])
+            .status()
+            .unwrap();
+        let local = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                upstream.path().to_str().unwrap(),
+                local.path().to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+
+        std::fs::write(local.path().join("b.rs"), "two").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["commit", "-q", "-m", "local-only"])
+            .status()
+            .unwrap();
+
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({ "path": local.path().display().to_string() }))
+            .unwrap();
+        let s = out.structured.unwrap();
+        assert_eq!(s["upstream"]["ahead"].as_u64(), Some(1));
+        assert_eq!(s["upstream"]["behind"].as_u64(), Some(0));
+    }
+
+    /// `other_branches` core-level tests already cover remote-only inclusion
+    /// individually; this exercises a mix of multiple local AND remote-only
+    /// branches through the full MCP `tool_history` path in one call.
+    #[test]
+    fn tool_history_other_branches_lists_mixed_local_and_remote_only() {
+        let upstream = scripted_git_repo(&[("a.rs", "one")]);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(upstream.path())
+            .args(["branch", "-M", "main"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(upstream.path())
+            .args(["branch", "remote-only-feature"])
+            .status()
+            .unwrap();
+
+        let local = tempfile::TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                upstream.path().to_str().unwrap(),
+                local.path().to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["fetch", "-q", "origin"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["checkout", "-q", "-b", "local-feature"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(local.path())
+            .args(["checkout", "-q", "main"])
+            .status()
+            .unwrap();
+
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({
+                "path": local.path().display().to_string(),
+                "other_branches": true,
+            }))
+            .unwrap();
+        let structured = out.structured.unwrap();
+        let names: Vec<String> = structured["other_branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            names.contains(&"local-feature".to_string()),
+            "got: {names:?}"
+        );
+        assert!(
+            names.contains(&"origin/remote-only-feature".to_string()),
+            "got: {names:?}"
+        );
+        assert_eq!(structured["other_branches_skipped"].as_u64(), Some(0));
+    }
+
     #[test]
     fn tool_history_other_branches_is_opt_in() {
         let repo = scripted_git_repo(&[("a.rs", "one")]);
@@ -6946,6 +7098,81 @@ mod tests {
             .clone();
         assert_eq!(branches.len(), 1, "got: {branches:?}");
         assert_eq!(branches[0]["name"].as_str(), Some("feature-a"));
+    }
+
+    /// Beyond `MAX_OTHER_BRANCHES`, branches used to be silently dropped —
+    /// a client couldn't tell "these are all of them" from "there are more
+    /// I'm not seeing." Both the text and the structured output must say so.
+    #[test]
+    fn tool_history_other_branches_reports_skipped_count_beyond_cap() {
+        let repo = scripted_git_repo(&[("a.rs", "one")]);
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["branch", "-M", "main"]);
+        for i in 0..(semantex_core::index::history::MAX_OTHER_BRANCHES + 1) {
+            git(&["branch", &format!("feature-{i}")]);
+        }
+
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({
+                "path": repo.path().display().to_string(),
+                "other_branches": true,
+            }))
+            .unwrap();
+        let structured = out.structured.unwrap();
+        let branches = structured["other_branches"].as_array().unwrap();
+        assert_eq!(
+            branches.len(),
+            semantex_core::index::history::MAX_OTHER_BRANCHES
+        );
+        assert_eq!(
+            structured["other_branches_skipped"].as_u64(),
+            Some(1),
+            "got: {structured:?}"
+        );
+        assert!(
+            out.text.contains("1 branch") && out.text.contains("skipped"),
+            "got: {}",
+            out.text
+        );
+    }
+
+    /// `other_branches: true` with zero results must say so in the text —
+    /// otherwise a client can't distinguish "explicitly requested, none
+    /// found" from "not requested at all" by reading the text alone.
+    #[test]
+    fn tool_history_other_branches_true_with_none_says_so() {
+        let repo = scripted_git_repo(&[("a.rs", "one")]);
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["branch", "-M", "main"])
+            .status()
+            .unwrap();
+
+        let server = make_server("all");
+        let out = server
+            .tool_history(&serde_json::json!({
+                "path": repo.path().display().to_string(),
+                "other_branches": true,
+            }))
+            .unwrap();
+        assert!(
+            out.text.contains("No other active branches."),
+            "opted-in with none found must say so, not silently omit: {}",
+            out.text
+        );
+        let structured = out.structured.unwrap();
+        assert_eq!(structured["other_branches"].as_array().unwrap().len(), 0);
+        assert_eq!(structured["other_branches_skipped"].as_u64(), Some(0));
     }
 
     /// A sha that doesn't resolve must surface in structured `errors`, not
@@ -7177,6 +7404,47 @@ mod tests {
         );
         assert_eq!(projects[0]["project"].as_str(), Some("outer-repo"));
         assert!(text.contains("outer commit"));
+    }
+
+    /// The nested-path dedup step used to `sort_by_key(path length)` on
+    /// `selected` in place, so the returned section order became "shortest
+    /// path first" as a side effect — for ANY two unrelated projects of
+    /// different path length, not just nested ones. Registry order must
+    /// survive the dedup.
+    #[test]
+    fn history_federated_all_scope_preserves_registry_order_after_dedup() {
+        let long_path = std::path::PathBuf::from("/tmp/semantex-order-test/proj-long-name-abcdefg");
+        let short_path = std::path::PathBuf::from("/tmp/semantex-order-test/short");
+        let reg = registry_of(&[
+            ("proj-long", long_path.as_path()),
+            ("proj-short", short_path.as_path()),
+        ]);
+        assert!(long_path.as_os_str().len() > short_path.as_os_str().len());
+
+        let (text, structured) = history_federated(
+            &reg,
+            &semantex_core::search::federation::SearchScope::All,
+            &serde_json::json!({}),
+            12_000,
+        )
+        .unwrap();
+
+        let long_idx = text
+            .find("## [proj-long]")
+            .expect("proj-long section present");
+        let short_idx = text
+            .find("## [proj-short]")
+            .expect("proj-short section present");
+        assert!(
+            long_idx < short_idx,
+            "registry order must be preserved after dedup, got: {text}"
+        );
+        let projects = structured["projects"].as_array().unwrap();
+        assert_eq!(
+            projects[0]["project"].as_str(),
+            Some("proj-long"),
+            "structured projects must also preserve registry order: {projects:?}"
+        );
     }
 
     #[test]
