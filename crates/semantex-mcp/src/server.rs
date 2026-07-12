@@ -6739,6 +6739,7 @@ mod tests {
                     display_name: (*name).to_string(),
                     branches: vec![],
                     embedder_fingerprint: String::new(),
+                    is_worktree: false,
                 });
         }
         reg

@@ -57,6 +57,11 @@ pub struct ProjectEntry {
     pub branches: Vec<BranchEntry>,
     #[serde(default)]
     pub embedder_fingerprint: String,
+    /// True if `path` is a linked git worktree rather than the repo's
+    /// primary checkout. Plain JSON registry, so old entries missing this
+    /// key deserialize as `false` — no schema version bump needed.
+    #[serde(default)]
+    pub is_worktree: bool,
 }
 
 /// The versioned registry file shape (contract §A: `"version": 2`).
@@ -120,6 +125,7 @@ fn load_from(path: &Path) -> RegistryV2 {
                     path,
                     branches: Vec::new(),
                     embedder_fingerprint: String::new(),
+                    is_worktree: false,
                 }
             })
             .collect();
@@ -276,6 +282,60 @@ pub fn is_likely_multi_repo_container(path: &Path) -> bool {
     nested_repo_count >= MULTI_REPO_THRESHOLD
 }
 
+/// True if `path` is a linked git worktree checkout rather than the primary
+/// clone that owns its `.git` directory. Compares `git rev-parse --git-dir`
+/// against `--git-common-dir`: identical for a normal checkout; different
+/// for a linked worktree (`--git-dir` resolves under
+/// `<main-repo>/.git/worktrees/<name>`, `--git-common-dir` points at the
+/// shared `.git`). Git-native, so this is correct regardless of which tool
+/// created the worktree (`git worktree add`, an IDE, an agent harness, ...)
+/// — not a match on a path convention like `.claude/worktrees/`. Any git
+/// failure (missing binary, non-git directory) returns `false`: fails
+/// closed, so a detection error just means "index and register normally",
+/// never "silently skip a real project".
+pub fn is_worktree_checkout(path: &Path) -> bool {
+    let (Some(git_dir), Some(common_dir)) = (
+        git_rev_parse(path, "--git-dir"),
+        git_rev_parse(path, "--git-common-dir"),
+    ) else {
+        return false;
+    };
+    match (
+        resolve_under(path, &git_dir),
+        resolve_under(path, &common_dir),
+    ) {
+        (Some(g), Some(c)) => g != c,
+        _ => false,
+    }
+}
+
+fn git_rev_parse(path: &Path, flag: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", flag])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// `git rev-parse --git-dir`/`--git-common-dir` return a path relative to
+/// `path` when possible — resolve against `path` and canonicalize so a
+/// relative and an absolute answer for the same directory compare equal.
+fn resolve_under(path: &Path, git_path: &str) -> Option<PathBuf> {
+    let p = Path::new(git_path);
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        path.join(p)
+    };
+    joined.canonicalize().ok()
+}
+
 /// Path-parameterized core of [`retain`].
 fn retain_at(path: &Path, mut keep: impl FnMut(&ProjectEntry) -> bool) -> usize {
     let mut registry = load_from(path);
@@ -315,6 +375,7 @@ fn register_at(path: &Path, canonical: &Path) {
         display_name: display_name_for_path(canonical),
         branches: Vec::new(),
         embedder_fingerprint: String::new(),
+        is_worktree: is_worktree_checkout(canonical),
     });
     save_to(path, &registry);
 }
@@ -351,6 +412,7 @@ fn upsert_branch_at(
             display_name: display_name_for_path(canonical),
             branches: Vec::new(),
             embedder_fingerprint: String::new(),
+            is_worktree: is_worktree_checkout(canonical),
         });
         registry.projects.last_mut().expect("just pushed")
     };
@@ -415,6 +477,97 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("projects.json");
         (tmp, path)
+    }
+
+    fn git_test(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git must be on PATH for these tests");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A minimal one-commit repo with a deterministic `main` branch name.
+    fn init_git_repo(dir: &Path) {
+        git_test(dir, &["init", "-q"]);
+        git_test(dir, &["config", "user.email", "test@example.com"]);
+        git_test(dir, &["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        git_test(dir, &["add", "."]);
+        git_test(dir, &["commit", "-q", "-m", "init"]);
+        git_test(dir, &["branch", "-M", "main"]);
+    }
+
+    #[test]
+    fn is_worktree_checkout_false_for_non_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!is_worktree_checkout(tmp.path()));
+    }
+
+    #[test]
+    fn is_worktree_checkout_distinguishes_main_from_linked_worktree() {
+        let main_repo = TempDir::new().unwrap();
+        init_git_repo(main_repo.path());
+
+        let worktree_dir = TempDir::new().unwrap();
+        // `git worktree add` requires the target directory to not exist yet.
+        std::fs::remove_dir(worktree_dir.path()).unwrap();
+        git_test(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-x",
+                worktree_dir.path().to_str().unwrap(),
+            ],
+        );
+
+        assert!(!is_worktree_checkout(main_repo.path()));
+        assert!(is_worktree_checkout(worktree_dir.path()));
+    }
+
+    #[test]
+    fn register_at_stamps_is_worktree_correctly() {
+        let main_repo = TempDir::new().unwrap();
+        init_git_repo(main_repo.path());
+
+        let worktree_dir = TempDir::new().unwrap();
+        std::fs::remove_dir(worktree_dir.path()).unwrap();
+        git_test(
+            main_repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature-y",
+                worktree_dir.path().to_str().unwrap(),
+            ],
+        );
+
+        let (_tmp, reg) = tmp_registry();
+        let main_canonical = main_repo.path().canonicalize().unwrap();
+        let worktree_canonical = worktree_dir.path().canonicalize().unwrap();
+        register_at(&reg, &main_canonical);
+        register_at(&reg, &worktree_canonical);
+
+        let registry = load_from(&reg);
+        let main_entry = registry
+            .projects
+            .iter()
+            .find(|p| p.path == main_canonical)
+            .unwrap();
+        let worktree_entry = registry
+            .projects
+            .iter()
+            .find(|p| p.path == worktree_canonical)
+            .unwrap();
+        assert!(!main_entry.is_worktree);
+        assert!(worktree_entry.is_worktree);
     }
 
     #[test]

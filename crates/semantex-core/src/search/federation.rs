@@ -519,6 +519,7 @@ mod tests {
                 },
             ],
             embedder_fingerprint: "fp".into(),
+            is_worktree: false,
         });
 
         let targets = resolve_targets(&SearchScope::All, &registry, Path::new("/anywhere"));
@@ -539,6 +540,7 @@ mod tests {
             display_name: "x".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
         let targets = resolve_targets(&SearchScope::All, &registry, Path::new("/anywhere"));
         assert_eq!(targets.len(), 1);
@@ -555,6 +557,7 @@ mod tests {
             display_name: "my-project".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
         registry.projects.push(ProjectEntry {
             path: PathBuf::from("/home/dev/other-project"),
@@ -562,6 +565,7 @@ mod tests {
             display_name: "other-project".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
 
         let targets = resolve_targets(
@@ -735,6 +739,7 @@ mod tests {
             display_name: "ready-project".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
         registry.projects.push(ProjectEntry {
             path: tmp_not_indexed.path().to_path_buf(),
@@ -742,6 +747,7 @@ mod tests {
             display_name: "not-ready-project".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
 
         let mut by_project = std::collections::HashMap::new();
@@ -779,6 +785,7 @@ mod tests {
             display_name: "p".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
 
         // No hits configured for this project → StubSearcher errors.
@@ -847,6 +854,7 @@ mod tests {
                 },
             ],
             embedder_fingerprint: "fp".into(),
+            is_worktree: false,
         });
         // Sanity: the registry really does resolve to 2 targets pre-dedupe.
         assert_eq!(
@@ -896,6 +904,7 @@ mod tests {
                 display_name: id.into(),
                 branches: vec![],
                 embedder_fingerprint: String::new(),
+            is_worktree: false,
             });
         }
 
@@ -976,6 +985,7 @@ mod tests {
             display_name: "real-project".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
 
         let mut by_project = std::collections::HashMap::new();
@@ -1035,6 +1045,7 @@ mod tests {
             display_name: "My Project".into(),
             branches: vec![],
             embedder_fingerprint: String::new(),
+            is_worktree: false,
         });
 
         assert_eq!(
