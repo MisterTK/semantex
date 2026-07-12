@@ -1381,8 +1381,10 @@ impl McpServer {
                     "Query the project's indexed git history: recent commits, commits since a ",
                     "tag/sha/date, commits touching a file, full-text search over commit messages, ",
                     "and per-commit detail with diffs. History refreshes incrementally from git on ",
-                    "every call, so results always reflect the repo's current HEAD (no reindex ",
-                    "needed after a pull). Use for release notes / changelogs ('since': tag or ",
+                    "every call, so results always reflect THIS LOCAL CLONE's current HEAD (no ",
+                    "reindex needed after a pull) — but an un-pulled clone looks falsely idle; run ",
+                    "`git pull` first when 'latest'/'recent' must mean upstream-current, not just ",
+                    "locally-current. Use for release notes / changelogs ('since': tag or ",
                     "YYYY-MM-DD), 'what changed recently?', and cross-repo dependency change ",
                     "tracking (scope='all' or named projects). List mode returns one compact line ",
                     "per commit; pass commits=[shas] for detail mode with --stat and a ",
@@ -1467,8 +1469,23 @@ impl McpServer {
                                 "type": "object",
                                 "properties": {
                                     "project": { "type": "string" },
-                                    "commits": { "type": "array" }
+                                    "commits": { "type": "array" },
+                                    "errors": { "type": "array" }
                                 }
+                            }
+                        },
+                        "errors": {
+                            "type": "array",
+                            "description": "Detail mode only: one entry per requested sha that failed \
+                                (not found, ambiguous, etc.) — distinct from skipped_shas, which is \
+                                capacity overflow, not a lookup failure.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "sha": { "type": "string" },
+                                    "error": { "type": "string" }
+                                },
+                                "required": ["sha", "error"]
                             }
                         },
                         "skipped": { "type": "array", "items": { "type": "string" } },
@@ -3711,6 +3728,7 @@ fn history_for_project(
         let per_commit_budget = (budget / take.len()).max(1_000);
         let mut text = header;
         let mut commits_json = Vec::new();
+        let mut errors_json = Vec::new();
         for sha in take {
             match history::commit_detail(project_root, &conn, sha, per_commit_budget) {
                 Ok(d) => {
@@ -3750,6 +3768,7 @@ fn history_for_project(
                 }
                 Err(e) => {
                     let _ = writeln!(text, "### {sha}\n[error: {e}]\n");
+                    errors_json.push(serde_json::json!({ "sha": sha, "error": e.to_string() }));
                 }
             }
         }
@@ -3764,7 +3783,11 @@ fn history_for_project(
         }
         return Ok((
             text.trim_end().to_string(),
-            serde_json::json!({ "commits": commits_json, "skipped_shas": skipped_shas }),
+            serde_json::json!({
+                "commits": commits_json,
+                "errors": errors_json,
+                "skipped_shas": skipped_shas
+            }),
         ));
     }
 
@@ -3910,6 +3933,8 @@ fn history_federated(
                 projects_json.push(serde_json::json!({
                     "project": p.display_name,
                     "commits": structured.get("commits").cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    "errors": structured.get("errors").cloned()
                         .unwrap_or_else(|| serde_json::json!([])),
                 }));
             }
@@ -6672,6 +6697,33 @@ mod tests {
         assert!(out.text.contains("a.rs"));
     }
 
+    /// A sha that doesn't resolve must surface in structured `errors`, not
+    /// just the human-readable text — otherwise a programmatic consumer
+    /// reading only `structured` can't tell "not found" from "no commits".
+    #[test]
+    fn tool_history_detail_mode_invalid_sha_reports_structured_error() {
+        let repo = scripted_git_repo(&[("a.rs", "one")]);
+        let server = make_server("all");
+        let bogus_sha = "0000000000000000000000000000000000dead";
+
+        let out = server
+            .tool_history(&serde_json::json!({
+                "path": repo.path().display().to_string(),
+                "commits": [bogus_sha],
+            }))
+            .expect("detail mode should not fail the whole call");
+        let s = out.structured.expect("structured");
+        assert!(
+            s["commits"].as_array().unwrap().is_empty(),
+            "no commit entry for an unresolved sha: {s}"
+        );
+        let errors = s["errors"].as_array().expect("errors array");
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert_eq!(errors[0]["sha"].as_str().unwrap(), bogus_sha);
+        assert!(!errors[0]["error"].as_str().unwrap().is_empty());
+        assert!(out.text.contains(bogus_sha) && out.text.contains("[error:"));
+    }
+
     /// In-memory registry pointing at real temp git repos — no SEMANTEX_HOME
     /// mutation (which would race parallel unit tests; the code-search
     /// federation suite needs a whole separate process for that).
@@ -6772,6 +6824,17 @@ mod tests {
             structured["skipped"].as_array().unwrap().is_empty(),
             "a missing sha is not a project-level skip"
         );
+        assert!(
+            projects[0]["errors"].as_array().unwrap().is_empty(),
+            "owning repo (proj-a) has no error: {projects:?}"
+        );
+        let non_owner_errors = projects[1]["errors"].as_array().unwrap();
+        assert_eq!(
+            non_owner_errors.len(),
+            1,
+            "non-owning repo (proj-b) must report the sha in structured errors: {projects:?}"
+        );
+        assert_eq!(non_owner_errors[0]["sha"].as_str().unwrap(), sha);
     }
 
     /// Two scope names resolving to the same project (display name + full

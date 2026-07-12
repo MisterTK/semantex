@@ -663,14 +663,16 @@ pub fn all_tools() -> Vec<ToolMetadata> {
                 "Query indexed git history: recent commits, commits since a tag/sha/date, ",
                 "commits touching a file, full-text search over commit messages, and ",
                 "per-commit detail with a budget-bounded diff. Refreshes incrementally from ",
-                "git on every call — results always reflect current HEAD. Cross-repo via ",
-                "'scope' for dependency change tracking. NOT for code content — use ",
-                "semantex_agent for that."
+                "git on every call — results always reflect THIS LOCAL CLONE's current HEAD, ",
+                "not upstream; an un-pulled clone looks falsely idle, so `git pull` first when ",
+                "'latest' must mean truly current. Cross-repo via 'scope' for dependency change ",
+                "tracking. NOT for code content — use semantex_agent for that."
             ),
             when_to_use: &[
                 "Drafting release notes or a changelog since the last tag.",
                 "Checking what changed recently, in this repo or across all indexed dependency repos (scope='all').",
                 "Onboarding to an unfamiliar repo: recent change activity alongside code search.",
+                "Before answering 'what's new/latest' for someone else's repo: consider `git pull` first — this tool reads the local clone, never the network.",
             ],
             args: &[
                 ToolArg {

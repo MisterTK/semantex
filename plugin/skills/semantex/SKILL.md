@@ -188,6 +188,9 @@ For commit-history questions — NOT code content — use `semantex_history`:
 - Drill into specific commits with diffs → `{"commits": ["<sha>", ...]}` (max 10)
 
 History refreshes from git on every call — no reindex needed after `git pull`.
+This reflects the **local clone's** HEAD, not upstream — an un-pulled clone looks
+falsely idle, so `git pull` first when the user's "latest"/"recent" means truly
+current, not just locally-current.
 One call per question; combine filters (`since` + `file` + `query` + `author`)
 instead of chaining calls. Code-content questions still go to `semantex_agent`.
 
