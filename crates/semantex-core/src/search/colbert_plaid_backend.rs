@@ -21,6 +21,34 @@ const PLAID_BUFFER_SIZE: usize = 50;
 /// the constant previously in `index/builder.rs`.
 const PLAID_BATCH: usize = 32;
 
+/// Number of chunks accumulated for the initial `update_or_create` call on a
+/// fresh build — comfortably above next-plaid's `start_from_scratch` default
+/// (999 docs), so real k-means training happens once and `num_documents` is
+/// past the from-scratch-retrain threshold before any further batch lands.
+/// Every later batch in `build_streaming_ids` streams via `update_append`
+/// against the resulting frozen codec instead of retraining, bounding
+/// fresh-build peak memory to ~this many chunks' embeddings regardless of
+/// total corpus size (see `build_streaming_ids`'s doc comment).
+const INITIAL_BUILD_CHUNKS: usize = 2_000;
+
+/// Batch size for Phase B's `update_append` calls in `build_streaming_ids`.
+/// Deliberately much larger than `PLAID_BATCH`: next-plaid's
+/// `update_append`/`update_index` reloads the ENTIRE on-disk IVF (centroid →
+/// doc-postings list) into memory, merges in the new batch, and rewrites it —
+/// an O(current-index-size) cost on every single call, not O(batch). At
+/// `PLAID_BATCH` (32) granularity a large corpus makes thousands of these
+/// read-modify-write cycles back to back with no allocator purge between
+/// them; empirically this drove RSS to the soft cap on a real 157k-chunk repo
+/// in under 90 seconds despite each call's own logical footprint being
+/// modest (pure fragmentation/churn, not a logical memory requirement).
+/// Batching this much larger cuts the call count — and the IVF-reload
+/// overhead — by ~16x for a corpus that size. Capped comfortably under
+/// SQLite's assumed `SQLITE_MAX_VARIABLE_NUMBER` (999; see `PLAID_BATCH`'s
+/// sibling comment and `ChunkStore::get_chunks`'s single `IN (...)` query,
+/// which does not itself sub-batch) since `fetch` ultimately runs one query
+/// per batch of this size.
+const PLAID_APPEND_BATCH: usize = 512;
+
 /// Query-time `colbert-plaid` backend: owns a `PlaidSearcher` and a reference
 /// to the process-global ColBERT encoder.
 pub struct ColbertPlaidBackend {
@@ -180,19 +208,31 @@ impl ColbertPlaidIndexBuilder {
     /// Memory-bounded full rebuild that streams chunk content from the store
     /// instead of materializing the entire corpus at once.
     ///
-    /// This preserves the hard-won PLAID index-build memory bound (the
-    /// 26GB→9GB fix): for each `PLAID_BATCH` (32) slice of `chunk_ids`, the
-    /// caller-supplied `fetch` pulls only that batch's content (≤32 ids — well
-    /// under SQLite's `SQLITE_MAX_VARIABLE_NUMBER` default of 999), we encode
-    /// it, accumulate the compact token embeddings, then DROP the batch content
-    /// before the next iteration. Only one batch's content is ever live; the
-    /// accumulated embeddings are far smaller than the source text.
+    /// Split into two phases so peak memory is bounded by `INITIAL_BUILD_CHUNKS`
+    /// instead of total corpus size (a from-scratch build over a very large repo
+    /// used to accumulate every chunk's embeddings before a single call — see
+    /// git history for the incident this replaced):
     ///
-    /// Crucially we still issue exactly ONE `update_or_create` over all
-    /// embeddings — identical to the pre-seam single-call strategy — so the
-    /// resulting PLAID index is byte-identical (repeated `update_or_create`
-    /// calls would re-run k-means per batch, both perturbing centroids and
-    /// reintroducing the ~10×-per-call RSS blowup the single call avoids).
+    ///   * Phase A: stream-encode the first `INITIAL_BUILD_CHUNKS` chunk ids
+    ///     (batches of `PLAID_BATCH`, content never fully materialized — the
+    ///     original 26GB→9GB fix) and issue ONE `update_or_create` call. This
+    ///     creates the index with real k-means training and pushes
+    ///     `num_documents` past next-plaid's `start_from_scratch` threshold, so
+    ///     later batches don't retrain from scratch.
+    ///   * Phase B: stream any remaining chunk ids in `PLAID_BATCH`-sized
+    ///     batches via `update_append` instead of `update_or_create` — it
+    ///     quantizes against the already-trained, now-frozen codec and appends,
+    ///     with no retraining and no per-call merged-file regeneration (that
+    ///     cost is deferred to the finalize step below; see `update_append`'s
+    ///     own doc comment in next-plaid). Memory per call is bounded by one
+    ///     batch, independent of corpus size.
+    ///   * Finalize: if Phase B ran, one `MmapIndex::load` call forces the
+    ///     deferred merge to happen now (at build time, logged) rather than
+    ///     silently on the first search.
+    ///
+    /// For corpora at or below `INITIAL_BUILD_CHUNKS`, Phase B is a no-op — this
+    /// is a strict generalization of the old single-call behavior, not a
+    /// size-gated special case.
     ///
     /// `fetch(batch_ids)` must return `(chunk_id, content)` pairs for the given
     /// ids; order need not match (we read the id back from each pair).
@@ -217,11 +257,15 @@ impl ColbertPlaidIndexBuilder {
         }
         std::fs::create_dir_all(&self.plaid_dir)?;
 
-        // Stream content batch-by-batch (memory bound) and accumulate only the
-        // compact embeddings; then ONE update_or_create over everything.
+        let split = chunk_ids.len().min(INITIAL_BUILD_CHUNKS);
+        let (initial_ids, remainder_ids) = chunk_ids.split_at(split);
+
+        // Phase A: bounded initial accumulation + ONE update_or_create call
+        // (identical in shape to the old single-call full build, just scoped
+        // to a bounded prefix instead of the whole corpus).
         let mut full_mapping: Vec<u64> = Vec::with_capacity(chunk_ids.len());
-        let mut all_embeddings: Vec<_> = Vec::with_capacity(chunk_ids.len());
-        for batch_ids in chunk_ids.chunks(PLAID_BATCH) {
+        let mut all_embeddings: Vec<_> = Vec::with_capacity(initial_ids.len());
+        for batch_ids in initial_ids.chunks(PLAID_BATCH) {
             if let Err(e) = crate::memory::check_rss_or_abort("PLAID encode batch") {
                 anyhow::bail!("Indexing aborted: {e}");
             }
@@ -243,7 +287,7 @@ impl ColbertPlaidIndexBuilder {
             return Ok(());
         }
 
-        if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (single call)") {
+        if let Err(e) = crate::memory::check_rss_or_abort("PLAID build (initial call)") {
             anyhow::bail!("Indexing aborted: {e}");
         }
         let (_index, plaid_doc_ids) = MmapIndex::update_or_create(
@@ -260,6 +304,68 @@ impl ColbertPlaidIndexBuilder {
         );
         drop(all_embeddings);
         crate::memory::purge_allocator();
+
+        // Phase B: stream any remainder against the now-frozen codec, in
+        // PLAID_APPEND_BATCH-sized batches — see that constant's doc comment
+        // for why this must NOT use PLAID_BATCH's much smaller granularity.
+        let mut appended_so_far: usize = 0;
+        for batch_ids in remainder_ids.chunks(PLAID_APPEND_BATCH) {
+            if let Err(e) = crate::memory::check_rss_or_abort("PLAID append batch") {
+                anyhow::bail!("Indexing aborted: {e}");
+            }
+            let batch = fetch(batch_ids)?;
+            if batch.is_empty() {
+                continue;
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+            let embeddings = embedder.encode_documents(&contents)?;
+            let plaid_doc_ids =
+                MmapIndex::update_append(&embeddings, &plaid_dir_str, &update_config)?;
+            anyhow::ensure!(
+                plaid_doc_ids.len() == batch.len(),
+                "PLAID returned {} doc IDs for {} chunks — contract violated",
+                plaid_doc_ids.len(),
+                batch.len(),
+            );
+            for (&doc_id, (chunk_id, _)) in plaid_doc_ids.iter().zip(batch.iter()) {
+                anyhow::ensure!(doc_id >= 0, "PLAID returned negative doc_id {doc_id}");
+                let idx = doc_id as usize;
+                while full_mapping.len() <= idx {
+                    full_mapping.push(DENSE_TOMBSTONE);
+                }
+                full_mapping[idx] = *chunk_id;
+            }
+            // `update_append`'s IVF reload/rewrite churns through a
+            // moderately large ephemeral HashMap<usize, Vec<i64>> every call
+            // (see PLAID_APPEND_BATCH's doc comment) — purge proactively
+            // instead of waiting for `check_rss_or_abort` to catch fragmented
+            // growth after the fact.
+            crate::memory::purge_allocator();
+            appended_so_far += batch.len();
+            if let Some(rss_mb) = crate::memory::current_rss_mb() {
+                // Diagnostic visibility into update_append's per-call cost,
+                // which scales with total corpus size already appended (the
+                // on-disk IVF is reloaded/rewritten whole every call — see
+                // PLAID_APPEND_BATCH's doc comment). Cheap (one log line per
+                // batch); lets a future large-repo failure be root-caused
+                // from the growth curve instead of just the final RSS number.
+                tracing::info!(
+                    appended_so_far,
+                    remainder_total = remainder_ids.len(),
+                    rss_mb,
+                    "PLAID append batch progress"
+                );
+            }
+        }
+
+        // `update_append` intentionally defers merged-code/residual
+        // regeneration (potentially 628MB+ on large indices — see its doc
+        // comment in next-plaid) to the next `load`/search. Force it now, at
+        // build time, so the cost is paid here (logged) instead of silently
+        // on the user's first query.
+        if !remainder_ids.is_empty() {
+            MmapIndex::load(&plaid_dir_str)?;
+        }
 
         write_mapping_atomic(&self.mapping_path, &full_mapping)?;
         tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
@@ -514,6 +620,69 @@ mod tests {
         assert!(
             (norm - 1.0).abs() < 1e-3,
             "projection must be L2-normalized, got norm={norm}"
+        );
+    }
+
+    /// Exercises both phases of `build_streaming_ids`: a corpus larger than
+    /// `INITIAL_BUILD_CHUNKS` forces Phase A (bounded `update_or_create`) AND
+    /// Phase B (streamed `update_append` for the remainder) to run across
+    /// several `PLAID_APPEND_BATCH`-sized iterations, verifying the resulting
+    /// mapping covers every chunk exactly once and the index is searchable
+    /// afterward. Multiple Phase B iterations matter here: a real-repo bug
+    /// (next-plaid's `update_append` reloading/rewriting the full on-disk IVF
+    /// every call) only showed up after many calls, not one. `#[ignore]`'d
+    /// like its sibling above — needs the real ColBERT model and is slow.
+    #[test]
+    #[ignore = "builds a >INITIAL_BUILD_CHUNKS PLAID index + loads the ColBERT model; run with --ignored"]
+    fn build_streaming_ids_covers_bounded_initial_and_streamed_remainder() {
+        use crate::config::SemantexConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = SemantexConfig::default();
+        let model_dir =
+            crate::embedding::model_manager::ensure_colbert_model(&cfg.models_dir()).unwrap();
+
+        // A few full PLAID_APPEND_BATCH iterations past INITIAL_BUILD_CHUNKS,
+        // so Phase B loops multiple times instead of completing in one call.
+        let total = INITIAL_BUILD_CHUNKS + PLAID_APPEND_BATCH * 3 + 1;
+        let chunk_ids: Vec<u64> = (1..=total as u64).collect();
+
+        let mut builder = ColbertPlaidIndexBuilder::new(tmp.path(), 4);
+        builder
+            .build_streaming_ids(&chunk_ids, |batch_ids| {
+                Ok(batch_ids
+                    .iter()
+                    .map(|&id| (id, format!("fn chunk_{id}() {{ return {id}; }}")))
+                    .collect())
+            })
+            .unwrap();
+
+        let mapping_path = tmp.path().join("plaid_mapping.bin");
+        let mapping: Vec<u64> =
+            postcard::from_bytes(&std::fs::read(&mapping_path).unwrap()).unwrap();
+        assert_eq!(
+            mapping.len(),
+            total,
+            "mapping must cover every chunk across both phases"
+        );
+        let mut seen: Vec<u64> = mapping
+            .iter()
+            .copied()
+            .filter(|&c| c != DENSE_TOMBSTONE)
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            total,
+            "every chunk id must appear exactly once across the phased build"
+        );
+
+        let backend = ColbertPlaidBackend::open(tmp.path(), &mapping_path, &model_dir).unwrap();
+        let hits = backend.search("chunk_1", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "search must return hits after a phased build"
         );
     }
 }

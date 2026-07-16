@@ -430,6 +430,71 @@ pub fn check_rss_or_abort(label: &str) -> Result<(), String> {
     ))
 }
 
+/// How far above the soft RSS cap the out-of-band watchdog thread waits
+/// before aborting. Set above 1.0 so routine transient spikes that
+/// `check_rss_or_abort`'s cooperative checkpoints already catch (and recover
+/// from via `purge_allocator`) don't race the watchdog into a spurious abort;
+/// this thread exists for the gap COOPERATIVE checkpoints can't see at all.
+const WATCHDOG_HARD_MULTIPLIER: f64 = 1.5;
+
+/// How often the watchdog thread polls RSS.
+const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Spawn a background thread that polls RSS on a fixed interval, entirely
+/// independent of the main thread's call stack, and hard-aborts the process
+/// if RSS blows well past the soft cap.
+///
+/// `check_rss_or_abort` is a *cooperative* checkpoint — it only catches
+/// runaway growth at call sites that actually invoke it. A single huge
+/// allocation or FFI/library call with no checkpoint inside it (e.g. a
+/// third-party crate's one-shot clustering/index-build routine) is invisible
+/// to that mechanism. On macOS there is also no kernel-level backstop
+/// (`install_kernel_rss_cap` is a no-op there — see its doc comment), so this
+/// watchdog is the ONLY guard against that class of gap on macOS, and a
+/// second, out-of-band guard everywhere else.
+///
+/// No-op if the soft RSS cap is explicitly disabled (`SEMANTEX_MAX_RSS_MB=0`).
+/// Call once at process start, after `register_purge_fn`.
+pub fn spawn_rss_watchdog() {
+    let soft_mb = soft_rss_limit_mb();
+    if soft_mb == 0 {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let hard_mb = (soft_mb as f64 * WATCHDOG_HARD_MULTIPLIER) as u64;
+
+    let spawned = std::thread::Builder::new()
+        .name("semantex-rss-watchdog".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+                let Some(rss_mb) = current_rss_mb() else {
+                    continue;
+                };
+                if rss_mb <= hard_mb {
+                    continue;
+                }
+                purge_allocator();
+                let after = current_rss_mb().unwrap_or(rss_mb);
+                if after > hard_mb {
+                    eprintln!(
+                        "\n[semantex FATAL] watchdog: RSS {after} MB exceeded the hard cap \
+                         {hard_mb} MB ({WATCHDOG_HARD_MULTIPLIER}x SEMANTEX_MAX_RSS_MB={soft_mb}). \
+                         Aborting to protect host memory. This is the out-of-band watchdog — it \
+                         does not depend on any code path calling check_rss_or_abort.\n"
+                    );
+                    // std::process::abort() bypasses Drop/panic handlers — the
+                    // main thread may be mid-allocation with no safe unwind
+                    // path; the kernel reaps us, the host is unaffected.
+                    std::process::abort();
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("Failed to spawn RSS watchdog thread: {e}");
+    }
+}
+
 #[cfg(test)]
 mod cap_tests {
     use super::*;

@@ -735,6 +735,15 @@ fn main() -> Result<()> {
     // Register mimalloc purge so memory module can force page return to OS.
     semantex_core::memory::register_purge_fn(mimalloc_purge);
 
+    // Out-of-band RSS watchdog: catches a single huge allocation/library call
+    // with no `check_rss_or_abort` checkpoint inside it (the gap that let one
+    // real-world index build reach ~30GB RSS on a 48GB Mac before it was
+    // killed by hand). Independent of the main thread's call stack, so it
+    // closes the gap regardless of which code path causes it. Must be spawned
+    // after `register_purge_fn` (it purges on overshoot) and before any
+    // memory-heavy work starts.
+    semantex_core::memory::spawn_rss_watchdog();
+
     // Pure-indexing subcommands (`index`, `watch`) run as a good background
     // citizen: lower the whole process to background CPU priority so it yields
     // to the developer's foreground work. Done before ORT/rayon threads spawn
