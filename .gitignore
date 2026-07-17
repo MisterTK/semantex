@@ -53,6 +53,10 @@ CLAUDE.md
 # its results/three-way/ raw output stays ignored).
 !/benchmarks/three_way.py
 !/benchmarks/three_way_nudge.py
+# Exception: lateon-colbert vs coderank-137m quality head-to-head aggregator (committed
+# source; its raw output under benchmarks/relevance/results/ and benchmarks/results/
+# stays ignored — only results/lateon-vs-coderank-quality/report.md is committed).
+!/benchmarks/lateon_vs_coderank_report.py
 # Exception: v1 benchmark-validation results writeup (committed report, not raw run data).
 !/benchmarks/RESULTS-v1.md
 /benches
@@ -90,3 +94,6 @@ settings.local.json
 !/results/three-way/
 /results/three-way/*
 !/results/three-way/report.md
+!/results/lateon-vs-coderank-quality/
+/results/lateon-vs-coderank-quality/*
+!/results/lateon-vs-coderank-quality/report.md
