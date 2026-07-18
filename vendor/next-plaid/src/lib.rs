@@ -13,6 +13,7 @@ extern crate blas_src;
 extern crate openblas_src;
 
 pub mod codec;
+pub mod compiled;
 #[cfg(feature = "_cuda")]
 pub mod cuda;
 pub mod delete;
@@ -29,6 +30,7 @@ pub mod update;
 pub mod utils;
 
 pub use codec::ResidualCodec;
+pub use compiled::CompiledIndexWriter;
 pub use delete::delete_from_index;
 pub use error::{Error, Result};
 pub use index::MmapIndex;

@@ -577,101 +577,18 @@ pub fn create_index_files(
     let total_embeddings: usize = embeddings.iter().map(|e| e.nrows()).sum();
     let avg_doclen = total_embeddings as f64 / num_documents as f64;
 
-    // Sample documents for codec training
-    let sample_count = ((16.0 * (120.0 * num_documents as f64).sqrt()) as usize)
-        .min(num_documents)
-        .max(1);
-
-    let mut rng = if let Some(seed) = config.seed {
-        use rand::SeedableRng;
-        rand_chacha::ChaCha8Rng::seed_from_u64(seed)
-    } else {
-        use rand::SeedableRng;
-        rand_chacha::ChaCha8Rng::from_entropy()
-    };
-
-    use rand::seq::SliceRandom;
-    let mut indices: Vec<usize> = (0..num_documents).collect();
-    indices.shuffle(&mut rng);
-    let sample_indices: Vec<usize> = indices.into_iter().take(sample_count).collect();
-
-    // Collect sample embeddings for training
-    let heldout_size = (0.05 * total_embeddings as f64).min(50000.0) as usize;
-    let mut heldout_embeddings: Vec<f32> = Vec::with_capacity(heldout_size * embedding_dim);
-    let mut collected = 0;
-
-    for &idx in sample_indices.iter().rev() {
-        if collected >= heldout_size {
-            break;
-        }
-        let emb = &embeddings[idx];
-        let take = (heldout_size - collected).min(emb.nrows());
-        for row in emb.axis_iter(Axis(0)).take(take) {
-            heldout_embeddings.extend(row.iter());
-        }
-        collected += take;
-    }
-
-    let heldout = Array2::from_shape_vec((collected, embedding_dim), heldout_embeddings)
-        .map_err(|e| Error::IndexCreation(format!("Failed to create heldout array: {}", e)))?;
-
-    // Train codec: compute residuals and quantization parameters
-    let avg_residual = Array1::zeros(embedding_dim);
-    let initial_codec =
-        ResidualCodec::new(config.nbits, centroids.clone(), avg_residual, None, None)?;
-
-    // Compute codes for heldout samples
-    // Use CPU-only version when force_cpu is set to avoid CUDA initialization overhead
-    let heldout_codes = if config.force_cpu {
-        initial_codec.compress_into_codes_cpu(&heldout)
-    } else {
-        initial_codec.compress_into_codes(&heldout)
-    };
-
-    // Compute residuals
-    let mut residuals = heldout.clone();
-    for i in 0..heldout.nrows() {
-        let centroid = initial_codec.centroids.row(heldout_codes[i]);
-        for j in 0..embedding_dim {
-            residuals[[i, j]] -= centroid[j];
-        }
-    }
-
-    // Compute cluster threshold from residual distances
-    let distances: Array1<f32> = residuals
-        .axis_iter(Axis(0))
-        .map(|row| row.dot(&row).sqrt())
-        .collect();
-    #[allow(unused_variables)]
-    let cluster_threshold = quantile(&distances, 0.75);
-
-    // Compute average residual per dimension
-    let avg_res_per_dim: Array1<f32> = residuals
-        .axis_iter(Axis(1))
-        .map(|col| col.iter().map(|x| x.abs()).sum::<f32>() / col.len() as f32)
-        .collect();
-
-    // Compute quantization buckets
-    let n_options = 1 << config.nbits;
-    let quantile_values: Vec<f64> = (1..n_options)
-        .map(|i| i as f64 / n_options as f64)
-        .collect();
-    let weight_quantile_values: Vec<f64> = (0..n_options)
-        .map(|i| (i as f64 + 0.5) / n_options as f64)
-        .collect();
-
-    // Flatten residuals for quantile computation
-    let flat_residuals: Array1<f32> = residuals.iter().copied().collect();
-    let bucket_cutoffs = Array1::from_vec(quantiles(&flat_residuals, &quantile_values));
-    let bucket_weights = Array1::from_vec(quantiles(&flat_residuals, &weight_quantile_values));
-
-    let codec = ResidualCodec::new(
-        config.nbits,
-        centroids.clone(),
-        avg_res_per_dim.clone(),
-        Some(bucket_cutoffs.clone()),
-        Some(bucket_weights.clone()),
-    )?;
+    // Train codec + residual statistics. This is the SAME computation
+    // CompiledIndexWriter::new performs — extracted into prepare_codec_artifacts
+    // and shared by both writers so the byte layout of the codec files
+    // (centroids/bucket_cutoffs/bucket_weights/avg_residual/cluster_threshold)
+    // cannot drift between them.
+    let PreparedCodecArtifacts {
+        codec,
+        cluster_threshold,
+        bucket_cutoffs,
+        bucket_weights,
+        avg_res_per_dim,
+    } = prepare_codec_artifacts(embeddings, centroids, config)?;
 
     // Save codec components
     use ndarray_npy::WriteNpyExt;
