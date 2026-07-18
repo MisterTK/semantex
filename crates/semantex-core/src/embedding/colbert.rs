@@ -69,6 +69,19 @@ fn index_ort_threads() -> usize {
 /// for one document, then drop the same ColBERT-style skiplist ids it filters
 /// out of its output embeddings. See the investigation notes on
 /// [`ColbertEmbedder::encode_documents_with_ids`] for file:line citations.
+///
+/// # Note on the truncation branch (`assemble_and_filter_ids`)
+///
+/// For `LateOn-Code-edge` specifically, `tokenizer.json` embeds its OWN
+/// truncation policy (`{"max_length": 2047, "direction": "Right", ...}`, i.e.
+/// exactly `document_length - 1`), which the `tokenizers` crate applies
+/// automatically inside `.encode()`. So `ids` below can never exceed 2047
+/// elements for THIS model, regardless of input length — the
+/// `real_len > truncate_limit` branch inside `assemble_and_filter_ids` is
+/// unreachable end-to-end via this function for `LateOn-Code-edge` today (it
+/// exists for models whose tokenizer does NOT pre-truncate, matching
+/// `next-plaid-onnx`'s own defensive logic exactly). It's unit-tested
+/// directly on synthetic ids — see `assemble_and_filter_ids`'s test.
 fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32>> {
     // Mirrors `next_plaid_onnx::preprocess_texts`: trim, lowercase if the
     // model config requests it.
@@ -81,13 +94,36 @@ fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32
         .tokenizer
         .encode(processed.as_str(), true)
         .map_err(|e| anyhow::anyhow!("tokenization error: {e}"))?;
-    let ids = encoding.get_ids();
+    Ok(assemble_and_filter_ids(
+        alignment.document_prefix_id,
+        alignment.document_length,
+        &alignment.skiplist_ids,
+        encoding.get_ids(),
+    ))
+}
 
+/// Pure id-assembly step, factored out of [`build_doc_token_ids`] so the
+/// truncation (`content_prefix_len`/`keep_sep`) branch can be unit-tested
+/// directly with a synthetic `ids` sequence, independent of whether any real
+/// tokenizer would ever hand back that many raw ids (see the doc comment on
+/// [`build_doc_token_ids`] — for `LateOn-Code-edge` it never does).
+///
+/// `ids` is an already-tokenized `[CLS], content..., [SEP]` sequence (as
+/// `tokenizer.encode(text, true).get_ids()` produces). Returns the
+/// `[CLS], [D]-marker, content (possibly truncated), optional [SEP]`
+/// sequence with ColBERT-style skiplist ids dropped — 1:1 with what
+/// `next-plaid-onnx` feeds the model and then filters out of its output rows.
+fn assemble_and_filter_ids(
+    document_prefix_id: u32,
+    document_length: usize,
+    skiplist_ids: &HashSet<u32>,
+    ids: &[u32],
+) -> Vec<u32> {
     // A single (unbatched) encode never pads, so `real_len` is just
     // `ids.len()`; the `.max(1)` guard mirrors next-plaid-onnx's own
     // defensive floor for degenerate (empty) inputs.
     let real_len = ids.len().max(1);
-    let truncate_limit = alignment.document_length.saturating_sub(1);
+    let truncate_limit = document_length.saturating_sub(1);
     let (content_prefix_len, keep_sep) = if real_len > truncate_limit {
         (truncate_limit.saturating_sub(1), true)
     } else {
@@ -96,7 +132,7 @@ fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32
 
     let mut token_ids = Vec::with_capacity(content_prefix_len + 2);
     token_ids.push(ids[0]); // [CLS]
-    token_ids.push(alignment.document_prefix_id); // [D] marker, inserted at position 1
+    token_ids.push(document_prefix_id); // [D] marker, inserted at position 1
     token_ids.extend(ids.iter().take(content_prefix_len).skip(1).copied());
     if keep_sep {
         token_ids.push(ids[real_len - 1]); // original [SEP], restored after truncation
@@ -105,8 +141,8 @@ fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32
     // ColBERT-style punctuation filter: next-plaid-onnx drops any row whose
     // token id is in the skiplist when it flattens the ONNX output, so we
     // drop the matching ids here to stay aligned with its embedding rows.
-    token_ids.retain(|id| !alignment.skiplist_ids.contains(id));
-    Ok(token_ids)
+    token_ids.retain(|id| !skiplist_ids.contains(id));
+    token_ids
 }
 
 /// ColBERT encoder wrapping LateOn-Code-edge via `next-plaid-onnx`.
@@ -400,6 +436,26 @@ impl ColbertEmbedder {
             anyhow::anyhow!("failed to load tokenizer {}: {e}", tokenizer_path.display())
         })?;
         let config = ColbertConfig::from_file(self.model_dir.join("onnx_config.json"))?;
+        // `next-plaid-onnx` itself resolves the `[D]` marker id via its private
+        // `ColbertConfig::document_prefix_id` field FIRST, falling back to
+        // `tokenizer.token_to_id(document_prefix)` only when that field is
+        // `None` (next-plaid-onnx 1.6.2 src/lib.rs:1902-1910). That private
+        // field has no public accessor, so we cannot read it from outside the
+        // crate — we always take the fallback path here. For the current
+        // model (`LateOn-Code-edge`, `document_prefix_id: 50369`) this is
+        // verified to resolve to the SAME id as the tokenizer lookup, so
+        // there is no active bug today. But the two paths are only known to
+        // coincide for this one model: if a future/different model's
+        // `onnx_config.json` ever sets a `document_prefix_id` override that
+        // does NOT match what the tokenizer resolves for `document_prefix`
+        // (e.g. a vocab quirk the override exists specifically to route
+        // around), this method would silently report the WRONG id for the
+        // marker row. Row-COUNT alignment (`ids.len() == embeddings.nrows()`)
+        // would still hold — exactly one marker row is always inserted
+        // regardless of its id value — so that check cannot catch this; only
+        // the id VALUE would be wrong. If per-token-id distillation (Task 3)
+        // ever looks wrong specifically for the `[D]`/marker slot on a new
+        // model, this divergence is the first thing to rule out.
         let document_prefix_id =
             tokenizer
                 .token_to_id(&config.document_prefix)
@@ -537,6 +593,121 @@ mod tests {
         // Consistency with the plain path: same matrix.
         let plain = e.encode_documents(&texts).unwrap();
         assert_eq!(emb, &plain[0]);
+    }
+
+    /// Covers the truncation branch in `assemble_and_filter_ids`
+    /// (`content_prefix_len` / `keep_sep`), which the short document in
+    /// `encode_with_ids_rows_align` never exercises.
+    ///
+    /// This is a PURE unit test on synthetic ids, not an end-to-end encode —
+    /// deliberately. `LateOn-Code-edge`'s `tokenizer.json` embeds its own
+    /// truncation at exactly `document_length - 1` (2047), which the
+    /// `tokenizers` crate applies inside `.encode()` before our code ever
+    /// sees the ids — so no real input text can make
+    /// `alignment.tokenizer.encode(...)` hand back more than 2047 raw ids for
+    /// this model, and the `real_len > truncate_limit` branch is unreachable
+    /// via the public `encode_documents_with_ids` API today (verified: a
+    /// 3000-distinct-identifier document was tried first and came back
+    /// pre-truncated to exactly 2047 raw ids by the tokenizer itself). Rather
+    /// than leave the branch untested because of that, `assemble_and_filter_ids`
+    /// was factored out of `build_doc_token_ids` specifically so this branch
+    /// can be exercised directly with a synthetic ids sequence, independent
+    /// of any tokenizer's own truncation policy.
+    #[test]
+    fn truncated_ids_keep_trailing_sep_and_stay_aligned() {
+        const CLS: u32 = 1;
+        const SEP: u32 = 2;
+        const DOC_MARKER: u32 = 999;
+        const DOCUMENT_LENGTH: usize = 10; // truncate_limit = 9
+
+        // [CLS], 5000 distinct content ids, [SEP] — far longer than
+        // DOCUMENT_LENGTH, forcing the `real_len > truncate_limit` branch.
+        let content: Vec<u32> = (10..5010).collect();
+        let mut ids = vec![CLS];
+        ids.extend(&content);
+        ids.push(SEP);
+
+        let skiplist_ids = HashSet::new();
+        let out = assemble_and_filter_ids(DOC_MARKER, DOCUMENT_LENGTH, &skiplist_ids, &ids);
+
+        // keep_sep path: content_prefix_len = truncate_limit - 1 = 8, so the
+        // final sequence is [CLS] + [D] + 7 content ids + [SEP] = 10 =
+        // DOCUMENT_LENGTH exactly.
+        assert_eq!(
+            out.len(),
+            DOCUMENT_LENGTH,
+            "truncated sequence must land exactly at document_length"
+        );
+        assert_eq!(out[0], CLS, "[CLS] must stay first");
+        assert_eq!(out[1], DOC_MARKER, "[D] marker inserted at position 1");
+        assert_eq!(
+            &out[2..out.len() - 1],
+            &content[..DOCUMENT_LENGTH - 3],
+            "kept content must be a PREFIX of the original content (truncation drops the tail)"
+        );
+        assert_eq!(
+            *out.last().unwrap(),
+            SEP,
+            "truncated document must keep the trailing [SEP], not cut it off mid-content"
+        );
+    }
+
+    /// End-to-end companion to the pure unit test above: confirms a real,
+    /// genuinely long document still produces aligned ids/embeddings through
+    /// the full `encode_documents_with_ids` pipeline — the scenario Task 3's
+    /// distillation corpus will actually hit. It does NOT exercise the
+    /// `keep_sep` branch (see the note on `build_doc_token_ids`: this
+    /// model's tokenizer pre-truncates to exactly `document_length - 1`
+    /// itself), but it does prove alignment holds once the tokenizer's own
+    /// truncation kicks in, and that [SEP] still ends up last via the
+    /// ordinary (non-`keep_sep`) path.
+    #[test]
+    fn encode_with_ids_stays_aligned_for_a_long_document() {
+        let Some(model_dir) = test_model_dir() else {
+            return;
+        };
+        let e = ColbertEmbedder::new(&model_dir).unwrap();
+
+        // Each `identifier_N` is distinct so it can't collapse into a single
+        // existing vocab token; 3000 of them is far more than this model's
+        // tokenizer needs to hit its own embedded truncation.
+        let long_text: String = (0..3000)
+            .map(|i| format!("identifier_{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let texts = vec![long_text];
+
+        let out = e.encode_documents_with_ids(&texts).unwrap();
+        assert_eq!(out.len(), 1);
+        let (ids, emb) = &out[0];
+        assert_eq!(
+            ids.len(),
+            emb.nrows(),
+            "one token id per embedding row, even for a long/truncated document"
+        );
+        assert!(!ids.is_empty());
+
+        let alignment = e.id_alignment().unwrap();
+
+        // Confirm the fixture actually reached this model's truncation limit
+        // (tokenizer.json's own embedded max_length), not that it happened
+        // to tokenize short.
+        let raw = alignment.tokenizer.encode(texts[0].as_str(), true).unwrap();
+        assert_eq!(
+            raw.get_ids().len(),
+            alignment.document_length - 1,
+            "tokenizer.json's embedded truncation should cap raw ids at document_length - 1"
+        );
+
+        let sep_id = alignment
+            .tokenizer
+            .token_to_id("[SEP]")
+            .expect("[SEP] must be in the tokenizer vocabulary");
+        assert_eq!(
+            *ids.last().unwrap(),
+            sep_id,
+            "long document must still end with [SEP]"
+        );
     }
 
     #[test]
