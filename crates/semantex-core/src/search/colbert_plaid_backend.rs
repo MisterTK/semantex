@@ -219,6 +219,36 @@ impl DocEncoderKind {
     }
 }
 
+/// Resolve the frozen-centroids artifact for an index build (Ember Plan B).
+///
+/// Opt-in and safe by construction: returns `Some` ONLY when
+/// `SEMANTEX_FROZEN_CENTROIDS` is set (same `env_bool` contract as
+/// `SEMANTEX_STATIC_DOC_EMBED`) AND `frozen_centroids.npy` exists in
+/// `model_dir`. Flag set but artifact missing warns and returns `None` — the
+/// build proceeds on the current per-repo k-means path, never errors. Load
+/// validation (npy parse, dim match) happens inside next-plaid, which falls
+/// back to training on any problem, so a corrupt artifact also cannot fail a
+/// build. Build-time only: queries never read this; excluded from the
+/// embedder fingerprint for the same reason as SEMANTEX_STATIC_DOC_EMBED
+/// (see model/registry.rs).
+fn frozen_centroids_for_build(model_dir: &Path) -> Option<PathBuf> {
+    if !crate::config::env_bool("SEMANTEX_FROZEN_CENTROIDS") {
+        return None;
+    }
+    let path = model_manager::frozen_centroids_path(model_dir);
+    if path.exists() {
+        tracing::info!("using frozen universal centroids: {}", path.display());
+        Some(path)
+    } else {
+        tracing::warn!(
+            "SEMANTEX_FROZEN_CENTROIDS is set but {} is missing; \
+             falling back to per-repo k-means for this build",
+            path.display()
+        );
+        None
+    }
+}
+
 /// Build-time `colbert-plaid` index builder. Owns the PLAID full-rebuild and
 /// incremental update logic lifted verbatim from `index/builder.rs` so the
 /// dense build path routes through `DenseIndexBuilder`.
@@ -251,17 +281,23 @@ impl ColbertPlaidIndexBuilder {
         self
     }
 
-    fn next_plaid_configs(&self) -> (next_plaid::IndexConfig, next_plaid::UpdateConfig) {
+    fn next_plaid_configs(
+        &self,
+        frozen_centroids: Option<&Path>,
+    ) -> (next_plaid::IndexConfig, next_plaid::UpdateConfig) {
+        let external_centroids_npy = frozen_centroids.map(|p| p.to_string_lossy().into_owned());
         let index_config = next_plaid::IndexConfig {
             nbits: self.nbits,
             batch_size: 1024,
             force_cpu: true,
+            external_centroids_npy: external_centroids_npy.clone(),
             ..Default::default()
         };
         let update_config = next_plaid::UpdateConfig {
             batch_size: 1024,
             buffer_size: PLAID_BUFFER_SIZE,
             force_cpu: true,
+            external_centroids_npy,
             ..Default::default()
         };
         (index_config, update_config)
@@ -311,7 +347,8 @@ impl ColbertPlaidIndexBuilder {
 
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
         let embedder = DocEncoderKind::for_indexing(&model_dir)?;
-        let (index_config, update_config) = self.next_plaid_configs();
+        let frozen = frozen_centroids_for_build(&model_dir);
+        let (index_config, update_config) = self.next_plaid_configs(frozen.as_deref());
         let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
 
         if self.plaid_dir.exists() {
@@ -451,7 +488,8 @@ impl ColbertPlaidIndexBuilder {
         }
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
         let embedder = DocEncoderKind::for_indexing(&model_dir)?;
-        let (index_config, update_config) = self.next_plaid_configs();
+        let frozen = frozen_centroids_for_build(&model_dir);
+        let (index_config, update_config) = self.next_plaid_configs(frozen.as_deref());
         let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
 
         let mut mapping: Vec<u64> = if self.mapping_path.exists() {
@@ -616,6 +654,81 @@ mod tests {
         // Compile-time invariant: PLAID_BATCH must stay below PLAID_BUFFER_SIZE so
         // single-file incremental updates hit the buffer-only fast path.
         const { assert!(PLAID_BATCH < PLAID_BUFFER_SIZE) };
+    }
+
+    // ── frozen_centroids_for_build / next_plaid_configs (Ember Plan B, Task 6) ──
+
+    /// Private to this test module: serializes every test that mutates
+    /// `SEMANTEX_FROZEN_CENTROIDS`, mirroring `STATIC_DOC_EMBED_ENV_LOCK`'s
+    /// pattern above for this crate's other single-flag/single-file env vars.
+    static FROZEN_CENTROIDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `SEMANTEX_FROZEN_CENTROIDS` set to `val` (or unset when
+    /// `None`), restoring whatever was there before, serialized by
+    /// `FROZEN_CENTROIDS_ENV_LOCK`.
+    fn with_frozen_centroids_env<F: FnOnce()>(val: Option<&str>, f: F) {
+        let _guard = FROZEN_CENTROIDS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_FROZEN_CENTROIDS").ok();
+        // SAFETY: guarded by FROZEN_CENTROIDS_ENV_LOCK.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("SEMANTEX_FROZEN_CENTROIDS", v),
+                None => std::env::remove_var("SEMANTEX_FROZEN_CENTROIDS"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: guarded by FROZEN_CENTROIDS_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_FROZEN_CENTROIDS", v),
+                None => std::env::remove_var("SEMANTEX_FROZEN_CENTROIDS"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn frozen_centroids_off_without_env_flag() {
+        // flag unset → None even when the artifact exists
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("frozen_centroids.npy"), b"x").unwrap();
+        with_frozen_centroids_env(None, || {
+            assert!(frozen_centroids_for_build(tmp.path()).is_none());
+        });
+    }
+
+    #[test]
+    fn frozen_centroids_on_with_flag_and_artifact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("frozen_centroids.npy"), b"x").unwrap();
+        with_frozen_centroids_env(Some("1"), || {
+            let p = frozen_centroids_for_build(tmp.path()).expect("flag + artifact → Some");
+            assert!(p.ends_with("frozen_centroids.npy"));
+        });
+    }
+
+    #[test]
+    fn frozen_centroids_flag_without_artifact_warns_and_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        with_frozen_centroids_env(Some("1"), || {
+            assert!(frozen_centroids_for_build(tmp.path()).is_none());
+        });
+    }
+
+    #[test]
+    fn configs_carry_the_centroid_path_on_both_structs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let b = ColbertPlaidIndexBuilder::new(tmp.path(), 4);
+        let cpath = tmp.path().join("frozen_centroids.npy");
+        let (ic, uc) = b.next_plaid_configs(Some(&cpath));
+        assert_eq!(ic.external_centroids_npy.as_deref(), cpath.to_str());
+        assert_eq!(uc.external_centroids_npy.as_deref(), cpath.to_str());
+        let (ic, uc) = b.next_plaid_configs(None);
+        assert!(ic.external_centroids_npy.is_none() && uc.external_centroids_npy.is_none());
     }
 
     // ── DocEncoderKind::for_indexing selection (Task 6) ─────────────────────
@@ -861,6 +974,144 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "search must return hits after a phased build"
+        );
+    }
+
+    /// End-to-end Ember Plan B check: train tiny frozen centroids from a real
+    /// `ColbertEmbedder`, then build the SAME corpus twice — once with
+    /// `SEMANTEX_FROZEN_CENTROIDS=1` (external centroids) and once without
+    /// (per-repo k-means) — and verify:
+    ///   1. the flagged build succeeds and its `centroids.npy` row count
+    ///      equals the trained k (proving the external artifact, not a
+    ///      per-repo k-means result, was actually used);
+    ///   2. the unflagged build also succeeds (the fallback path is
+    ///      unaffected by the artifact merely existing on disk); and
+    ///   3. both indexes agree on the top-1 chunk for a distinctive query
+    ///      (frozen centroids don't change *what* is retrieved, only how the
+    ///      codec is built).
+    ///
+    /// Needs the real downloaded LateOn-Code-edge model; `#[ignore]`'d like
+    /// this file's other model-gated tests. The real model dir is never
+    /// mutated: a temp overlay dir symlinks the model's onnx/tokenizer files
+    /// in (so `ensure_colbert_model` sees `model_int8.onnx` and skips
+    /// downloading) and only the overlay gets the trained
+    /// `frozen_centroids.npy` written into it.
+    #[test]
+    #[ignore = "requires the downloaded LateOn-Code-edge model and builds a real PLAID index"]
+    fn frozen_centroids_build_produces_searchable_index_and_fallback_matches() {
+        use crate::config::SemantexConfig;
+        use crate::embedding::centroid_train::{
+            CentroidTrainOptions, save_centroids_npy, train_centroids,
+        };
+
+        let real_models_dir = SemantexConfig::default().models_dir();
+        let real_model_dir = model_manager::ensure_colbert_model(&real_models_dir)
+            .expect("LateOn-Code-edge must be downloaded for this ignored test");
+
+        // Build an overlay model dir that symlinks in the real model's
+        // files, so ensure_colbert_model(&overlay) is satisfied without
+        // touching (or downloading into) the real model dir.
+        let overlay = tempfile::TempDir::new().unwrap();
+        let overlay_model_dir = overlay.path().join("LateOn-Code-edge");
+        std::fs::create_dir_all(&overlay_model_dir).unwrap();
+        for file in ["model_int8.onnx", "tokenizer.json", "onnx_config.json"] {
+            let src = real_model_dir.join(file);
+            let dst = overlay_model_dir.join(file);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&src, &dst).unwrap();
+            #[cfg(not(unix))]
+            std::fs::copy(&src, &dst).unwrap();
+        }
+
+        // 1. Train tiny centroids from a few dozen synthetic code strings via
+        //    train_centroids + the REAL ColbertEmbedder; save to the overlay.
+        let embedder = ColbertEmbedder::for_indexing(&overlay_model_dir).unwrap();
+        let corpus: Vec<String> = (0..40)
+            .map(|i| format!("fn synthetic_helper_{i}(x: i32) -> i32 {{ x + {i} }}"))
+            .collect();
+        let k = 8usize;
+        let opts = CentroidTrainOptions {
+            num_centroids: k,
+            sample_capacity: 10_000,
+            batch: 8,
+        };
+        let centroids = train_centroids(&embedder, corpus.into_iter(), &opts).unwrap();
+        assert_eq!(centroids.nrows(), k, "trained k must match request");
+        let frozen_path = model_manager::frozen_centroids_path(&overlay_model_dir);
+        save_centroids_npy(&frozen_path, &centroids).unwrap();
+
+        // Distinctive chunk both indexes must retrieve identically.
+        let chunks: Vec<(u64, String)> = (0u64..40)
+            .map(|i| {
+                (
+                    i,
+                    format!("fn synthetic_helper_{i}(x: i32) -> i32 {{ x + {i} }}"),
+                )
+            })
+            .collect();
+        let chunk_ids: Vec<u64> = chunks.iter().map(|(id, _)| *id).collect();
+        let fetch = |batch_ids: &[u64]| -> Result<Vec<(u64, String)>> {
+            Ok(batch_ids
+                .iter()
+                .map(|&id| (id, chunks[id as usize].1.clone()))
+                .collect())
+        };
+
+        // 2. Build once with SEMANTEX_FROZEN_CENTROIDS=1 → assert build OK and
+        //    the index's centroids.npy row count == trained k.
+        let flagged_dir = tempfile::TempDir::new().unwrap();
+        with_frozen_centroids_env(Some("1"), || {
+            let mut builder = ColbertPlaidIndexBuilder::new(flagged_dir.path(), 4)
+                .with_models_dir(overlay.path().to_path_buf());
+            builder
+                .build_streaming_ids(&chunk_ids, fetch)
+                .expect("flagged build (external centroids) must succeed");
+        });
+        let flagged_centroids: ndarray::Array2<f32> = ndarray_npy::ReadNpyExt::read_npy(
+            std::fs::File::open(flagged_dir.path().join("centroids.npy")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            flagged_centroids.nrows(),
+            k,
+            "flagged build's centroids.npy must carry the trained k rows, \
+             proving the external artifact (not per-repo k-means) was used"
+        );
+
+        // 3. Build again WITHOUT the flag → assert build OK (per-repo path)
+        //    and a search for a distinctive token returns the same top-1
+        //    chunk in both indexes.
+        let unflagged_dir = tempfile::TempDir::new().unwrap();
+        with_frozen_centroids_env(None, || {
+            let mut builder = ColbertPlaidIndexBuilder::new(unflagged_dir.path(), 4)
+                .with_models_dir(overlay.path().to_path_buf());
+            builder
+                .build_streaming_ids(&chunk_ids, fetch)
+                .expect("unflagged build (per-repo k-means) must succeed");
+        });
+
+        let flagged_mapping_path = flagged_dir.path().join("plaid_mapping.bin");
+        let unflagged_mapping_path = unflagged_dir.path().join("plaid_mapping.bin");
+        let flagged_backend = ColbertPlaidBackend::open(
+            flagged_dir.path(),
+            &flagged_mapping_path,
+            &overlay_model_dir,
+        )
+        .unwrap();
+        let unflagged_backend = ColbertPlaidBackend::open(
+            unflagged_dir.path(),
+            &unflagged_mapping_path,
+            &overlay_model_dir,
+        )
+        .unwrap();
+
+        let query = "synthetic_helper_7";
+        let flagged_hits = flagged_backend.search(query, 1).unwrap();
+        let unflagged_hits = unflagged_backend.search(query, 1).unwrap();
+        assert!(!flagged_hits.is_empty() && !unflagged_hits.is_empty());
+        assert_eq!(
+            flagged_hits[0].chunk_id, unflagged_hits[0].chunk_id,
+            "frozen centroids must not change what is retrieved, only how the codec is built"
         );
     }
 }
