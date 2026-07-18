@@ -627,6 +627,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "loads the ColBERT model and builds a real ONNX session; run with --ignored"]
     fn encode_with_ids_rows_align() {
         let Some(model_dir) = test_model_dir() else {
             return;
@@ -710,6 +711,7 @@ mod tests {
     /// truncation kicks in, and that [SEP] still ends up last via the
     /// ordinary (non-`keep_sep`) path.
     #[test]
+    #[ignore = "loads the ColBERT model and builds a real ONNX session; run with --ignored"]
     fn encode_with_ids_stays_aligned_for_a_long_document() {
         let Some(model_dir) = test_model_dir() else {
             return;

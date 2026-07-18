@@ -10,11 +10,13 @@ out of scope for this task — Plans B–D.
 
 ## TL;DR — Gate verdict: **PASS**
 
-Tier-0 (encoder-free, static per-token doc embeddings) retains **96.6%–97.3%** of full
-contextual lateon-colbert's nDCG@10 in the shipping-relevant hybrid arm (target: ≥85%),
-and clearly beats BM25-alone in 2 of 3 languages (the python exception is a pre-existing
-property of the full contextual model on this dataset, not a Tier-0 regression — see
-below). Index build time drops 13×–21× and peak RSS drops 30%–80% depending on language.
+Tier-0 (encoder-free, static per-token doc embeddings) retains **91.5%–101.7%** of full
+contextual lateon-colbert's nDCG@10 in the shipping-relevant hybrid arm across the three
+languages (mean of per-language ratios: 96.5%; aggregate mean-nDCG/mean-nDCG: 97.3%;
+target: ≥85%), and clearly beats BM25-alone in 2 of 3 languages (the python exception is
+a pre-existing property of the full contextual model on this dataset, not a Tier-0
+regression — see below). Index build time drops 13×–21× and peak RSS drops 41%–80%
+depending on language.
 **Recommendation: proceed to Plan B (frozen centroids) and Plan C (background upgrader).**
 
 ---
