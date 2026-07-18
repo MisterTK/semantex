@@ -129,6 +129,9 @@ sha2 = "0.10"
 # Parallelism
 rayon = "1"
 ndarray = "0.16"
+# .npy read/write for the frozen-centroid training artifact (embedding/centroid_train.rs).
+# Version pinned to match the vendored next-plaid's own ndarray-npy dependency.
+ndarray-npy = "0.9.1"
 
 # HTTP (model download only)
 ureq = "3"

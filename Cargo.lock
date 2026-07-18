@@ -4319,6 +4319,7 @@ dependencies = [
  "lopdf",
  "memmap2",
  "ndarray 0.16.1",
+ "ndarray-npy",
  "next-plaid",
  "next-plaid-onnx",
  "notify",
