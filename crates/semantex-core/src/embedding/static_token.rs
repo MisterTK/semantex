@@ -70,26 +70,34 @@ impl StaticTokenEmbedder {
     }
 }
 
-/// Build the [`WINDOW_LEN`]-token window centered at position `i` in `ids`.
+/// Build the `N`-token window centered at position `i` in `ids` (center =
+/// `N / 2`).
 ///
-/// Uses the SAME edge convention
-/// `static_distill::Accumulator::ingest_document` used to build the
-/// reservoir samples the fitted `mix_weights` were calibrated against
-/// (`static_distill.rs`, around lines 196-208): a window position that falls
-/// outside the document reuses the CENTER token's own id, rather than
-/// reading into a neighboring document or padding with an out-of-vocab
-/// sentinel. Getting this wrong would apply the fitted weights inconsistently
-/// with how they were trained — silently, with no test catching it unless it
-/// specifically checks this edge case.
-fn window_ids_at(ids: &[u32], i: usize) -> [u32; WINDOW_LEN] {
+/// Generic over the window width `N` so a single edge-replication
+/// implementation serves BOTH this module's 5-tap linear window
+/// (`window_ids_at::<WINDOW_LEN>`, center 2) AND Cinder's 9-tap mixer window
+/// (`window_ids_at::<MIXER_WINDOW>`, center 4). `N / 2` reproduces both
+/// (`5/2 = 2`, `9/2 = 4`), and the per-offset "reuse center past either edge"
+/// rule is identical at both widths.
+///
+/// Uses the SAME edge convention `static_distill::Accumulator::ingest_document`
+/// / `mixer_train::Accumulator::ingest_document` use to build the samples the
+/// fitted `mix_weights` and the trained `MicroMixer` were calibrated against: a
+/// window position that falls outside the document reuses the CENTER token's own
+/// id, rather than reading into a neighboring document or padding with an
+/// out-of-vocab sentinel. Getting this wrong would apply the fitted weights /
+/// trained mixer inconsistently with how they were trained — silently, with no
+/// test catching it unless it specifically checks this edge case.
+pub(crate) fn window_ids_at<const N: usize>(ids: &[u32], i: usize) -> [u32; N] {
+    let center = N / 2;
     let id = ids[i];
-    let mut window = [id; WINDOW_LEN];
-    for offset in 1..=CENTER_OFFSET {
+    let mut window = [id; N];
+    for offset in 1..=center {
         if i >= offset {
-            window[CENTER_OFFSET - offset] = ids[i - offset];
+            window[center - offset] = ids[i - offset];
         }
         if i + offset < ids.len() {
-            window[CENTER_OFFSET + offset] = ids[i + offset];
+            window[center + offset] = ids[i + offset];
         }
     }
     window
@@ -166,7 +174,7 @@ fn mix_document(table: &StaticTokenTable, ids: &[u32]) -> TokenEmbeddings {
     let dims = table.dims;
     let mut out = Array2::<f32>::zeros((ids.len(), dims));
     for i in 0..ids.len() {
-        let window = window_ids_at(ids, i);
+        let window = window_ids_at::<WINDOW_LEN>(ids, i);
         let row = mix_token(table, window, table.mix_weights);
         out.row_mut(i).assign(&ndarray::ArrayView1::from(&row));
     }

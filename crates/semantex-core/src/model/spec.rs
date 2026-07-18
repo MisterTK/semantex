@@ -563,4 +563,47 @@ mod tests {
             "aux artifacts are doc-side only; they must never invalidate an index"
         );
     }
+
+    #[test]
+    fn cinder_env_flag_never_enters_the_fingerprint() {
+        // SEMANTEX_CINDER is a build-time-only opt-in (see
+        // search::colbert_plaid_backend::cinder_for_build). Like
+        // SEMANTEX_STATIC_DOC_EMBED / SEMANTEX_FROZEN_CENTROIDS it must NEVER
+        // change the embedder fingerprint, or flipping it would auto-invalidate
+        // every existing index. `compute` takes no env, so this is structurally
+        // true — the test guards against a future regression that starts folding
+        // the var in, computing the fingerprint with the var set vs. unset.
+        let specs = crate::model::manifest::builtin_specs();
+        let s = specs.iter().find(|s| s.id == "lateon-colbert").unwrap();
+        let RoleData::Embedder(e) = &s.role_data else {
+            panic!()
+        };
+
+        // Serialize with the crate-wide SEMANTEX_CINDER lock so this can't race
+        // the colbert_plaid_backend cinder_for_build tests that also mutate it.
+        let _guard = crate::search::colbert_plaid_backend::CINDER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_CINDER").ok();
+
+        // SAFETY: guarded by CINDER_ENV_LOCK.
+        unsafe { std::env::remove_var("SEMANTEX_CINDER") };
+        let fp_unset = EmbedderFingerprint::compute("lateon-colbert", e, false);
+        // SAFETY: guarded by CINDER_ENV_LOCK.
+        unsafe { std::env::set_var("SEMANTEX_CINDER", "1") };
+        let fp_set = EmbedderFingerprint::compute("lateon-colbert", e, false);
+
+        // SAFETY: guarded by CINDER_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_CINDER", v),
+                None => std::env::remove_var("SEMANTEX_CINDER"),
+            }
+        }
+
+        assert_eq!(
+            fp_unset, fp_set,
+            "SEMANTEX_CINDER must never affect the embedder fingerprint"
+        );
+    }
 }

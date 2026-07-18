@@ -32,15 +32,21 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Axis, s};
 use ndarray_npy::WriteNpyExt;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index::{
-    ChunkMetadata, IndexConfig, Metadata, PreparedCodecArtifacts, encode_index_chunk,
-    prepare_codec_artifacts,
+    ChunkMetadata, EncodedIndexChunk, IndexConfig, Metadata, PreparedCodecArtifacts,
+    encode_index_chunk, prepare_codec_artifacts,
 };
 use crate::utils::atomic_write_file;
+
+/// A caller-supplied centroid-assignment function: maps a `[n_tokens, dim]`
+/// batch of embeddings to one centroid id per row, replacing the codec's
+/// exhaustive [`crate::codec::ResidualCodec::compress_into_codes_cpu`] scan.
+/// See [`CompiledIndexWriter::with_assigner`].
+pub type CodeAssigner = Box<dyn Fn(&Array2<f32>) -> Array1<usize>>;
 
 /// Builds a PLAID index in ONE pass over per-document embeddings, with frozen
 /// centroids, flushing packed codes/residuals to on-disk chunk files instead of
@@ -78,6 +84,12 @@ pub struct CompiledIndexWriter {
     /// IVF accumulator: one `(centroid, global_doc_id)` pair per token, in the
     /// same global token order `create_index_files` walks.
     ivf_pairs: Vec<(u32, i64)>,
+    /// Optional caller-supplied centroid assigner (see [`Self::with_assigner`]).
+    /// `None` (the default) means each chunk is assigned by the codec's own
+    /// exhaustive `compress_into_codes_cpu` — the byte-identical reference path.
+    /// `Some(f)` swaps ONLY the assignment step; residual computation and
+    /// quantization stay byte-for-byte the same as the default.
+    assigner: Option<CodeAssigner>,
 }
 
 impl CompiledIndexWriter {
@@ -138,7 +150,25 @@ impl CompiledIndexWriter {
             next_doc_id: 0,
             total_embeddings: 0,
             ivf_pairs: Vec::new(),
+            assigner: None,
         })
+    }
+
+    /// Install a caller-supplied centroid [`CodeAssigner`], used instead of the
+    /// codec's exhaustive `compress_into_codes_cpu` when flushing each chunk.
+    ///
+    /// This is a minimal, additive hook: it changes ONLY which centroid id each
+    /// token is assigned to. Residual computation (`embedding − centroid[code]`)
+    /// and quantization are unchanged, so with NO assigner installed the writer
+    /// is still byte-identical to [`crate::index::create_index_files`] (proven by
+    /// `default_no_assigner_path_stays_byte_identical`). Cinder passes a closure
+    /// wrapping its shortlist-union argmax; the codes it produces agree with the
+    /// exhaustive default to within a small tolerance (proven by
+    /// `shortlist_assigner_agrees_with_exhaustive_default`).
+    #[must_use]
+    pub fn with_assigner(mut self, assigner: CodeAssigner) -> Self {
+        self.assigner = Some(assigner);
+        self
     }
 
     /// Append one document's token embeddings (unit-norm, `[n_tokens, dim]`).
@@ -163,9 +193,15 @@ impl CompiledIndexWriter {
         let chunk_idx = self.num_chunks;
 
         // Same encode path as create_index_files (compress_into_codes_cpu +
-        // quantize_residuals), producing byte-identical codes/residuals.
-        let encoded =
-            encode_index_chunk(&self.buffer, &self.artifacts.codec, self.config.force_cpu)?;
+        // quantize_residuals), producing byte-identical codes/residuals — UNLESS
+        // a caller supplied an assigner via `with_assigner`, in which case only
+        // the centroid-assignment step is swapped (residuals/quantization stay
+        // identical). The default (no-assigner) arm is untouched, preserving the
+        // byte-identity contract.
+        let encoded = match self.assigner.as_ref() {
+            None => encode_index_chunk(&self.buffer, &self.artifacts.codec, self.config.force_cpu)?,
+            Some(assigner) => self.encode_chunk_with_assigner(assigner.as_ref())?,
+        };
 
         // {chunk}.metadata.json — written with embedding_offset: 0 first, exactly
         // as create_index_files does; finalize() rewrites the offsets in a second
@@ -231,6 +267,71 @@ impl CompiledIndexWriter {
         self.num_chunks += 1;
         self.buffer.clear();
         Ok(())
+    }
+
+    /// Encode the buffered documents into a chunk using a CALLER-SUPPLIED code
+    /// [`CodeAssigner`] in place of the codec's exhaustive
+    /// `compress_into_codes_cpu`.
+    ///
+    /// Everything except the assignment step mirrors
+    /// [`crate::index::encode_index_chunk`] / its `compress_and_residuals_cpu`
+    /// byte-for-byte: the docs are concatenated into one `[total_tokens, dim]`
+    /// batch, residuals are `embedding − centroid[code]`, and quantization runs
+    /// through the same [`crate::codec::ResidualCodec::quantize_residuals`]. Only
+    /// exercised when [`Self::with_assigner`] was called.
+    fn encode_chunk_with_assigner(
+        &self,
+        assigner: &dyn Fn(&Array2<f32>) -> Array1<usize>,
+    ) -> Result<EncodedIndexChunk> {
+        let codec = &self.artifacts.codec;
+        let embedding_dim = codec.embedding_dim();
+        let packed_dim = embedding_dim * codec.nbits / 8;
+        let doclens: Vec<i64> = self.buffer.iter().map(|d| d.nrows() as i64).collect();
+        let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
+
+        // Concatenate the buffered docs into one [total_tokens, dim] batch,
+        // exactly as encode_index_chunk does.
+        let mut batch = Array2::<f32>::zeros((total_tokens, embedding_dim));
+        let mut offset = 0;
+        for doc in &self.buffer {
+            let n = doc.nrows();
+            batch.slice_mut(s![offset..offset + n, ..]).assign(doc);
+            offset += n;
+        }
+
+        // The ONLY divergence from the default path: caller-supplied assignment
+        // instead of the exhaustive compress_into_codes_cpu.
+        let batch_codes = assigner(&batch);
+
+        // residuals = embedding − centroid[code], identical to
+        // compress_and_residuals_cpu's residual pass.
+        let centroids = codec.centroids_view();
+        let mut residuals = batch;
+        for (mut row, &code) in residuals.axis_iter_mut(Axis(0)).zip(batch_codes.iter()) {
+            let centroid = centroids.row(code);
+            row.iter_mut()
+                .zip(centroid.iter())
+                .for_each(|(r, c)| *r -= c);
+        }
+
+        // Quantize/pack exactly as encode_index_chunk does.
+        let batch_packed = codec.quantize_residuals(&residuals)?;
+        let (raw_residuals, residuals_offset) = batch_packed.into_raw_vec_and_offset();
+        if residuals_offset != Some(0) {
+            return Err(Error::Shape(format!(
+                "Unexpected residual packing offset: {:?}",
+                residuals_offset
+            )));
+        }
+        let residuals = Array2::from_shape_vec((batch_codes.len(), packed_dim), raw_residuals)
+            .map_err(|e| Error::Shape(format!("Failed to reshape residuals: {}", e)))?;
+        let codes: Array1<i64> = batch_codes.iter().map(|&x| x as i64).collect();
+
+        Ok(EncodedIndexChunk {
+            codes,
+            residuals,
+            doclens,
+        })
     }
 
     /// Flush the final chunk, write `plan.json`, fix chunk-metadata offsets,
@@ -405,6 +506,173 @@ mod tests {
             let b = std::fs::read(out_dir.join(f)).unwrap();
             assert_eq!(a, b, "file {f} differs");
         }
+    }
+
+    /// Read and concatenate every `{i}.codes.npy` chunk file in `dir`, in
+    /// ascending chunk order, into one flat `Vec<i64>` of centroid ids.
+    fn read_all_codes(dir: &std::path::Path) -> Vec<i64> {
+        use ndarray_npy::ReadNpyExt;
+        let mut all = Vec::new();
+        let mut i = 0usize;
+        loop {
+            let p = dir.join(format!("{i}.codes.npy"));
+            if !p.exists() {
+                break;
+            }
+            let arr = Array1::<i64>::read_npy(std::fs::File::open(&p).unwrap()).unwrap();
+            all.extend(arr.iter().copied());
+            i += 1;
+        }
+        all
+    }
+
+    #[test]
+    fn default_no_assigner_path_stays_byte_identical() {
+        // Regression proof for the `with_assigner` addition: a writer built
+        // WITHOUT calling `with_assigner` must remain byte-identical to
+        // `create_index_files`. Kept separate from
+        // `output_is_byte_identical_to_create_index_files` so a future change to
+        // the assigner plumbing that perturbs the default path fails HERE, with
+        // an obviously-named test.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dim = 8;
+        let docs = synth_docs(57, dim);
+        let centroids = synth_centroids(32, dim);
+        let config = IndexConfig {
+            nbits: 4,
+            batch_size: 16,
+            force_cpu: true,
+            ..Default::default()
+        };
+
+        let ref_dir = tmp.path().join("reference");
+        create_index_files(&docs, centroids.clone(), ref_dir.to_str().unwrap(), &config).unwrap();
+
+        let out_dir = tmp.path().join("compiled");
+        // No with_assigner → default exhaustive assignment path.
+        let mut w =
+            CompiledIndexWriter::new(out_dir.to_str().unwrap(), centroids, &config, &docs).unwrap();
+        for d in &docs {
+            w.add_document(d).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let _ = std::fs::remove_file(ref_dir.join("embeddings.npy"));
+        let mut ref_files: Vec<_> = std::fs::read_dir(&ref_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        ref_files.sort();
+        let mut out_files: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        out_files.sort();
+        assert_eq!(ref_files, out_files, "file inventories differ");
+        for f in &ref_files {
+            let a = std::fs::read(ref_dir.join(f)).unwrap();
+            let b = std::fs::read(out_dir.join(f)).unwrap();
+            assert_eq!(a, b, "file {f} differs");
+        }
+    }
+
+    #[test]
+    fn shortlist_assigner_agrees_with_exhaustive_default() {
+        // Mechanism gate for `with_assigner`: a shortlist-style assigner (a
+        // stand-in for Cinder's shortlist-union argmax) must (1) actually be
+        // invoked, (2) produce codes that reach disk (so agreement is strictly
+        // < 1.0 thanks to ONE deliberate second-best pick), and (3) agree with
+        // the exhaustive default on ≥99% of tokens.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dim = 8;
+        let docs = synth_docs(57, dim);
+        let centroids = synth_centroids(32, dim);
+        let config = IndexConfig {
+            nbits: 4,
+            batch_size: 16,
+            force_cpu: true,
+            ..Default::default()
+        };
+
+        // Reference index: default exhaustive assignment.
+        let ref_dir = tmp.path().join("ref");
+        let mut wr =
+            CompiledIndexWriter::new(ref_dir.to_str().unwrap(), centroids.clone(), &config, &docs)
+                .unwrap();
+        for d in &docs {
+            wr.add_document(d).unwrap();
+        }
+        wr.finalize().unwrap();
+        let ref_codes = read_all_codes(&ref_dir);
+
+        // Shortlist-style assigner: per-row exact scan (a stand-in for the real
+        // shortlist union) that deliberately returns the SECOND-best centroid
+        // for exactly one row (first row of the first flushed chunk). The
+        // deliberate miss proves the assigner's codes — not the codec's own
+        // exhaustive ones — actually reached disk.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cl = Arc::clone(&calls);
+        let cen = centroids.clone();
+        let assigner: super::CodeAssigner = Box::new(move |emb: &Array2<f32>| -> Array1<usize> {
+            let call_idx = calls_cl.fetch_add(1, Ordering::SeqCst);
+            let c = cen.view();
+            let mut out = Vec::with_capacity(emb.nrows());
+            for (ri, row) in emb.axis_iter(Axis(0)).enumerate() {
+                let mut best = (f32::NEG_INFINITY, 0usize);
+                let mut second = (f32::NEG_INFINITY, 0usize);
+                for (id, cc) in c.axis_iter(Axis(0)).enumerate() {
+                    let dot: f32 = row.iter().zip(cc.iter()).map(|(&a, &b)| a * b).sum();
+                    if dot > best.0 {
+                        second = best;
+                        best = (dot, id);
+                    } else if dot > second.0 {
+                        second = (dot, id);
+                    }
+                }
+                let pick = if call_idx == 0 && ri == 0 && emb.nrows() > 1 {
+                    second.1
+                } else {
+                    best.1
+                };
+                out.push(pick);
+            }
+            Array1::from_vec(out)
+        });
+
+        let out_dir = tmp.path().join("shortlist");
+        let mut w = CompiledIndexWriter::new(out_dir.to_str().unwrap(), centroids, &config, &docs)
+            .unwrap()
+            .with_assigner(assigner);
+        for d in &docs {
+            w.add_document(d).unwrap();
+        }
+        w.finalize().unwrap();
+        let test_codes = read_all_codes(&out_dir);
+
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "the assigner hook was never invoked"
+        );
+        assert_eq!(ref_codes.len(), test_codes.len(), "token counts differ");
+        assert!(!ref_codes.is_empty(), "no codes were written");
+        let agree = ref_codes
+            .iter()
+            .zip(test_codes.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        let frac = agree as f64 / ref_codes.len() as f64;
+        assert!(
+            frac >= 0.99,
+            "shortlist assigner agreement {frac} < 0.99 with the exhaustive default"
+        );
+        assert!(
+            frac < 1.0,
+            "the one deliberate second-best pick must reach disk (proving the hook \
+             is actually used); got perfect agreement {frac}"
+        );
     }
 
     #[test]

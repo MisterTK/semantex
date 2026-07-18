@@ -2,6 +2,7 @@
 //! wrapping the ColBERT late-interaction + vendored next-plaid PLAID path.
 //! Behavior is byte-identical to the pre-seam inline PLAID code.
 
+use crate::embedding::cinder::CinderEncoder;
 use crate::embedding::colbert::{ColbertEmbedder, TokenEmbeddings};
 use crate::embedding::model_manager;
 use crate::embedding::static_token::StaticTokenEmbedder;
@@ -49,6 +50,16 @@ const INITIAL_BUILD_CHUNKS: usize = 2_000;
 /// which does not itself sub-batch) since `fetch` ultimately runs one query
 /// per batch of this size.
 const PLAID_APPEND_BATCH: usize = 512;
+
+/// Test-only: serializes every test ACROSS THE CRATE that mutates
+/// `SEMANTEX_CINDER` — this file's `cinder_for_build` tests AND
+/// `model::spec`'s Cinder fingerprint-invariance test. Deliberately
+/// module-scoped and `pub(crate)` (unlike the private-to-`mod tests`
+/// `STATIC_DOC_EMBED_ENV_LOCK` / `FROZEN_CENTROIDS_ENV_LOCK`) precisely because
+/// a second module needs the SAME lock instance: two separate locks would not
+/// serialize the single shared process env var, reintroducing the race.
+#[cfg(test)]
+pub(crate) static CINDER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Query-time `colbert-plaid` backend: owns a `PlaidSearcher` and a reference
 /// to the process-global ColBERT encoder.
@@ -249,6 +260,43 @@ fn frozen_centroids_for_build(model_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve the Cinder compiled-indexing encoder for a fresh index build
+/// (spec §4, plan Task 6).
+///
+/// Opt-in and safe by construction, mirroring `frozen_centroids_for_build` /
+/// `DocEncoderKind::for_indexing`: returns `Some` ONLY when `SEMANTEX_CINDER`
+/// is set AND all three Cinder artifacts (`static_token_table.bin`,
+/// `cinder_mixer.bin`, `cinder_shortlists.bin`) load cleanly from `model_dir`.
+/// Flag unset → `None` before any load is attempted. Flag set but any artifact
+/// missing/corrupt → `tracing::warn!` (naming the failed artifact, via
+/// `CinderEncoder::new`'s contextualized error) and `None`. Either way the
+/// existing tier chain in `build_streaming_ids` (contextual / static-embed
+/// flag / frozen-centroids flag) proceeds untouched. This NEVER errors — a
+/// flipped experimental flag must never turn a working build into a failed one.
+///
+/// Build-time only: queries never construct this, and `SEMANTEX_CINDER` is
+/// excluded from the embedder fingerprint (see `model/registry.rs`), so
+/// toggling it never forces a re-embed.
+fn cinder_for_build(model_dir: &Path) -> Option<CinderEncoder> {
+    if !crate::config::env_bool("SEMANTEX_CINDER") {
+        return None;
+    }
+    match CinderEncoder::new(model_dir) {
+        Ok(encoder) => {
+            tracing::info!("using cinder compiled indexing");
+            Some(encoder)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "SEMANTEX_CINDER is set but the Cinder artifacts failed to load from {} \
+                 ({e:#}); falling back to the existing PLAID build path for this build",
+                model_dir.display()
+            );
+            None
+        }
+    }
+}
+
 /// Build-time `colbert-plaid` index builder. Owns the PLAID full-rebuild and
 /// incremental update logic lifted verbatim from `index/builder.rs` so the
 /// dense build path routes through `DenseIndexBuilder`.
@@ -346,6 +394,28 @@ impl ColbertPlaidIndexBuilder {
         }
 
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
+
+        // Cinder compiled-indexing fast path (fresh builds ONLY; the incremental
+        // `insert_streaming_ids` is untouched). Opt-in via `SEMANTEX_CINDER` and
+        // gated on all three Cinder artifacts AND frozen centroids. Any missing
+        // artifact / failed load falls back to the existing tier chain below,
+        // which is left completely unchanged (this is a pure INSERT — no existing
+        // line is modified). Frozen centroids are REQUIRED here (the cinder path
+        // never runs per-repo k-means); a missing/corrupt centroid file also
+        // falls back rather than erroring.
+        if let Some(cinder) = cinder_for_build(&model_dir) {
+            let centroids_path = model_manager::frozen_centroids_path(&model_dir);
+            match crate::embedding::centroid_train::load_centroids_npy(&centroids_path) {
+                Ok(centroids) => return self.build_cinder(chunk_ids, fetch, &cinder, centroids),
+                Err(e) => tracing::warn!(
+                    "SEMANTEX_CINDER is set and Cinder artifacts loaded, but the frozen \
+                     centroids the cinder path REQUIRES failed to load from {} ({e:#}); \
+                     falling back to the existing PLAID build path",
+                    centroids_path.display()
+                ),
+            }
+        }
+
         let embedder = DocEncoderKind::for_indexing(&model_dir)?;
         let frozen = frozen_centroids_for_build(&model_dir);
         let (index_config, update_config) = self.next_plaid_configs(frozen.as_deref());
@@ -468,6 +538,119 @@ impl ColbertPlaidIndexBuilder {
 
         write_mapping_atomic(&self.mapping_path, &full_mapping)?;
         tracing::info!("PLAID index built ({} chunks)", full_mapping.len());
+        Ok(())
+    }
+
+    /// Cinder single-pass compiled build (spec §4, plan Task 6): encode every
+    /// chunk with the encoder-free [`CinderEncoder`] and stream the per-document
+    /// f32 embeddings straight into a [`next_plaid::CompiledIndexWriter`] built
+    /// on FROZEN centroids — no per-repo k-means, no `update_or_create` /
+    /// `update_append` cycle. Called only from `build_streaming_ids` when
+    /// `cinder_for_build` returned `Some` and the frozen centroids loaded.
+    ///
+    /// Memory: the writer needs a residual-statistics sample at construction, so
+    /// the first `INITIAL_BUILD_CHUNKS.min(total)` docs' embeddings are held for
+    /// `CompiledIndexWriter::new` and then streamed into it; the remainder streams
+    /// one `PLAID_APPEND_BATCH` at a time and the sample is dropped first — so
+    /// peak is bounded by that same `INITIAL_BUILD_CHUNKS` prefix (the constant
+    /// is reused deliberately: identical bound to the contextual Phase A). v1
+    /// hands f32 embeddings to the writer's DEFAULT (exhaustive) assignment, so
+    /// the resulting index is byte-compatible with the reference PLAID layout;
+    /// the writer's `with_assigner` shortlist hook is a deferred optimization.
+    fn build_cinder<F>(
+        &mut self,
+        chunk_ids: &[u64],
+        mut fetch: F,
+        cinder: &CinderEncoder,
+        centroids: ndarray::Array2<f32>,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
+    {
+        use next_plaid::{CompiledIndexWriter, IndexConfig};
+
+        if chunk_ids.is_empty() {
+            tracing::info!("No chunks to encode for PLAID index");
+            return Ok(());
+        }
+
+        let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
+        if self.plaid_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.plaid_dir);
+        }
+        std::fs::create_dir_all(&self.plaid_dir)?;
+
+        let config = IndexConfig {
+            nbits: self.nbits,
+            batch_size: 1024,
+            force_cpu: true,
+            ..Default::default()
+        };
+
+        // Bounded residual-stats sample = the first INITIAL_BUILD_CHUNKS.min(total)
+        // docs' embeddings (same constant/bound as the contextual Phase A).
+        let split = chunk_ids.len().min(INITIAL_BUILD_CHUNKS);
+        let (initial_ids, remainder_ids) = chunk_ids.split_at(split);
+
+        let mut full_mapping: Vec<u64> = Vec::with_capacity(chunk_ids.len());
+        let mut sample: Vec<TokenEmbeddings> = Vec::with_capacity(initial_ids.len());
+        for batch_ids in initial_ids.chunks(PLAID_BATCH) {
+            if let Err(e) = crate::memory::check_rss_or_abort("cinder encode (sample)") {
+                anyhow::bail!("Indexing aborted: {e}");
+            }
+            let batch = fetch(batch_ids)?;
+            if batch.is_empty() {
+                continue;
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+            let embeddings = cinder.encode_documents(&contents)?;
+            sample.extend(embeddings);
+            full_mapping.extend(batch.iter().map(|(id, _)| *id));
+        }
+
+        if sample.is_empty() {
+            tracing::info!("No chunks to encode for PLAID index");
+            return Ok(());
+        }
+
+        // Build the writer from the frozen centroids + the sample, then feed the
+        // WHOLE corpus: the held sample first (same order), then the remainder.
+        let mut writer = CompiledIndexWriter::new(&plaid_dir_str, centroids, &config, &sample)?;
+        for doc in &sample {
+            writer.add_document(doc)?;
+        }
+        drop(sample); // free the bounded prefix before streaming the remainder
+        crate::memory::purge_allocator();
+
+        for batch_ids in remainder_ids.chunks(PLAID_APPEND_BATCH) {
+            if let Err(e) = crate::memory::check_rss_or_abort("cinder encode (stream)") {
+                anyhow::bail!("Indexing aborted: {e}");
+            }
+            let batch = fetch(batch_ids)?;
+            if batch.is_empty() {
+                continue;
+            }
+            let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+            let embeddings = cinder.encode_documents(&contents)?;
+            for (doc, (chunk_id, _)) in embeddings.iter().zip(batch.iter()) {
+                writer.add_document(doc)?;
+                full_mapping.push(*chunk_id);
+            }
+            crate::memory::purge_allocator();
+        }
+
+        let meta = writer.finalize()?;
+        anyhow::ensure!(
+            meta.num_documents == full_mapping.len(),
+            "cinder build wrote {} docs but mapping has {} entries — contract violated",
+            meta.num_documents,
+            full_mapping.len(),
+        );
+        write_mapping_atomic(&self.mapping_path, &full_mapping)?;
+        tracing::info!(
+            "PLAID index built via cinder ({} chunks)",
+            full_mapping.len()
+        );
         Ok(())
     }
 
@@ -729,6 +912,215 @@ mod tests {
         assert_eq!(uc.external_centroids_npy.as_deref(), cpath.to_str());
         let (ic, uc) = b.next_plaid_configs(None);
         assert!(ic.external_centroids_npy.is_none() && uc.external_centroids_npy.is_none());
+    }
+
+    // ── cinder_for_build gating (Task 6) ────────────────────────────────────
+
+    /// Run `f` with `SEMANTEX_CINDER` set to `val` (or unset when `None`),
+    /// restoring the prior value, serialized by the crate-wide
+    /// [`super::CINDER_ENV_LOCK`] — mirrors `with_frozen_centroids_env` /
+    /// `with_static_doc_embed_env`, but uses the shared module-scoped lock so it
+    /// also serializes against `model::spec`'s fingerprint-invariance test.
+    fn with_cinder_env<F: FnOnce()>(val: Option<&str>, f: F) {
+        let _guard = super::CINDER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_CINDER").ok();
+        // SAFETY: guarded by CINDER_ENV_LOCK.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("SEMANTEX_CINDER", v),
+                None => std::env::remove_var("SEMANTEX_CINDER"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: guarded by CINDER_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_CINDER", v),
+                None => std::env::remove_var("SEMANTEX_CINDER"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Write the three Cinder artifact files (contents don't matter for the
+    /// flag-off test — the load is never reached) so "artifacts present" is
+    /// literally true.
+    fn write_placeholder_cinder_artifacts(dir: &Path) {
+        for name in [
+            "static_token_table.bin",
+            "cinder_mixer.bin",
+            "cinder_shortlists.bin",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn cinder_for_build_off_without_env_flag() {
+        // (a) flag unset → None even with all three artifacts present (the flag
+        // gate short-circuits before any load is attempted).
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_placeholder_cinder_artifacts(tmp.path());
+        with_cinder_env(None, || {
+            assert!(cinder_for_build(tmp.path()).is_none());
+        });
+    }
+
+    #[test]
+    fn cinder_for_build_on_with_flag_but_mixer_missing_returns_none() {
+        // (b) flag on + a valid table but NO mixer → the constructor fails
+        // (naming cinder_mixer.bin, asserted directly in cinder.rs) and
+        // cinder_for_build WARNS and returns None rather than propagating —
+        // the existing tier chain must proceed untouched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::embedding::static_table::StaticTokenTable::new(4, 2, [0.0, 0.0, 1.0, 0.0, 0.0])
+            .save(&model_manager::static_token_table_path(tmp.path()))
+            .unwrap();
+        with_cinder_env(Some("1"), || {
+            assert!(
+                cinder_for_build(tmp.path()).is_none(),
+                "a set flag with a missing mixer must fall back (None), never error"
+            );
+        });
+    }
+
+    /// End-to-end Cinder build (spec §4, plan Task 6 Step 4): train the four
+    /// REAL Cinder artifacts from the downloaded teacher over a synthetic
+    /// corpus, build a small index with `SEMANTEX_CINDER=1`, and verify
+    /// (i) the build succeeds, (ii) `MmapIndex::load` works and `num_documents`
+    /// matches, (iii) a distinctive token retrieves its chunk top-1 via the
+    /// normal query path. `#[ignore]`'d like this file's other model-gated
+    /// tests; the real model dir is never mutated (temp overlay symlinks it in,
+    /// only the overlay receives the trained artifacts).
+    #[test]
+    #[ignore = "requires the downloaded LateOn-Code-edge model and real Cinder artifacts"]
+    fn cinder_build_produces_searchable_index() {
+        use crate::config::SemantexConfig;
+        use crate::embedding::centroid_train::{
+            CentroidTrainOptions, save_centroids_npy, train_centroids,
+        };
+        use crate::embedding::mixer_train::{MixerTrainOptions, train_mixer};
+        use crate::embedding::shortlists::CentroidShortlists;
+        use crate::embedding::static_distill::distill;
+
+        let real_models_dir = SemantexConfig::default().models_dir();
+        let real_model_dir = model_manager::ensure_colbert_model(&real_models_dir)
+            .expect("LateOn-Code-edge must be downloaded for this ignored test");
+
+        // Overlay model dir: symlink the real files in so ensure_colbert_model
+        // is satisfied without touching the real model dir; only the overlay
+        // receives the trained artifacts.
+        let overlay = tempfile::TempDir::new().unwrap();
+        let overlay_model_dir = overlay.path().join("LateOn-Code-edge");
+        std::fs::create_dir_all(&overlay_model_dir).unwrap();
+        for file in ["model_int8.onnx", "tokenizer.json", "onnx_config.json"] {
+            let src = real_model_dir.join(file);
+            let dst = overlay_model_dir.join(file);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&src, &dst).unwrap();
+            #[cfg(not(unix))]
+            std::fs::copy(&src, &dst).unwrap();
+        }
+
+        // Real teacher + synthetic corpus; distill table, train mixer, train
+        // frozen centroids, derive shortlists — all four Cinder artifacts.
+        let teacher = ColbertEmbedder::for_indexing(&overlay_model_dir).unwrap();
+        let corpus: Vec<String> = (0..50)
+            .map(|i| format!("fn cinder_helper_{i}(x: i32) -> i32 {{ x * {i} + 1 }}"))
+            .collect();
+
+        let table = distill(&teacher, corpus.clone().into_iter(), 8).unwrap();
+        table
+            .save(&model_manager::static_token_table_path(&overlay_model_dir))
+            .unwrap();
+
+        let (mixer, _report) = train_mixer(
+            &teacher,
+            &table,
+            corpus.clone().into_iter(),
+            &MixerTrainOptions {
+                sample_capacity: 50_000,
+                epochs: 2,
+                batch: 8,
+                lr: 1e-3,
+                holdout_frac: 0.1,
+            },
+        )
+        .unwrap();
+        mixer
+            .save(&model_manager::cinder_mixer_path(&overlay_model_dir))
+            .unwrap();
+
+        let centroids = train_centroids(
+            &teacher,
+            corpus.clone().into_iter(),
+            &CentroidTrainOptions {
+                num_centroids: 16,
+                sample_capacity: 50_000,
+                batch: 8,
+            },
+        )
+        .unwrap();
+        save_centroids_npy(
+            &model_manager::frozen_centroids_path(&overlay_model_dir),
+            &centroids,
+        )
+        .unwrap();
+
+        CentroidShortlists::derive(&table, &centroids.view(), 8)
+            .unwrap()
+            .save(&model_manager::cinder_shortlists_path(&overlay_model_dir))
+            .unwrap();
+
+        // Distinctive chunks to index + search.
+        let chunks: Vec<(u64, String)> = (0u64..50)
+            .map(|i| {
+                (
+                    i,
+                    format!("fn cinder_helper_{i}(x: i32) -> i32 {{ x * {i} + 1 }}"),
+                )
+            })
+            .collect();
+        let chunk_ids: Vec<u64> = chunks.iter().map(|(id, _)| *id).collect();
+        let fetch = |batch_ids: &[u64]| -> Result<Vec<(u64, String)>> {
+            Ok(batch_ids
+                .iter()
+                .map(|&id| (id, chunks[id as usize].1.clone()))
+                .collect())
+        };
+
+        // (i) build with SEMANTEX_CINDER=1.
+        let idx_dir = tempfile::TempDir::new().unwrap();
+        with_cinder_env(Some("1"), || {
+            let mut builder = ColbertPlaidIndexBuilder::new(idx_dir.path(), 4)
+                .with_models_dir(overlay.path().to_path_buf());
+            builder
+                .build_streaming_ids(&chunk_ids, fetch)
+                .expect("cinder build must succeed");
+        });
+
+        // (ii) MmapIndex::load works and num_documents matches.
+        let plaid_dir_str = idx_dir.path().to_string_lossy().into_owned();
+        let loaded = next_plaid::MmapIndex::load(&plaid_dir_str).unwrap();
+        assert_eq!(loaded.metadata.num_documents, chunks.len());
+
+        // (iii) a distinctive token retrieves its chunk top-1.
+        let mapping_path = idx_dir.path().join("plaid_mapping.bin");
+        let backend =
+            ColbertPlaidBackend::open(idx_dir.path(), &mapping_path, &overlay_model_dir).unwrap();
+        let hits = backend.search("cinder_helper_7", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "search must return hits after a cinder build"
+        );
+        assert_eq!(
+            hits[0].chunk_id, 7,
+            "the distinctive token must retrieve its own chunk top-1"
+        );
     }
 
     // ── DocEncoderKind::for_indexing selection (Task 6) ─────────────────────

@@ -1,4 +1,5 @@
 pub mod centroid_train;
+pub mod cinder;
 pub mod colbert;
 pub mod mixer;
 pub mod mixer_train;

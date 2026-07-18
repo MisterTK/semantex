@@ -160,6 +160,16 @@ impl ModelRegistry {
     /// (frozen universal centroids vs. per-corpus K-means), not this identity's
     /// id/dims/pooling/quant/normalization/prefixes — so toggling it never
     /// forces a re-embed.
+    ///
+    /// Also deliberately excluded: `SEMANTEX_CINDER` (the Cinder compiled-
+    /// indexing fast path; see `search::colbert_plaid_backend::cinder_for_build`).
+    /// Same rationale — it is a build-time doc-side option selecting an
+    /// encoder-free, mixer-based document embedding produced from frozen
+    /// artifacts, and v1 hands those f32 embeddings to the same PLAID writer /
+    /// codec, so it does not change this identity's
+    /// id/dims/pooling/quant/normalization/prefixes. Folding it in would make
+    /// every flip auto-invalidate the index; instead A/B-ing the Cinder tier
+    /// against the same corpus uses an explicit, manual `semantex index` rebuild.
     pub fn active_embedder_fingerprint(&self) -> Result<String> {
         let spec = self.active_embedder()?;
         let RoleData::Embedder(data) = &spec.role_data else {
