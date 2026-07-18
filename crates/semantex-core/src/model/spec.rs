@@ -520,6 +520,18 @@ mod tests {
         };
         assert!(e.static_token_table.is_none());
         assert!(e.frozen_centroids.is_none());
+
+        // Real TOML roundtrip: a minimal embedder table that omits both aux
+        // artifact keys entirely must still deserialize with both as None.
+        let doc = r#"
+            dims = 768
+            max_context = 8192
+            pooling = "cls"
+            quant = "int8_symmetric"
+        "#;
+        let parsed: EmbedderSpec = toml::from_str(doc).unwrap();
+        assert!(parsed.static_token_table.is_none());
+        assert!(parsed.frozen_centroids.is_none());
     }
 
     #[test]

@@ -2173,6 +2173,29 @@ mod tests {
     }
 
     #[test]
+    fn external_centroids_corrupt_file_falls_back_to_training() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("idx");
+        let dim = 8;
+        let docs: Vec<Array2<f32>> = (0..12)
+            .map(|d| Array2::from_shape_fn((5, dim), |(i, j)| ((d + i + j) as f32).cos()))
+            .collect();
+        let cpath = tmp.path().join("corrupt.npy");
+        std::fs::write(&cpath, b"not an npy file").unwrap();
+        let config = IndexConfig {
+            nbits: 2,
+            force_cpu: true,
+            external_centroids_npy: Some(cpath.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        // Must NOT error — falls back to training per-repo centroids.
+        let meta =
+            create_index_with_kmeans_files(&docs, index_path.to_str().unwrap(), &config).unwrap();
+        assert!(meta.num_partitions > 0);
+        assert!(index_path.join("centroids.npy").exists());
+    }
+
+    #[test]
     fn external_centroids_dim_mismatch_falls_back_to_training() {
         use ndarray_npy::WriteNpyExt;
         let tmp = tempfile::TempDir::new().unwrap();

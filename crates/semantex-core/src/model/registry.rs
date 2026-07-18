@@ -152,6 +152,14 @@ impl ModelRegistry {
     /// Instead flipping it requires an explicit, manual `semantex index`
     /// rebuild — exactly the mechanism the Gate-1 harness (Task 7) uses to
     /// A/B the two tiers against the same corpus.
+    ///
+    /// Also deliberately excluded: `SEMANTEX_FROZEN_CENTROIDS` (Ember Plan B —
+    /// frozen universal PLAID centroids; see `EmbedderSpec::frozen_centroids`).
+    /// Like `SEMANTEX_STATIC_DOC_EMBED`, this is a build-time doc-side option:
+    /// it only changes HOW the document side's PLAID index is quantized/built
+    /// (frozen universal centroids vs. per-corpus K-means), not this identity's
+    /// id/dims/pooling/quant/normalization/prefixes — so toggling it never
+    /// forces a re-embed.
     pub fn active_embedder_fingerprint(&self) -> Result<String> {
         let spec = self.active_embedder()?;
         let RoleData::Embedder(data) = &spec.role_data else {
