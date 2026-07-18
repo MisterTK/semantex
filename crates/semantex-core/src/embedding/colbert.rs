@@ -594,10 +594,11 @@ impl ColbertEmbedder {
 
     /// Number of vocab tokens actually reachable on the document side. With
     /// `do_lower_case: true` (LateOn's onnx_config), any token containing an
-    /// uppercase character can never be produced from lowered input — 25.7%
-    /// of the LateOn vocab (see results/ember-gate1/vocab-coverage-
-    /// investigation.md). Data-driven: when the model config doesn't lower,
-    /// this equals `tokenizer_vocab_size`.
+    /// uppercase character can never be produced from lowered input —
+    /// 25.9% of the LateOn vocab (13,035 of 50,370, empirically measured;
+    /// see results/ember-gate1/vocab-coverage-investigation.md, which
+    /// independently reports 12,953). Data-driven: when the model config
+    /// doesn't lower, this equals `tokenizer_vocab_size`.
     ///
     /// # Implementation note: must check the *decoded* token, not the raw
     /// vocab key
@@ -615,6 +616,24 @@ impl ColbertEmbedder {
     /// the investigation doc's 12,953 within expected special-token
     /// variance). Decoding each id is the only correct way to answer "would
     /// lowercasing ever produce this token".
+    ///
+    /// # This count is an approximation, not an exact reachability oracle
+    ///
+    /// Byte-level BPE vocabularies also contain **byte-fragment** tokens —
+    /// pieces of a multi-byte UTF-8 codepoint that only form valid text when
+    /// concatenated with a sibling fragment from the same original
+    /// character. Decoded in isolation (as this method does, one id at a
+    /// time), such a fragment either renders as a Unicode replacement
+    /// character (U+FFFD) — counted as "reachable" with no real basis, since
+    /// replacement chars are never case-bearing — or `decode` returns an
+    /// error, which `.is_ok_and(...)` silently treats as "not reachable"
+    /// even though the fragment may in fact be produced by real tokenization
+    /// (just never standalone). Neither outcome is validated against actual
+    /// document-side tokenization. The returned count is therefore a
+    /// **diagnostic approximation** — accurate enough to distinguish "most
+    /// of the vocab is reachable" from "half of it is" (the bug this method
+    /// replaced), but not a byte-for-byte guarantee for every id. Do not
+    /// treat it as an exact reachability oracle.
     ///
     /// # Errors
     ///
