@@ -180,10 +180,27 @@ impl StaticTokenTable {
             cursor += 4;
         }
 
-        // Read data
-        let expected_data_size = vocab_size * dims * 2; // f16 is 2 bytes
-        if cursor + expected_data_size > buf.len() {
-            anyhow::bail!("file too short for data");
+        // Read data — all size arithmetic checked. A forged header can put
+        // arbitrary u32s in vocab_size/dims; unchecked `vocab_size * dims * 2`
+        // can wrap (32-bit usize, or u32::MAX² on 64-bit), letting the bounds
+        // check pass and the row loop read past `buf`. Additionally reject any
+        // claimed data size larger than the actual file remainder BEFORE
+        // allocating vocab_size rows, so a 40-byte forged file can never
+        // request a multi-GB allocation.
+        let expected_data_size = vocab_size
+            .checked_mul(dims)
+            .and_then(|n| n.checked_mul(2)) // f16 is 2 bytes
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "implausibly large table header: vocab_size {vocab_size} × dims {dims} overflows"
+                )
+            })?;
+        let remaining = buf.len() - cursor; // cursor ≤ buf.len() holds here
+        if expected_data_size > remaining {
+            anyhow::bail!(
+                "file too short for data: header claims {expected_data_size} bytes, \
+                 {remaining} remain"
+            );
         }
         let mut data = vec![vec![0.0f32; dims]; vocab_size];
         for row in &mut data {
@@ -231,5 +248,61 @@ mod tests {
         std::fs::write(&path, b"NOPE1234").unwrap();
         let err = StaticTokenTable::load(&path).unwrap_err();
         assert!(err.to_string().contains("magic"), "got: {err}");
+    }
+
+    /// Build a syntactically valid SXST header with attacker-chosen
+    /// vocab_size/dims and no (or tiny) data section.
+    fn forged_header(vocab_size: u32, dims: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"SXST");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&vocab_size.to_le_bytes());
+        buf.extend_from_slice(&dims.to_le_bytes());
+        for _ in 0..5 {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn load_rejects_overflowing_vocab_times_dims() {
+        // vocab_size * dims * 2 wraps a 32-bit usize and, at u32::MAX * u32::MAX,
+        // even exceeds u64 when multiplied out naively — the checked path must
+        // reject it as an error, not pass the bounds check.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("forged.bin");
+        std::fs::write(&path, forged_header(u32::MAX, u32::MAX)).unwrap();
+        let err = StaticTokenTable::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("implausibly large") || msg.contains("overflow"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_huge_but_non_overflowing_header() {
+        // 100M vocab × 65k dims doesn't wrap on 64-bit but is an implausible
+        // (multi-TB) allocation request from a 40-byte file — must error out
+        // BEFORE any allocation is attempted.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("huge.bin");
+        std::fs::write(&path, forged_header(100_000_000, 65_536)).unwrap();
+        let err = StaticTokenTable::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("implausibly large") || msg.contains("file too short"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_truncated_data_section() {
+        // Plausible header (10 × 4) but zero data bytes → clean error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("trunc.bin");
+        std::fs::write(&path, forged_header(10, 4)).unwrap();
+        let err = StaticTokenTable::load(&path).unwrap_err();
+        assert!(err.to_string().contains("file too short"), "got: {err}");
     }
 }
