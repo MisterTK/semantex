@@ -97,3 +97,7 @@ settings.local.json
 !/results/lateon-vs-coderank-quality/
 /results/lateon-vs-coderank-quality/*
 !/results/lateon-vs-coderank-quality/report.md
+# Exception: Ember Plan A Gate 1 evaluation report (committed report, not raw run data).
+!/results/ember-gate1/
+/results/ember-gate1/*
+!/results/ember-gate1/report.md
