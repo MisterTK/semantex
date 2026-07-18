@@ -4,6 +4,7 @@ pub mod mixer;
 pub mod mixer_train;
 pub mod model_manager;
 pub mod runtime_manager;
+pub mod shortlists;
 pub mod single_vector;
 pub mod single_vector_model;
 pub mod static_distill;

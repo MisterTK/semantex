@@ -54,6 +54,11 @@ impl StaticTokenTable {
         self.data[idx].copy_from_slice(row);
     }
 
+    /// Number of rows (vocab size) in the table.
+    pub fn vocab_size(&self) -> usize {
+        self.data.len()
+    }
+
     /// Look up the embedding for a token.
     ///
     /// Returns `None` if the token is out-of-vocabulary or if the row is all zeros

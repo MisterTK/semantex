@@ -18,6 +18,10 @@ const LATEON_CODE_EDGE_DIR: &str = "LateOn-Code-edge";
 pub const STATIC_TOKEN_TABLE_FILE: &str = "static_token_table.bin";
 /// Filename of the Ember Plan-B frozen universal centroids inside a model dir.
 pub const FROZEN_CENTROIDS_FILE: &str = "frozen_centroids.npy";
+/// Filename of the Cinder micro-mixer inside a model dir.
+pub const CINDER_MIXER_FILE: &str = "cinder_mixer.bin";
+/// Filename of the Cinder centroid shortlists (SXCS) inside a model dir.
+pub const CINDER_SHORTLISTS_FILE: &str = "cinder_shortlists.bin";
 
 /// Resolve the Ember Tier-0 static token table's path inside `model_dir`.
 pub fn static_token_table_path(model_dir: &Path) -> PathBuf {
@@ -27,6 +31,16 @@ pub fn static_token_table_path(model_dir: &Path) -> PathBuf {
 /// Resolve the Ember Plan-B frozen universal centroids' path inside `model_dir`.
 pub fn frozen_centroids_path(model_dir: &Path) -> PathBuf {
     model_dir.join(FROZEN_CENTROIDS_FILE)
+}
+
+/// Resolve the Cinder micro-mixer's path inside `model_dir`.
+pub fn cinder_mixer_path(model_dir: &Path) -> PathBuf {
+    model_dir.join(CINDER_MIXER_FILE)
+}
+
+/// Resolve the Cinder centroid shortlists' path inside `model_dir`.
+pub fn cinder_shortlists_path(model_dir: &Path) -> PathBuf {
+    model_dir.join(CINDER_SHORTLISTS_FILE)
 }
 
 /// Download LateOn-Code-edge ColBERT model if not already cached. Provisioning for
