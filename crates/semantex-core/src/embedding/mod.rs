@@ -1,6 +1,7 @@
 pub mod centroid_train;
 pub mod colbert;
 pub mod mixer;
+pub mod mixer_train;
 pub mod model_manager;
 pub mod runtime_manager;
 pub mod single_vector;

@@ -13,6 +13,7 @@ const MAGIC: &[u8; 4] = b"SXCM";
 const VERSION: u32 = 1;
 const MAX_DIMS: usize = 4096; // implausibility cap for forged headers
 
+#[derive(Debug)]
 pub struct MicroMixer {
     pub dims: usize,
     pub dw: Vec<f32>,
