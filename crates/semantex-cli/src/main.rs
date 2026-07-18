@@ -469,6 +469,27 @@ enum Commands {
     /// Only available when built with `--features llm`.
     #[cfg(feature = "llm")]
     LlmStatus,
+    /// Distill a static per-token embedding table from the ColBERT document
+    /// encoder (Ember Plan A, Task 4 — see
+    /// `docs/superpowers/plans/2026-07-17-ember-plan-a-gate1.md`). Internal
+    /// dev/eval tooling for the Gate-1 quality decision, not a stable
+    /// user-facing command.
+    #[command(hide = true)]
+    DistillStaticTable {
+        /// Corpus directory to walk (repeatable: pass `--corpus` multiple
+        /// times to concatenate several directories into one corpus).
+        #[arg(long = "corpus", value_name = "DIR", required = true)]
+        corpus: Vec<PathBuf>,
+
+        /// Output path for the distilled `static_token_table.bin`.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+
+        /// After saving, reload the table via `StaticTokenTable::load` and
+        /// print its dims (sanity-checks the save/load round trip).
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 /// Resolve the ONNX Runtime shared library for `ort`'s load-dynamic mode.
@@ -1232,6 +1253,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Commands::DistillStaticTable {
+            corpus,
+            out,
+            verify,
+        }) => commands::distill_static_table::run(&corpus, &out, verify),
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {
