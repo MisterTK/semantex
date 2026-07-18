@@ -5,12 +5,12 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
-use ndarray::{s, Array1, Array2, Axis};
+use ndarray::{Array1, Array2, Axis, s};
 use serde::{Deserialize, Serialize};
 
 use crate::codec::ResidualCodec;
 use crate::error::{Error, Result};
-use crate::kmeans::{compute_kmeans, ComputeKmeansConfig};
+use crate::kmeans::{ComputeKmeansConfig, compute_kmeans};
 use crate::utils::{atomic_write_file, quantile, quantiles};
 
 /// CPU implementation of fused compress_into_codes + residual computation.
@@ -71,6 +71,13 @@ pub struct IndexConfig {
     /// Default: `Unicode61` (word-level). Use `Trigram` for code / substring search.
     #[serde(default)]
     pub fts_tokenizer: crate::text_search::FtsTokenizer,
+    /// Optional path to pre-trained ("frozen universal") centroids as an .npy
+    /// Array2<f32> of shape [k, dim]. When set and loadable with matching dim,
+    /// index creation uses these centroids verbatim and SKIPS k-means training.
+    /// Any load problem (missing file, parse error, dim mismatch) falls back to
+    /// per-repo training with a warning — never an error.
+    #[serde(default)]
+    pub external_centroids_npy: Option<String>,
 }
 
 fn default_start_from_scratch() -> usize {
@@ -97,6 +104,7 @@ impl Default for IndexConfig {
             start_from_scratch: crate::default_start_from_scratch(),
             force_cpu: false,
             fts_tokenizer: crate::text_search::FtsTokenizer::default(),
+            external_centroids_npy: None,
         }
     }
 }
@@ -752,7 +760,10 @@ pub fn create_index_files(
                             Ok(result) => result,
                             Err(e) => {
                                 if force_gpu {
-                                    panic!("FORCE_GPU is set but CUDA compress_and_residuals failed: {}", e);
+                                    panic!(
+                                        "FORCE_GPU is set but CUDA compress_and_residuals failed: {}",
+                                        e
+                                    );
                                 }
                                 eprintln!(
                                     "[next-plaid] CUDA compress_and_residuals failed: {}, falling back to CPU",
@@ -910,6 +921,44 @@ pub fn create_index_files(
     Ok(metadata)
 }
 
+/// Try to load externally supplied centroids per `config.external_centroids_npy`.
+/// Returns `None` (caller trains per-repo) unless the file loads as an
+/// Array2<f32> whose column count matches the embeddings' dim; every failure
+/// path warns on stderr (this crate's existing logging idiom) and falls back.
+fn load_external_centroids(
+    config: &IndexConfig,
+    embeddings: &[Array2<f32>],
+) -> Option<Array2<f32>> {
+    let path = config.external_centroids_npy.as_deref()?;
+    let dim = embeddings.first().map(|e| e.ncols())?;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("external centroids {path}: open failed ({e}); training per-repo k-means");
+            return None;
+        }
+    };
+    let centroids: Array2<f32> = match ndarray_npy::ReadNpyExt::read_npy(file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "external centroids {path}: npy parse failed ({e}); training per-repo k-means"
+            );
+            return None;
+        }
+    };
+    if centroids.ncols() != dim || centroids.nrows() == 0 {
+        eprintln!(
+            "external centroids {path}: shape [{}, {}] incompatible with embedding dim {dim}; \
+             training per-repo k-means",
+            centroids.nrows(),
+            centroids.ncols()
+        );
+        return None;
+    }
+    Some(centroids)
+}
+
 /// Create index files with automatic K-means centroid computation.
 ///
 /// This is a standalone function that runs K-means to compute centroids,
@@ -955,8 +1004,12 @@ pub fn create_index_with_kmeans_files(
         force_cpu: config.force_cpu,
     };
 
-    // Compute centroids using fast-plaid's approach
-    let centroids = compute_kmeans(embeddings, &kmeans_config)?;
+    // Compute centroids: external frozen centroids when configured and valid,
+    // else fast-plaid-style k-means training.
+    let centroids = match load_external_centroids(config, embeddings) {
+        Some(c) => c,
+        None => compute_kmeans(embeddings, &kmeans_config)?,
+    };
 
     // Create the index files
     let metadata = create_index_files(embeddings, centroids, index_path, config)?;
@@ -1481,6 +1534,7 @@ impl MmapIndex {
                     n_samples_kmeans: config.n_samples_kmeans,
                     start_from_scratch: config.start_from_scratch,
                     force_cpu: config.force_cpu,
+                    external_centroids_npy: config.external_centroids_npy.clone(),
                     ..Default::default()
                 };
 
@@ -2057,5 +2111,89 @@ mod tests {
                 .expect("Failed to update index");
         assert_eq!(index2.metadata.num_documents, 8);
         assert_eq!(doc_ids2, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn external_centroids_are_used_verbatim() {
+        use ndarray_npy::{ReadNpyExt, WriteNpyExt};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("idx");
+        let dim = 8;
+        // 4 fixed centroids we can recognize on disk afterwards.
+        let ext: Array2<f32> =
+            Array2::from_shape_fn((4, dim), |(i, j)| if j == i { 1.0 } else { 0.0 });
+        let cpath = tmp.path().join("frozen.npy");
+        ext.write_npy(std::fs::File::create(&cpath).unwrap())
+            .unwrap();
+
+        let docs: Vec<Array2<f32>> = (0..12)
+            .map(|d| Array2::from_shape_fn((5, dim), |(i, j)| ((d + i + j) as f32).sin()))
+            .collect();
+        let config = IndexConfig {
+            nbits: 2,
+            force_cpu: true,
+            external_centroids_npy: Some(cpath.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        create_index_with_kmeans_files(&docs, index_path.to_str().unwrap(), &config).unwrap();
+
+        let written: Array2<f32> =
+            Array2::read_npy(std::fs::File::open(index_path.join("centroids.npy")).unwrap())
+                .unwrap();
+        assert_eq!(
+            written, ext,
+            "index must carry the external centroids verbatim"
+        );
+    }
+
+    #[test]
+    fn external_centroids_missing_file_falls_back_to_training() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("idx");
+        let dim = 8;
+        let docs: Vec<Array2<f32>> = (0..12)
+            .map(|d| Array2::from_shape_fn((5, dim), |(i, j)| ((d + i + j) as f32).cos()))
+            .collect();
+        let config = IndexConfig {
+            nbits: 2,
+            force_cpu: true,
+            external_centroids_npy: Some(
+                tmp.path()
+                    .join("does_not_exist.npy")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+        // Must NOT error — trains per-repo centroids instead.
+        let meta =
+            create_index_with_kmeans_files(&docs, index_path.to_str().unwrap(), &config).unwrap();
+        assert!(meta.num_partitions > 0);
+        assert!(index_path.join("centroids.npy").exists());
+    }
+
+    #[test]
+    fn external_centroids_dim_mismatch_falls_back_to_training() {
+        use ndarray_npy::WriteNpyExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_path = tmp.path().join("idx");
+        let ext: Array2<f32> = Array2::zeros((4, 16)); // wrong dim (docs are 8)
+        let cpath = tmp.path().join("frozen.npy");
+        ext.write_npy(std::fs::File::create(&cpath).unwrap())
+            .unwrap();
+        let docs: Vec<Array2<f32>> = (0..12)
+            .map(|d| Array2::from_shape_fn((5, 8), |(i, j)| ((d * i + j) as f32).sin()))
+            .collect();
+        let config = IndexConfig {
+            nbits: 2,
+            force_cpu: true,
+            external_centroids_npy: Some(cpath.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let meta =
+            create_index_with_kmeans_files(&docs, index_path.to_str().unwrap(), &config).unwrap();
+        // Fallback trained centroids have the DOCS' dim, and there's no way 4
+        // zero-vectors of dim 16 got through.
+        assert!(meta.num_partitions > 0);
     }
 }

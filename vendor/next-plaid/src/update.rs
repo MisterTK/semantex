@@ -15,15 +15,15 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use ndarray::{s, Array1, Array2, Axis};
+use ndarray::{Array1, Array2, Axis, s};
 use rayon::prelude::*;
 
 use crate::codec::ResidualCodec;
 use crate::error::Error;
 use crate::error::Result;
 use crate::index::Metadata;
-use crate::kmeans::compute_kmeans;
 use crate::kmeans::ComputeKmeansConfig;
+use crate::kmeans::compute_kmeans;
 use crate::utils::atomic_write_file;
 use crate::utils::quantile;
 
@@ -90,6 +90,12 @@ pub struct UpdateConfig {
     /// Force CPU execution for K-means even when CUDA feature is enabled.
     #[serde(default)]
     pub force_cpu: bool,
+    /// Optional path to pre-trained ("frozen universal") centroids as an .npy
+    /// Array2<f32> of shape [k, dim]. Threaded into the start-from-scratch
+    /// `IndexConfig` rebuild; see `IndexConfig::external_centroids_npy` for the
+    /// full load/fallback contract.
+    #[serde(default)]
+    pub external_centroids_npy: Option<String>,
 }
 
 impl Default for UpdateConfig {
@@ -103,6 +109,7 @@ impl Default for UpdateConfig {
             start_from_scratch: crate::default_start_from_scratch(),
             buffer_size: 100,
             force_cpu: false,
+            external_centroids_npy: None,
         }
     }
 }
@@ -1123,8 +1130,8 @@ pub fn update_index(
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     #[test]
