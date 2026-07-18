@@ -544,6 +544,34 @@ impl ColbertEmbedder {
             .collect()
     }
 
+    /// Vocabulary size of the tokenizer this embedder uses for document
+    /// token-id alignment (see [`ColbertEmbedder::encode_documents_with_ids`]).
+    /// Used by static-table distillation (Task 3) to size its per-token
+    /// accumulators (`vocab_size × dims`) up front.
+    ///
+    /// Passes `with_added_tokens: true` so the reported size matches the
+    /// id-space `encode_documents_with_ids` can actually emit — added
+    /// special tokens (like the `[D]` document marker) occupy ids inside
+    /// that space, and an accumulator sized without them could be too
+    /// small, causing an out-of-bounds write for legitimate ids the encoder
+    /// hands back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the tokenizer/config files under
+    /// `model_dir` are missing or malformed — the same failure
+    /// [`ColbertEmbedder::encode_documents_with_ids`] would hit on its own
+    /// first call (`id_alignment()` is shared, memoizing HF-crate
+    /// `tokenizer.json` file access with a slow tokenizer, and
+    /// `onnx_config.json` parsing). There is no runtime scenario where the
+    /// model directory would be valid at construction and then go missing
+    /// mid-process; it is not user-editable at runtime, so this is a
+    /// construction-time integrity property of the embedder, not something
+    /// that "presently is, then later isn't".
+    pub fn tokenizer_vocab_size(&self) -> Result<usize> {
+        Ok(self.id_alignment()?.tokenizer.get_vocab_size(true))
+    }
+
     /// Returns true if the ONNX session has been materialized.
     /// Test/diagnostics helper — not used in production paths.
     #[doc(hidden)]
