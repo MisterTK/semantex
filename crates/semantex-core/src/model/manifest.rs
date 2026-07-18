@@ -64,7 +64,8 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
         // Apache-2.0) and the SHIPPED DEFAULT embedder (2026-06-02 cutover). The
         // spec id is model-descriptive (`lateon-colbert`); its multi-vector
         // capability routes it to the `colbert-plaid` BACKEND. coderank-137m /
-        // coderank-hnsw remains a first-class opt-in.
+        // coderank-hnsw is a legacy opt-in only — see config.rs's `embedder`
+        // default comment for why it's not a target for further investment.
         ModelSpec {
             id: "lateon-colbert".to_string(),
             role: ModelRole::Embedder,

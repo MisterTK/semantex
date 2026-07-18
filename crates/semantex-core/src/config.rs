@@ -159,7 +159,13 @@ impl Default for SemantexConfig {
             // chunked-real-pipeline A/B (+6.2% nDCG@10 / +12% MRR@10 over
             // coderank, ~10x lower query latency, ~19x smaller index — see
             // docs/superpowers/plans/2026-06-02-item3-realrepo-ab-results.md).
-            // coderank-137m stays a first-class opt-in (SEMANTEX_EMBEDDER=coderank-137m).
+            // coderank-137m / coderank-hnsw is kept registered as a legacy opt-in
+            // (SEMANTEX_EMBEDDER=coderank-137m) for anyone who explicitly wants it,
+            // but per the 2026-07-16 lateon-vs-coderank head-to-head
+            // (results/lateon-vs-coderank-quality/report.md) it is NOT a target for
+            // further investment: no quality edge on the larger/more representative
+            // benchmark, consistently slower, and more timeout-prone on large repos.
+            // Treat it the same as qwen3-embed-0.6b — available, not promoted.
             embedder: "lateon-colbert".to_string(),
             reranker_model: "bge-reranker-v2-m3".to_string(),
             llm_model: String::new(),
