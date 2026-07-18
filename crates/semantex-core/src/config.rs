@@ -321,6 +321,18 @@ pub(crate) fn env_string(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Read a boolean tuning/experiment flag from an environment variable.
+///
+/// `true` when `key` is set to `"1"` or a case-insensitive `"true"`; missing
+/// or any other value is `false`. This is the same truthy convention already
+/// applied ad hoc at several call sites (`SEMANTEX_DENSE_CONTEXT` in
+/// `model/registry.rs::dense_context_enabled`, `SEMANTEX_SEMANTIC_CACHE` in
+/// `search/semantic_cache.rs::is_enabled`) — new boolean env flags should call
+/// this helper instead of re-deriving the parse.
+pub(crate) fn env_bool(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +509,41 @@ mod tests {
         // any global config file); asserting the pool here would be fragile
         // because `load(None)` also reads the global config file.
         assert_eq!(cfg.rerank_top_n, 12, "env overlay sets the scoring window");
+    }
+
+    /// Dedicated lock for `env_bool`'s own env-mutating test — a private probe
+    /// key untouched by any other test, so this doesn't need to share a
+    /// broader family lock like `RERANKER_TEST_ENV_LOCK`.
+    static ENV_BOOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_bool_recognizes_truthy_and_falsy_values() {
+        const KEY: &str = "SEMANTEX_TEST_ENV_BOOL_PROBE";
+        let _g = ENV_BOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: guarded by ENV_BOOL_TEST_LOCK; KEY is private to this test.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert!(!env_bool(KEY), "unset must default to false");
+        for truthy in ["1", "true", "TRUE", "True"] {
+            // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
+            unsafe {
+                std::env::set_var(KEY, truthy);
+            }
+            assert!(env_bool(KEY), "{truthy:?} must be truthy");
+        }
+        for falsy in ["0", "false", "yes", ""] {
+            // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
+            unsafe {
+                std::env::set_var(KEY, falsy);
+            }
+            assert!(!env_bool(KEY), "{falsy:?} must be falsy");
+        }
+        // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
     }
 }

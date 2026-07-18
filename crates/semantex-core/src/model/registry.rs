@@ -140,6 +140,18 @@ impl ModelRegistry {
     /// [`dense_context_enabled`] — the SINGLE env-read site for the fingerprint —
     /// so the builder's write-time fingerprint and `detect_for_config`'s
     /// open-time expected fingerprint can never disagree about it.
+    ///
+    /// Deliberately excluded from this fingerprint: `SEMANTEX_STATIC_DOC_EMBED`
+    /// (Ember Plan A, Task 6 — the tier-0 encoder-free document embedder;
+    /// see `search::colbert_plaid_backend::DocEncoderKind`). Unlike
+    /// `SEMANTEX_DENSE_CONTEXT`, that flag only changes HOW the document side
+    /// of a build computes its per-token embeddings (table-lookup
+    /// approximation vs. the full contextual `ColbertEmbedder`); it does not
+    /// change this identity's id/dims/pooling/quant/normalization/prefixes.
+    /// Folding it in here would make every flip auto-invalidate the index.
+    /// Instead flipping it requires an explicit, manual `semantex index`
+    /// rebuild — exactly the mechanism the Gate-1 harness (Task 7) uses to
+    /// A/B the two tiers against the same corpus.
     pub fn active_embedder_fingerprint(&self) -> Result<String> {
         let spec = self.active_embedder()?;
         let RoleData::Embedder(data) = &spec.role_data else {

@@ -2,8 +2,9 @@
 //! wrapping the ColBERT late-interaction + vendored next-plaid PLAID path.
 //! Behavior is byte-identical to the pre-seam inline PLAID code.
 
-use crate::embedding::colbert::ColbertEmbedder;
+use crate::embedding::colbert::{ColbertEmbedder, TokenEmbeddings};
 use crate::embedding::model_manager;
+use crate::embedding::static_token::StaticTokenEmbedder;
 use crate::search::dense_backend::{DenseBackend, DenseHit, DenseIndexBuilder};
 use crate::search::plaid_search::PlaidSearcher;
 use crate::types::DENSE_TOMBSTONE;
@@ -157,6 +158,67 @@ fn write_mapping_atomic(path: &Path, mapping: &[u64]) -> Result<()> {
     Ok(())
 }
 
+/// Document-side encoder selector for index builds (Ember Plan A, Task 6).
+///
+/// Defaults to the full contextual [`ColbertEmbedder`]. When
+/// `SEMANTEX_STATIC_DOC_EMBED` is set AND a distilled static token table
+/// loads successfully from the model directory, uses the tier-0
+/// encoder-free [`StaticTokenEmbedder`] instead — table lookups + a fixed
+/// mixing formula, no ONNX session per document. This ONLY affects how
+/// document-side embeddings are produced during an index build
+/// (`build_streaming_ids` / `insert_streaming_ids`); **queries and the
+/// search path never construct this type and are completely unaffected**.
+///
+/// See `ModelRegistry::active_embedder_fingerprint`'s doc comment (in
+/// `model/registry.rs`) for why `SEMANTEX_STATIC_DOC_EMBED` is deliberately
+/// excluded from the embedder fingerprint that gates automatic re-embeds.
+enum DocEncoderKind {
+    Contextual(ColbertEmbedder),
+    Static(StaticTokenEmbedder),
+}
+
+impl DocEncoderKind {
+    /// Encode documents into per-token embeddings — same output shape
+    /// contract regardless of which variant is active, so both build call
+    /// sites stay a single code path.
+    fn encode_documents(&self, texts: &[String]) -> Result<Vec<TokenEmbeddings>> {
+        match self {
+            DocEncoderKind::Contextual(embedder) => embedder.encode_documents(texts),
+            DocEncoderKind::Static(embedder) => embedder.encode_documents(texts),
+        }
+    }
+
+    /// Select the document encoder for an index build rooted at `model_dir`.
+    ///
+    /// `SEMANTEX_STATIC_DOC_EMBED` unset (the default) always returns
+    /// [`DocEncoderKind::Contextual`]. When the flag is set, this attempts to
+    /// load a [`StaticTokenEmbedder`] from `model_dir`; if that fails for ANY
+    /// reason (the distilled `static_token_table.bin` is missing/corrupt, or
+    /// the tokenizer files it also needs aren't present), that is **not** a
+    /// hard error — it logs `tracing::warn!` and falls back to the
+    /// contextual encoder, exactly as if the flag had never been set. This
+    /// is a deliberate safety property: flipping an experimental env var
+    /// must never turn a working index build into a failed one.
+    fn for_indexing(model_dir: &Path) -> Result<Self> {
+        if crate::config::env_bool("SEMANTEX_STATIC_DOC_EMBED") {
+            match StaticTokenEmbedder::new(model_dir) {
+                Ok(embedder) => return Ok(DocEncoderKind::Static(embedder)),
+                Err(e) => {
+                    tracing::warn!(
+                        "SEMANTEX_STATIC_DOC_EMBED is set but the static token table \
+                         failed to load from {} ({e:#}); falling back to the contextual \
+                         ColBERT encoder for this build",
+                        model_dir.display()
+                    );
+                }
+            }
+        }
+        Ok(DocEncoderKind::Contextual(ColbertEmbedder::for_indexing(
+            model_dir,
+        )?))
+    }
+}
+
 /// Build-time `colbert-plaid` index builder. Owns the PLAID full-rebuild and
 /// incremental update logic lifted verbatim from `index/builder.rs` so the
 /// dense build path routes through `DenseIndexBuilder`.
@@ -248,7 +310,7 @@ impl ColbertPlaidIndexBuilder {
         }
 
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
-        let embedder = ColbertEmbedder::for_indexing(&model_dir)?;
+        let embedder = DocEncoderKind::for_indexing(&model_dir)?;
         let (index_config, update_config) = self.next_plaid_configs();
         let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
 
@@ -388,7 +450,7 @@ impl ColbertPlaidIndexBuilder {
             return Ok(());
         }
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
-        let embedder = ColbertEmbedder::for_indexing(&model_dir)?;
+        let embedder = DocEncoderKind::for_indexing(&model_dir)?;
         let (index_config, update_config) = self.next_plaid_configs();
         let plaid_dir_str = self.plaid_dir.to_string_lossy().into_owned();
 
@@ -554,6 +616,122 @@ mod tests {
         // Compile-time invariant: PLAID_BATCH must stay below PLAID_BUFFER_SIZE so
         // single-file incremental updates hit the buffer-only fast path.
         const { assert!(PLAID_BATCH < PLAID_BUFFER_SIZE) };
+    }
+
+    // ── DocEncoderKind::for_indexing selection (Task 6) ─────────────────────
+
+    /// Private to this test module: serializes every test that mutates
+    /// `SEMANTEX_STATIC_DOC_EMBED`, mirroring `index::state::DENSE_CONTEXT_ENV_LOCK`'s
+    /// pattern for this crate's other single-flag/single-file env vars.
+    static STATIC_DOC_EMBED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `SEMANTEX_STATIC_DOC_EMBED` set to `val` (or unset when
+    /// `None`), restoring whatever was there before, serialized by
+    /// `STATIC_DOC_EMBED_ENV_LOCK`.
+    fn with_static_doc_embed_env<F: FnOnce()>(val: Option<&str>, f: F) {
+        let _guard = STATIC_DOC_EMBED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("SEMANTEX_STATIC_DOC_EMBED").ok();
+        // SAFETY: guarded by STATIC_DOC_EMBED_ENV_LOCK.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("SEMANTEX_STATIC_DOC_EMBED", v),
+                None => std::env::remove_var("SEMANTEX_STATIC_DOC_EMBED"),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: guarded by STATIC_DOC_EMBED_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("SEMANTEX_STATIC_DOC_EMBED", v),
+                None => std::env::remove_var("SEMANTEX_STATIC_DOC_EMBED"),
+            }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Locate the local LateOn-Code-edge tokenizer files, if the model has
+    /// been downloaded. Mirrors `static_token.rs`'s `test_tokenizer_dir`
+    /// gating: skip (not fail) the one test that needs a real tokenizer to
+    /// build a loadable `StaticTokenEmbedder`, so this file's other tests
+    /// always run in CI without the model present.
+    fn test_tokenizer_dir() -> Option<std::path::PathBuf> {
+        let dir = crate::config::SemantexConfig::default()
+            .models_dir()
+            .join("LateOn-Code-edge");
+        (dir.join("tokenizer.json").exists() && dir.join("onnx_config.json").exists())
+            .then_some(dir)
+    }
+
+    #[test]
+    fn doc_encoder_kind_defaults_to_contextual_when_flag_unset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        with_static_doc_embed_env(None, || {
+            let kind = DocEncoderKind::for_indexing(tmp.path())
+                .expect("contextual construction only requires the dir to exist");
+            assert!(
+                matches!(kind, DocEncoderKind::Contextual(_)),
+                "flag unset must always select the contextual encoder"
+            );
+        });
+    }
+
+    #[test]
+    fn doc_encoder_kind_falls_back_to_contextual_when_flag_set_but_table_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        with_static_doc_embed_env(Some("1"), || {
+            // No static_token_table.bin (or tokenizer.json/onnx_config.json)
+            // under tmp.path() — StaticTokenEmbedder::new must fail, and
+            // for_indexing must fall back rather than propagate that error.
+            let kind = DocEncoderKind::for_indexing(tmp.path())
+                .expect("a set flag with a missing table must fall back, never error");
+            assert!(
+                matches!(kind, DocEncoderKind::Contextual(_)),
+                "missing table must fall back to the contextual encoder"
+            );
+        });
+    }
+
+    #[test]
+    fn doc_encoder_kind_selects_static_when_flag_set_and_table_present() {
+        let Some(model_dir) = test_tokenizer_dir() else {
+            return;
+        };
+        let vocab_size = ColbertEmbedder::new(&model_dir)
+            .unwrap()
+            .tokenizer_vocab_size()
+            .unwrap();
+        let table = crate::embedding::static_table::StaticTokenTable::new(
+            vocab_size,
+            4,
+            [0.1, 0.2, 0.4, 0.2, 0.1],
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        table
+            .save(&tmp.path().join("static_token_table.bin"))
+            .unwrap();
+        std::fs::copy(
+            model_dir.join("tokenizer.json"),
+            tmp.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            model_dir.join("onnx_config.json"),
+            tmp.path().join("onnx_config.json"),
+        )
+        .unwrap();
+
+        with_static_doc_embed_env(Some("1"), || {
+            let kind = DocEncoderKind::for_indexing(tmp.path())
+                .expect("a valid table + flag must succeed");
+            assert!(
+                matches!(kind, DocEncoderKind::Static(_)),
+                "flag set with a loadable table must select the static encoder"
+            );
+        });
     }
 
     /// S1/S7 seam: `embed_text_vector` returns a `Some(Vec<f32>)` of the model
