@@ -518,6 +518,55 @@ enum Commands {
         #[arg(long)]
         verify: bool,
     },
+    /// Train the Cinder micro-mixer (spec §4.1 #3) against a teacher ColBERT
+    /// encoder using student inputs gathered from the Ember Plan A static
+    /// token table. Internal dev/eval tooling, not a stable user-facing
+    /// command.
+    #[command(hide = true)]
+    DistillMixer {
+        /// Corpus directory to walk (repeatable: pass `--corpus` multiple
+        /// times to concatenate several directories into one corpus).
+        #[arg(long = "corpus", value_name = "DIR", required = true)]
+        corpus: Vec<PathBuf>,
+
+        /// Output path for the trained `cinder_mixer.bin`.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+
+        /// Max `(window, teacher_row)` pairs retained by reservoir sampling.
+        #[arg(long, default_value_t = 2_000_000)]
+        sample: usize,
+
+        /// Number of training epochs (Adam learning rate is halved after
+        /// each one).
+        #[arg(long, default_value_t = 3)]
+        epochs: usize,
+
+        /// After saving, reload the mixer via `MicroMixer::load` and print
+        /// its dims (sanity-checks the save/load round trip).
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Derive per-vocab-token centroid shortlists (SXCS, spec §4.1 #4) from
+    /// the Ember Plan A static token table and the Ember Plan B frozen
+    /// centroids. Internal dev/eval tooling, not a stable user-facing
+    /// command.
+    #[command(hide = true)]
+    DeriveShortlists {
+        /// Output path for the derived `cinder_shortlists.bin`.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+
+        /// Shortlist entries retained per vocab token (and in the fallback
+        /// row), capped at the trained centroid count.
+        #[arg(long, default_value_t = 32)]
+        m: usize,
+
+        /// After saving, reload the shortlists via `CentroidShortlists::load`
+        /// and print their shape (sanity-checks the save/load round trip).
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 /// Resolve the ONNX Runtime shared library for `ort`'s load-dynamic mode.
@@ -1293,6 +1342,16 @@ fn main() -> Result<()> {
             sample,
             verify,
         }) => commands::distill_centroids::run(&corpus, &out, k, sample, verify, &config),
+        Some(Commands::DistillMixer {
+            corpus,
+            out,
+            sample,
+            epochs,
+            verify,
+        }) => commands::distill_mixer::run(&corpus, &out, sample, epochs, verify, &config),
+        Some(Commands::DeriveShortlists { out, m, verify }) => {
+            commands::derive_shortlists::run(&out, m, verify, &config)
+        }
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {
