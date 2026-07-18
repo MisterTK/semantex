@@ -644,36 +644,54 @@ impl ColbertPlaidIndexBuilder {
         // across every row (shortlist_argmax clears+refills it). That's one
         // small alloc per chunk (not per row, not via a RefCell), which is
         // negligible next to the chunk's residual/quantize work.
-        let assigner_centroids = centroids.clone();
-        let assigner_shortlists = cinder.shortlists().clone();
-        let assigner: IdAwareCodeAssigner = Box::new(
-            move |batch: &ndarray::Array2<f32>, window_ids: &[Vec<u32>]| {
-                let cview = assigner_centroids.view();
-                let mut scratch: Vec<u16> = Vec::new();
-                let mut out = Vec::with_capacity(batch.nrows());
-                for (r, row) in batch.rows().into_iter().enumerate() {
-                    // Batch rows are freshly built in standard (C) layout by the
-                    // writer, so `as_slice` is always `Some`.
-                    let e = row
-                        .as_slice()
-                        .expect("compiled-writer batch rows are contiguous");
-                    out.push(shortlist_argmax(
-                        e,
-                        &window_ids[r],
-                        &assigner_shortlists,
-                        &cview,
-                        &mut scratch,
-                    ));
-                }
-                Array1::from_vec(out)
-            },
-        );
+        // Diagnostic (gate C1 ablation arm 2): SEMANTEX_CINDER_EXACT_ASSIGN=1
+        // forces the writer's DEFAULT exhaustive per-centroid scan instead of
+        // Cinder's shortlist-union assigner, isolating the assignment
+        // approximation from the mixer's contribution. Off by default → the
+        // shortlist-union assigner is the production path.
+        let exact_assign = crate::config::env_bool("SEMANTEX_CINDER_EXACT_ASSIGN");
+        let assigner: Option<IdAwareCodeAssigner> = if exact_assign {
+            tracing::info!(
+                "SEMANTEX_CINDER_EXACT_ASSIGN=1: forcing exhaustive centroid assignment \
+                 (diagnostic; Cinder's shortlist-union assigner disabled)"
+            );
+            None
+        } else {
+            let assigner_centroids = centroids.clone();
+            let assigner_shortlists = cinder.shortlists().clone();
+            Some(Box::new(
+                move |batch: &ndarray::Array2<f32>, window_ids: &[Vec<u32>]| {
+                    let cview = assigner_centroids.view();
+                    let mut scratch: Vec<u16> = Vec::new();
+                    let mut out = Vec::with_capacity(batch.nrows());
+                    for (r, row) in batch.rows().into_iter().enumerate() {
+                        // Batch rows are freshly built in standard (C) layout by
+                        // the writer, so `as_slice` is always `Some`.
+                        let e = row
+                            .as_slice()
+                            .expect("compiled-writer batch rows are contiguous");
+                        out.push(shortlist_argmax(
+                            e,
+                            &window_ids[r],
+                            &assigner_shortlists,
+                            &cview,
+                            &mut scratch,
+                        ));
+                    }
+                    Array1::from_vec(out)
+                },
+            ))
+        };
 
-        // Build the writer from the frozen centroids + the sample, install the
-        // shortlist assigner, then feed the WHOLE corpus WITH per-token window
-        // ids: the held sample first (same order), then the remainder.
-        let mut writer = CompiledIndexWriter::new(&plaid_dir_str, centroids, &config, &sample_emb)?
-            .with_id_aware_assigner(assigner);
+        // Build the writer from the frozen centroids + the sample; install the
+        // shortlist assigner unless the diagnostic disabled it (then the writer's
+        // default exhaustive scan runs and the buffered window ids are ignored).
+        // Feed the WHOLE corpus WITH per-token window ids: the held sample first
+        // (same order), then the remainder.
+        let mut writer = CompiledIndexWriter::new(&plaid_dir_str, centroids, &config, &sample_emb)?;
+        if let Some(assigner) = assigner {
+            writer = writer.with_id_aware_assigner(assigner);
+        }
         for (emb, windows) in sample_emb.iter().zip(sample_windows.iter()) {
             writer.add_document_with_ids(emb, windows)?;
         }
@@ -1240,6 +1258,102 @@ mod tests {
                 got, expected,
                 "on-disk codes must equal direct shortlist_argmax output — proves \
                  build_cinder used the shortlist-union assigner, not the exhaustive default"
+            );
+        }
+
+        // (v) Task 8 / gate C1 ablation arm 2: SEMANTEX_CINDER_EXACT_ASSIGN=1
+        // must force the writer's EXHAUSTIVE default assignment — i.e. NO
+        // id-aware shortlist assigner is installed. Rebuild the identical corpus
+        // with the diagnostic set and assert the on-disk codes equal the
+        // exhaustive full-scan argmax over ALL centroids (same dot-product metric
+        // + lowest-id tie-break that `shortlist_argmax` approximates). Had the
+        // shortlist assigner still been installed the codes would instead match
+        // the (iv) shortlist codes; the two references coincide only where the
+        // shortlist already covers the global argmax (the C4 agreement fraction),
+        // so an exact match to the exhaustive reference pins the diagnostic path.
+        {
+            use crate::embedding::centroid_train::load_centroids_npy;
+            use ndarray::Array1;
+            use ndarray_npy::ReadNpyExt;
+
+            // Local copy of shortlists::exhaustive_argmax (private there): dot
+            // product, strict `>` with ascending iteration = lowest-id tie-break,
+            // matching the compiled writer's default per-token assignment.
+            fn exhaustive_argmax(e: &[f32], centroids: &ndarray::ArrayView2<f32>) -> i64 {
+                let mut best_id = 0i64;
+                let mut best_dot = f32::NEG_INFINITY;
+                for (id, row) in centroids.rows().into_iter().enumerate() {
+                    let dot: f32 = e.iter().zip(row.iter()).map(|(&a, &b)| a * b).sum();
+                    if dot > best_dot {
+                        best_dot = dot;
+                        best_id = id as i64;
+                    }
+                }
+                best_id
+            }
+
+            let idx_dir2 = tempfile::TempDir::new().unwrap();
+            let fetch2 = |batch_ids: &[u64]| -> Result<Vec<(u64, String)>> {
+                Ok(batch_ids
+                    .iter()
+                    .map(|&id| (id, chunks[id as usize].1.clone()))
+                    .collect())
+            };
+            with_cinder_env(Some("1"), || {
+                // SAFETY: CINDER_ENV_LOCK is held by with_cinder_env for the
+                // duration of this closure, serializing all env mutation.
+                unsafe { std::env::set_var("SEMANTEX_CINDER_EXACT_ASSIGN", "1") };
+                let mut builder = ColbertPlaidIndexBuilder::new(idx_dir2.path(), 4)
+                    .with_models_dir(overlay.path().to_path_buf());
+                let build_res = builder.build_streaming_ids(&chunk_ids, fetch2);
+                // SAFETY: same held lock; remove BEFORE asserting so a build
+                // failure can't leak the diagnostic flag into later tests.
+                unsafe { std::env::remove_var("SEMANTEX_CINDER_EXACT_ASSIGN") };
+                build_res.expect("cinder build with EXACT_ASSIGN must succeed");
+            });
+
+            let cinder = CinderEncoder::new(&overlay_model_dir).unwrap();
+            let centroids =
+                load_centroids_npy(&model_manager::frozen_centroids_path(&overlay_model_dir))
+                    .unwrap();
+            let cview = centroids.view();
+
+            let all_texts: Vec<String> = chunk_ids
+                .iter()
+                .map(|&id| chunks[id as usize].1.clone())
+                .collect();
+            let encoded = cinder.encode_documents_with_window_ids(&all_texts).unwrap();
+
+            let mut expected_exhaustive: Vec<i64> = Vec::new();
+            for (emb, _windows) in &encoded {
+                for row in emb.rows() {
+                    let e = row.as_slice().unwrap();
+                    expected_exhaustive.push(exhaustive_argmax(e, &cview));
+                }
+            }
+
+            let mut got: Vec<i64> = Vec::new();
+            let mut ci = 0usize;
+            loop {
+                let p = idx_dir2.path().join(format!("{ci}.codes.npy"));
+                if !p.exists() {
+                    break;
+                }
+                let arr = Array1::<i64>::read_npy(std::fs::File::open(&p).unwrap()).unwrap();
+                got.extend(arr.iter().copied());
+                ci += 1;
+            }
+            assert!(!expected_exhaustive.is_empty(), "no codes recomputed");
+            assert_eq!(
+                got.len(),
+                expected_exhaustive.len(),
+                "on-disk vs recomputed token count (EXACT_ASSIGN)"
+            );
+            assert_eq!(
+                got, expected_exhaustive,
+                "with SEMANTEX_CINDER_EXACT_ASSIGN=1 the on-disk codes must equal the \
+                 EXHAUSTIVE full-scan argmax — proves the shortlist-union assigner was NOT \
+                 installed and the writer's default exhaustive scan ran"
             );
         }
     }
