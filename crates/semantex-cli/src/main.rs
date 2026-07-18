@@ -490,6 +490,34 @@ enum Commands {
         #[arg(long)]
         verify: bool,
     },
+    /// Train frozen universal PLAID centroids from contextual token
+    /// embeddings over generic corpora (Ember Plan B). Internal dev/eval
+    /// tooling, not a stable user-facing command.
+    #[command(hide = true)]
+    DistillCentroids {
+        /// Corpus directory to walk (repeatable: pass `--corpus` multiple
+        /// times to concatenate several directories into one corpus).
+        #[arg(long = "corpus", value_name = "DIR", required = true)]
+        corpus: Vec<PathBuf>,
+
+        /// Output path for the trained `frozen_centroids.npy`.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+
+        /// Number of centroids to train (clamped to the sample size).
+        #[arg(long, default_value_t = 8192)]
+        k: usize,
+
+        /// Max token embeddings retained (reservoir-sampled) for k-means.
+        #[arg(long, default_value_t = 1_000_000)]
+        sample: usize,
+
+        /// After saving, reload the centroids via
+        /// `centroid_train::load_centroids_npy` and print their shape
+        /// (sanity-checks the save/load round trip).
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 /// Resolve the ONNX Runtime shared library for `ort`'s load-dynamic mode.
@@ -1258,6 +1286,13 @@ fn main() -> Result<()> {
             out,
             verify,
         }) => commands::distill_static_table::run(&corpus, &out, verify, &config),
+        Some(Commands::DistillCentroids {
+            corpus,
+            out,
+            k,
+            sample,
+            verify,
+        }) => commands::distill_centroids::run(&corpus, &out, k, sample, verify, &config),
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {

@@ -1,5 +1,7 @@
 pub mod connect;
 pub mod disconnect;
+pub mod distill_centroids;
+pub mod distill_corpus;
 pub mod distill_static_table;
 pub mod download;
 pub mod federated;

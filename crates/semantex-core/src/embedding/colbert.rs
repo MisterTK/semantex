@@ -592,6 +592,53 @@ impl ColbertEmbedder {
         Ok(self.id_alignment()?.tokenizer.get_vocab_size(true))
     }
 
+    /// Number of vocab tokens actually reachable on the document side. With
+    /// `do_lower_case: true` (LateOn's onnx_config), any token containing an
+    /// uppercase character can never be produced from lowered input — 25.7%
+    /// of the LateOn vocab (see results/ember-gate1/vocab-coverage-
+    /// investigation.md). Data-driven: when the model config doesn't lower,
+    /// this equals `tokenizer_vocab_size`.
+    ///
+    /// # Implementation note: must check the *decoded* token, not the raw
+    /// vocab key
+    ///
+    /// This tokenizer is byte-level BPE: its raw vocab keys use a
+    /// byte-to-unicode remapping (à la GPT-2) where non-printable bytes —
+    /// including the extremely common word-boundary space byte — are
+    /// stood in for by characters like `Ġ` (U+0120) and `Ċ` (U+010A), which
+    /// land in the Latin Extended-A block and are themselves classified as
+    /// Unicode-uppercase. Checking `char::is_uppercase` against the raw key
+    /// (as opposed to `tokenizer.decode`'s reconstructed text) therefore
+    /// misclassifies most word-initial tokens as "contains uppercase" —
+    /// empirically 35,225 of 50,370 raw keys vs. only 13,035 of the
+    /// correctly decoded tokens for `LateOn-Code-edge` (the latter matches
+    /// the investigation doc's 12,953 within expected special-token
+    /// variance). Decoding each id is the only correct way to answer "would
+    /// lowercasing ever produce this token".
+    ///
+    /// # Errors
+    ///
+    /// Same failure mode as [`ColbertEmbedder::tokenizer_vocab_size`]: only if
+    /// `tokenizer.json`/`onnx_config.json` under `model_dir` are missing or
+    /// malformed.
+    pub fn tokenizer_reachable_vocab_count(&self) -> Result<usize> {
+        let alignment = self.id_alignment()?;
+        if !alignment.do_lower_case {
+            return Ok(alignment.tokenizer.get_vocab_size(true));
+        }
+        Ok(alignment
+            .tokenizer
+            .get_vocab(true)
+            .values()
+            .filter(|&&id| {
+                alignment
+                    .tokenizer
+                    .decode(&[id], false)
+                    .is_ok_and(|decoded| !decoded.chars().any(char::is_uppercase))
+            })
+            .count())
+    }
+
     /// Returns true if the ONNX session has been materialized.
     /// Test/diagnostics helper — not used in production paths.
     #[doc(hidden)]
@@ -698,6 +745,30 @@ mod tests {
             *out.last().unwrap(),
             SEP,
             "truncated document must keep the trailing [SEP], not cut it off mid-content"
+        );
+    }
+
+    /// LateOn's `onnx_config.json` sets `do_lower_case: true`, so any vocab
+    /// token containing an uppercase character can never be produced from
+    /// lowered document input — `tokenizer_reachable_vocab_count` must report
+    /// strictly fewer tokens than the raw vocab for this model (see
+    /// `results/ember-gate1/vocab-coverage-investigation.md`).
+    #[test]
+    #[ignore = "loads the ColBERT model and builds a real ONNX session; run with --ignored"]
+    fn reachable_vocab_is_smaller_than_raw_vocab_for_lowercasing_model() {
+        let Some(model_dir) = test_model_dir() else {
+            return;
+        };
+        let e = ColbertEmbedder::new(&model_dir).unwrap();
+        let raw = e.tokenizer_vocab_size().unwrap();
+        let reachable = e.tokenizer_reachable_vocab_count().unwrap();
+        assert!(
+            reachable < raw,
+            "LateOn lowers input: reachable {reachable} must be < raw {raw}"
+        );
+        assert!(
+            reachable > raw / 2,
+            "sanity: ~74% of vocab is lowercase-only (reachable={reachable}, raw={raw})"
         );
     }
 
