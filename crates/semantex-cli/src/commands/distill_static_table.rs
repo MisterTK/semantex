@@ -31,13 +31,35 @@ use std::path::{Path, PathBuf};
 /// amortizing session call overhead.
 const DISTILL_BATCH: usize = 32;
 
-pub fn run(corpus_dirs: &[PathBuf], out: &Path, verify: bool) -> Result<()> {
+/// `config` is the SAME `SemantexConfig` every other CLI command uses — built
+/// by `main()` via `SemantexConfig::load(Some(&cli.path))` (default CWD),
+/// which overlays `.semantexrc.yaml` and env var overrides
+/// (`SEMANTEX_MAX_FILE_SIZE`, `SEMANTEX_MODEL_DIR`, ...) on top of defaults.
+/// Passing it through (rather than reconstructing `SemantexConfig::default()`
+/// here) keeps chunking/walking parity with what `semantex index` would
+/// actually do to these files — a `.semantexrc.yaml` with non-default
+/// `chunk_size`/`chunk_overlap`, or `SEMANTEX_MODEL_DIR` on the box, must be
+/// honored the same way in both places or the distilled table's token
+/// distribution silently stops matching production.
+///
+/// With multiple `--corpus` dirs, this is inherently one config for
+/// potentially several directories with their own (possibly differing)
+/// `.semantexrc.yaml` files — there's no single right resolution short of
+/// walking each dir under its own config. We accept that ambiguity and use
+/// the CWD/`--path`-resolved config for all of them, same as every other
+/// command that isn't itself per-directory-scoped; this is still a strict
+/// improvement over ignoring project config and env overrides entirely.
+pub fn run(
+    corpus_dirs: &[PathBuf],
+    out: &Path,
+    verify: bool,
+    config: &SemantexConfig,
+) -> Result<()> {
     anyhow::ensure!(
         !corpus_dirs.is_empty(),
         "at least one --corpus <dir> is required"
     );
 
-    let config = SemantexConfig::default();
     let walker = FileWalker::new(config.max_file_size, config.max_file_count);
 
     // Walk (and validate) every corpus dir up front, before touching the

@@ -1257,7 +1257,7 @@ fn main() -> Result<()> {
             corpus,
             out,
             verify,
-        }) => commands::distill_static_table::run(&corpus, &out, verify),
+        }) => commands::distill_static_table::run(&corpus, &out, verify, &config),
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {
