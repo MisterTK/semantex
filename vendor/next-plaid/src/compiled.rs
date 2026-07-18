@@ -50,6 +50,16 @@ use crate::utils::atomic_write_file;
 /// resulting index directory is BYTE-IDENTICAL (excluding `embeddings.npy` /
 /// buffer files, which this writer never creates) to
 /// `create_index_files(embeddings, centroids, path, config)`.
+///
+/// ⚠️ Of the logic in [`crate::index::create_index_files`], only
+/// [`prepare_codec_artifacts`] (residual statistics) is genuinely shared —
+/// the chunk-encoding, IVF-building, and metadata-writing paths here are
+/// parallel implementations kept in sync solely by the differential test
+/// `output_is_byte_identical_to_create_index_files` below. That test does
+/// NOT run under `cargo test --workspace` (see the sync note on
+/// `create_index_files` in `index.rs` for why, and how to run it manually).
+/// Any change to `create_index_files`'s chunk/IVF/metadata logic requires
+/// re-running that test against this writer before merging.
 pub struct CompiledIndexWriter {
     /// Destination index directory.
     index_dir: PathBuf,

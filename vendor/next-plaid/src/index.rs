@@ -556,6 +556,25 @@ pub fn write_index_from_encoded_chunks(
 /// # Returns
 ///
 /// Metadata about the created index
+///
+/// # ⚠️ Keep [`crate::compiled::CompiledIndexWriter`] in sync
+///
+/// `CompiledIndexWriter` reimplements this function's chunk-encoding,
+/// IVF-building, and metadata-writing logic as a separate, single-pass code
+/// path — only [`prepare_codec_artifacts`] is genuinely shared between the
+/// two. If you change chunk encoding, IVF construction, or the metadata JSON
+/// written here, you MUST manually verify `CompiledIndexWriter` still
+/// produces byte-identical output, via its differential test
+/// (`output_is_byte_identical_to_create_index_files` in `compiled.rs`).
+///
+/// That test does NOT run under `cargo test --workspace` — `next-plaid` is
+/// vendored via a `[patch.crates-io]` path override, not a workspace member,
+/// so normal CI never exercises it. Run it manually:
+///
+/// 1. Temporarily add `vendor/next-plaid` to the root `Cargo.toml`'s
+///    `[workspace] members`.
+/// 2. `cargo test -p next-plaid compiled`
+/// 3. Revert the `Cargo.toml` / `Cargo.lock` changes before committing.
 pub fn create_index_files(
     embeddings: &[Array2<f32>],
     centroids: Array2<f32>,
