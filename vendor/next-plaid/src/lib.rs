@@ -30,7 +30,7 @@ pub mod update;
 pub mod utils;
 
 pub use codec::ResidualCodec;
-pub use compiled::CompiledIndexWriter;
+pub use compiled::{CompiledIndexWriter, IdAwareCodeAssigner};
 pub use delete::delete_from_index;
 pub use error::{Error, Result};
 pub use index::MmapIndex;

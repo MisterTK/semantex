@@ -9,17 +9,21 @@
 //! handful of table lookups fed through the tiny depthwise-mix + GELU + linear
 //! [`MicroMixer::forward`] (the only floating-point compute in the path).
 //!
-//! # v1 scope
+//! # Assignment path
 //!
-//! `encode_documents` hands f32 embeddings to [`next_plaid::CompiledIndexWriter`],
-//! which assigns/quantizes them — so byte-identity with the reference PLAID
-//! path is trivially preserved and the "integer codes end to end" optimization
-//! (which would route through the writer's `with_assigner` shortlist hook) is
-//! deferred to a later profiling-driven pass. `CentroidShortlists` is therefore
-//! LOADED and validated here (so the presence/corruptness contract in
-//! [`CinderEncoder::new`] holds and the artifact is ready for that later path)
-//! but not yet consumed by `encode_documents`; [`CinderEncoder::shortlists`]
-//! exposes it.
+//! [`CinderEncoder::encode_documents`] produces plain per-token embeddings (the
+//! generic embedder contract). [`CinderEncoder::encode_documents_with_window_ids`]
+//! additionally returns, per token, the 9-tap window ids the mix consumed — the
+//! `(embedding, window)` inputs a shortlist-union argmax needs. Cinder's build
+//! path (`ColbertPlaidIndexBuilder::build_cinder`) feeds those to
+//! [`next_plaid::CompiledIndexWriter::add_document_with_ids`] with an
+//! [`next_plaid::IdAwareCodeAssigner`] that calls
+//! [`crate::embedding::shortlists::shortlist_argmax`] over the loaded
+//! [`CentroidShortlists`] — replacing the writer's default exhaustive
+//! per-centroid scan with the O(~m·|window|) shortlist union. Residual
+//! computation and quantization are untouched, so the on-disk layout stays
+//! byte-compatible with the reference PLAID format. [`CinderEncoder::shortlists`]
+//! exposes the loaded shortlists to that build path.
 
 use crate::embedding::colbert::{
     DocIdAlignment, TokenEmbeddings, build_doc_token_ids, load_doc_id_alignment,
@@ -43,9 +47,9 @@ pub struct CinderEncoder {
     table: StaticTokenTable,
     /// Distilled contextualization operator. Read on every token.
     mixer: MicroMixer,
-    /// Per-vocab centroid shortlists (SXCS). Loaded/validated here; consumed by
-    /// the deferred codes-end-to-end assigner path (see module docs), exposed
-    /// via [`Self::shortlists`].
+    /// Per-vocab centroid shortlists (SXCS). Loaded/validated here; consumed at
+    /// build time by the shortlist-union assigner (see module docs), exposed via
+    /// [`Self::shortlists`].
     shortlists: CentroidShortlists,
     /// Tokenization + id-alignment (shared with `StaticTokenEmbedder` /
     /// `ColbertEmbedder`), so Cinder's input ids can never drift from the ids
@@ -102,10 +106,10 @@ impl CinderEncoder {
         })
     }
 
-    /// The loaded centroid shortlists (SXCS). Not consumed by v1's
-    /// `encode_documents` (see module docs) — exposed for the deferred
-    /// codes-end-to-end assigner path and for tests that assert the artifact
-    /// loaded correctly.
+    /// The loaded centroid shortlists (SXCS). Consumed at build time by the
+    /// shortlist-union assigner (see module docs) — the build path clones these
+    /// into the [`next_plaid::IdAwareCodeAssigner`] closure — and by tests that
+    /// assert the artifact loaded correctly.
     #[must_use]
     pub fn shortlists(&self) -> &CentroidShortlists {
         &self.shortlists
@@ -127,6 +131,30 @@ impl CinderEncoder {
             .collect()
     }
 
+    /// Like [`Self::encode_documents`], but ALSO returns, per document, the
+    /// 9-tap window ids used at each token position (one `Vec<u32>` per row, in
+    /// the SAME row order as the embeddings). These are exactly the
+    /// `(embedding, window)` inputs the shortlist-union argmax consumes at build
+    /// time (see [`crate::embedding::shortlists::shortlist_argmax`]), so Cinder's
+    /// compiled build path can hand them straight to
+    /// [`next_plaid::CompiledIndexWriter::add_document_with_ids`] alongside the
+    /// embeddings — no re-tokenization, no drift from the encode path.
+    ///
+    /// `window_ids.len() == embeddings.nrows()` holds for every returned
+    /// document (both are one entry per token position).
+    pub fn encode_documents_with_window_ids(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<(TokenEmbeddings, Vec<Vec<u32>>)>> {
+        texts
+            .iter()
+            .map(|text| {
+                let ids = build_doc_token_ids(&self.alignment, text)?;
+                Ok(self.encode_ids_with_window_ids(&ids))
+            })
+            .collect()
+    }
+
     /// Contextualize one document's token-id sequence into an `[n_tokens, dims]`
     /// matrix, replicating `mixer_train`'s STUDENT-input convention EXACTLY:
     /// the 9-tap window (same edge-replication as training via
@@ -143,6 +171,25 @@ impl CinderEncoder {
                 .assign(&ndarray::ArrayView1::from(e.as_slice()));
         }
         out
+    }
+
+    /// Like [`Self::encode_ids`] but also collects, per token position, the
+    /// 9-tap window ids [`Self::mix_at`] used. Routes through the SAME `mix_at`
+    /// (the single source of truth for Cinder's windowing/gather/mix), so the
+    /// embeddings it returns are identical to `encode_ids`' and the window ids
+    /// can never drift from the ones the mixing actually consumed.
+    fn encode_ids_with_window_ids(&self, ids: &[u32]) -> (TokenEmbeddings, Vec<Vec<u32>>) {
+        let dims = self.table.dims;
+        let mut out = Array2::<f32>::zeros((ids.len(), dims));
+        let mut windows: Vec<Vec<u32>> = Vec::with_capacity(ids.len());
+        let mut e = vec![0.0f32; dims];
+        for i in 0..ids.len() {
+            let window_ids = self.mix_at(ids, i, &mut e);
+            out.row_mut(i)
+                .assign(&ndarray::ArrayView1::from(e.as_slice()));
+            windows.push(window_ids.to_vec());
+        }
+        (out, windows)
     }
 
     /// Contextualize token position `i` of `ids` into `e` (must already be
@@ -421,5 +468,172 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── (Task 6b) genuine end-to-end WIRING correctness ─────────────────────
+
+    /// Concatenate every `{i}.codes.npy` chunk file in `dir` (ascending chunk
+    /// order) into one flat `Vec<i64>` of centroid ids — the codes actually
+    /// written to disk.
+    fn read_all_codes(dir: &std::path::Path) -> Vec<i64> {
+        use ndarray_npy::ReadNpyExt;
+        let mut all = Vec::new();
+        let mut i = 0usize;
+        loop {
+            let p = dir.join(format!("{i}.codes.npy"));
+            if !p.exists() {
+                break;
+            }
+            let arr = ndarray::Array1::<i64>::read_npy(std::fs::File::open(&p).unwrap()).unwrap();
+            all.extend(arr.iter().copied());
+            i += 1;
+        }
+        all
+    }
+
+    /// The real production wiring, proven end to end WITHOUT the model: build a
+    /// tiny index through `CompiledIndexWriter::add_document_with_ids` + the REAL
+    /// `shortlist_argmax`/`CentroidShortlists` (Task 3) — the exact closure shape
+    /// `build_cinder` installs — then assert the codes on disk EXACTLY equal
+    /// calling `shortlist_argmax` directly on the same embeddings/window-ids.
+    ///
+    /// This is strictly stronger than Task 6's mechanism-gate test (which used a
+    /// per-row exhaustive stand-in): it proves the SHORTLIST-UNION function
+    /// itself is what reaches disk through the id-aware writer path, row-for-row,
+    /// across a chunk boundary, with `m < n_centroids` so the union is a genuine
+    /// subset (the interesting case). `add_document`/`with_assigner` byte-identity
+    /// is untouched — this exercises only the new id-aware surface.
+    #[test]
+    fn add_document_with_ids_writes_real_shortlist_codes() {
+        use crate::embedding::shortlists::{CentroidShortlists, shortlist_argmax};
+        use crate::embedding::static_table::StaticTokenTable;
+        use ndarray::{Array1, Array2};
+        use next_plaid::{CompiledIndexWriter, IdAwareCodeAssigner, IndexConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dim = 8usize;
+        let n_centroids = 24usize;
+        let vocab = 40usize;
+
+        // Deterministic unit-norm centroids + a fully-populated table; derive
+        // REAL shortlists with m (6) < n_centroids (24) so each window's union
+        // is a strict subset of all centroids.
+        let mut centroids = Array2::<f32>::from_shape_fn((n_centroids, dim), |(i, j)| {
+            ((i * 13 + j * 5) as f32 * 0.31).cos()
+        });
+        for mut r in centroids.rows_mut() {
+            let n = r.dot(&r).sqrt();
+            if n > 0.0 {
+                r.mapv_inplace(|v| v / n);
+            }
+        }
+        let mut table = StaticTokenTable::new(vocab, dim, [0.2; 5]);
+        for id in 0..vocab as u32 {
+            let row: Vec<f32> = (0..dim)
+                .map(|j| ((id as usize * 7 + j * 3) as f32 * 0.17).sin())
+                .collect();
+            table.set_row(id, &row);
+        }
+        let shortlists = CentroidShortlists::derive(&table, &centroids.view(), 6).unwrap();
+
+        // Synthetic docs: unit-norm embeddings + 1..=3 in-vocab window ids per
+        // token. 37 docs at batch_size 16 → multiple flushed chunks.
+        let make_doc = |seed: usize, n_tokens: usize| -> (Array2<f32>, Vec<Vec<u32>>) {
+            let mut e = Array2::<f32>::from_shape_fn((n_tokens, dim), |(i, j)| {
+                ((seed * 31 + i * 7 + j) as f32 * 0.37).sin()
+            });
+            for mut r in e.rows_mut() {
+                let n = r.dot(&r).sqrt();
+                if n > 0.0 {
+                    r.mapv_inplace(|v| v / n);
+                }
+            }
+            let windows: Vec<Vec<u32>> = (0..n_tokens)
+                .map(|i| {
+                    let len = 1 + i % 3;
+                    (0..len)
+                        .map(|k| ((seed + i * 5 + k * 11) % vocab) as u32)
+                        .collect()
+                })
+                .collect();
+            (e, windows)
+        };
+        let docs: Vec<(Array2<f32>, Vec<Vec<u32>>)> =
+            (0..37).map(|s| make_doc(s, 2 + s % 5)).collect();
+
+        // Real shortlist assigner — identical in shape to build_cinder's closure
+        // (one scratch buffer reused across all rows in a chunk).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cl = Arc::clone(&calls);
+        let a_shortlists = shortlists.clone();
+        let a_centroids = centroids.clone();
+        let assigner: IdAwareCodeAssigner =
+            Box::new(move |batch: &Array2<f32>, windows: &[Vec<u32>]| {
+                calls_cl.fetch_add(1, Ordering::SeqCst);
+                let cview = a_centroids.view();
+                let mut scratch: Vec<u16> = Vec::new();
+                let mut out = Vec::with_capacity(batch.nrows());
+                for (r, row) in batch.rows().into_iter().enumerate() {
+                    let e = row
+                        .as_slice()
+                        .expect("standard-layout batch rows are contiguous");
+                    out.push(shortlist_argmax(
+                        e,
+                        &windows[r],
+                        &a_shortlists,
+                        &cview,
+                        &mut scratch,
+                    ));
+                }
+                Array1::from_vec(out)
+            });
+
+        let config = IndexConfig {
+            nbits: 4,
+            batch_size: 16,
+            force_cpu: true,
+            ..Default::default()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out_dir = tmp.path().join("idx");
+        let sample: Vec<Array2<f32>> = docs.iter().map(|(e, _)| e.clone()).collect();
+        let mut w = CompiledIndexWriter::new(
+            out_dir.to_str().unwrap(),
+            centroids.clone(),
+            &config,
+            &sample,
+        )
+        .unwrap()
+        .with_id_aware_assigner(assigner);
+        for (e, win) in &docs {
+            w.add_document_with_ids(e, win).unwrap();
+        }
+        w.finalize().unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "the id-aware shortlist assigner was never invoked"
+        );
+
+        // Expected: direct shortlist_argmax over every token, in doc/token order.
+        let cview = centroids.view();
+        let mut scratch: Vec<u16> = Vec::new();
+        let mut expected: Vec<i64> = Vec::new();
+        for (e, win) in &docs {
+            for (r, row) in e.rows().into_iter().enumerate() {
+                let es = row.as_slice().unwrap();
+                expected
+                    .push(shortlist_argmax(es, &win[r], &shortlists, &cview, &mut scratch) as i64);
+            }
+        }
+
+        let got = read_all_codes(&out_dir);
+        assert!(!expected.is_empty(), "no codes written");
+        assert_eq!(got.len(), expected.len(), "token counts differ");
+        assert_eq!(
+            got, expected,
+            "on-disk codes must EXACTLY equal direct shortlist_argmax output — \
+             the real shortlist-union function must be what the writer persisted"
+        );
     }
 }

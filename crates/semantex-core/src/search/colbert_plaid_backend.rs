@@ -553,10 +553,19 @@ impl ColbertPlaidIndexBuilder {
     /// `CompiledIndexWriter::new` and then streamed into it; the remainder streams
     /// one `PLAID_APPEND_BATCH` at a time and the sample is dropped first — so
     /// peak is bounded by that same `INITIAL_BUILD_CHUNKS` prefix (the constant
-    /// is reused deliberately: identical bound to the contextual Phase A). v1
-    /// hands f32 embeddings to the writer's DEFAULT (exhaustive) assignment, so
-    /// the resulting index is byte-compatible with the reference PLAID layout;
-    /// the writer's `with_assigner` shortlist hook is a deferred optimization.
+    /// is reused deliberately: identical bound to the contextual Phase A).
+    ///
+    /// Assignment: every document is encoded via
+    /// [`CinderEncoder::encode_documents_with_window_ids`] and streamed into the
+    /// writer through [`next_plaid::CompiledIndexWriter::add_document_with_ids`]
+    /// with an [`next_plaid::IdAwareCodeAssigner`] installed — so each token's
+    /// centroid is chosen by the shortlist-union argmax
+    /// ([`crate::embedding::shortlists::shortlist_argmax`], O(~m·|window|)
+    /// candidates) rather than the writer's default exhaustive scan over all
+    /// centroids. Residual computation and quantization are untouched, so the
+    /// on-disk layout stays byte-compatible with the reference PLAID format
+    /// (only WHICH centroid each token maps to differs, within the C4
+    /// shortlist-agreement tolerance).
     fn build_cinder<F>(
         &mut self,
         chunk_ids: &[u64],
@@ -567,7 +576,9 @@ impl ColbertPlaidIndexBuilder {
     where
         F: FnMut(&[u64]) -> Result<Vec<(u64, String)>>,
     {
-        use next_plaid::{CompiledIndexWriter, IndexConfig};
+        use crate::embedding::shortlists::shortlist_argmax;
+        use ndarray::Array1;
+        use next_plaid::{CompiledIndexWriter, IdAwareCodeAssigner, IndexConfig};
 
         if chunk_ids.is_empty() {
             tracing::info!("No chunks to encode for PLAID index");
@@ -593,7 +604,13 @@ impl ColbertPlaidIndexBuilder {
         let (initial_ids, remainder_ids) = chunk_ids.split_at(split);
 
         let mut full_mapping: Vec<u64> = Vec::with_capacity(chunk_ids.len());
-        let mut sample: Vec<TokenEmbeddings> = Vec::with_capacity(initial_ids.len());
+        // Parallel buffers for the residual-stats sample: the embeddings
+        // (needed by `CompiledIndexWriter::new`) and the matching per-token
+        // window ids (needed by the shortlist assigner when these same docs are
+        // streamed back in). Kept split so `new` gets a `&[Array2<f32>]` with no
+        // extra clone, and each doc's window ids stay aligned to its rows.
+        let mut sample_emb: Vec<TokenEmbeddings> = Vec::with_capacity(initial_ids.len());
+        let mut sample_windows: Vec<Vec<Vec<u32>>> = Vec::with_capacity(initial_ids.len());
         for batch_ids in initial_ids.chunks(PLAID_BATCH) {
             if let Err(e) = crate::memory::check_rss_or_abort("cinder encode (sample)") {
                 anyhow::bail!("Indexing aborted: {e}");
@@ -603,23 +620,65 @@ impl ColbertPlaidIndexBuilder {
                 continue;
             }
             let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-            let embeddings = cinder.encode_documents(&contents)?;
-            sample.extend(embeddings);
+            for (emb, windows) in cinder.encode_documents_with_window_ids(&contents)? {
+                sample_emb.push(emb);
+                sample_windows.push(windows);
+            }
             full_mapping.extend(batch.iter().map(|(id, _)| *id));
         }
 
-        if sample.is_empty() {
+        if sample_emb.is_empty() {
             tracing::info!("No chunks to encode for PLAID index");
             return Ok(());
         }
 
-        // Build the writer from the frozen centroids + the sample, then feed the
-        // WHOLE corpus: the held sample first (same order), then the remainder.
-        let mut writer = CompiledIndexWriter::new(&plaid_dir_str, centroids, &config, &sample)?;
-        for doc in &sample {
-            writer.add_document(doc)?;
+        // The real Cinder assignment step: a shortlist-union nearest-centroid
+        // argmax (O(~m·|window|) candidates per token) in place of the writer's
+        // default exhaustive scan over all centroids. The closure owns its own
+        // copy of the frozen centroids + the per-vocab shortlists (both bounded,
+        // shared read-only) so it can outlive this stack frame inside the writer.
+        //
+        // Scratch: `IdAwareCodeAssigner` is `Fn`, so we can't thread a `&mut`
+        // scratch buffer across calls — but each closure invocation is one
+        // FLUSHED CHUNK, and within it we allocate ONE `Vec<u16>` and reuse it
+        // across every row (shortlist_argmax clears+refills it). That's one
+        // small alloc per chunk (not per row, not via a RefCell), which is
+        // negligible next to the chunk's residual/quantize work.
+        let assigner_centroids = centroids.clone();
+        let assigner_shortlists = cinder.shortlists().clone();
+        let assigner: IdAwareCodeAssigner = Box::new(
+            move |batch: &ndarray::Array2<f32>, window_ids: &[Vec<u32>]| {
+                let cview = assigner_centroids.view();
+                let mut scratch: Vec<u16> = Vec::new();
+                let mut out = Vec::with_capacity(batch.nrows());
+                for (r, row) in batch.rows().into_iter().enumerate() {
+                    // Batch rows are freshly built in standard (C) layout by the
+                    // writer, so `as_slice` is always `Some`.
+                    let e = row
+                        .as_slice()
+                        .expect("compiled-writer batch rows are contiguous");
+                    out.push(shortlist_argmax(
+                        e,
+                        &window_ids[r],
+                        &assigner_shortlists,
+                        &cview,
+                        &mut scratch,
+                    ));
+                }
+                Array1::from_vec(out)
+            },
+        );
+
+        // Build the writer from the frozen centroids + the sample, install the
+        // shortlist assigner, then feed the WHOLE corpus WITH per-token window
+        // ids: the held sample first (same order), then the remainder.
+        let mut writer = CompiledIndexWriter::new(&plaid_dir_str, centroids, &config, &sample_emb)?
+            .with_id_aware_assigner(assigner);
+        for (emb, windows) in sample_emb.iter().zip(sample_windows.iter()) {
+            writer.add_document_with_ids(emb, windows)?;
         }
-        drop(sample); // free the bounded prefix before streaming the remainder
+        drop(sample_emb); // free the bounded prefix before streaming the remainder
+        drop(sample_windows);
         crate::memory::purge_allocator();
 
         for batch_ids in remainder_ids.chunks(PLAID_APPEND_BATCH) {
@@ -631,9 +690,9 @@ impl ColbertPlaidIndexBuilder {
                 continue;
             }
             let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-            let embeddings = cinder.encode_documents(&contents)?;
-            for (doc, (chunk_id, _)) in embeddings.iter().zip(batch.iter()) {
-                writer.add_document(doc)?;
+            let encoded = cinder.encode_documents_with_window_ids(&contents)?;
+            for ((emb, windows), (chunk_id, _)) in encoded.iter().zip(batch.iter()) {
+                writer.add_document_with_ids(emb, windows)?;
                 full_mapping.push(*chunk_id);
             }
             crate::memory::purge_allocator();
@@ -1121,6 +1180,68 @@ mod tests {
             hits[0].chunk_id, 7,
             "the distinctive token must retrieve its own chunk top-1"
         );
+
+        // (iv) Task 6b: confirm the SHORTLIST-UNION assigner genuinely ran (not
+        // a silent fall-through to the writer's exhaustive default). Recompute
+        // the expected codes independently — same encoder, same frozen
+        // centroids, same shortlists, same shortlist_argmax — over the corpus in
+        // build order (all 50 docs land in the initial sample, one flushed
+        // chunk), and assert the on-disk codes match EXACTLY. If build_cinder
+        // had used the exhaustive default, these would diverge wherever the
+        // shortlist disagrees with the global argmax (the <100% C4 tolerance).
+        {
+            use crate::embedding::centroid_train::load_centroids_npy;
+            use crate::embedding::shortlists::shortlist_argmax;
+            use ndarray::Array1;
+            use ndarray_npy::ReadNpyExt;
+
+            let cinder = CinderEncoder::new(&overlay_model_dir).unwrap();
+            let centroids =
+                load_centroids_npy(&model_manager::frozen_centroids_path(&overlay_model_dir))
+                    .unwrap();
+            let shortlists = cinder.shortlists();
+            let cview = centroids.view();
+
+            let all_texts: Vec<String> = chunk_ids
+                .iter()
+                .map(|&id| chunks[id as usize].1.clone())
+                .collect();
+            let encoded = cinder.encode_documents_with_window_ids(&all_texts).unwrap();
+
+            let mut scratch: Vec<u16> = Vec::new();
+            let mut expected: Vec<i64> = Vec::new();
+            for (emb, windows) in &encoded {
+                for (r, row) in emb.rows().into_iter().enumerate() {
+                    let e = row.as_slice().unwrap();
+                    expected.push(
+                        shortlist_argmax(e, &windows[r], shortlists, &cview, &mut scratch) as i64,
+                    );
+                }
+            }
+
+            let mut got: Vec<i64> = Vec::new();
+            let mut ci = 0usize;
+            loop {
+                let p = idx_dir.path().join(format!("{ci}.codes.npy"));
+                if !p.exists() {
+                    break;
+                }
+                let arr = Array1::<i64>::read_npy(std::fs::File::open(&p).unwrap()).unwrap();
+                got.extend(arr.iter().copied());
+                ci += 1;
+            }
+            assert!(!expected.is_empty(), "no codes recomputed");
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "on-disk vs recomputed token count"
+            );
+            assert_eq!(
+                got, expected,
+                "on-disk codes must equal direct shortlist_argmax output — proves \
+                 build_cinder used the shortlist-union assigner, not the exhaustive default"
+            );
+        }
     }
 
     // ── DocEncoderKind::for_indexing selection (Task 6) ─────────────────────

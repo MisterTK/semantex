@@ -48,6 +48,16 @@ use crate::utils::atomic_write_file;
 /// See [`CompiledIndexWriter::with_assigner`].
 pub type CodeAssigner = Box<dyn Fn(&Array2<f32>) -> Array1<usize>>;
 
+/// A caller-supplied, ID-AWARE centroid-assignment function: like
+/// [`CodeAssigner`], but each embedding row is accompanied by that token's
+/// window of vocab ids (`window_ids[r]` for row `r`, in the SAME row order as
+/// the embeddings matrix). This is what a shortlist-union argmax needs — it
+/// unions the per-id centroid shortlists of the window before scanning, so the
+/// plain [`CodeAssigner`] (embeddings only) cannot express it. See
+/// [`CompiledIndexWriter::with_id_aware_assigner`] /
+/// [`CompiledIndexWriter::add_document_with_ids`].
+pub type IdAwareCodeAssigner = Box<dyn Fn(&Array2<f32>, &[Vec<u32>]) -> Array1<usize>>;
+
 /// Builds a PLAID index in ONE pass over per-document embeddings, with frozen
 /// centroids, flushing packed codes/residuals to on-disk chunk files instead of
 /// holding all embeddings in memory, and NEVER rewriting the IVF incrementally.
@@ -90,6 +100,20 @@ pub struct CompiledIndexWriter {
     /// `Some(f)` swaps ONLY the assignment step; residual computation and
     /// quantization stay byte-for-byte the same as the default.
     assigner: Option<CodeAssigner>,
+    /// Optional caller-supplied ID-AWARE centroid assigner (see
+    /// [`Self::with_id_aware_assigner`]). Mutually exclusive with `assigner`;
+    /// when set it takes precedence in [`Self::flush_chunk`]. Requires documents
+    /// to be fed via [`Self::add_document_with_ids`] (which also populates
+    /// `id_buffer`), never the plain [`Self::add_document`]. Like `assigner`, it
+    /// swaps ONLY the assignment step — residual computation and quantization
+    /// stay byte-for-byte the same as the default path.
+    id_aware_assigner: Option<IdAwareCodeAssigner>,
+    /// Per-token window-id rows for the documents currently in `buffer`, FLAT in
+    /// the same global row order [`Self::flush_chunk`]'s concatenated batch walks
+    /// (document-by-document, then token-by-token). Populated only by
+    /// [`Self::add_document_with_ids`]; cleared in lockstep with `buffer` at each
+    /// chunk flush, so it always lines up row-for-row with the batch.
+    id_buffer: Vec<Vec<u32>>,
 }
 
 impl CompiledIndexWriter {
@@ -151,6 +175,8 @@ impl CompiledIndexWriter {
             total_embeddings: 0,
             ivf_pairs: Vec::new(),
             assigner: None,
+            id_aware_assigner: None,
+            id_buffer: Vec::new(),
         })
     }
 
@@ -171,6 +197,35 @@ impl CompiledIndexWriter {
         self
     }
 
+    /// Install a caller-supplied ID-AWARE [`IdAwareCodeAssigner`], used instead
+    /// of the codec's exhaustive `compress_into_codes_cpu` when flushing each
+    /// chunk. Unlike [`Self::with_assigner`], the assigner ALSO receives, per
+    /// embedding row, that token's window of vocab ids — so it can express a
+    /// shortlist-union argmax (which unions per-id shortlists over the window
+    /// before scanning).
+    ///
+    /// Documents MUST then be fed via [`Self::add_document_with_ids`] (not the
+    /// plain [`Self::add_document`]), so the per-token window ids are buffered
+    /// alongside the embeddings and handed to this assigner at flush time.
+    ///
+    /// Mutually exclusive with [`Self::with_assigner`]: if BOTH are installed
+    /// the id-aware assigner takes precedence (see [`Self::flush_chunk`]); a
+    /// debug build additionally asserts against installing this while a plain
+    /// assigner is already present. Like `with_assigner`, this is a minimal,
+    /// additive hook: with NO assigner installed the writer stays byte-identical
+    /// to [`crate::index::create_index_files`], and everything from residual
+    /// computation onward is shared with the plain-assigner path.
+    #[must_use]
+    pub fn with_id_aware_assigner(mut self, assigner: IdAwareCodeAssigner) -> Self {
+        debug_assert!(
+            self.assigner.is_none(),
+            "with_id_aware_assigner and with_assigner are mutually exclusive; \
+             the id-aware assigner takes precedence in flush_chunk"
+        );
+        self.id_aware_assigner = Some(assigner);
+        self
+    }
+
     /// Append one document's token embeddings (unit-norm, `[n_tokens, dim]`).
     ///
     /// The document is buffered; once `config.batch_size` documents have
@@ -178,6 +233,45 @@ impl CompiledIndexWriter {
     /// per-chunk files), matching `create_index_files`'s chunk boundaries.
     pub fn add_document(&mut self, embeddings: &Array2<f32>) -> Result<()> {
         self.buffer.push(embeddings.clone());
+        if self.buffer.len() >= self.config.batch_size {
+            self.flush_chunk()?;
+        }
+        Ok(())
+    }
+
+    /// Append one document's token embeddings (unit-norm, `[n_tokens, dim]`)
+    /// TOGETHER with the per-token window ids an [`IdAwareCodeAssigner`] needs.
+    ///
+    /// `window_ids[r]` is the window of vocab ids for row `r` of `embeddings`
+    /// (same order); `window_ids.len()` MUST equal `embeddings.nrows()`. The
+    /// embeddings buffer and the window-id buffer advance in lockstep and are
+    /// flushed/cleared together at each `config.batch_size` chunk boundary, so
+    /// the ids handed to the assigner always line up row-for-row with the
+    /// concatenated chunk batch.
+    ///
+    /// Use this (never the plain [`Self::add_document`]) for EVERY document when
+    /// an id-aware assigner is installed via [`Self::with_id_aware_assigner`];
+    /// mixing the two would leave some batch rows without corresponding window
+    /// ids and misalign the assigner input (a debug build asserts against it at
+    /// flush time).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Shape`] if `window_ids.len() != embeddings.nrows()`.
+    pub fn add_document_with_ids(
+        &mut self,
+        embeddings: &Array2<f32>,
+        window_ids: &[Vec<u32>],
+    ) -> Result<()> {
+        if window_ids.len() != embeddings.nrows() {
+            return Err(Error::Shape(format!(
+                "add_document_with_ids: {} window-id rows != {} embedding rows",
+                window_ids.len(),
+                embeddings.nrows()
+            )));
+        }
+        self.buffer.push(embeddings.clone());
+        self.id_buffer.extend_from_slice(window_ids);
         if self.buffer.len() >= self.config.batch_size {
             self.flush_chunk()?;
         }
@@ -198,9 +292,12 @@ impl CompiledIndexWriter {
         // the centroid-assignment step is swapped (residuals/quantization stay
         // identical). The default (no-assigner) arm is untouched, preserving the
         // byte-identity contract.
-        let encoded = match self.assigner.as_ref() {
-            None => encode_index_chunk(&self.buffer, &self.artifacts.codec, self.config.force_cpu)?,
-            Some(assigner) => self.encode_chunk_with_assigner(assigner.as_ref())?,
+        let encoded = if let Some(id_assigner) = self.id_aware_assigner.as_ref() {
+            self.encode_chunk_with_id_aware_assigner(id_assigner.as_ref())?
+        } else if let Some(assigner) = self.assigner.as_ref() {
+            self.encode_chunk_with_assigner(assigner.as_ref())?
+        } else {
+            encode_index_chunk(&self.buffer, &self.artifacts.codec, self.config.force_cpu)?
         };
 
         // {chunk}.metadata.json — written with embedding_offset: 0 first, exactly
@@ -266,31 +363,21 @@ impl CompiledIndexWriter {
         self.total_embeddings += encoded.codes.len();
         self.num_chunks += 1;
         self.buffer.clear();
+        // Cleared in lockstep with `buffer` so the next chunk's window ids start
+        // aligned at row 0 (no-op unless `add_document_with_ids` was used).
+        self.id_buffer.clear();
         Ok(())
     }
 
-    /// Encode the buffered documents into a chunk using a CALLER-SUPPLIED code
-    /// [`CodeAssigner`] in place of the codec's exhaustive
-    /// `compress_into_codes_cpu`.
-    ///
-    /// Everything except the assignment step mirrors
-    /// [`crate::index::encode_index_chunk`] / its `compress_and_residuals_cpu`
-    /// byte-for-byte: the docs are concatenated into one `[total_tokens, dim]`
-    /// batch, residuals are `embedding − centroid[code]`, and quantization runs
-    /// through the same [`crate::codec::ResidualCodec::quantize_residuals`]. Only
-    /// exercised when [`Self::with_assigner`] was called.
-    fn encode_chunk_with_assigner(
-        &self,
-        assigner: &dyn Fn(&Array2<f32>) -> Array1<usize>,
-    ) -> Result<EncodedIndexChunk> {
-        let codec = &self.artifacts.codec;
-        let embedding_dim = codec.embedding_dim();
-        let packed_dim = embedding_dim * codec.nbits / 8;
+    /// Concatenate the buffered documents into one `[total_tokens, dim]` batch
+    /// (row order = document order, then token order within each document),
+    /// returning it with the per-document token counts. Matches
+    /// [`crate::index::encode_index_chunk`]'s concatenation exactly; shared by
+    /// both caller-assigner paths.
+    fn concat_buffer(&self) -> (Array2<f32>, Vec<i64>) {
+        let embedding_dim = self.artifacts.codec.embedding_dim();
         let doclens: Vec<i64> = self.buffer.iter().map(|d| d.nrows() as i64).collect();
         let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
-
-        // Concatenate the buffered docs into one [total_tokens, dim] batch,
-        // exactly as encode_index_chunk does.
         let mut batch = Array2::<f32>::zeros((total_tokens, embedding_dim));
         let mut offset = 0;
         for doc in &self.buffer {
@@ -298,10 +385,26 @@ impl CompiledIndexWriter {
             batch.slice_mut(s![offset..offset + n, ..]).assign(doc);
             offset += n;
         }
+        (batch, doclens)
+    }
 
-        // The ONLY divergence from the default path: caller-supplied assignment
-        // instead of the exhaustive compress_into_codes_cpu.
-        let batch_codes = assigner(&batch);
+    /// Given the concatenated chunk `batch`, one centroid `code` per row (from a
+    /// caller-supplied assigner), and the per-document token counts, compute
+    /// residuals (`embedding − centroid[code]`) and quantize/pack them, then
+    /// build the [`EncodedIndexChunk`]. This mirrors
+    /// [`crate::index::encode_index_chunk`] / its `compress_and_residuals_cpu`
+    /// residual+quantize pass BYTE-FOR-BYTE. The ONLY thing that varies between
+    /// the plain and id-aware assigner paths is how `batch_codes` was produced;
+    /// everything from residuals onward lives here so it cannot drift between
+    /// the two.
+    fn finish_encoded_chunk(
+        &self,
+        batch: Array2<f32>,
+        batch_codes: Array1<usize>,
+        doclens: Vec<i64>,
+    ) -> Result<EncodedIndexChunk> {
+        let codec = &self.artifacts.codec;
+        let packed_dim = codec.embedding_dim() * codec.nbits / 8;
 
         // residuals = embedding − centroid[code], identical to
         // compress_and_residuals_cpu's residual pass.
@@ -332,6 +435,50 @@ impl CompiledIndexWriter {
             residuals,
             doclens,
         })
+    }
+
+    /// Encode the buffered documents into a chunk using a CALLER-SUPPLIED code
+    /// [`CodeAssigner`] in place of the codec's exhaustive
+    /// `compress_into_codes_cpu`.
+    ///
+    /// Everything except the assignment step mirrors
+    /// [`crate::index::encode_index_chunk`] byte-for-byte (concatenation via
+    /// [`Self::concat_buffer`], residual+quantize via
+    /// [`Self::finish_encoded_chunk`]); the ONLY divergence from the default
+    /// path is that the caller assigns centroids instead of the exhaustive
+    /// scan. Only exercised when [`Self::with_assigner`] was called.
+    fn encode_chunk_with_assigner(
+        &self,
+        assigner: &dyn Fn(&Array2<f32>) -> Array1<usize>,
+    ) -> Result<EncodedIndexChunk> {
+        let (batch, doclens) = self.concat_buffer();
+        let batch_codes = assigner(&batch);
+        self.finish_encoded_chunk(batch, batch_codes, doclens)
+    }
+
+    /// Encode the buffered documents into a chunk using a CALLER-SUPPLIED
+    /// [`IdAwareCodeAssigner`], which receives both the concatenated batch and
+    /// the row-aligned per-token window ids accumulated in `self.id_buffer`.
+    /// Everything from residuals onward is shared with
+    /// [`Self::encode_chunk_with_assigner`] via [`Self::finish_encoded_chunk`],
+    /// so the two paths cannot drift. Only exercised when
+    /// [`Self::with_id_aware_assigner`] was called AND documents were fed via
+    /// [`Self::add_document_with_ids`].
+    fn encode_chunk_with_id_aware_assigner(
+        &self,
+        assigner: &dyn Fn(&Array2<f32>, &[Vec<u32>]) -> Array1<usize>,
+    ) -> Result<EncodedIndexChunk> {
+        let (batch, doclens) = self.concat_buffer();
+        debug_assert_eq!(
+            self.id_buffer.len(),
+            batch.nrows(),
+            "id_buffer rows ({}) must align with the concatenated batch rows ({}); \
+             did a caller mix add_document with add_document_with_ids?",
+            self.id_buffer.len(),
+            batch.nrows(),
+        );
+        let batch_codes = assigner(&batch, &self.id_buffer);
+        self.finish_encoded_chunk(batch, batch_codes, doclens)
     }
 
     /// Flush the final chunk, write `plan.json`, fix chunk-metadata offsets,
@@ -672,6 +819,130 @@ mod tests {
             frac < 1.0,
             "the one deliberate second-best pick must reach disk (proving the hook \
              is actually used); got perfect agreement {frac}"
+        );
+    }
+
+    #[test]
+    fn add_document_with_ids_rejects_length_mismatch() {
+        // Validation gate for the id-aware surface: a window-id slice whose
+        // length disagrees with the embedding row count is a caller error and
+        // must be rejected with a descriptive Shape error (never silently
+        // truncated / misaligned).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dim = 8;
+        let docs = synth_docs(4, dim);
+        let centroids = synth_centroids(16, dim);
+        let config = IndexConfig {
+            nbits: 4,
+            batch_size: 16,
+            force_cpu: true,
+            ..Default::default()
+        };
+        let out_dir = tmp.path().join("idx");
+        let assigner: super::IdAwareCodeAssigner =
+            Box::new(|emb: &Array2<f32>, _w: &[Vec<u32>]| {
+                Array1::from_vec(vec![0usize; emb.nrows()])
+            });
+        let mut w = CompiledIndexWriter::new(out_dir.to_str().unwrap(), centroids, &config, &docs)
+            .unwrap()
+            .with_id_aware_assigner(assigner);
+
+        let doc0 = &docs[0];
+        let bad = vec![vec![0u32]]; // 1 window row vs doc0.nrows() (>1) embedding rows
+        assert!(
+            doc0.nrows() != bad.len(),
+            "precondition: row counts must differ"
+        );
+        let err = w.add_document_with_ids(doc0, &bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("window-id rows"),
+            "error must describe the row-count mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn id_aware_assigner_receives_aligned_window_ids_and_reaches_disk() {
+        // Mechanism gate for with_id_aware_assigner / add_document_with_ids: the
+        // id-aware assigner must (1) be invoked, (2) receive per-row window ids
+        // that line up with the concatenated batch rows, and (3) have its codes
+        // reach disk. A stand-in assigner derives each row's code PURELY from
+        // that row's window ids (code = window_ids[r][0] % n_centroids), so the
+        // codes on disk are fully predictable from the inputs — proving the
+        // window ids threaded through add_document_with_ids → flush → assigner
+        // row-for-row (across a chunk boundary: 57 docs at batch_size 16).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dim = 8;
+        let n_centroids = 32usize;
+        let docs = synth_docs(57, dim);
+        let centroids = synth_centroids(n_centroids, dim);
+        let config = IndexConfig {
+            nbits: 4,
+            batch_size: 16,
+            force_cpu: true,
+            ..Default::default()
+        };
+
+        // Per-document window ids, one 1-element window per token, deterministic
+        // in the GLOBAL token index so each row's expected code is knowable.
+        let mut global = 0u32;
+        let per_doc_windows: Vec<Vec<Vec<u32>>> = docs
+            .iter()
+            .map(|d| {
+                (0..d.nrows())
+                    .map(|_| {
+                        let w = vec![global.wrapping_mul(7) % n_centroids as u32];
+                        global += 1;
+                        w
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cl = Arc::clone(&calls);
+        let n_cen = n_centroids;
+        let assigner: super::IdAwareCodeAssigner =
+            Box::new(move |emb: &Array2<f32>, windows: &[Vec<u32>]| {
+                calls_cl.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    windows.len(),
+                    emb.nrows(),
+                    "window rows must line up with batch rows"
+                );
+                let out: Vec<usize> = windows.iter().map(|w| w[0] as usize % n_cen).collect();
+                Array1::from_vec(out)
+            });
+
+        let out_dir = tmp.path().join("idaware");
+        let mut w = CompiledIndexWriter::new(out_dir.to_str().unwrap(), centroids, &config, &docs)
+            .unwrap()
+            .with_id_aware_assigner(assigner);
+        for (d, win) in docs.iter().zip(per_doc_windows.iter()) {
+            w.add_document_with_ids(d, win).unwrap();
+        }
+        w.finalize().unwrap();
+
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "the id-aware assigner hook was never invoked"
+        );
+
+        // Expected codes: flatten the window ids in doc/token order and apply
+        // the same rule; must equal the on-disk codes exactly.
+        let expected: Vec<i64> = per_doc_windows
+            .iter()
+            .flatten()
+            .map(|w| (w[0] as usize % n_centroids) as i64)
+            .collect();
+        let got = read_all_codes(&out_dir);
+        assert!(!expected.is_empty(), "no codes were written");
+        assert_eq!(
+            got, expected,
+            "on-disk codes must equal the id-aware assigner's window-id-derived output"
         );
     }
 
