@@ -566,6 +566,15 @@ enum Commands {
         /// and print their shape (sanity-checks the save/load round trip).
         #[arg(long)]
         verify: bool,
+
+        /// Measure gate-C4 shortlist agreement over this corpus dir
+        /// (repeatable) after deriving: prints the fraction of sampled mixed
+        /// embeddings whose shortlist-union argmax equals the exhaustive
+        /// argmax over all centroids. Off when omitted. Requires the static
+        /// table + `cinder_mixer.bin` + the just-saved `cinder_shortlists.bin`
+        /// present in the model dir.
+        #[arg(long = "agreement", value_name = "DIR")]
+        agreement: Vec<PathBuf>,
     },
 }
 
@@ -1349,9 +1358,12 @@ fn main() -> Result<()> {
             epochs,
             verify,
         }) => commands::distill_mixer::run(&corpus, &out, sample, epochs, verify, &config),
-        Some(Commands::DeriveShortlists { out, m, verify }) => {
-            commands::derive_shortlists::run(&out, m, verify, &config)
-        }
+        Some(Commands::DeriveShortlists {
+            out,
+            m,
+            verify,
+            agreement,
+        }) => commands::derive_shortlists::run(&out, m, verify, &agreement, &config),
         None => {
             // Default: search
             if let Some(ref symbol) = cli.around {

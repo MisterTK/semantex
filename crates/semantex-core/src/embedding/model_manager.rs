@@ -43,6 +43,20 @@ pub fn cinder_shortlists_path(model_dir: &Path) -> PathBuf {
     model_dir.join(CINDER_SHORTLISTS_FILE)
 }
 
+/// Resolve the LateOn-Code-edge model directory under `models_dir` WITHOUT
+/// provisioning it. This is the `<models_dir>/LateOn-Code-edge` subdir where
+/// the ColBERT files AND all Ember/Cinder artifacts (`static_token_table.bin`,
+/// `frozen_centroids.npy`, `cinder_mixer.bin`, `cinder_shortlists.bin`) live —
+/// the same dir [`ensure_colbert_model`] returns, but with no download side
+/// effect. Offline artifact tooling (`derive-shortlists`) that only reads
+/// already-distilled tables should use this rather than `models_dir` directly:
+/// the artifacts are in the subdir, not at the `models_dir` root (which is the
+/// mistake this helper exists to prevent).
+#[must_use]
+pub fn colbert_model_dir(models_dir: &Path) -> PathBuf {
+    models_dir.join(LATEON_CODE_EDGE_DIR)
+}
+
 /// Download LateOn-Code-edge ColBERT model if not already cached. Provisioning for
 /// the opt-in `lateon-colbert` late-interaction backend (the only model whose
 /// download lives here rather than in its own module — it has no separate

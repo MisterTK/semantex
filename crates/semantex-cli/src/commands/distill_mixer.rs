@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 /// uses — see the parity note on `distill_static_table::run` for why this
 /// (rather than `SemantexConfig::default()`) is required to keep
 /// walking/chunking consistent with `semantex index`.
+// `models_dir` (base) vs `model_dir` (the `LateOn-Code-edge` subdir) are a
+// deliberate, meaningful pair — same `#[allow]` `model_manager` uses for it.
+#[allow(clippy::similar_names)]
 pub fn run(
     corpus_dirs: &[PathBuf],
     out: &Path,
@@ -29,10 +32,15 @@ pub fn run(
     let corpus_texts = crate::commands::distill_corpus::corpus_chunk_texts(corpus_dirs, config)?;
 
     let models_dir = config.models_dir();
+    // All model artifacts live in the `LateOn-Code-edge` subdir under
+    // `models_dir` (the same dir `ensure_colbert_model` resolves), NOT at the
+    // `models_dir` root — resolve it so the table is loaded from where
+    // `distill-static-table` actually wrote it.
+    let model_dir = model_manager::colbert_model_dir(&models_dir);
 
     // Fail fast on the cheap, local artifact before provisioning/loading the
     // (much heavier) teacher encoder.
-    let table_path = model_manager::static_token_table_path(&models_dir);
+    let table_path = model_manager::static_token_table_path(&model_dir);
     let table = StaticTokenTable::load(&table_path).with_context(|| {
         format!(
             "failed to load static token table {} — run distill-static-table first",

@@ -138,26 +138,111 @@ impl CinderEncoder {
         let mut out = Array2::<f32>::zeros((ids.len(), dims));
         let mut e = vec![0.0f32; dims];
         for i in 0..ids.len() {
-            let window_ids = window_ids_at::<MIXER_WINDOW>(ids, i);
-            // Gather window rows (owned) so `forward` can borrow them as slices;
-            // a table miss contributes an all-zero row, exactly as
-            // `mixer_train::gather_student_inputs` does.
-            let window_rows: Vec<Vec<f32>> = window_ids
-                .iter()
-                .map(|&id| {
-                    self.table
-                        .lookup(id)
-                        .map_or_else(|| vec![0.0f32; dims], <[f32]>::to_vec)
-                })
-                .collect();
-            let window_refs: [&[f32]; MIXER_WINDOW] =
-                std::array::from_fn(|k| window_rows[k].as_slice());
-            let center_row = window_rows[MIXER_CENTER].as_slice();
-            self.mixer.forward(&window_refs, center_row, &mut e);
+            self.mix_at(ids, i, &mut e);
             out.row_mut(i)
                 .assign(&ndarray::ArrayView1::from(e.as_slice()));
         }
         out
+    }
+
+    /// Contextualize token position `i` of `ids` into `e` (must already be
+    /// length `self.table.dims`; fully overwritten), returning the 9-tap window
+    /// ids used. This is the single source of truth for Cinder's per-position
+    /// mixing — [`Self::encode_ids`] and [`Self::agreement_samples`] both route
+    /// through it so the encode path and the C4 agreement measurement can never
+    /// drift apart.
+    fn mix_at(&self, ids: &[u32], i: usize, e: &mut [f32]) -> [u32; MIXER_WINDOW] {
+        let dims = self.table.dims;
+        let window_ids = window_ids_at::<MIXER_WINDOW>(ids, i);
+        // Gather window rows (owned) so `forward` can borrow them as slices;
+        // a table miss contributes an all-zero row, exactly as
+        // `mixer_train::gather_student_inputs` does.
+        let window_rows: Vec<Vec<f32>> = window_ids
+            .iter()
+            .map(|&id| {
+                self.table
+                    .lookup(id)
+                    .map_or_else(|| vec![0.0f32; dims], <[f32]>::to_vec)
+            })
+            .collect();
+        let window_refs: [&[f32]; MIXER_WINDOW] =
+            std::array::from_fn(|k| window_rows[k].as_slice());
+        let center_row = window_rows[MIXER_CENTER].as_slice();
+        self.mixer.forward(&window_refs, center_row, e);
+        window_ids
+    }
+
+    /// Reservoir-sample up to `max_samples` `(mixed_embedding, window_ids)`
+    /// pairs across EVERY token position of EVERY document in `texts`, for gate
+    /// C4's shortlist-agreement measurement
+    /// ([`crate::embedding::shortlists::shortlist_agreement`]). Each pair is
+    /// `(e_i, window_ids_at(ids, i))` — exactly the `(embedding, window)` inputs
+    /// the deferred shortlist-union argmax would consume at build time (see the
+    /// module docs' v1-scope note), so the measured agreement reflects real
+    /// build-time inputs, not a proxy.
+    ///
+    /// Uses Algorithm-R reservoir sampling seeded by `seed`, so the result is a
+    /// uniform draw over the whole corpus (not just its first N tokens) and is
+    /// fully deterministic given the same corpus iteration order and seed.
+    pub fn agreement_samples(
+        &self,
+        texts: impl IntoIterator<Item = String>,
+        max_samples: usize,
+        seed: u64,
+    ) -> Result<Vec<(Vec<f32>, Vec<u32>)>> {
+        if max_samples == 0 {
+            return Ok(Vec::new());
+        }
+        let dims = self.table.dims;
+        let mut reservoir: Vec<(Vec<f32>, Vec<u32>)> = Vec::new();
+        let mut n_seen: u64 = 0;
+        let mut rng = SplitMix64::new(seed);
+        let mut e = vec![0.0f32; dims];
+        for text in texts {
+            let ids = build_doc_token_ids(&self.alignment, &text)?;
+            for i in 0..ids.len() {
+                let window_ids = self.mix_at(&ids, i, &mut e);
+                if reservoir.len() < max_samples {
+                    reservoir.push((e.clone(), window_ids.to_vec()));
+                } else {
+                    // Algorithm R: the (n_seen+1)-th item replaces a
+                    // uniformly-chosen reservoir slot with probability
+                    // max_samples/(n_seen+1).
+                    let j = rng.next_below(n_seen + 1) as usize;
+                    if j < max_samples {
+                        reservoir[j] = (e.clone(), window_ids.to_vec());
+                    }
+                }
+                n_seen += 1;
+            }
+        }
+        Ok(reservoir)
+    }
+}
+
+/// Minimal splitmix64 PRNG for the deterministic reservoir sample in
+/// [`CinderEncoder::agreement_samples`]. Mirrors the same tiny generator
+/// already copied into `mixer_train` / `centroid_train` / `shortlists` tests
+/// (each private to its own module); no cryptographic randomness is needed —
+/// just a reproducible stream for uniform reservoir replacement.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `0..bound` (bound clamped to ≥1 so the modulo is defined).
+    fn next_below(&mut self, bound: u64) -> u64 {
+        self.next_u64() % bound.max(1)
     }
 }
 
