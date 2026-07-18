@@ -82,7 +82,7 @@ fn index_ort_threads() -> usize {
 /// exists for models whose tokenizer does NOT pre-truncate, matching
 /// `next-plaid-onnx`'s own defensive logic exactly). It's unit-tested
 /// directly on synthetic ids — see `assemble_and_filter_ids`'s test.
-fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32>> {
+pub(crate) fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32>> {
     // Mirrors `next_plaid_onnx::preprocess_texts`: trim, lowercase if the
     // model config requests it.
     let processed = if alignment.do_lower_case {
@@ -185,7 +185,13 @@ pub struct ColbertEmbedder {
 /// See the investigation doc comment on
 /// [`ColbertEmbedder::encode_documents_with_ids`] for why this is a replica
 /// rather than something read directly off the vendored encoder.
-struct DocIdAlignment {
+///
+/// `pub(crate)` (not `pub`): this is an internal replication-of-vendor-
+/// behavior detail, not part of the crate's public API. [`StaticTokenEmbedder`]
+/// (`embedding::static_token`) is the one other crate-internal consumer —
+/// it needs the same alignment `ColbertEmbedder` uses so its own doc-side
+/// tokenization can't drift from the contract Task 2/3 established.
+pub(crate) struct DocIdAlignment {
     tokenizer: Tokenizer,
     /// Token id for the `[D] ` document marker `next-plaid-onnx` inserts at
     /// position 1 (right after `[CLS]`).
@@ -200,6 +206,65 @@ struct DocIdAlignment {
     /// punctuation filter) — `next-plaid-onnx` drops these from its output
     /// embedding rows, so this replica must drop the matching ids too.
     skiplist_ids: HashSet<u32>,
+}
+
+/// Load the tokenizer + id-alignment settings from `model_dir`'s
+/// `tokenizer.json` / `onnx_config.json` files — the same files the ONNX
+/// encoder reads.
+///
+/// Extracted from [`ColbertEmbedder::id_alignment`]'s lazy-init body
+/// (behavior-preserving: `id_alignment` now just calls this and caches the
+/// result in its own `OnceLock`, exactly as before) so a second, independent
+/// caller — [`crate::embedding::static_token::StaticTokenEmbedder`] (Task 5)
+/// — can build the identical `DocIdAlignment` once at construction, without
+/// needing its own copy of this loading logic or a dependency on
+/// `ColbertEmbedder`'s caching.
+pub(crate) fn load_doc_id_alignment(model_dir: &Path) -> Result<DocIdAlignment> {
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        anyhow::anyhow!("failed to load tokenizer {}: {e}", tokenizer_path.display())
+    })?;
+    let config = ColbertConfig::from_file(model_dir.join("onnx_config.json"))?;
+    // `next-plaid-onnx` itself resolves the `[D]` marker id via its private
+    // `ColbertConfig::document_prefix_id` field FIRST, falling back to
+    // `tokenizer.token_to_id(document_prefix)` only when that field is
+    // `None` (next-plaid-onnx 1.6.2 src/lib.rs:1902-1910). That private
+    // field has no public accessor, so we cannot read it from outside the
+    // crate — we always take the fallback path here. For the current
+    // model (`LateOn-Code-edge`, `document_prefix_id: 50369`) this is
+    // verified to resolve to the SAME id as the tokenizer lookup, so
+    // there is no active bug today. But the two paths are only known to
+    // coincide for this one model: if a future/different model's
+    // `onnx_config.json` ever sets a `document_prefix_id` override that
+    // does NOT match what the tokenizer resolves for `document_prefix`
+    // (e.g. a vocab quirk the override exists specifically to route
+    // around), this method would silently report the WRONG id for the
+    // marker row. Row-COUNT alignment (`ids.len() == embeddings.nrows()`)
+    // would still hold — exactly one marker row is always inserted
+    // regardless of its id value — so that check cannot catch this; only
+    // the id VALUE would be wrong. If per-token-id distillation (Task 3)
+    // ever looks wrong specifically for the `[D]`/marker slot on a new
+    // model, this divergence is the first thing to rule out.
+    let document_prefix_id = tokenizer
+        .token_to_id(&config.document_prefix)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "document prefix token '{}' not found in tokenizer vocabulary",
+                config.document_prefix
+            )
+        })?;
+    let skiplist_ids = config
+        .skiplist_words
+        .iter()
+        .filter_map(|word| tokenizer.token_to_id(word))
+        .collect();
+    Ok(DocIdAlignment {
+        tokenizer,
+        document_prefix_id,
+        document_length: config.document_length,
+        do_lower_case: config.do_lower_case,
+        skiplist_ids,
+    })
 }
 
 /// Global singleton for `ColbertEmbedder`.
@@ -431,52 +496,7 @@ impl ColbertEmbedder {
         if let Some(alignment) = self.id_alignment.get() {
             return Ok(alignment);
         }
-        let tokenizer_path = self.model_dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            anyhow::anyhow!("failed to load tokenizer {}: {e}", tokenizer_path.display())
-        })?;
-        let config = ColbertConfig::from_file(self.model_dir.join("onnx_config.json"))?;
-        // `next-plaid-onnx` itself resolves the `[D]` marker id via its private
-        // `ColbertConfig::document_prefix_id` field FIRST, falling back to
-        // `tokenizer.token_to_id(document_prefix)` only when that field is
-        // `None` (next-plaid-onnx 1.6.2 src/lib.rs:1902-1910). That private
-        // field has no public accessor, so we cannot read it from outside the
-        // crate — we always take the fallback path here. For the current
-        // model (`LateOn-Code-edge`, `document_prefix_id: 50369`) this is
-        // verified to resolve to the SAME id as the tokenizer lookup, so
-        // there is no active bug today. But the two paths are only known to
-        // coincide for this one model: if a future/different model's
-        // `onnx_config.json` ever sets a `document_prefix_id` override that
-        // does NOT match what the tokenizer resolves for `document_prefix`
-        // (e.g. a vocab quirk the override exists specifically to route
-        // around), this method would silently report the WRONG id for the
-        // marker row. Row-COUNT alignment (`ids.len() == embeddings.nrows()`)
-        // would still hold — exactly one marker row is always inserted
-        // regardless of its id value — so that check cannot catch this; only
-        // the id VALUE would be wrong. If per-token-id distillation (Task 3)
-        // ever looks wrong specifically for the `[D]`/marker slot on a new
-        // model, this divergence is the first thing to rule out.
-        let document_prefix_id =
-            tokenizer
-                .token_to_id(&config.document_prefix)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "document prefix token '{}' not found in tokenizer vocabulary",
-                        config.document_prefix
-                    )
-                })?;
-        let skiplist_ids = config
-            .skiplist_words
-            .iter()
-            .filter_map(|word| tokenizer.token_to_id(word))
-            .collect();
-        let alignment = DocIdAlignment {
-            tokenizer,
-            document_prefix_id,
-            document_length: config.document_length,
-            do_lower_case: config.do_lower_case,
-            skiplist_ids,
-        };
+        let alignment = load_doc_id_alignment(&self.model_dir)?;
         let _ = self.id_alignment.set(alignment);
         Ok(self
             .id_alignment
