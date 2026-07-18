@@ -105,3 +105,7 @@ settings.local.json
 !/results/ember-gate3/
 /results/ember-gate3/*
 !/results/ember-gate3/report.md
+# Exception: Cinder gate evaluation report (committed report, not raw run data).
+!/results/cinder-gate/
+/results/cinder-gate/*
+!/results/cinder-gate/report.md
