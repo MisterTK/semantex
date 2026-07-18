@@ -12,10 +12,12 @@
 
 use anyhow::Result;
 use ndarray::Array2;
-use next_plaid_onnx::Colbert;
+use next_plaid_onnx::{Colbert, ColbertConfig};
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use tokenizers::Tokenizer;
 
 /// Per-token embedding matrix: rows = tokens, cols = embedding dimension (48).
 pub type TokenEmbeddings = Array2<f32>;
@@ -63,6 +65,50 @@ fn index_ort_threads() -> usize {
     crate::config::env_usize("SEMANTEX_INDEX_ORT_THREADS", default)
 }
 
+/// Rebuild the exact token-id sequence `next-plaid-onnx` feeds to the model
+/// for one document, then drop the same ColBERT-style skiplist ids it filters
+/// out of its output embeddings. See the investigation notes on
+/// [`ColbertEmbedder::encode_documents_with_ids`] for file:line citations.
+fn build_doc_token_ids(alignment: &DocIdAlignment, text: &str) -> Result<Vec<u32>> {
+    // Mirrors `next_plaid_onnx::preprocess_texts`: trim, lowercase if the
+    // model config requests it.
+    let processed = if alignment.do_lower_case {
+        text.trim().to_lowercase()
+    } else {
+        text.trim().to_string()
+    };
+    let encoding = alignment
+        .tokenizer
+        .encode(processed.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("tokenization error: {e}"))?;
+    let ids = encoding.get_ids();
+
+    // A single (unbatched) encode never pads, so `real_len` is just
+    // `ids.len()`; the `.max(1)` guard mirrors next-plaid-onnx's own
+    // defensive floor for degenerate (empty) inputs.
+    let real_len = ids.len().max(1);
+    let truncate_limit = alignment.document_length.saturating_sub(1);
+    let (content_prefix_len, keep_sep) = if real_len > truncate_limit {
+        (truncate_limit.saturating_sub(1), true)
+    } else {
+        (real_len, false)
+    };
+
+    let mut token_ids = Vec::with_capacity(content_prefix_len + 2);
+    token_ids.push(ids[0]); // [CLS]
+    token_ids.push(alignment.document_prefix_id); // [D] marker, inserted at position 1
+    token_ids.extend(ids.iter().take(content_prefix_len).skip(1).copied());
+    if keep_sep {
+        token_ids.push(ids[real_len - 1]); // original [SEP], restored after truncation
+    }
+
+    // ColBERT-style punctuation filter: next-plaid-onnx drops any row whose
+    // token id is in the skiplist when it flattens the ONNX output, so we
+    // drop the matching ids here to stay aligned with its embedding rows.
+    token_ids.retain(|id| !alignment.skiplist_ids.contains(id));
+    Ok(token_ids)
+}
+
 /// ColBERT encoder wrapping LateOn-Code-edge via `next-plaid-onnx`.
 ///
 /// Produces per-token embeddings (N_tokens x 48d) for both queries and documents.
@@ -89,6 +135,35 @@ pub struct ColbertEmbedder {
     /// Used by the race-condition test to verify single-build behaviour.
     #[doc(hidden)]
     build_count: std::sync::atomic::AtomicUsize,
+    /// Lazily-loaded tokenizer + settings needed to replicate the doc-side
+    /// token-id sequence for [`ColbertEmbedder::encode_documents_with_ids`].
+    /// Independent `OnceLock` from `encoder` — building this never touches
+    /// the ONNX session.
+    id_alignment: OnceLock<DocIdAlignment>,
+}
+
+/// Tokenizer + config needed to reconstruct, for a single document, the exact
+/// token-id sequence `next-plaid-onnx` feeds to the model and then filters
+/// down to produce its output embedding rows.
+///
+/// See the investigation doc comment on
+/// [`ColbertEmbedder::encode_documents_with_ids`] for why this is a replica
+/// rather than something read directly off the vendored encoder.
+struct DocIdAlignment {
+    tokenizer: Tokenizer,
+    /// Token id for the `[D] ` document marker `next-plaid-onnx` inserts at
+    /// position 1 (right after `[CLS]`).
+    document_prefix_id: u32,
+    /// `onnx_config.json`'s `document_length` — content beyond
+    /// `document_length - 1` tokens is truncated, keeping the trailing
+    /// `[SEP]`, mirroring `next-plaid-onnx`'s truncation exactly.
+    document_length: usize,
+    /// Whether the model lowercases text before tokenizing.
+    do_lower_case: bool,
+    /// Token ids for `onnx_config.json`'s `skiplist_words` (ColBERT-style
+    /// punctuation filter) — `next-plaid-onnx` drops these from its output
+    /// embedding rows, so this replica must drop the matching ids too.
+    skiplist_ids: HashSet<u32>,
 }
 
 /// Global singleton for `ColbertEmbedder`.
@@ -157,6 +232,7 @@ impl ColbertEmbedder {
             encoder: OnceLock::new(),
             build_lock: std::sync::Mutex::new(()),
             build_count: std::sync::atomic::AtomicUsize::new(0),
+            id_alignment: OnceLock::new(),
         })
     }
 
@@ -311,6 +387,107 @@ impl ColbertEmbedder {
         Ok(embeddings)
     }
 
+    /// Lazily load the tokenizer + id-alignment settings from the same
+    /// `tokenizer.json` / `onnx_config.json` files the ONNX encoder reads.
+    /// Separate `OnceLock` from `encoder()` — this never builds an ONNX
+    /// session, only the (cheap-ish) HF tokenizer.
+    fn id_alignment(&self) -> Result<&DocIdAlignment> {
+        if let Some(alignment) = self.id_alignment.get() {
+            return Ok(alignment);
+        }
+        let tokenizer_path = self.model_dir.join("tokenizer.json");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!("failed to load tokenizer {}: {e}", tokenizer_path.display())
+        })?;
+        let config = ColbertConfig::from_file(self.model_dir.join("onnx_config.json"))?;
+        let document_prefix_id =
+            tokenizer
+                .token_to_id(&config.document_prefix)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "document prefix token '{}' not found in tokenizer vocabulary",
+                        config.document_prefix
+                    )
+                })?;
+        let skiplist_ids = config
+            .skiplist_words
+            .iter()
+            .filter_map(|word| tokenizer.token_to_id(word))
+            .collect();
+        let alignment = DocIdAlignment {
+            tokenizer,
+            document_prefix_id,
+            document_length: config.document_length,
+            do_lower_case: config.do_lower_case,
+            skiplist_ids,
+        };
+        let _ = self.id_alignment.set(alignment);
+        Ok(self
+            .id_alignment
+            .get()
+            .expect("id_alignment set in previous statement"))
+    }
+
+    /// Encode documents into per-token embeddings AND the token id that
+    /// produced each row, aligned 1:1 (`ids[i]` labels `embeddings.row(i)`).
+    ///
+    /// # Investigation finding
+    ///
+    /// `next-plaid-onnx::Colbert::encode_documents` does NOT hand back one
+    /// row per raw input token id — it rewrites the sequence and filters it:
+    ///
+    /// - It tokenizes without the doc marker, then inserts the `[D] `
+    ///   document-prefix token id at position 1 (right after `[CLS]`),
+    ///   matching PyLate's tokenization approach (`next-plaid-onnx` 1.6.2
+    ///   `src/lib.rs:1816-1823`, assembled per-document in
+    ///   `prepare_batch_from_tokenizer_encodings`, `:2007-2131`).
+    /// - When extracting embedding rows from the ONNX output it drops
+    ///   padding rows AND rows whose token id is in `onnx_config.json`'s
+    ///   `skiplist_words` — a ColBERT-style punctuation filter
+    ///   (`encode_prepared_batch_with_session`, `:2154-2246`, gated by the
+    ///   `filter_skiplist` flag that `encode_documents`/`encode_documents_raw`
+    ///   always pass as `true`, `:1118-1138`).
+    ///
+    /// So the true output shape is `[CLS], [D], content tokens minus
+    /// punctuation, optional [SEP] (only if the document was truncated to
+    /// `document_length`)`.
+    ///
+    /// Nothing in `next-plaid-onnx`'s public API exposes these ids directly:
+    /// `Colbert::tokenize_documents` (`:1140-1142`) returns a
+    /// `PreparedDocumentBatch` that DOES carry the exact sequence internally
+    /// (its private `all_token_ids` field, alongside `original_lengths` and
+    /// `filter_skiplist`, `:742-759`), but that struct only exposes
+    /// `batch_size()`/`batch_max_len()` publicly (`:766-774`) — there is no
+    /// accessor for the ids. So this method replicates the construction
+    /// itself from the same `tokenizer.json` + `onnx_config.json` the encoder
+    /// loads (see [`DocIdAlignment`] / [`build_doc_token_ids`]) and applies
+    /// the identical skiplist filter, rather than trying to read the ids off
+    /// the encoder. `ids.len() == embeddings.nrows()` always holds for every
+    /// document — callers (e.g. static-token-table distillation) can zip them
+    /// directly.
+    pub fn encode_documents_with_ids(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<(Vec<u32>, TokenEmbeddings)>> {
+        let embeddings = self.encode_documents(texts)?;
+        let alignment = self.id_alignment()?;
+        texts
+            .iter()
+            .zip(embeddings)
+            .map(|(text, emb)| {
+                let ids = build_doc_token_ids(alignment, text)?;
+                anyhow::ensure!(
+                    ids.len() == emb.nrows(),
+                    "token id/embedding row mismatch ({} ids vs {} rows) for document {:?}",
+                    ids.len(),
+                    emb.nrows(),
+                    text
+                );
+                Ok((ids, emb))
+            })
+            .collect()
+    }
+
     /// Returns true if the ONNX session has been materialized.
     /// Test/diagnostics helper — not used in production paths.
     #[doc(hidden)]
@@ -330,6 +507,37 @@ impl ColbertEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locate the local LateOn-Code-edge ColBERT model directory used by the
+    /// model-gated encode test below. Returns `None` (causing the test to
+    /// skip) when the model hasn't been downloaded, so `cargo test` stays
+    /// green in environments without it (CI, fresh clones). Never downloads
+    /// on its own — mirrors the path `model_manager::ensure_colbert_model`
+    /// downloads to, resolved the same repo-agnostic way production code
+    /// does (`SemantexConfig::models_dir`), never a hardcoded path.
+    fn test_model_dir() -> Option<PathBuf> {
+        let dir = crate::config::SemantexConfig::default()
+            .models_dir()
+            .join("LateOn-Code-edge");
+        dir.join("model_int8.onnx").exists().then_some(dir)
+    }
+
+    #[test]
+    fn encode_with_ids_rows_align() {
+        let Some(model_dir) = test_model_dir() else {
+            return;
+        }; // follow existing gate helper
+        let e = ColbertEmbedder::new(&model_dir).unwrap();
+        let texts = vec!["fn main() { println!(\"hi\"); }".to_string()];
+        let out = e.encode_documents_with_ids(&texts).unwrap();
+        assert_eq!(out.len(), 1);
+        let (ids, emb) = &out[0];
+        assert_eq!(ids.len(), emb.nrows(), "one token id per embedding row");
+        assert!(!ids.is_empty());
+        // Consistency with the plain path: same matrix.
+        let plain = e.encode_documents(&texts).unwrap();
+        assert_eq!(emb, &plain[0]);
+    }
 
     #[test]
     fn default_index_threads_uses_all_cores_when_only_one_build_slot_exists() {
