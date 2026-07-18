@@ -93,6 +93,17 @@ pub struct EmbedderSpec {
     pub normalize: bool,
     /// On-disk vector quantization.
     pub quant: QuantKind,
+    /// Optional distilled static token table artifact (Ember Tier-0 doc-side
+    /// encoder), as a bare filename resolved inside the model directory. Not
+    /// downloaded from the model source — produced offline by
+    /// `semantex distill-static-table`. `None` for models without one.
+    #[serde(default)]
+    pub static_token_table: Option<String>,
+    /// Optional frozen universal PLAID centroids artifact (Ember Plan B), as
+    /// a bare filename resolved inside the model directory. Produced offline
+    /// by `semantex distill-centroids`. `None` for models without one.
+    #[serde(default)]
+    pub frozen_centroids: Option<String>,
 }
 
 /// Reranker-specific nuance.
@@ -238,6 +249,21 @@ impl ModelSpec {
                 "model `{}`: embedder `max_context` must be > 0",
                 self.id
             );
+            for (field, value) in [
+                ("static_token_table", &e.static_token_table),
+                ("frozen_centroids", &e.frozen_centroids),
+            ] {
+                if let Some(name) = value {
+                    anyhow::ensure!(
+                        !name.is_empty()
+                            && !name.contains('/')
+                            && !name.contains('\\')
+                            && !name.contains(".."),
+                        "model `{}`: embedder `{field}` must be a bare filename, got {name:?}",
+                        self.id
+                    );
+                }
+            }
         }
         if let RoleData::Reranker(r) = &self.role_data
             && matches!(r.score_strategy, ScoreStrategyKind::YesNoLogit)
@@ -361,6 +387,8 @@ mod tests {
             pooling: Pooling::Cls,
             normalize: true,
             quant: QuantKind::Int8Symmetric,
+            static_token_table: None,
+            frozen_centroids: None,
         };
         // The fields are data, not behavior — a spec is fully described here.
         assert_eq!(e.dims, 768);
@@ -379,6 +407,8 @@ mod tests {
             pooling: Pooling::Cls,
             normalize: true,
             quant: QuantKind::Int8Symmetric,
+            static_token_table: None,
+            frozen_centroids: None,
         };
         let fp1 = EmbedderFingerprint::compute("coderank-137m", &base, false);
         let fp2 = EmbedderFingerprint::compute("coderank-137m", &base, false);
@@ -431,6 +461,8 @@ mod tests {
             pooling: Pooling::Cls,
             normalize: true,
             quant: QuantKind::Int8Symmetric,
+            static_token_table: None,
+            frozen_centroids: None,
         };
         let off = EmbedderFingerprint::compute("coderank-137m", &base, false);
         let on = EmbedderFingerprint::compute("coderank-137m", &base, true);
@@ -459,6 +491,8 @@ mod tests {
             pooling: Pooling::Cls,
             normalize: true,
             quant: QuantKind::Int8Symmetric,
+            static_token_table: None,
+            frozen_centroids: None,
         };
         let mut diff_doc = base.clone();
         diff_doc.doc_prefix = "passage: ".to_string();
@@ -473,5 +507,48 @@ mod tests {
     #[derive(Deserialize)]
     struct RoleHolder {
         role: ModelRole,
+    }
+
+    #[test]
+    fn embedder_aux_artifact_fields_default_to_none_and_roundtrip() {
+        let s = crate::model::manifest::builtin_specs()
+            .into_iter()
+            .find(|s| s.id == "coderank-137m")
+            .unwrap();
+        let RoleData::Embedder(e) = &s.role_data else {
+            panic!()
+        };
+        assert!(e.static_token_table.is_none());
+        assert!(e.frozen_centroids.is_none());
+    }
+
+    #[test]
+    fn embedder_aux_artifact_fields_reject_path_traversal() {
+        let mut s = crate::model::manifest::builtin_specs()
+            .into_iter()
+            .find(|s| s.id == "lateon-colbert")
+            .unwrap();
+        if let RoleData::Embedder(e) = &mut s.role_data {
+            e.frozen_centroids = Some("../evil.npy".to_string());
+        }
+        let err = s.validate().unwrap_err();
+        assert!(err.to_string().contains("frozen_centroids"), "got: {err}");
+    }
+
+    #[test]
+    fn aux_artifact_fields_do_not_change_the_fingerprint() {
+        let specs = crate::model::manifest::builtin_specs();
+        let s = specs.iter().find(|s| s.id == "lateon-colbert").unwrap();
+        let RoleData::Embedder(e) = &s.role_data else {
+            panic!()
+        };
+        let mut stripped = e.clone();
+        stripped.static_token_table = None;
+        stripped.frozen_centroids = None;
+        assert_eq!(
+            EmbedderFingerprint::compute("lateon-colbert", e, false),
+            EmbedderFingerprint::compute("lateon-colbert", &stripped, false),
+            "aux artifacts are doc-side only; they must never invalidate an index"
+        );
     }
 }

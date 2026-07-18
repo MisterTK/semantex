@@ -58,6 +58,8 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 pooling: Pooling::Mean,
                 normalize: true,
                 quant: QuantKind::Int8Symmetric,
+                static_token_table: None,
+                frozen_centroids: None,
             }),
         },
         // LateOn-Code-edge ColBERT — the late-interaction path (17M, dim-48, int8,
@@ -89,6 +91,12 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 pooling: Pooling::LateInteraction,
                 normalize: true,
                 quant: QuantKind::Int8Symmetric,
+                static_token_table: Some(
+                    crate::embedding::model_manager::STATIC_TOKEN_TABLE_FILE.to_string(),
+                ),
+                frozen_centroids: Some(
+                    crate::embedding::model_manager::FROZEN_CENTROIDS_FILE.to_string(),
+                ),
             }),
         },
         // Qwen3-Embedding-0.6B (Apache-2.0) — the 2026-SOTA single-vector A/B
@@ -124,6 +132,8 @@ pub fn builtin_specs() -> Vec<ModelSpec> {
                 pooling: Pooling::Mean,
                 normalize: true,
                 quant: QuantKind::Int8Symmetric,
+                static_token_table: None,
+                frozen_centroids: None,
             }),
         },
         // ── Rerankers ───────────────────────────────────────────────────────
@@ -608,5 +618,21 @@ mod tests {
         let merged = merge(builtin.clone(), vec![newspec]);
         assert_eq!(merged.len(), builtin.len() + 1);
         assert!(merged.iter().any(|s| s.id == "my-custom-embedder"));
+    }
+
+    #[test]
+    fn lateon_colbert_declares_both_ember_artifacts() {
+        let s = builtin_specs()
+            .into_iter()
+            .find(|s| s.id == "lateon-colbert")
+            .unwrap();
+        let RoleData::Embedder(e) = &s.role_data else {
+            panic!()
+        };
+        assert_eq!(
+            e.static_token_table.as_deref(),
+            Some("static_token_table.bin")
+        );
+        assert_eq!(e.frozen_centroids.as_deref(), Some("frozen_centroids.npy"));
     }
 }

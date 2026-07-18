@@ -14,6 +14,21 @@ const LATEON_CODE_EDGE_BASE_URL: &str =
 const LATEON_CODE_EDGE_FILES: &[&str] = &["model_int8.onnx", "tokenizer.json", "onnx_config.json"];
 const LATEON_CODE_EDGE_DIR: &str = "LateOn-Code-edge";
 
+/// Filename of the Ember Tier-0 static token table inside a model dir.
+pub const STATIC_TOKEN_TABLE_FILE: &str = "static_token_table.bin";
+/// Filename of the Ember Plan-B frozen universal centroids inside a model dir.
+pub const FROZEN_CENTROIDS_FILE: &str = "frozen_centroids.npy";
+
+/// Resolve the Ember Tier-0 static token table's path inside `model_dir`.
+pub fn static_token_table_path(model_dir: &Path) -> PathBuf {
+    model_dir.join(STATIC_TOKEN_TABLE_FILE)
+}
+
+/// Resolve the Ember Plan-B frozen universal centroids' path inside `model_dir`.
+pub fn frozen_centroids_path(model_dir: &Path) -> PathBuf {
+    model_dir.join(FROZEN_CENTROIDS_FILE)
+}
+
 /// Download LateOn-Code-edge ColBERT model if not already cached. Provisioning for
 /// the opt-in `lateon-colbert` late-interaction backend (the only model whose
 /// download lives here rather than in its own module — it has no separate

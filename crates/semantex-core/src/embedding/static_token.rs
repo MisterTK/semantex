@@ -48,7 +48,7 @@ impl StaticTokenEmbedder {
     /// caller decides the fallback (e.g. to the full
     /// [`crate::embedding::colbert::ColbertEmbedder`]).
     pub fn new(model_dir: &Path) -> Result<Self> {
-        let table_path = model_dir.join("static_token_table.bin");
+        let table_path = crate::embedding::model_manager::static_token_table_path(model_dir);
         let table = StaticTokenTable::load(&table_path).with_context(|| {
             format!("failed to load static token table {}", table_path.display())
         })?;
