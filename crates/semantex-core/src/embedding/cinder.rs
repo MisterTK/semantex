@@ -35,6 +35,7 @@ use crate::embedding::static_table::StaticTokenTable;
 use crate::embedding::static_token::window_ids_at;
 use anyhow::{Context, Result};
 use ndarray::Array2;
+use rayon::prelude::*;
 use std::path::Path;
 
 /// Encoder-free document embedder for Cinder's compiled index path.
@@ -121,9 +122,16 @@ impl CinderEncoder {
     /// [`crate::embedding::static_token::StaticTokenEmbedder::encode_documents`].
     /// Every row is L2-normalized (or all-zero when the whole window missed the
     /// table, which MaxSim ignores downstream).
+    ///
+    /// Documents are encoded in PARALLEL (`rayon::par_iter`): each document's
+    /// encoding is fully independent — it only reads the shared, immutable
+    /// table/mixer/alignment (`CinderEncoder` is `Sync`) and owns its scratch
+    /// buffer — so parallelizing is byte-identical to the serial map. Collecting
+    /// an indexed parallel iterator preserves order, so row `i` of the output is
+    /// still document `i`.
     pub fn encode_documents(&self, texts: &[String]) -> Result<Vec<TokenEmbeddings>> {
         texts
-            .iter()
+            .par_iter()
             .map(|text| {
                 let ids = build_doc_token_ids(&self.alignment, text)?;
                 Ok(self.encode_ids(&ids))
@@ -142,12 +150,20 @@ impl CinderEncoder {
     ///
     /// `window_ids.len() == embeddings.nrows()` holds for every returned
     /// document (both are one entry per token position).
+    ///
+    /// Documents are encoded in PARALLEL (`rayon::par_iter`), the same way (and
+    /// for the same reason) as [`Self::encode_documents`]: per-document encoding
+    /// is independent and reads only the shared immutable artifacts, so the
+    /// result is byte-identical to the serial map with document order preserved.
+    /// This is Cinder's build-path hot loop (`build_cinder` feeds the output to
+    /// `add_document_with_ids`), so preserving order keeps each `(embedding,
+    /// window)` pair matched to its document.
     pub fn encode_documents_with_window_ids(
         &self,
         texts: &[String],
     ) -> Result<Vec<(TokenEmbeddings, Vec<Vec<u32>>)>> {
         texts
-            .iter()
+            .par_iter()
             .map(|text| {
                 let ids = build_doc_token_ids(&self.alignment, text)?;
                 Ok(self.encode_ids_with_window_ids(&ids))
