@@ -21,6 +21,77 @@ for C2/C3. Post-Task-10/9/6b and Appendix A are retained as the honest before/af
 **Scope:** Cinder validation gates **C1 (quality), C2 (build speed), C3 (build memory),
 C4 (shortlist agreement)**. Cinder is off-by-default; `SEMANTEX_CINDER=1` activates it.
 
+---
+
+## ⚠️ SUPERSEDED (2026-07-19) — Cinder shipped DEFAULT-ON in v1.1.0
+
+**Everything below this banner is the gate-evaluation ledger that produced the
+original "stop here, merge default-OFF" recommendation. That recommendation was
+subsequently SUPERSEDED: Cinder ships as the DEFAULT dense-indexing path in
+v1.1.0** (`SEMANTEX_CINDER` default-on; opt out with `SEMANTEX_CINDER=0` or
+`SEMANTEX_CINDER=false` — those two case-insensitive tokens only; `off`/`no` do
+**not** disable it). The gate findings are unchanged and the historical reasoning
+is retained verbatim below **on purpose** — it is exactly why this is a
+*disclosed, understood* tradeoff rather than a silent regression.
+
+**What changed the calculus.** The ledger below recommended default-OFF because
+Cinder misses C1(go), C2, and C3 against their absolute targets. Two facts moved
+the real-world ship decision without changing any gate number:
+
+1. **The previous default cannot complete large-repo builds at all.** The gates
+   score Cinder's dense-stage speed/memory against fixed targets, but the
+   *practical* alternative — the full contextual encoder — OOMs and produces
+   **no index** on very large repos, whereas Cinder completes those same builds
+   in seconds to tens of seconds (see the *Post-Task-11 Addendum* full-wall-clock
+   numbers). The honest comparison for the common case is therefore "a fast,
+   complete index with a small Go quality gap" vs. "no index at all," not "Cinder
+   vs. a faster contextual encoder." That inverts the ship decision.
+2. **Artifact distribution now works for fresh installs.** Cinder's static
+   table / micro-mixer / shortlist artifacts are distributed as GitHub release
+   assets as of v1.1.0, so default-on Cinder actually works on a fresh install —
+   not only on the machine that trained the artifacts locally.
+
+**The disclosed tradeoffs stand, unchanged and stated plainly in the v1.1.0
+CHANGELOG:** C1(go) is a small (~2.8% relative nDCG@10) encoder-free quality gap
+on Go (Python and JavaScript at or above the previous default's quality bar);
+C2/C3 miss their aggressive absolute targets at extreme (~150k+ chunk) scale,
+though the build still completes and is far faster than the alternative. The
+per-round gate ledger below is preserved as the engineering record.
+
+## Fast-follow: quality hill-climbing (closing the Go gap)
+
+The Go C1 miss is the one disclosed quality regression, and it is a **planned
+fast-follow, not shipped in v1.1.0.** The specific levers discussed for closing
+it are recorded here so they are not lost. **None is implemented**; this is a
+tracking note.
+
+- **Hashed bigram/trigram contextual tables — the spec's own named contingency.**
+  Scoped in the original Cinder design (`docs/superpowers/specs/2026-07-18-cinder-*`)
+  as the C1-shortfall contingency, but **not applied** during the gate because
+  the Go shortfall was judged **not mixer-attributable** at the time — the mixer
+  *improves* Go by +0.0121, so the residual gap is the fundamental
+  encoder-free-vs-contextual limitation, not a mixer defect (see §V.2 / §5.3).
+  Revisiting it means adding real n-gram context to the static table's per-token
+  features.
+- **A deeper micro-mixer.** The spec explicitly left FLOP headroom for "a second
+  block … if ablation demands," without blowing the compiled-encoder FLOP budget.
+  The shipped mixer is the minimal single-block distillation; a second block is
+  the sanctioned next size up.
+- **A larger / more diverse training corpus.** Earlier Ember work measured only
+  **~46% vocab coverage** in the distillation run and flagged it as a likely
+  limiting factor — a broader, more diverse corpus would fill in under-trained
+  token rows that the Go gap may partly reflect.
+
+**Re-validation required — this is the key constraint.** Every one of these
+levers changes Cinder's *output* (different static-table / mixer weights →
+different embeddings → different codes). Pursuing any of them therefore requires
+**re-running C1 (quality) and C4 (shortlist / mechanism agreement) from
+scratch** — not just re-timing C2/C3. The end-to-end byte-identity proofs that
+let Tasks 9–11 skip a C1 re-run do **not** carry over to an output-changing
+quality lever.
+
+---
+
 ## TL;DR — final (post-Task-11) per-gate verdicts
 
 | Gate | What it checks | Verdict (post-Task-11 epoch-marker argmax, on top of Task-9/10 parallelization) |
@@ -29,6 +100,10 @@ C4 (shortlist agreement)**. Cinder is off-by-default; `SEMANTEX_CINDER=1` activa
 | **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) — unchanged (byte-identical index, proven end-to-end old-vs-new binary) |
 | **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — but a real profile + fix: assign (measured ~74% of the build) −40–54%, whole build −30–40%** (CopilotKit 79.4s→**~54s**, platform 4.45s→**3.06s**). Now measured, not guessed: the residue is the byte-locked, already-parallel per-token dot products — CPU parallelism on the byte-identical path is exhausted |
 | **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL** (CopilotKit ~2232MB, platform 760MB) — **did NOT rise** this round (marker is ~32KB/thread); verdict unchanged (floored ~1GB+ by next-plaid construction + O(corpus) IVF) |
+
+> **⚠️ SUPERSEDED 2026-07-19 — see the banner at the top of this report.** Cinder shipped
+> **DEFAULT-ON** in v1.1.0; the default-OFF decision recorded in this paragraph is retained as the
+> historical record and the honest engineering rationale behind the disclosed tradeoff.
 
 **Final decision (2026-07-18) — stop here, merge to `main` default-OFF.** After the three rounds of
 real, reviewed optimization documented below (Tasks 9/10/11), the user directed the team to **stop
@@ -99,6 +174,12 @@ exhaustive number as the EXACT reference is legitimate. Quality is unaffected (C
 within ≤0.002 nDCG, exactly as C4's 99.5% agreement predicts) and peak memory actually **drops**
 (per-token processing avoids the batched score matrix) — but the speed regression means **C2 is now
 failed harder, not fixed.**
+
+> **⚠️ SUPERSEDED 2026-07-19 — see the banner at the top of this report.** Cinder shipped
+> **DEFAULT-ON** in v1.1.0. The "default-OFF; do NOT promote" recommendation below is the
+> gate-evaluation conclusion as of 2026-07-18, retained verbatim as the historical record; the
+> real-world calculus that changed it (large-repo builds the previous default can't complete +
+> release-asset artifact distribution) is documented in the top banner.
 
 **Overall recommendation — FINAL (stop here): merge to `main` default-OFF; do NOT promote.** The
 feature is correct (byte-compatible index, confirmed activation, clean fallback chain), C4-safe, and
