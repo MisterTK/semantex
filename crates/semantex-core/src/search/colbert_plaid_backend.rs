@@ -395,6 +395,28 @@ impl ColbertPlaidIndexBuilder {
 
         let model_dir = model_manager::ensure_colbert_model(&self.models_dir)?;
 
+        // Provision the four encoder-free Ember/Cinder artifacts from the pinned
+        // GitHub release BEFORE the load attempts below — but ONLY when Cinder is
+        // enabled, so a user who opted out never pays a network fetch. This is
+        // deliberately kept OUT of `cinder_for_build` (which stays a pure,
+        // network-free loader so its unit tests never touch the network); the
+        // download is orchestrated here, one level up, right after the ColBERT
+        // model fetch. NON-FATAL by construction: a failed download is logged and
+        // we fall through to `cinder_for_build`, whose own missing-artifact path
+        // warns and returns `None`, dropping to the existing tier chain — exactly
+        // as a missing artifact behaves today. A flipped/enabled flag must never
+        // turn a working build into a failed one.
+        if crate::config::env_bool("SEMANTEX_CINDER")
+            && let Err(e) = model_manager::ensure_ember_cinder_artifacts(&model_dir)
+        {
+            tracing::warn!(
+                "failed to provision Ember/Cinder artifacts from the pinned release into {} \
+                 ({e:#}); will load any already-present artifacts, else fall back to the \
+                 existing PLAID build path",
+                model_dir.display()
+            );
+        }
+
         // Cinder compiled-indexing fast path (fresh builds ONLY; the incremental
         // `insert_streaming_ids` is untouched). Opt-in via `SEMANTEX_CINDER` and
         // gated on all three Cinder artifacts AND frozen centroids. Any missing
