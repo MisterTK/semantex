@@ -5,8 +5,9 @@
 Cinder — compiled encoder-free indexing — becomes the default dense-indexing
 path. This is a real behavior change, not a drop-in upgrade: dense builds are
 dramatically faster and more reliable, at the cost of a small, disclosed
-retrieval-quality regression on Go (below). Opt out with `SEMANTEX_CINDER=0` or
-`SEMANTEX_CINDER=false` to restore the previous contextual-encoder build path.
+retrieval-quality regression on two of three tested languages (below). Opt out
+with `SEMANTEX_CINDER=0` or `SEMANTEX_CINDER=false` to restore the previous
+contextual-encoder build path.
 
 ### Changed
 
@@ -25,12 +26,16 @@ retrieval-quality regression on Go (below). Opt out with `SEMANTEX_CINDER=0` or
 
 ### Known tradeoffs
 
-- **Retrieval quality on Go regresses slightly.** The encoder-free approach
-  costs ~2.8% relative nDCG@10 on Go specifically versus the full contextual
-  encoder (CodeSearchNet hybrid). Python and JavaScript are at or above the
-  previous default's quality bar; Go is the only language that regresses. This
-  is an inherent property of encoder-free indexing, not a bug — a
-  quality-improvement fast-follow is planned (see `results/cinder-gate/report.md`).
+- **Retrieval quality regresses slightly on two of three tested languages,
+  measured against the previous default (full contextual encoder), not
+  against an internal target.** CodeSearchNet hybrid nDCG@10: Python improves
+  (+1.1% relative — Cinder is actually better here), JavaScript regresses
+  ~3.8% relative, Go regresses ~2.8% relative (retains 97.2% of the previous
+  default's quality). This is an inherent property of encoder-free indexing —
+  approximating what a real neural encoder would produce via a distilled
+  micro-mixer over static lookups, instead of running it — not a bug. A
+  quality-improvement fast-follow is planned (see
+  `results/cinder-gate/report.md`).
 - **Aggressive build targets not fully met at extreme scale.** At ~150k+ chunks
   Cinder's own internal build-speed / peak-memory targets aren't fully reached,
   though the build still completes successfully — and still far faster than the

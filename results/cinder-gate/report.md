@@ -52,11 +52,15 @@ the real-world ship decision without changing any gate number:
    not only on the machine that trained the artifacts locally.
 
 **The disclosed tradeoffs stand, unchanged and stated plainly in the v1.1.0
-CHANGELOG:** C1(go) is a small (~2.8% relative nDCG@10) encoder-free quality gap
-on Go (Python and JavaScript at or above the previous default's quality bar);
-C2/C3 miss their aggressive absolute targets at extreme (~150k+ chunk) scale,
-though the build still completes and is far faster than the alternative. The
-per-round gate ledger below is preserved as the engineering record.
+CHANGELOG:** measured against the previous default (full contextual encoder,
+arm 4 in the ablation tables below) rather than against C1's internal gate
+threshold, Cinder retains/regresses per-language nDCG@10 as: Python **+1.1%**
+(Cinder is actually better), JavaScript **−3.8%**, Go **−2.8%** (97.2%
+retention) — Go is the only one that also misses the internal gate bar (§5),
+but JavaScript regresses too, just within the gate's tolerance. C2/C3 miss
+their aggressive absolute targets at extreme (~150k+ chunk) scale, though the
+build still completes and is far faster than the alternative. The per-round
+gate ledger below is preserved as the engineering record.
 
 ## Fast-follow: quality hill-climbing (closing the Go gap)
 
