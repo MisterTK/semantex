@@ -223,37 +223,103 @@ fn top_m_by_dot(row: &[f32], centroids: &ArrayView2<f32>, m: usize) -> Vec<u16> 
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
-/// `argmax_{c in union of window shortlists} (e · centroid_c)`, ties broken
-/// by lowest id. `scratch` is cleared and reused (rather than allocated
-/// fresh) to build the deduped candidate id list — `window_ids` may repeat
-/// the same id (edge replication), which dedup absorbs.
+/// Reusable per-thread scratch for [`shortlist_argmax`]. Holds an
+/// epoch-stamped "seen" marker over centroid ids so each unique candidate is
+/// scored exactly once WITHOUT sorting/deduping the ~`window·m` gathered ids —
+/// `seen[cid] == epoch` means "already scored during the current call", and
+/// bumping `epoch` once per call retires the previous marks in O(1) instead of
+/// re-clearing the whole array. One instance per worker (created via
+/// `map_init`), reused across every token that worker handles.
+///
+/// This replaced the previous `Vec<u16>` gather-then-`sort_unstable`+`dedup`
+/// scratch: at the production window (9 taps) × `m` (128) that was a ~1152-wide
+/// sort per token, and profiling (Task 11) showed the assign stage — of which
+/// that sort is a large part — dominates the whole dense build (~74%). The
+/// marker dedup is O(window·m) with no sort, and the argmax it drives is
+/// BYTE-IDENTICAL to the old sorted scan (see `shortlist_argmax`'s tie-break
+/// note and the `marker_argmax_matches_sorted_reference` differential test).
+#[derive(Default)]
+pub struct ArgmaxScratch {
+    /// `seen[cid]` holds the epoch during which `cid` was last scored.
+    seen: Vec<u32>,
+    /// Current call's epoch; `seen[cid] == epoch` ⇒ already scored this call.
+    epoch: u32,
+}
+
+impl ArgmaxScratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start a new call: grow the marker to cover `n_centroids` and advance the
+    /// epoch. On the (practically unreachable) `u32` wrap back to 0 the whole
+    /// marker is reset so a freshly-`resize`d `0` can never be mistaken for the
+    /// live epoch.
+    #[inline]
+    fn begin(&mut self, n_centroids: usize) {
+        if self.seen.len() < n_centroids {
+            self.seen.resize(n_centroids, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen.iter_mut().for_each(|s| *s = 0);
+            self.epoch = 1;
+        }
+    }
+
+    /// `true` the FIRST time `cid` is offered during the current call, `false`
+    /// on every later repeat (the union of window shortlists overlaps heavily).
+    #[inline]
+    fn first_time(&mut self, cid: usize) -> bool {
+        if self.seen[cid] == self.epoch {
+            false
+        } else {
+            self.seen[cid] = self.epoch;
+            true
+        }
+    }
+}
+
+/// `argmax_{c in union of window shortlists} (e · centroid_c)`, ties broken by
+/// lowest id. `scratch` (see [`ArgmaxScratch`]) dedups the candidate ids via an
+/// epoch marker so each unique centroid is scored once; `window_ids` may repeat
+/// the same id (edge replication), which the marker absorbs.
+///
+/// Byte-identity with the previous sort-based implementation: the set of unique
+/// candidate centroids scored, and each individual dot product `e · centroid_c`
+/// (same 48-wide sequential sum, unchanged), are identical — only the ORDER in
+/// which candidates are scored differs (marker/first-seen order vs ascending
+/// id). The explicit `dot > best || (dot == best && cid < best_id)` tie-break
+/// makes the winner independent of that order — max dot, lowest id on an exact
+/// tie — reproducing the old "sorted ascending + strict `>`" result bit-for-bit
+/// (proven empirically by `marker_argmax_matches_sorted_reference`).
 pub fn shortlist_argmax(
     e: &[f32],
     window_ids: &[u32],
     shortlists: &CentroidShortlists,
     centroids: &ArrayView2<f32>,
-    scratch: &mut Vec<u16>,
+    scratch: &mut ArgmaxScratch,
 ) -> usize {
-    scratch.clear();
-    for &id in window_ids {
-        scratch.extend_from_slice(shortlists.for_token(id));
-    }
-    scratch.sort_unstable();
-    scratch.dedup();
+    scratch.begin(centroids.nrows());
 
-    let mut best_id: u16 = 0;
+    let mut best_id: usize = 0;
     let mut best_dot = f32::NEG_INFINITY;
-    for &cid in scratch.iter() {
-        let row = centroids.row(cid as usize);
-        let dot: f32 = e.iter().zip(row.iter()).map(|(&a, &b)| a * b).sum();
-        // Strict `>` plus ascending-id iteration order (scratch is sorted)
-        // gives lowest-id tie-breaking for free.
-        if dot > best_dot {
-            best_dot = dot;
-            best_id = cid;
+    for &id in window_ids {
+        for &cid in shortlists.for_token(id) {
+            let cid = cid as usize;
+            if !scratch.first_time(cid) {
+                continue;
+            }
+            let row = centroids.row(cid);
+            let dot: f32 = e.iter().zip(row.iter()).map(|(&a, &b)| a * b).sum();
+            if dot > best_dot || (dot == best_dot && cid < best_id) {
+                best_dot = dot;
+                best_id = cid;
+            }
         }
     }
-    best_id as usize
+    best_id
 }
 
 /// Exhaustive argmax over every centroid, with the same tie-break rule as
@@ -283,7 +349,7 @@ pub fn shortlist_agreement(
     if samples.is_empty() {
         return 1.0;
     }
-    let mut scratch = Vec::new();
+    let mut scratch = ArgmaxScratch::new();
     let matches = samples
         .iter()
         .filter(|(e, window_ids)| {
@@ -479,7 +545,7 @@ mod tests {
     #[test]
     fn shortlist_argmax_matches_exhaustive_when_shortlist_covers_all_centroids() {
         let (centroids, shortlists, samples) = full_coverage_fixture();
-        let mut scratch = Vec::new();
+        let mut scratch = ArgmaxScratch::new();
         for (e, window_ids) in &samples {
             let got = shortlist_argmax(e, window_ids, &shortlists, &centroids.view(), &mut scratch);
             let want = exhaustive_argmax(e, &centroids.view());
@@ -505,7 +571,7 @@ mod tests {
         let samples = random_samples(64, FULL_DIMS, 0xD37E_0003);
         let cview = centroids.view();
 
-        let mut scratch = Vec::new();
+        let mut scratch = ArgmaxScratch::new();
         let serial: Vec<usize> = samples
             .iter()
             .map(|(e, w)| shortlist_argmax(e, w, &shortlists, &cview, &mut scratch))
@@ -513,7 +579,7 @@ mod tests {
 
         let parallel: Vec<usize> = (0..samples.len())
             .into_par_iter()
-            .map_init(Vec::<u16>::new, |scratch, r| {
+            .map_init(ArgmaxScratch::new, |scratch, r| {
                 let (e, w) = &samples[r];
                 shortlist_argmax(e, w, &shortlists, &cview, scratch)
             })
@@ -523,6 +589,85 @@ mod tests {
             serial, parallel,
             "parallel argmax must match serial exactly"
         );
+    }
+
+    /// The pre–Task-11 `shortlist_argmax` body: gather the window's shortlist
+    /// ids, `sort_unstable`+`dedup`, then scan ascending with strict `>`
+    /// (lowest-id tie-break for free). Kept ONLY as a byte-identity oracle for
+    /// the epoch-marker rewrite.
+    fn sorted_reference_argmax(
+        e: &[f32],
+        window_ids: &[u32],
+        shortlists: &CentroidShortlists,
+        centroids: &ArrayView2<f32>,
+    ) -> usize {
+        let mut scratch: Vec<u16> = Vec::new();
+        for &id in window_ids {
+            scratch.extend_from_slice(shortlists.for_token(id));
+        }
+        scratch.sort_unstable();
+        scratch.dedup();
+        let mut best_id: u16 = 0;
+        let mut best_dot = f32::NEG_INFINITY;
+        for &cid in scratch.iter() {
+            let row = centroids.row(cid as usize);
+            let dot: f32 = e.iter().zip(row.iter()).map(|(&a, &b)| a * b).sum();
+            if dot > best_dot {
+                best_dot = dot;
+                best_id = cid;
+            }
+        }
+        best_id as usize
+    }
+
+    #[test]
+    fn marker_argmax_matches_sorted_reference() {
+        // Byte-identity oracle for the Task-11 sort→epoch-marker rewrite of
+        // shortlist_argmax. Over thousands of pseudo-random (embedding, window)
+        // cases — spanning strict-subset shortlists (m < n_centroids),
+        // near-full unions (large m), and 9-tap (production MIXER_WINDOW)
+        // windows with freely-repeated ids — the marker implementation must
+        // return the IDENTICAL centroid id the old sort+dedup+ascending-scan
+        // implementation did. Different m values give different-sized deduped
+        // candidate sets, exercising the marker dedup across the range the real
+        // build hits.
+        let dims = 24;
+        let n_centroids = 512;
+        let centroids = random_centroids(n_centroids, dims, 0x7A11_0001);
+        let cview = centroids.view();
+        let vocab = 256;
+        let table = random_table(vocab, dims, 0x7A11_0002);
+        for &m in &[1usize, 4, 32, 128] {
+            let shortlists = CentroidShortlists::derive(&table, &cview, m).unwrap();
+            let mut rng = SplitMix64::new(0x7A11_1000 + m as u64);
+            let mut scratch = ArgmaxScratch::new();
+            for _ in 0..2000 {
+                let e: Vec<f32> = (0..dims).map(|_| rng.next_range_f32(-1.0, 1.0)).collect();
+                let window: Vec<u32> = (0..9)
+                    .map(|_| rng.next_below(vocab as u64) as u32)
+                    .collect();
+                let got = shortlist_argmax(&e, &window, &shortlists, &cview, &mut scratch);
+                let want = sorted_reference_argmax(&e, &window, &shortlists, &cview);
+                assert_eq!(got, want, "m={m} window={window:?}");
+            }
+        }
+
+        // Exact-dot tie: centroids 1 and 2 are identical rows, so any e scores
+        // them equally. The lowest id (1) must win in BOTH implementations,
+        // exercising the marker path's explicit `dot == best && cid < best_id`
+        // tie-break (the `==` branch the reference resolves via ascending order).
+        let tie_centroids =
+            Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 0.5, 0.5, 0.5, 0.5, 0.0, 1.0]).unwrap();
+        let tcv = tie_centroids.view();
+        let mut tie_table = StaticTokenTable::new(1, 2, [0.2; 5]);
+        tie_table.set_row(0, &[0.5, 0.5]);
+        let tie_short = CentroidShortlists::derive(&tie_table, &tcv, 4).unwrap();
+        let mut scratch = ArgmaxScratch::new();
+        for e in [vec![0.3f32, 0.3], vec![0.9, 0.1], vec![-0.2, 0.7]] {
+            let got = shortlist_argmax(&e, &[0, 0, 0], &tie_short, &tcv, &mut scratch);
+            let want = sorted_reference_argmax(&e, &[0, 0, 0], &tie_short, &tcv);
+            assert_eq!(got, want, "exact-tie case e={e:?} must match reference");
+        }
     }
 
     #[test]

@@ -579,6 +579,7 @@ impl ColbertPlaidIndexBuilder {
         use crate::embedding::shortlists::shortlist_argmax;
         use ndarray::Array1;
         use next_plaid::{CompiledIndexWriter, IdAwareCodeAssigner, IndexConfig};
+        use std::time::{Duration, Instant};
 
         if chunk_ids.is_empty() {
             tracing::info!("No chunks to encode for PLAID index");
@@ -603,6 +604,18 @@ impl ColbertPlaidIndexBuilder {
         let split = chunk_ids.len().min(INITIAL_BUILD_CHUNKS);
         let (initial_ids, remainder_ids) = chunk_ids.split_at(split);
 
+        // Stage-boundary wall-clock timers. These wrap coarse pipeline stages
+        // (a few hundred calls total across the whole build), so the
+        // `Instant::now()` overhead is negligible (<20µs total) and always on;
+        // the single summary line below only formats/emits under
+        // `RUST_LOG=semantex_core=info`. Gives a real per-stage breakdown of the
+        // dense build instead of one opaque wall-clock number.
+        let build_start = Instant::now();
+        let mut t_fetch = Duration::ZERO;
+        let mut t_encode = Duration::ZERO;
+        let mut t_add = Duration::ZERO;
+        let mut t_purge = Duration::ZERO;
+
         let mut full_mapping: Vec<u64> = Vec::with_capacity(chunk_ids.len());
         // Parallel buffers for the residual-stats sample: the embeddings
         // (needed by `CompiledIndexWriter::new`) and the matching per-token
@@ -615,15 +628,19 @@ impl ColbertPlaidIndexBuilder {
             if let Err(e) = crate::memory::check_rss_or_abort("cinder encode (sample)") {
                 anyhow::bail!("Indexing aborted: {e}");
             }
+            let t = Instant::now();
             let batch = fetch(batch_ids)?;
+            t_fetch += t.elapsed();
             if batch.is_empty() {
                 continue;
             }
             let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+            let t = Instant::now();
             for (emb, windows) in cinder.encode_documents_with_window_ids(&contents)? {
                 sample_emb.push(emb);
                 sample_windows.push(windows);
             }
+            t_encode += t.elapsed();
             full_mapping.extend(batch.iter().map(|(id, _)| *id));
         }
 
@@ -672,27 +689,33 @@ impl ColbertPlaidIndexBuilder {
                     // batching (`Codec::compress_into_codes_cpu`); without it the
                     // shortlist scan is single-threaded while exhaustive is not,
                     // which is the whole ~8× C2 regression. `map_init` hands each
-                    // worker ONE reusable scratch `Vec<u16>` (cleared+refilled per
-                    // row inside `shortlist_argmax`) rather than allocating per
-                    // token; the per-thread scratch stays tiny (≤ m·|window| u16),
-                    // so peak RSS is unaffected.
+                    // worker ONE reusable `ArgmaxScratch` (an epoch-stamped seen
+                    // marker; see its docs) reused across every row rather than
+                    // allocating per token; the per-thread marker is one u32 per
+                    // centroid (~32 KB at 8192 centroids), so peak RSS is
+                    // unaffected. It replaced a per-token sort+dedup that Task 11
+                    // profiling identified as a large part of this (dominant)
+                    // assign stage.
                     let out: Vec<usize> = (0..batch.nrows())
                         .into_par_iter()
-                        .map_init(Vec::<u16>::new, |scratch, r| {
-                            // Batch rows are freshly built in standard (C) layout
-                            // by the writer, so `as_slice` is always `Some`.
-                            let row = batch.row(r);
-                            let e = row
-                                .as_slice()
-                                .expect("compiled-writer batch rows are contiguous");
-                            shortlist_argmax(
-                                e,
-                                &window_ids[r],
-                                &assigner_shortlists,
-                                &cview,
-                                scratch,
-                            )
-                        })
+                        .map_init(
+                            crate::embedding::shortlists::ArgmaxScratch::new,
+                            |scratch, r| {
+                                // Batch rows are freshly built in standard (C) layout
+                                // by the writer, so `as_slice` is always `Some`.
+                                let row = batch.row(r);
+                                let e = row
+                                    .as_slice()
+                                    .expect("compiled-writer batch rows are contiguous");
+                                shortlist_argmax(
+                                    e,
+                                    &window_ids[r],
+                                    &assigner_shortlists,
+                                    &cview,
+                                    scratch,
+                                )
+                            },
+                        )
                         .collect();
                     Array1::from_vec(out)
                 },
@@ -704,35 +727,63 @@ impl ColbertPlaidIndexBuilder {
         // default exhaustive scan runs and the buffered window ids are ignored).
         // Feed the WHOLE corpus WITH per-token window ids: the held sample first
         // (same order), then the remainder.
+        let t = Instant::now();
         let mut writer = CompiledIndexWriter::new(&plaid_dir_str, centroids, &config, &sample_emb)?;
+        let t_writer_new = t.elapsed();
         if let Some(assigner) = assigner {
             writer = writer.with_id_aware_assigner(assigner);
         }
+        let t = Instant::now();
         for (emb, windows) in sample_emb.iter().zip(sample_windows.iter()) {
             writer.add_document_with_ids(emb, windows)?;
         }
+        t_add += t.elapsed();
         drop(sample_emb); // free the bounded prefix before streaming the remainder
         drop(sample_windows);
+        let t = Instant::now();
         crate::memory::purge_allocator();
+        t_purge += t.elapsed();
 
         for batch_ids in remainder_ids.chunks(PLAID_APPEND_BATCH) {
             if let Err(e) = crate::memory::check_rss_or_abort("cinder encode (stream)") {
                 anyhow::bail!("Indexing aborted: {e}");
             }
+            let t = Instant::now();
             let batch = fetch(batch_ids)?;
+            t_fetch += t.elapsed();
             if batch.is_empty() {
                 continue;
             }
             let contents: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+            let t = Instant::now();
             let encoded = cinder.encode_documents_with_window_ids(&contents)?;
+            t_encode += t.elapsed();
+            let t = Instant::now();
             for ((emb, windows), (chunk_id, _)) in encoded.iter().zip(batch.iter()) {
                 writer.add_document_with_ids(emb, windows)?;
                 full_mapping.push(*chunk_id);
             }
+            t_add += t.elapsed();
+            let t = Instant::now();
             crate::memory::purge_allocator();
+            t_purge += t.elapsed();
         }
 
+        let t = Instant::now();
         let meta = writer.finalize()?;
+        let t_finalize = t.elapsed();
+        tracing::info!(
+            "cinder dense-stage breakdown: total={:.2}s | fetch={:.2}s encode={:.2}s \
+             writer_new(residual_stats)={:.2}s add(buffer+flush_chunk)={:.2}s \
+             purge_allocator={:.2}s finalize(sort+ivf_write)={:.2}s",
+            build_start.elapsed().as_secs_f64(),
+            t_fetch.as_secs_f64(),
+            t_encode.as_secs_f64(),
+            t_writer_new.as_secs_f64(),
+            t_add.as_secs_f64(),
+            t_purge.as_secs_f64(),
+            t_finalize.as_secs_f64(),
+        );
         anyhow::ensure!(
             meta.num_documents == full_mapping.len(),
             "cinder build wrote {} docs but mapping has {} entries — contract violated",
@@ -1225,7 +1276,7 @@ mod tests {
         // shortlist disagrees with the global argmax (the <100% C4 tolerance).
         {
             use crate::embedding::centroid_train::load_centroids_npy;
-            use crate::embedding::shortlists::shortlist_argmax;
+            use crate::embedding::shortlists::{ArgmaxScratch, shortlist_argmax};
             use ndarray::Array1;
             use ndarray_npy::ReadNpyExt;
 
@@ -1242,7 +1293,7 @@ mod tests {
                 .collect();
             let encoded = cinder.encode_documents_with_window_ids(&all_texts).unwrap();
 
-            let mut scratch: Vec<u16> = Vec::new();
+            let mut scratch = ArgmaxScratch::new();
             let mut expected: Vec<i64> = Vec::new();
             for (emb, windows) in &encoded {
                 for (r, row) in emb.rows().into_iter().enumerate() {

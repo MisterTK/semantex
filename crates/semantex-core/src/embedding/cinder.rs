@@ -521,7 +521,7 @@ mod tests {
     /// is untouched — this exercises only the new id-aware surface.
     #[test]
     fn add_document_with_ids_writes_real_shortlist_codes() {
-        use crate::embedding::shortlists::{CentroidShortlists, shortlist_argmax};
+        use crate::embedding::shortlists::{ArgmaxScratch, CentroidShortlists, shortlist_argmax};
         use crate::embedding::static_table::StaticTokenTable;
         use ndarray::{Array1, Array2};
         use next_plaid::{CompiledIndexWriter, IdAwareCodeAssigner, IndexConfig};
@@ -588,7 +588,7 @@ mod tests {
             Box::new(move |batch: &Array2<f32>, windows: &[Vec<u32>]| {
                 calls_cl.fetch_add(1, Ordering::SeqCst);
                 let cview = a_centroids.view();
-                let mut scratch: Vec<u16> = Vec::new();
+                let mut scratch = ArgmaxScratch::new();
                 let mut out = Vec::with_capacity(batch.nrows());
                 for (r, row) in batch.rows().into_iter().enumerate() {
                     let e = row
@@ -633,7 +633,7 @@ mod tests {
 
         // Expected: direct shortlist_argmax over every token, in doc/token order.
         let cview = centroids.view();
-        let mut scratch: Vec<u16> = Vec::new();
+        let mut scratch = ArgmaxScratch::new();
         let mut expected: Vec<i64> = Vec::new();
         for (e, win) in &docs {
             for (r, row) in e.rows().into_iter().enumerate() {
