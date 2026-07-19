@@ -263,22 +263,26 @@ fn frozen_centroids_for_build(model_dir: &Path) -> Option<PathBuf> {
 /// Resolve the Cinder compiled-indexing encoder for a fresh index build
 /// (spec §4, plan Task 6).
 ///
-/// Opt-in and safe by construction, mirroring `frozen_centroids_for_build` /
-/// `DocEncoderKind::for_indexing`: returns `Some` ONLY when `SEMANTEX_CINDER`
-/// is set AND all three Cinder artifacts (`static_token_table.bin`,
-/// `cinder_mixer.bin`, `cinder_shortlists.bin`) load cleanly from `model_dir`.
-/// Flag unset → `None` before any load is attempted. Flag set but any artifact
+/// DEFAULT-ON and safe by construction: returns `Some` unless the caller opted
+/// out via `SEMANTEX_CINDER=0`/`false` (see [`crate::config::env_bool_default_true`])
+/// AND all three Cinder artifacts (`static_token_table.bin`, `cinder_mixer.bin`,
+/// `cinder_shortlists.bin`) load cleanly from `model_dir`. Explicit opt-out →
+/// `None` before any load is attempted. Enabled (the default) but any artifact
 /// missing/corrupt → `tracing::warn!` (naming the failed artifact, via
 /// `CinderEncoder::new`'s contextualized error) and `None`. Either way the
 /// existing tier chain in `build_streaming_ids` (contextual / static-embed
 /// flag / frozen-centroids flag) proceeds untouched. This NEVER errors — a
-/// flipped experimental flag must never turn a working build into a failed one.
+/// missing artifact must never turn a working build into a failed one.
+///
+/// This is a PURE, network-free loader: the artifact download that populates a
+/// missing `model_dir` is orchestrated by the caller (`build_streaming_ids`)
+/// BEFORE this runs, so this function's unit tests never touch the network.
 ///
 /// Build-time only: queries never construct this, and `SEMANTEX_CINDER` is
 /// excluded from the embedder fingerprint (see `model/registry.rs`), so
 /// toggling it never forces a re-embed.
 fn cinder_for_build(model_dir: &Path) -> Option<CinderEncoder> {
-    if !crate::config::env_bool("SEMANTEX_CINDER") {
+    if !crate::config::env_bool_default_true("SEMANTEX_CINDER") {
         return None;
     }
     match CinderEncoder::new(model_dir) {
@@ -406,7 +410,7 @@ impl ColbertPlaidIndexBuilder {
         // warns and returns `None`, dropping to the existing tier chain — exactly
         // as a missing artifact behaves today. A flipped/enabled flag must never
         // turn a working build into a failed one.
-        if crate::config::env_bool("SEMANTEX_CINDER")
+        if crate::config::env_bool_default_true("SEMANTEX_CINDER")
             && let Err(e) = model_manager::ensure_ember_cinder_artifacts(&model_dir)
         {
             tracing::warn!(
@@ -1112,9 +1116,10 @@ mod tests {
         }
     }
 
-    /// Write the three Cinder artifact files (contents don't matter for the
-    /// flag-off test — the load is never reached) so "artifacts present" is
-    /// literally true.
+    /// Write the three Cinder artifact files as INVALID placeholders (`b"x"`).
+    /// For the opt-out test the load is never reached (gate short-circuits); for
+    /// the default-on test the placeholders are present but fail to parse, which
+    /// is exactly the fail-safe path under test (invalid artifact → `None`).
     fn write_placeholder_cinder_artifacts(dir: &Path) {
         for name in [
             "static_token_table.bin",
@@ -1126,19 +1131,42 @@ mod tests {
     }
 
     #[test]
-    fn cinder_for_build_off_without_env_flag() {
-        // (a) flag unset → None even with all three artifacts present (the flag
-        // gate short-circuits before any load is attempted).
+    fn cinder_for_build_opts_out_when_flag_is_falsy() {
+        // Default-ON, explicit OPT-OUT: SEMANTEX_CINDER=0 (and "false") short-
+        // circuits to None BEFORE any load — even with all Cinder files present.
+        // This is the post-default-on equivalent of the old "unset → off" gate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_placeholder_cinder_artifacts(tmp.path());
+        for opt_out in ["0", "false", "False"] {
+            with_cinder_env(Some(opt_out), || {
+                assert!(
+                    cinder_for_build(tmp.path()).is_none(),
+                    "SEMANTEX_CINDER={opt_out} must opt out (None) before any load"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn cinder_for_build_default_on_attempts_load_when_flag_unset() {
+        // Default-ON: with the flag UNSET the gate no longer short-circuits — it
+        // attempts to load. Here the artifacts are invalid placeholders, so the
+        // load fails and cinder_for_build WARNS and returns None (fail-safe),
+        // never errors. (No network: the real download lives one level up in
+        // build_streaming_ids; this pure loader never fetches.)
         let tmp = tempfile::TempDir::new().unwrap();
         write_placeholder_cinder_artifacts(tmp.path());
         with_cinder_env(None, || {
-            assert!(cinder_for_build(tmp.path()).is_none());
+            assert!(
+                cinder_for_build(tmp.path()).is_none(),
+                "unset (default-on) with invalid artifacts must fall back to None, never error"
+            );
         });
     }
 
     #[test]
     fn cinder_for_build_on_with_flag_but_mixer_missing_returns_none() {
-        // (b) flag on + a valid table but NO mixer → the constructor fails
+        // Explicitly enabled + a valid table but NO mixer → the constructor fails
         // (naming cinder_mixer.bin, asserted directly in cinder.rs) and
         // cinder_for_build WARNS and returns None rather than propagating —
         // the existing tier chain must proceed untouched.

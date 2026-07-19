@@ -339,6 +339,26 @@ pub(crate) fn env_bool(key: &str) -> bool {
     std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Read a DEFAULT-ON boolean flag from an environment variable.
+///
+/// Inverse-default sibling of [`env_bool`]: returns `true` when `key` is missing,
+/// and `false` ONLY when it is explicitly set to a recognized falsy token —
+/// `"0"` or a case-insensitive `"false"`. Any other value (including `"1"` /
+/// `"true"` / `"yes"` / an empty string) is `true`. This is the same
+/// `v != "0" && !v.eq_ignore_ascii_case("false")` opt-out convention already
+/// applied ad hoc to the default-ON flags in [`SemantexConfig::load`]
+/// (`SEMANTEX_RERANK`, `SEMANTEX_ADAPTIVE_SIZING`), surfaced as a reusable helper.
+///
+/// Note the deliberate asymmetry with `env_bool`'s truthy set: `env_bool` only
+/// treats `"1"`/`"true"` as truthy (a default-OFF opt-IN), whereas here anything
+/// that is not an explicit falsy token opts IN, because absent must mean "on".
+pub(crate) fn env_bool_default_true(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +566,46 @@ mod tests {
                 std::env::set_var(KEY, falsy);
             }
             assert!(!env_bool(KEY), "{falsy:?} must be falsy");
+        }
+        // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+    }
+
+    #[test]
+    fn env_bool_default_true_defaults_on_and_opts_out_on_falsy() {
+        const KEY: &str = "SEMANTEX_TEST_ENV_BOOL_DEFAULT_TRUE_PROBE";
+        let _g = ENV_BOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: guarded by ENV_BOOL_TEST_LOCK; KEY is private to this test.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        // Absent → ON (the whole point of the default-true helper).
+        assert!(env_bool_default_true(KEY), "unset must default to true");
+
+        // ONLY "0" / case-insensitive "false" opt out.
+        for falsy in ["0", "false", "False", "FALSE"] {
+            // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
+            unsafe {
+                std::env::set_var(KEY, falsy);
+            }
+            assert!(
+                !env_bool_default_true(KEY),
+                "{falsy:?} must opt OUT (false)"
+            );
+        }
+        // Everything else stays ON — note "yes" and "" differ from env_bool,
+        // which treats them as falsy; here anything not an explicit falsy token
+        // means "on".
+        for truthy in ["1", "true", "True", "yes", "", "on", "anything"] {
+            // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
+            unsafe {
+                std::env::set_var(KEY, truthy);
+            }
+            assert!(env_bool_default_true(KEY), "{truthy:?} must stay ON (true)");
         }
         // SAFETY: guarded by ENV_BOOL_TEST_LOCK.
         unsafe {

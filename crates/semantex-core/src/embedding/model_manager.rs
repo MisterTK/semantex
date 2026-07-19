@@ -301,7 +301,10 @@ mod tests {
     #[test]
     fn are_ember_cinder_artifacts_present_requires_all_four() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(!are_ember_cinder_artifacts_present(tmp.path()), "none present");
+        assert!(
+            !are_ember_cinder_artifacts_present(tmp.path()),
+            "none present"
+        );
         // Present only after the LAST of the four lands.
         for (i, f) in EMBER_CINDER_ARTIFACT_FILES.iter().enumerate() {
             std::fs::write(tmp.path().join(f), b"x").unwrap();
