@@ -294,13 +294,51 @@ pub fn prepare_codec_artifacts(
     })
 }
 
+/// Quantize/pack already-computed residuals and assemble an [`EncodedIndexChunk`].
+///
+/// This is the residual PACK tail shared by [`encode_index_chunk`] (its CPU and
+/// CUDA paths) and [`crate::compiled::CompiledIndexWriter`]'s assigner paths (via
+/// their `finish_encoded_chunk`). Given the per-row centroid `codes` and the
+/// matching `residuals` (`embedding − centroid[code]`, however they were
+/// computed), it quantizes the residuals, verifies the pack offset, reshapes to
+/// `[n_tokens, packed_dim]`, and widens the codes to `i64`. Both callers reach an
+/// identical `(codes, residuals)` pair before this point, so sharing this tail
+/// makes the on-disk residual pack layout impossible to drift between the
+/// exhaustive default path and the Cinder assigner paths — the same "shared code,
+/// not luck" guarantee [`prepare_codec_artifacts`] provides for the codec files.
+pub(crate) fn pack_encoded_chunk(
+    codec: &ResidualCodec,
+    codes: &Array1<usize>,
+    residuals: &Array2<f32>,
+    doclens: Vec<i64>,
+) -> Result<EncodedIndexChunk> {
+    let packed_dim = codec.embedding_dim() * codec.nbits / 8;
+
+    let batch_packed = codec.quantize_residuals(residuals)?;
+    let (raw_residuals, residuals_offset) = batch_packed.into_raw_vec_and_offset();
+    if residuals_offset != Some(0) {
+        return Err(Error::Shape(format!(
+            "Unexpected residual packing offset: {:?}",
+            residuals_offset
+        )));
+    }
+    let residuals = Array2::from_shape_vec((codes.len(), packed_dim), raw_residuals)
+        .map_err(|e| Error::Shape(format!("Failed to reshape residuals: {}", e)))?;
+    let codes: Array1<i64> = codes.iter().map(|&x| x as i64).collect();
+
+    Ok(EncodedIndexChunk {
+        codes,
+        residuals,
+        doclens,
+    })
+}
+
 pub fn encode_index_chunk(
     embeddings: &[Array2<f32>],
     codec: &ResidualCodec,
     force_cpu: bool,
 ) -> Result<EncodedIndexChunk> {
     let embedding_dim = codec.embedding_dim();
-    let packed_dim = embedding_dim * codec.nbits / 8;
     let doclens: Vec<i64> = embeddings.iter().map(|d| d.nrows() as i64).collect();
     let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
 
@@ -359,23 +397,7 @@ pub fn encode_index_chunk(
         }
     };
 
-    let batch_packed = codec.quantize_residuals(&batch_residuals)?;
-    let (raw_residuals, residuals_offset) = batch_packed.into_raw_vec_and_offset();
-    if residuals_offset != Some(0) {
-        return Err(Error::Shape(format!(
-            "Unexpected residual packing offset: {:?}",
-            residuals_offset
-        )));
-    }
-    let residuals = Array2::from_shape_vec((batch_codes.len(), packed_dim), raw_residuals)
-        .map_err(|e| Error::Shape(format!("Failed to reshape residuals: {}", e)))?;
-    let codes: Array1<i64> = batch_codes.iter().map(|&x| x as i64).collect();
-
-    Ok(EncodedIndexChunk {
-        codes,
-        residuals,
-        doclens,
-    })
+    pack_encoded_chunk(codec, &batch_codes, &batch_residuals, doclens)
 }
 
 pub fn write_index_from_encoded_chunks(
@@ -561,11 +583,16 @@ pub fn write_index_from_encoded_chunks(
 ///
 /// `CompiledIndexWriter` reimplements this function's chunk-encoding,
 /// IVF-building, and metadata-writing logic as a separate, single-pass code
-/// path — only [`prepare_codec_artifacts`] is genuinely shared between the
-/// two. If you change chunk encoding, IVF construction, or the metadata JSON
-/// written here, you MUST manually verify `CompiledIndexWriter` still
-/// produces byte-identical output, via its differential test
-/// (`output_is_byte_identical_to_create_index_files` in `compiled.rs`).
+/// path. Two pieces ARE genuinely shared and so cannot drift:
+/// [`prepare_codec_artifacts`] (the codec/residual statistics) and
+/// [`pack_encoded_chunk`] (the residual quantize/pack tail, which
+/// `CompiledIndexWriter::finish_encoded_chunk` also calls). The residual
+/// SUBTRACT, IVF construction, and metadata JSON remain parallel
+/// implementations. If you change chunk encoding, IVF construction, or the
+/// metadata JSON written here, you MUST manually verify `CompiledIndexWriter`
+/// still produces byte-identical output, via its differential tests
+/// (`output_is_byte_identical_to_create_index_files` and
+/// `finish_encoded_chunk_matches_encode_index_chunk` in `compiled.rs`).
 ///
 /// That test does NOT run under `cargo test --workspace` — `next-plaid` is
 /// vendored via a `[patch.crates-io]` path override, not a workspace member,

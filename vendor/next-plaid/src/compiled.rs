@@ -38,7 +38,7 @@ use ndarray_npy::WriteNpyExt;
 use crate::error::{Error, Result};
 use crate::index::{
     ChunkMetadata, EncodedIndexChunk, IndexConfig, Metadata, PreparedCodecArtifacts,
-    encode_index_chunk, prepare_codec_artifacts,
+    encode_index_chunk, pack_encoded_chunk, prepare_codec_artifacts,
 };
 use crate::utils::atomic_write_file;
 
@@ -67,15 +67,17 @@ pub type IdAwareCodeAssigner = Box<dyn Fn(&Array2<f32>, &[Vec<u32>]) -> Array1<u
 /// buffer files, which this writer never creates) to
 /// `create_index_files(embeddings, centroids, path, config)`.
 ///
-/// ⚠️ Of the logic in [`crate::index::create_index_files`], only
-/// [`prepare_codec_artifacts`] (residual statistics) is genuinely shared —
-/// the chunk-encoding, IVF-building, and metadata-writing paths here are
-/// parallel implementations kept in sync solely by the differential test
-/// `output_is_byte_identical_to_create_index_files` below. That test does
-/// NOT run under `cargo test --workspace` (see the sync note on
-/// `create_index_files` in `index.rs` for why, and how to run it manually).
+/// ⚠️ Of the logic in [`crate::index::create_index_files`], two pieces are
+/// genuinely shared: [`prepare_codec_artifacts`] (residual statistics) and
+/// [`pack_encoded_chunk`] (the residual quantize/pack tail, called by
+/// [`Self::finish_encoded_chunk`]). The residual SUBTRACT, IVF-building, and
+/// metadata-writing paths here remain parallel implementations kept in sync by
+/// the differential tests `output_is_byte_identical_to_create_index_files` and
+/// `finish_encoded_chunk_matches_encode_index_chunk` below. Those tests do NOT
+/// run under `cargo test --workspace` (see the sync note on
+/// `create_index_files` in `index.rs` for why, and how to run them manually).
 /// Any change to `create_index_files`'s chunk/IVF/metadata logic requires
-/// re-running that test against this writer before merging.
+/// re-running them against this writer before merging.
 pub struct CompiledIndexWriter {
     /// Destination index directory.
     index_dir: PathBuf,
@@ -390,13 +392,17 @@ impl CompiledIndexWriter {
 
     /// Given the concatenated chunk `batch`, one centroid `code` per row (from a
     /// caller-supplied assigner), and the per-document token counts, compute
-    /// residuals (`embedding − centroid[code]`) and quantize/pack them, then
-    /// build the [`EncodedIndexChunk`]. This mirrors
-    /// [`crate::index::encode_index_chunk`] / its `compress_and_residuals_cpu`
-    /// residual+quantize pass BYTE-FOR-BYTE. The ONLY thing that varies between
-    /// the plain and id-aware assigner paths is how `batch_codes` was produced;
-    /// everything from residuals onward lives here so it cannot drift between
-    /// the two.
+    /// residuals (`embedding − centroid[code]`) and then quantize/pack them via
+    /// the SHARED [`crate::index::pack_encoded_chunk`] — the exact tail
+    /// [`crate::index::encode_index_chunk`] uses — so the on-disk residual pack
+    /// layout cannot drift from the default path. The residual subtraction here
+    /// is the same elementwise math `compress_and_residuals_cpu` runs (serial vs
+    /// its parallel form is numerically identical, since each row is
+    /// independent). The ONLY thing that varies between the plain and id-aware
+    /// assigner paths is how `batch_codes` was produced; everything from
+    /// residuals onward lives here (and in the shared tail) so it cannot drift
+    /// between the two. The subtract's own agreement with `encode_index_chunk` is
+    /// pinned by `finish_encoded_chunk_matches_encode_index_chunk`.
     fn finish_encoded_chunk(
         &self,
         batch: Array2<f32>,
@@ -404,10 +410,11 @@ impl CompiledIndexWriter {
         doclens: Vec<i64>,
     ) -> Result<EncodedIndexChunk> {
         let codec = &self.artifacts.codec;
-        let packed_dim = codec.embedding_dim() * codec.nbits / 8;
 
-        // residuals = embedding − centroid[code], identical to
-        // compress_and_residuals_cpu's residual pass.
+        // residuals = embedding − centroid[code], the same elementwise
+        // subtraction compress_and_residuals_cpu performs (it runs the pass in
+        // parallel; running it serially here is numerically identical because
+        // each row is independent).
         let centroids = codec.centroids_view();
         let mut residuals = batch;
         for (mut row, &code) in residuals.axis_iter_mut(Axis(0)).zip(batch_codes.iter()) {
@@ -417,24 +424,9 @@ impl CompiledIndexWriter {
                 .for_each(|(r, c)| *r -= c);
         }
 
-        // Quantize/pack exactly as encode_index_chunk does.
-        let batch_packed = codec.quantize_residuals(&residuals)?;
-        let (raw_residuals, residuals_offset) = batch_packed.into_raw_vec_and_offset();
-        if residuals_offset != Some(0) {
-            return Err(Error::Shape(format!(
-                "Unexpected residual packing offset: {:?}",
-                residuals_offset
-            )));
-        }
-        let residuals = Array2::from_shape_vec((batch_codes.len(), packed_dim), raw_residuals)
-            .map_err(|e| Error::Shape(format!("Failed to reshape residuals: {}", e)))?;
-        let codes: Array1<i64> = batch_codes.iter().map(|&x| x as i64).collect();
-
-        Ok(EncodedIndexChunk {
-            codes,
-            residuals,
-            doclens,
-        })
+        // Quantize/pack via the SHARED tail so this layout cannot drift from
+        // encode_index_chunk.
+        pack_encoded_chunk(codec, &batch_codes, &residuals, doclens)
     }
 
     /// Encode the buffered documents into a chunk using a CALLER-SUPPLIED code
@@ -653,6 +645,56 @@ mod tests {
             let b = std::fs::read(out_dir.join(f)).unwrap();
             assert_eq!(a, b, "file {f} differs");
         }
+    }
+
+    #[test]
+    fn finish_encoded_chunk_matches_encode_index_chunk() {
+        // Directly guard the assigner path's residual+pack. The two byte-identity
+        // tests above only exercise the DEFAULT (no-assigner) path, which calls
+        // the shared encode_index_chunk; NEITHER touches finish_encoded_chunk,
+        // through which BOTH assigner paths flow (including Cinder's production
+        // id-aware path). This feeds the SAME batch + SAME codes to both
+        // encode_index_chunk and finish_encoded_chunk and asserts byte-equal
+        // codes/residuals/doclens — so a future edit that desyncs the residual
+        // subtract (the one piece finish_encoded_chunk still hand-copies rather
+        // than shares with encode_index_chunk) fails HERE immediately, instead of
+        // silently corrupting the shipped Cinder index.
+        let dim = 8;
+        let docs = synth_docs(20, dim);
+        let centroids = synth_centroids(16, dim);
+        let config = IndexConfig {
+            nbits: 4,
+            batch_size: 64, // > 20 docs: all buffered as one chunk, none flushed
+            force_cpu: true,
+            ..Default::default()
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("idx");
+        let mut w =
+            CompiledIndexWriter::new(out.to_str().unwrap(), centroids, &config, &docs).unwrap();
+
+        // Reference: the shared default path over the same docs and codec.
+        let reference = encode_index_chunk(&docs, &w.artifacts.codec, config.force_cpu).unwrap();
+
+        // Buffer the same docs (no flush at batch_size 64), rebuild the exact
+        // concatenated batch the assigner paths feed finish_encoded_chunk, assign
+        // the SAME codes the default exhaustive path would, and run
+        // finish_encoded_chunk directly.
+        for d in &docs {
+            w.add_document(d).unwrap();
+        }
+        let (batch, doclens) = w.concat_buffer();
+        let codes = w.artifacts.codec.compress_into_codes_cpu(&batch);
+        let got = w.finish_encoded_chunk(batch, codes, doclens).unwrap();
+
+        assert!(!got.codes.is_empty(), "no codes were produced");
+        assert_eq!(got.doclens, reference.doclens, "doclens differ");
+        assert_eq!(got.codes, reference.codes, "codes differ");
+        assert_eq!(
+            got.residuals, reference.residuals,
+            "packed residuals differ between finish_encoded_chunk and encode_index_chunk"
+        );
     }
 
     /// Read and concatenate every `{i}.codes.npy` chunk file in `dir`, in
