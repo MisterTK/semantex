@@ -35,13 +35,23 @@ bit-identical). `quantize_residuals` in the shared pack tail was **already** ray
 was left untouched. Result: a **real, reproducible ~26% dense-stage reduction** on both gate repos
 (CopilotKit 106.8s→79.4s, platform 6.0s→4.45s; user-CPU ≈10× wall confirms parallelism is live).
 **But the ~65% the Task-9 estimate hoped for did not materialize:** within the "53% writer" only the
-residual subtract was serial (quantize was already parallel; the `.npy` IO writes + the O(corpus)
-IVF `(centroid,doc_id)` accumulation + `concat_buffer` copy are inherently serial and untouched), and
-the encode's speedup is sublinear (tokenization + per-token Vec allocation under allocator
-contention). By Amdahl's law that serial writer/finalize residue now dominates. **C2 stays FAIL by
-15.9×/4.4×.** Peak RSS rose modestly (parallel buffers). Recommendation: keep Cinder default-OFF;
-genuinely hitting <5s/<1s needs a lighter codec or GPU assist, not more CPU parallelism — the CPU
-serial floor is now the binding constraint. See **Post-Task-10** below.
+residual subtract was serial (quantize was already parallel); the `.npy` IO writes, the O(corpus)
+IVF `(centroid,doc_id)` accumulation, and the `concat_buffer` copy remain serial **as currently
+written** and were left untouched by this task, and the encode's speedup is sublinear (tokenization +
+per-token Vec allocation under allocator contention). **C2 stays FAIL by 15.9×/4.4×.** Peak RSS rose
+modestly (parallel buffers).
+
+**Important caveat on the conclusion below (flagged by review, not independently re-measured):** the
+"CPU parallelism is essentially exhausted" framing is Amdahl-*reasoned* from the pre-Task-10 profile
+(the 35%/53% split measured before this task's fixes landed), not confirmed by a fresh post-Task-10
+profile of where the remaining 79.4s now goes. The named remaining costs (IVF accumulation, chunk IO,
+`concat_buffer`) are serial in the current implementation, but that is not the same claim as
+*inherently* unparallelizable — IVF accumulation is plausibly per-chunk-local-then-merge, chunk IO is
+pipelineable, and the finalize sort has a parallel variant. Treat "needs a lighter codec or GPU, not
+more CPU parallelism" as the team's best current estimate, not a proven ceiling; a fresh profile of
+the post-Task-10 build would be the right next step before concluding further CPU parallelization is
+not worth attempting. Recommendation stands regardless: keep Cinder default-OFF pending further work.
+See **Post-Task-10** below.
 
 ### ⚠️ Headline finding (Task 6b) — wiring the real shortlist assigner INVERTS the v1 hypothesis
 
@@ -156,12 +166,15 @@ number is solid, not noise.
   IO + IVF accumulation. Assign was already parallel (Task 9); **quantize was already parallel**
   (codec.rs); only the residual subtract was the serial lever this task pulled. The remaining
   writer work — atomic `.npy` writes per chunk, the O(corpus) `ivf_pairs.push((centroid,doc_id))`
-  loop, and the `concat_buffer` copy — is inherently serial and **untouched**.
+  loop, and the `concat_buffer` copy — is serial **as currently written and untouched by this task**.
 - **The ~35% encode parallelized sublinearly.** Its dominant cost is `build_doc_token_ids` →
   `tokenizer.encode` plus a per-token `Vec<Vec<f32>>` window gather; under rayon these hit allocator
   contention, so wall-clock scales well below core count.
-- By **Amdahl's law**, that serial writer/finalize residue + sublinear encode is now the binding
-  floor. No further CPU parallelism of these two functions can close a 15.9×/4.4× gap.
+- **Caveat (per review, not independently re-measured):** the Amdahl reasoning above extrapolates
+  from the *pre-Task-10* 35%/53% profile, not a fresh profile of where the post-Task-10 79.4s
+  actually goes. "Inherently serial" overstates what's shown — IVF accumulation is plausibly
+  per-chunk-local-then-merge, chunk IO is pipelineable, and the finalize sort has a parallel variant.
+  A fresh profile is the right next step before ruling out further CPU parallelism as a lever.
 
 ## X.4 C3 — build memory (peak RSS), same protocol as §V.4
 
@@ -215,14 +228,18 @@ floor that dominates it.
 **Keep Cinder default-OFF.** Task 10 removes the two named CPU-parallelizable hotspots and delivers a
 real ~26% dense-stage win at byte-identical quality — the assignment, encode, and residual-subtract
 paths are all now rayon-parallel, and `quantize_residuals` already was. But **C2's absolute <5s/<1s
-targets remain unmet by 15.9×/4.4×**, and the binding constraint is now the *serial* remainder of the
-writer (per-chunk `.npy` IO, O(corpus) IVF accumulation, `concat_buffer`) + finalize (IVF
-sort/dedup) + sublinear encode scaling — none of which more CPU parallelism can meaningfully move.
+targets remain unmet by 15.9×/4.4×**, and the current best hypothesis for the binding constraint is
+the *serial* remainder of the writer (per-chunk `.npy` IO, O(corpus) IVF accumulation,
+`concat_buffer`) + finalize (IVF sort/dedup) + sublinear encode scaling. **This hypothesis is
+Amdahl-reasoned from the pre-Task-10 profile, not confirmed by re-profiling the post-Task-10 build**
+(flagged by review) — a fresh profile of where the current 79.4s actually goes is the right next step
+before concluding more CPU parallelism can't meaningfully move it further; IVF accumulation, chunk
+IO, and the finalize sort all plausibly admit parallel/pipelined variants that haven't been tried.
 **C3** additionally rose ~+267 MB (CopilotKit) as the cost of parallel buffers and remains FAIL,
-floored regardless by the ~1 GB next-plaid construction working set + in-memory IVF. Consistent with
-Task 9's caveat: genuinely hitting the spec on this hardware likely needs a **lighter codec** (fewer
-residual bytes / a cheaper writer) or **GPU assist**, not further CPU parallelization. The
-CPU-parallel dense pipeline is now essentially exhausted as a lever.
+floored regardless by the ~1 GB next-plaid construction working set + in-memory IVF. A **lighter
+codec** or **GPU assist** remains the most likely path to genuinely hitting the spec on this
+hardware, but that conclusion should be treated as the team's best current estimate rather than a
+proven ceiling until a post-Task-10 profile is actually run.
 
 ---
 
