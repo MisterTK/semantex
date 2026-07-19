@@ -488,6 +488,44 @@ mod tests {
     }
 
     #[test]
+    fn parallel_map_init_matches_serial_argmax() {
+        // Proves the build-path parallelization strategy used in
+        // `build_cinder`'s id-aware assigner — `(0..n).into_par_iter()
+        // .map_init(Vec::new, ...)` over the chunk's token rows — produces
+        // BYTE-IDENTICAL codes to the serial loop, regardless of thread
+        // scheduling. This is the determinism guarantee the Cinder
+        // byte-identity contract depends on: each row's argmax reads only its
+        // own inputs, and rayon's indexed `collect` restores row order.
+        use rayon::prelude::*;
+        let centroids = random_centroids(FULL_N_CENTROIDS, FULL_DIMS, 0xD37E_0001);
+        let table = random_table(64, FULL_DIMS, 0xD37E_0002);
+        // m=4 << 16 centroids so the shortlist union is a strict subset and the
+        // argmax genuinely depends on the union (not a trivial full scan).
+        let shortlists = CentroidShortlists::derive(&table, &centroids.view(), 4).unwrap();
+        let samples = random_samples(64, FULL_DIMS, 0xD37E_0003);
+        let cview = centroids.view();
+
+        let mut scratch = Vec::new();
+        let serial: Vec<usize> = samples
+            .iter()
+            .map(|(e, w)| shortlist_argmax(e, w, &shortlists, &cview, &mut scratch))
+            .collect();
+
+        let parallel: Vec<usize> = (0..samples.len())
+            .into_par_iter()
+            .map_init(Vec::<u16>::new, |scratch, r| {
+                let (e, w) = &samples[r];
+                shortlist_argmax(e, w, &shortlists, &cview, scratch)
+            })
+            .collect();
+
+        assert_eq!(
+            serial, parallel,
+            "parallel argmax must match serial exactly"
+        );
+    }
+
+    #[test]
     fn shortlist_agreement_is_1_when_shortlists_cover_all_centroids() {
         let (centroids, shortlists, samples) = full_coverage_fixture();
         let agreement = shortlist_agreement(&samples, &shortlists, &centroids.view());

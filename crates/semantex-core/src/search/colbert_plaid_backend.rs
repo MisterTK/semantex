@@ -661,23 +661,39 @@ impl ColbertPlaidIndexBuilder {
             let assigner_shortlists = cinder.shortlists().clone();
             Some(Box::new(
                 move |batch: &ndarray::Array2<f32>, window_ids: &[Vec<u32>]| {
+                    use rayon::prelude::*;
                     let cview = assigner_centroids.view();
-                    let mut scratch: Vec<u16> = Vec::new();
-                    let mut out = Vec::with_capacity(batch.nrows());
-                    for (r, row) in batch.rows().into_iter().enumerate() {
-                        // Batch rows are freshly built in standard (C) layout by
-                        // the writer, so `as_slice` is always `Some`.
-                        let e = row
-                            .as_slice()
-                            .expect("compiled-writer batch rows are contiguous");
-                        out.push(shortlist_argmax(
-                            e,
-                            &window_ids[r],
-                            &assigner_shortlists,
-                            &cview,
-                            &mut scratch,
-                        ));
-                    }
+                    // Each token's assignment is fully independent and written
+                    // into its indexed output slot `r`, so parallelizing across
+                    // the chunk's token rows is deterministic — the result is
+                    // byte-identical to the serial argmax regardless of thread
+                    // count/scheduling (rayon's indexed `collect` preserves row
+                    // order). This mirrors the exhaustive path's own rayon
+                    // batching (`Codec::compress_into_codes_cpu`); without it the
+                    // shortlist scan is single-threaded while exhaustive is not,
+                    // which is the whole ~8× C2 regression. `map_init` hands each
+                    // worker ONE reusable scratch `Vec<u16>` (cleared+refilled per
+                    // row inside `shortlist_argmax`) rather than allocating per
+                    // token; the per-thread scratch stays tiny (≤ m·|window| u16),
+                    // so peak RSS is unaffected.
+                    let out: Vec<usize> = (0..batch.nrows())
+                        .into_par_iter()
+                        .map_init(Vec::<u16>::new, |scratch, r| {
+                            // Batch rows are freshly built in standard (C) layout
+                            // by the writer, so `as_slice` is always `Some`.
+                            let row = batch.row(r);
+                            let e = row
+                                .as_slice()
+                                .expect("compiled-writer batch rows are contiguous");
+                            shortlist_argmax(
+                                e,
+                                &window_ids[r],
+                                &assigner_shortlists,
+                                &cview,
+                                scratch,
+                            )
+                        })
+                        .collect();
                     Array1::from_vec(out)
                 },
             ))
