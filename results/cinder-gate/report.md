@@ -1,37 +1,47 @@
 # Cinder — Gate Evaluation Report (compiled encoder-free indexing)
 
-**Date:** 2026-07-18 (updated post-Task-9)
-**Branch:** `feat/cinder-instant-indexing` @ `fe39706`+Task-9
+**Date:** 2026-07-18 (updated post-Task-10)
+**Branch:** `feat/cinder-instant-indexing` @ `ffd0f3c` (Task-10)
 **History:** Tasks 0–7 merged. Task 8's first pass measured the four gates against **v1**, which
 silently shipped **exhaustive** centroid assignment (preserved verbatim in **Appendix A**).
 **Task 6b** (`ba378b2`) wired the real shortlist-union assigner into `build_cinder`; Task 8's second
 pass re-validated the gates and added `SEMANTEX_CINDER_EXACT_ASSIGN` (`0e258b3`, preserved in the
-**Post-Task-6b** section). **Task 9 (this task)** found the shortlist assigner was a single-threaded
+**Post-Task-6b** section). **Task 9** found the shortlist assigner was a single-threaded
 scalar loop (the entire ~8× C2 regression vs the rayon-parallel exhaustive path) and **parallelized
-it** — see the **Post-Task-9** section, which is now the current/primary record for C2. Post-Task-6b
-and Appendix A are retained as the honest before/after ledger.
+it** (Post-Task-9 section). **Task 10 (this task)** parallelized the two remaining dense-stage
+hotspots the Task-9 floor breakdown named — the `CinderEncoder` static+mixer token encode (~35%)
+and the vendored `CompiledIndexWriter` residual subtraction (part of the ~53% writer) — see the
+**Post-Task-10** section, now the current/primary record for C2/C3. Post-Task-9, Post-Task-6b, and
+Appendix A are retained as the honest before/after ledger.
 **Spec:** `docs/superpowers/specs/2026-07-18-cinder-*` (design `9aeb82f`, plan `5857973`)
 **Scope:** Cinder validation gates **C1 (quality), C2 (build speed), C3 (build memory),
 C4 (shortlist agreement)**. Cinder is off-by-default; `SEMANTEX_CINDER=1` activates it.
 
-## TL;DR — final (post-Task-9) per-gate verdicts
+## TL;DR — final (post-Task-10) per-gate verdicts
 
-| Gate | What it checks | Verdict (post-Task-9 parallel shortlist assignment) |
+| Gate | What it checks | Verdict (post-Task-10 parallel encode + residual, on top of Task-9 parallel assign) |
 |---|---|---|
-| **C4** shortlist agreement | shortlist-union argmax ≥99% agreement w/ exhaustive argmax | **PASS** at m=128 (0.99547) — unchanged |
-| **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) — unchanged (byte-identical codes) |
-| **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — but the ~8× Task-6b regression is FIXED** (CopilotKit 787.8s→**106.8s**, platform 44.6s→**6.0s**; now on par w/ exhaustive; floored by non-assignment dense work) |
-| **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL** (CopilotKit 1965MB, platform 670MB) — not regressed by Task 9; still < exhaustive |
+| **C4** shortlist agreement | shortlist-union argmax ≥99% agreement w/ exhaustive argmax | **PASS** at m=128 (0.99547) — unchanged (assigner code untouched) |
+| **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) — unchanged (byte-identical codes, proven) |
+| **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — improved ~26% more** (CopilotKit 106.8s→**79.4s**, platform 6.0s→**4.45s**); both hotspots now parallel but the serial writer IO + IVF accumulation + sublinear encode floor keeps it far over target |
+| **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL** (CopilotKit 2232MB, platform 750MB) — **rose ~+267MB/+84MB from Task-9** as the expected cost of parallel buffers; verdict unchanged (floored ~1GB+ by next-plaid construction + O(corpus) IVF) |
 
-**Task-9 headline:** the shortlist assigner Task 6b wired was single-threaded; the exhaustive path is
-rayon-parallel + batched matmul — the whole ~8× C2 pessimization. Parallelizing the per-token
-assignment loop (rayon `into_par_iter().map_init`, byte-identical output) removes the regression
-(7.4× faster on CopilotKit + platform, on par with exhaustive, equal memory). **But C2's absolute
-<5s/<1s targets remain unmet: after the fix, assignment is only ~4% of the CopilotKit build.** The
-floor is non-assignment dense work — serial static+mixer encode (~35%) + the vendored next-plaid
-residual/quantize/IVF writer path (~53%) — which no assignment optimization can touch. See
-**Post-Task-9** below. Recommendation: keep Cinder default-OFF; the assigner is no longer a
-pessimization, but hitting C2 needs a broader dense-pipeline parallelization (escalated).
+**Task-10 headline:** Task 9's floor breakdown named the two remaining dense-stage costs — serial
+`CinderEncoder::encode_documents_with_window_ids` static+mixer encode (~35%) and the vendored
+next-plaid residual/quantize/IVF writer path (~53%). Task 10 parallelized both **parallelizable**
+pieces: the encode (`rayon::par_iter` over documents, order-preserving → byte-identical) and the
+writer's residual subtraction (mirroring the already-parallel `compress_and_residuals_cpu`,
+bit-identical). `quantize_residuals` in the shared pack tail was **already** rayon-parallel, so it
+was left untouched. Result: a **real, reproducible ~26% dense-stage reduction** on both gate repos
+(CopilotKit 106.8s→79.4s, platform 6.0s→4.45s; user-CPU ≈10× wall confirms parallelism is live).
+**But the ~65% the Task-9 estimate hoped for did not materialize:** within the "53% writer" only the
+residual subtract was serial (quantize was already parallel; the `.npy` IO writes + the O(corpus)
+IVF `(centroid,doc_id)` accumulation + `concat_buffer` copy are inherently serial and untouched), and
+the encode's speedup is sublinear (tokenization + per-token Vec allocation under allocator
+contention). By Amdahl's law that serial writer/finalize residue now dominates. **C2 stays FAIL by
+15.9×/4.4×.** Peak RSS rose modestly (parallel buffers). Recommendation: keep Cinder default-OFF;
+genuinely hitting <5s/<1s needs a lighter codec or GPU assist, not more CPU parallelism — the CPU
+serial floor is now the binding constraint. See **Post-Task-10** below.
 
 ### ⚠️ Headline finding (Task 6b) — wiring the real shortlist assigner INVERTS the v1 hypothesis
 
@@ -71,7 +81,152 @@ recommendation and the out-of-scope follow-up (a vectorized/batched shortlist).
 
 ---
 
-# Post-Task-9 (v3) — parallelized shortlist assigner (PRIMARY / CURRENT for C2)
+# Post-Task-10 (v4) — parallelized token encode + writer residual subtract (PRIMARY / CURRENT for C2, C3)
+
+Task 10 targeted the two dense-stage costs the Post-Task-9 floor breakdown (§IX.2) named as the
+remaining floor after assignment stopped being the bottleneck: the **serial static+mixer token
+encode (~35%)** and the **vendored next-plaid residual/quantize/IVF writer path (~53%)**. Both were
+parallelized where parallelizable; the change is verified byte-identical (so C1/C4 cannot move) and
+the C2/C3 numbers below are the current record.
+
+## X.1 The two fixes
+
+- **Part A — `CinderEncoder` token encode** (`crates/semantex-core/src/embedding/cinder.rs`,
+  commit `2767ad3`). `encode_documents` and `encode_documents_with_window_ids` were serial
+  `texts.iter().map(…)` loops. Each document's encoding is fully independent — it reads only the
+  shared immutable table/mixer/alignment (`CinderEncoder` is `Sync`, compiler-enforced by
+  `par_iter`) and owns its scratch buffer — so both were switched to `rayon::par_iter`. Collecting
+  an **indexed** parallel iterator preserves order, so row `i` of the output is still document `i`
+  and the result is byte-identical to the serial map. `encode_documents_with_window_ids` is
+  `build_cinder`'s build-path hot loop feeding `add_document_with_ids`; order preservation keeps
+  each `(embedding, window)` pair matched to its document.
+
+- **Part B — `CompiledIndexWriter` residual subtraction** (`vendor/next-plaid/src/compiled.rs`,
+  commit `ffd0f3c`). `finish_encoded_chunk` computed `residuals = embedding − centroid[code]` with a
+  serial `axis_iter_mut` loop over token rows. Each row depends only on its own embedding and its own
+  assigned centroid, so it now mirrors the **already-parallel** `compress_and_residuals_cpu`
+  (`index.rs`) form exactly:
+  `residuals.axis_iter_mut(Axis(0)).into_par_iter().zip(batch_codes.as_slice().unwrap().par_iter()).for_each(…)`.
+  Bit-identical to the serial pass (no cross-row interaction, no reduction, no within-row
+  reordering) — only wall-clock changes. **`codec.quantize_residuals` in the shared `pack_encoded_chunk`
+  tail was checked and is *already* rayon-parallel over rows** (`codec.rs:356`), so it was left
+  untouched — there was no second serial lever to pull there.
+
+No new dependency (`rayon` is already used by both crates). No change to `shortlists.rs`,
+`shortlist_argmax`, or any assigner semantics.
+
+## X.2 Correctness — byte-identity proven, not assumed
+
+- **Part A** emits byte-identical embeddings/window-ids: order-preserving `par_iter().collect()` over
+  a pure per-document function. The model-gated `zero_mixer_equals_static_center_lookup_end_to_end`
+  test (which runs the parallelized `encode_documents` against the **real** LateOn-Code-edge
+  tokenizer and asserts row-for-row equality vs `StaticTokenEmbedder`) **passed** in
+  `cargo test --workspace`. Identical encode output → identical assigner input → identical codes.
+- **Part B** is guarded directly by next-plaid's own `finish_encoded_chunk_matches_encode_index_chunk`
+  byte-identity test (added by `fe39706`), plus `output_is_byte_identical_to_create_index_files`,
+  `default_no_assigner_path_stays_byte_identical`, `shortlist_assigner_agrees_with_exhaustive_default`,
+  and the id-aware wiring test. All ran via the **workspace-member dance** (temporarily add
+  `vendor/next-plaid` to `[workspace] members`, `cargo test -p next-plaid`, revert `Cargo.toml`/
+  `Cargo.lock` — verified `git diff --stat` zero on both) and **passed unchanged: 142 lib tests, 0
+  failures.**
+- `cargo test --workspace` = **all green** (1245 semantex-core lib tests + all crates, 0 failures).
+- Both index builds produced the **exact original chunk counts** (gin 2,233 / platform 7,831 /
+  CopilotKit 159,013) with no fallback warnings, confirming the parallel paths build a correct index.
+
+## X.3 C2 — build speed (dense-stage increment), same protocol as §V.3 / §IX.2
+
+`.semantex` preserved/restored per repo, `/usr/bin/time -l`, `RUST_LOG=semantex_core=info`,
+`SEMANTEX_CINDER=1`; dense Δt = `PLAID index built via cinder` − `using cinder compiled indexing`
+timestamps. Release binary at HEAD `ffd0f3c`. Raw logs: `results/cinder-gate/task10-evidence/`.
+
+| repo (chunks) | Task-9 parallel assign | **Task-10 + parallel encode + residual** | Δ | exhaustive ref | target | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| gin (2,233) | 1.31s | **1.08s** | −18% | 1.25s | (not a gate) | on par |
+| platform (7,831) | 6.00s | **4.45s** (4.436 / 4.485, two runs) | −26% | 5.41s | <1s | **FAIL** (4.4×) |
+| CopilotKit (159,013) | 106.76s | **79.39s** | −26% | 102.42s | <5s | **FAIL** (15.9×) |
+
+Parallelism is genuinely live: platform user-CPU 60.2s over 5.9s wall ≈ **10.2×**; CopilotKit
+1085.7s over 102.1s wall ≈ **10.6×**. The two platform runs (4.436s, 4.485s) are within 1% — the
+number is solid, not noise.
+
+**The ~26% gain is real and reproducible, but well short of the Task-9 estimate (~2s platform /
+~30–40s CopilotKit).** Why the shortfall, honestly:
+
+- **The "53% writer" was only partly serial.** It is assign + residual-subtract + quantize + `.npy`
+  IO + IVF accumulation. Assign was already parallel (Task 9); **quantize was already parallel**
+  (codec.rs); only the residual subtract was the serial lever this task pulled. The remaining
+  writer work — atomic `.npy` writes per chunk, the O(corpus) `ivf_pairs.push((centroid,doc_id))`
+  loop, and the `concat_buffer` copy — is inherently serial and **untouched**.
+- **The ~35% encode parallelized sublinearly.** Its dominant cost is `build_doc_token_ids` →
+  `tokenizer.encode` plus a per-token `Vec<Vec<f32>>` window gather; under rayon these hit allocator
+  contention, so wall-clock scales well below core count.
+- By **Amdahl's law**, that serial writer/finalize residue + sublinear encode is now the binding
+  floor. No further CPU parallelism of these two functions can close a 15.9×/4.4× gap.
+
+## X.4 C3 — build memory (peak RSS), same protocol as §V.4
+
+| repo | Task-9 | **Task-10** | Δ | increment vs sparse (~68–80 MB) | verdict |
+|---|---:|---:|---:|---:|---|
+| gin (2,233) | 651.8 MB | **655.2 MB** | +3 MB | — | (not a gate repo) |
+| platform (7,831) | 670.2 MB | **750.5 MB** (750.5 / 757.6) | **+84 MB** | ≈675 MB | **FAIL** |
+| CopilotKit (159,013) | 1965.5 MB | **2232.1 MB** | **+267 MB** | ≈2152 MB | **FAIL** |
+
+**C3 stays FAIL, and peak RSS rose** — the expected, reproducible cost of parallel buffers (rayon
+holds multiple in-flight per-document encode outputs / row slices concurrently; the two platform runs
+agree within ~1%, so the increase is genuine, not noise). This does **not** change the verdict: C3
+was already ~6× over the 300 MB gate, floored by the **~1 GB next-plaid index-construction working
+set** (Appendix A §8) plus the single-pass writer's whole-corpus in-memory IVF `(u32,i64)`
+accumulation (≈12 B/token) — neither of which Task 10 touches. But it is an honest regression worth
+stating: **the parallelism buys ~26% speed for ~+13% peak RSS on CopilotKit.** If C3 is ever pursued,
+that trade must be accounted for (or bounded, e.g. a rayon thread cap) alongside the architectural
+floor that dominates it.
+
+## X.5 C1 / C4 sanity (post-fix)
+
+- **C1 (quality): UNCHANGED — provably.** Both changes emit byte-identical codes (Part A: order-
+  preserving encode → identical assigner input; Part B: proven bit-identical by
+  `finish_encoded_chunk_matches_encode_index_chunk`). Byte-identical codes → identical index →
+  identical nDCG, so the §V.2 / §IX.3 verdict stands verbatim: **py 0.9066 PASS / js 0.5354 PASS /
+  go 0.7382 FAIL**. A CSN re-run would deterministically reproduce those numbers; it is redundant,
+  not skipped — matching Task 9's approach.
+- **C4 (agreement): UNCHANGED.** `shortlist_argmax` / `shortlist_agreement` are byte-for-byte
+  untouched by this task. **PASS at m=128 (0.99547).**
+
+## X.6 Tests, restoration, harness note
+
+- **Tests:** `cargo test --workspace` all green (0 failures); `cargo test -p next-plaid` via the
+  workspace-member dance = 142 lib tests, 0 failures (byte-identity suite unchanged); `Cargo.toml`/
+  `Cargo.lock` reverted to zero diff after the dance. clippy (pinned 1.91) introduced **zero** new
+  warnings in the changed code (the 10 pre-existing warnings live in unrelated files).
+- **Model-gated `cinder_build_produces_searchable_index`:** fails under bare `cargo test` on an ORT
+  `dlopen` (`libonnxruntime.dylib` not on the test binary's load path) — the **same pre-existing
+  harness gap** Task 9 documented (§IX.4), which occurs *before* any Cinder code runs and is
+  unrelated to this change. The real CLI provisions ORT at runtime, and all three C2 builds above ran
+  clean end-to-end through it, which is the stronger end-to-end validation.
+- **Repo restoration — verified:** gin 2,233 / platform 7,831 / CopilotKit 159,013 chunks, all
+  restored. No `.semantex.pre-cinder`/`.aside` backups remain. `.gitignore` side effects handled:
+  CopilotKit's build re-appended `.semantex/` (working tree was clean pre-run) → **reverted to
+  committed**; platform's `.gitignore` was only stat-dirty (empty content diff) → clean; gin's
+  `.gitignore` retains its **pre-existing** (pre-session) `.semantex/` append unchanged (hash
+  `5dbfed10…`, not this task's doing).
+
+## X.7 Recommendation (updated)
+
+**Keep Cinder default-OFF.** Task 10 removes the two named CPU-parallelizable hotspots and delivers a
+real ~26% dense-stage win at byte-identical quality — the assignment, encode, and residual-subtract
+paths are all now rayon-parallel, and `quantize_residuals` already was. But **C2's absolute <5s/<1s
+targets remain unmet by 15.9×/4.4×**, and the binding constraint is now the *serial* remainder of the
+writer (per-chunk `.npy` IO, O(corpus) IVF accumulation, `concat_buffer`) + finalize (IVF
+sort/dedup) + sublinear encode scaling — none of which more CPU parallelism can meaningfully move.
+**C3** additionally rose ~+267 MB (CopilotKit) as the cost of parallel buffers and remains FAIL,
+floored regardless by the ~1 GB next-plaid construction working set + in-memory IVF. Consistent with
+Task 9's caveat: genuinely hitting the spec on this hardware likely needs a **lighter codec** (fewer
+residual bytes / a cheaper writer) or **GPU assist**, not further CPU parallelization. The
+CPU-parallel dense pipeline is now essentially exhausted as a lever.
+
+---
+
+# Post-Task-9 (v3) — parallelized shortlist assigner (superseded for C2/C3 by Post-Task-10; retained as ledger)
 
 Task 9 targeted the C2 regression the Post-Task-6b section documented (real shortlist assignment ran
 ~8× SLOWER than exhaustive). **Root cause confirmed by profiling:** the `build_cinder`
