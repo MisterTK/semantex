@@ -1,6 +1,6 @@
 # Cinder — Gate Evaluation Report (compiled encoder-free indexing)
 
-**Date:** 2026-07-18 (updated post-Task-11)
+**Date:** 2026-07-18 (updated post-Task-11; 2026-07-19 real-world wall-clock addendum + final stop-here decision)
 **Branch:** `feat/cinder-instant-indexing` (Task-11: real profile + epoch-marker argmax)
 **History:** Tasks 0–7 merged. Task 8's first pass measured the four gates against **v1**, which
 silently shipped **exhaustive** centroid assignment (preserved verbatim in **Appendix A**).
@@ -29,6 +29,23 @@ C4 (shortlist agreement)**. Cinder is off-by-default; `SEMANTEX_CINDER=1` activa
 | **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) — unchanged (byte-identical index, proven end-to-end old-vs-new binary) |
 | **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — but a real profile + fix: assign (measured ~74% of the build) −40–54%, whole build −30–40%** (CopilotKit 79.4s→**~54s**, platform 4.45s→**3.06s**). Now measured, not guessed: the residue is the byte-locked, already-parallel per-token dot products — CPU parallelism on the byte-identical path is exhausted |
 | **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL** (CopilotKit ~2232MB, platform 760MB) — **did NOT rise** this round (marker is ~32KB/thread); verdict unchanged (floored ~1GB+ by next-plaid construction + O(corpus) IVF) |
+
+**Final decision (2026-07-18) — stop here, merge to `main` default-OFF.** After the three rounds of
+real, reviewed optimization documented below (Tasks 9/10/11), the user directed the team to **stop
+and merge**. Cinder ships to `main` as an **off-by-default, experimental** feature
+(`SEMANTEX_CINDER=1` to activate); it changes **no** default behavior. Final gate ledger: **C1** py
+PASS / js PASS / go narrow FAIL (−0.0075); **C2** FAIL (fast in absolute terms for typical repos, but
+~3.1×/~11× over the <1s/<5s dense-increment targets at platform/CopilotKit scale); **C3** FAIL (~4–9×
+over the 300 MB budget, floored by the ~1 GB next-plaid construction working set + O(corpus) IVF);
+**C4** PASS (0.99547 at m=128). The compounding engineering win is genuine — CopilotKit's dense build
+went **787.81s → 79.39s → ~54–58s (~14.6× cumulative)** at byte-identical quality — even though the
+formal <5s target was never reached. The team is **not** pursuing the remaining output-changing levers
+(smaller shortlist `m`, lighter codec — either would force a fresh C1/C4 re-validation) or GPU (out of
+scope per spec R4); those stay documented as the evidence-based path forward, not attempted. **Anyone
+activating Cinder should understand:** fast and safe for typical repo sizes (see the *Post-Task-11
+Addendum* full-wall-clock numbers), formally short of the <5s/<1s/<300 MB targets at very large scale,
+and quality-good on 2 of the 3 tested languages. The full per-round ledger (Post-Task-11 → Appendix A)
+is preserved below unchanged.
 
 **Task-11 headline:** Task 11 replaced the Amdahl guessing with a **real profile** of the current
 build (stage `Instant` timers, `RUST_LOG=semantex_core=info` + a `SEMANTEX_CINDER_PROFILE` writer
@@ -83,15 +100,19 @@ within ≤0.002 nDCG, exactly as C4's 99.5% agreement predicts) and peak memory 
 (per-token processing avoids the batched score matrix) — but the speed regression means **C2 is now
 failed harder, not fixed.**
 
-**Overall recommendation (unchanged in direction): keep Cinder default-OFF; do NOT promote.** The
+**Overall recommendation — FINAL (stop here): merge to `main` default-OFF; do NOT promote.** The
 feature is correct (byte-compatible index, confirmed activation, clean fallback chain), C4-safe, and
 quality-neutral, but meets none of C1(go)/C2/C3. Tasks 9–11 turned the shortlist-assignment path from
-an ~8× *pessimization* (the v1 "fix" run single-threaded) into a parallel, sort-free assigner ~24×
-faster than where it started (CopilotKit 787.8s→~54s) at byte-identical quality — but **C2 is still
-~11×/3.1× over target**, and Task 11's real profile now shows *why*: the residual cost is byte-locked,
-already-parallel per-token dot products, not anything more CPU parallelism can touch. See the
-**Post-Task-11** section (§XI) for the measured breakdown, the epoch-marker fix, the end-to-end
-byte-identity proof, and the evidence-based conclusion that the spec needs a lighter codec / GPU or an
+an ~8× *pessimization* (the v1 "fix" run single-threaded) into a parallel, sort-free assigner
+**~14.6× faster than where it started** (CopilotKit 787.8s→~54s) at byte-identical quality — but
+**C2 is still ~11×/3.1× over target**, and Task 11's real profile now shows *why*: the residual cost
+is byte-locked, already-parallel per-token dot products, not anything more CPU parallelism can touch.
+Per the user's decision the team is **stopping here** rather than pursuing further output-changing
+levers (smaller `m` / lighter codec, both of which would require re-validating C1/C4 from scratch) or
+GPU (out of scope per spec R4). See the **Post-Task-11** section (§XI) for the measured breakdown, the
+epoch-marker fix, and the end-to-end byte-identity proof; the **Post-Task-11 Addendum** for fresh
+real-world full-wall-clock context (typical repos build fast in absolute terms); and the
+evidence-based conclusion that closing the remaining gap needs a lighter codec / GPU or an
 `m`-vs-quality retune — not more parallelization.
 
 ---
@@ -259,6 +280,50 @@ measured** (not reasoned) breakdown of the build, and a now-evidence-based concl
 targets are unreachable by further CPU parallelization of the byte-identical path. **C3** unchanged
 (FAIL, ~1 GB-floored). Direction unchanged: default-OFF; the path to spec is a lighter codec / GPU or
 an `m`-vs-quality retune, not more parallelism.
+
+---
+
+# Post-Task-11 Addendum (2026-07-19) — real-world cold-delete FULL-wall-clock context
+
+One measurement was taken **after** the Post-Task-11 gate update and is folded in here rather than
+rewriting any number above: a fresh, genuinely-cold, **full-command wall-clock** run on three repos
+not previously measured this way. Raw findings: `.superpowers/sdd/cinder-fresh-wallclock-report.md`.
+
+**Read this first — it is a *different* measurement from the rest of the report.** Every C2 figure
+above (and the R1/<5s target itself) measures the **dense-stage increment only** — the span between
+the `using cinder compiled indexing` and `PLAID index built via cinder` log timestamps, under the
+preserve/restore protocol. The numbers in *this* addendum measure the **entire `semantex index .`
+command wall-clock** (file walk + BM25 + tree-sitter/graph resolution + PageRank + the dense/Cinder
+stage + final writes), under a cold-delete (`rm -rf .semantex`) protocol. The dense stage is only
+**58–68%** of the internal build, so full wall-clock ≈ **1.5–1.8×** the dense-only number.
+**Conflating the two would misstate C2** — R1/C2 is defined on the dense increment, not full
+wall-clock; they are not the same metric.
+
+Protocol: `feat/cinder-instant-indexing` @ `de35fff`, release binary rebuilt from HEAD; per repo
+`rm -rf .semantex` then a single cold `SEMANTEX_CINDER=1 … semantex index .` timed with
+`/usr/bin/time -l`; runs strictly sequential, one process at a time. Cinder activation confirmed on
+every run (`using cinder compiled indexing` + `PLAID index built via cinder`), **zero** fallback
+warnings.
+
+| Repo | Lang | Chunks | **Full wall-clock (real)** | dense-stage only | Peak RSS (full cmd) |
+|---|---|---:|---:|---:|---:|
+| gin | Go | 2,233 | **1.43s** | 0.80s | 685.3 MB |
+| pub | Dart | 2,895 | **3.81s** | 1.78s | 1,110.1 MB |
+| adk-python | Python | 29,134 | **18.41s** | 11.91s | 1,478.3 MB |
+
+- **Cross-validation of the dense-stage number:** gin's cold-delete dense-only figure (0.80s)
+  matches the gate report's preserve/restore dense-only figure (§XI.4, **0.83s**) within noise — the
+  two protocols agree, so the dense-stage numbers this report tracks are protocol-robust.
+- **Practical takeaway:** for the vast majority of realistic repo sizes — everything tested here, up
+  to `adk-python`'s **29,134 chunks** — Cinder's *full end-to-end* cold build finishes in **under
+  20 seconds**, which reads as "fast" to a user running `semantex index .` cold. The formal C2 gate
+  is missed specifically at **CopilotKit's unusual 159,013-chunk scale** (≈5.5× adk-python's chunk
+  count); it is a large-scale, dense-increment gate miss — **not** a "Cinder is slow for real repos"
+  result.
+- **Scope note — no verdict changes.** C2/R1 are defined on the dense-stage increment at the gate
+  repos (platform <1s, CopilotKit <5s) and remain **FAIL** (§XI.4); C3 is the dense-stage peak-RSS
+  *increment* (the whole-command peak RSS shown above is a superset). This addendum adds
+  absolute-terms, real-user context; it does not restate or supersede any gate metric.
 
 ---
 
