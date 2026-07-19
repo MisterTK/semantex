@@ -28,9 +28,11 @@
 //! allocation. The raw corpus is never held in full (unlike `create_index_files`,
 //! which takes the entire `&[Array2<f32>]` up front).
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ndarray::{Array1, Array2, Axis, s};
 use ndarray_npy::WriteNpyExt;
@@ -116,6 +118,47 @@ pub struct CompiledIndexWriter {
     /// [`Self::add_document_with_ids`]; cleared in lockstep with `buffer` at each
     /// chunk flush, so it always lines up row-for-row with the batch.
     id_buffer: Vec<Vec<u32>>,
+    /// Per-stage wall-clock profiling accumulators. Timing is measured with a
+    /// handful of `Instant::now()` calls per chunk (negligible overhead, always
+    /// on) but only *reported* — via a single `eprintln!` at [`Self::finalize`] —
+    /// when the `SEMANTEX_CINDER_PROFILE` env var is set, so the default build
+    /// path prints nothing. `Cell` because every writer method is called
+    /// single-threaded (the parallelism lives inside each stage via rayon, not
+    /// across writer calls), so no `Sync` is needed. Purely observational: does
+    /// not touch any bytes written, so byte-identity is unaffected.
+    prof: WriterProfile,
+}
+
+/// Wall-clock accumulators for the dense-build stages, filled in by
+/// [`CompiledIndexWriter`] and dumped once at finalize under
+/// `SEMANTEX_CINDER_PROFILE`. See the `prof` field for why these are `Cell`s.
+#[derive(Default)]
+struct WriterProfile {
+    /// `concat_buffer`: memcpy of buffered docs into one `[tokens, dim]` batch.
+    concat: Cell<Duration>,
+    /// Caller-supplied centroid assigner (shortlist-union argmax) per chunk.
+    assign: Cell<Duration>,
+    /// Residual subtraction `embedding − centroid[code]` in `finish_encoded_chunk`.
+    residual: Cell<Duration>,
+    /// `pack_encoded_chunk` (residual quantize/pack) in `finish_encoded_chunk`.
+    pack: Cell<Duration>,
+    /// The four per-chunk `.npy`/`.json` file writes in `flush_chunk`.
+    write_files: Cell<Duration>,
+    /// The O(corpus) IVF `(centroid, doc_id)` accumulation loop in `flush_chunk`.
+    ivf_accum: Cell<Duration>,
+    /// `finalize`: IVF `sort_unstable` + `dedup` over all accumulated pairs.
+    finalize_sort: Cell<Duration>,
+    /// `finalize`: `ivf.npy` / `ivf_lengths.npy` / `metadata.json` writes.
+    finalize_write: Cell<Duration>,
+}
+
+impl WriterProfile {
+    /// Add `start.elapsed()` to `cell`. Free-function form (no `&self`) so it can
+    /// be called from `&self` writer methods without extra borrows.
+    #[inline]
+    fn add(cell: &Cell<Duration>, start: Instant) {
+        cell.set(cell.get() + start.elapsed());
+    }
 }
 
 impl CompiledIndexWriter {
@@ -179,6 +222,7 @@ impl CompiledIndexWriter {
             assigner: None,
             id_aware_assigner: None,
             id_buffer: Vec::new(),
+            prof: WriterProfile::default(),
         })
     }
 
@@ -302,6 +346,7 @@ impl CompiledIndexWriter {
             encode_index_chunk(&self.buffer, &self.artifacts.codec, self.config.force_cpu)?
         };
 
+        let t_write = Instant::now();
         // {chunk}.metadata.json — written with embedding_offset: 0 first, exactly
         // as create_index_files does; finalize() rewrites the offsets in a second
         // pass so the serialized key order matches byte-for-byte.
@@ -348,9 +393,11 @@ impl CompiledIndexWriter {
                 Ok(())
             },
         )?;
+        WriterProfile::add(&self.prof.write_files, t_write);
 
         // Accumulate IVF pairs (centroid, global_doc_id) per token, walking the
         // chunk in the same doc/token order create_index_files uses.
+        let t_ivf = Instant::now();
         let mut emb_idx = 0usize;
         for &len in &encoded.doclens {
             let doc_id = self.next_doc_id;
@@ -361,6 +408,7 @@ impl CompiledIndexWriter {
             }
             self.next_doc_id += 1;
         }
+        WriterProfile::add(&self.prof.ivf_accum, t_ivf);
 
         self.total_embeddings += encoded.codes.len();
         self.num_chunks += 1;
@@ -377,6 +425,7 @@ impl CompiledIndexWriter {
     /// [`crate::index::encode_index_chunk`]'s concatenation exactly; shared by
     /// both caller-assigner paths.
     fn concat_buffer(&self) -> (Array2<f32>, Vec<i64>) {
+        let t = Instant::now();
         let embedding_dim = self.artifacts.codec.embedding_dim();
         let doclens: Vec<i64> = self.buffer.iter().map(|d| d.nrows() as i64).collect();
         let total_tokens: usize = doclens.iter().sum::<i64>() as usize;
@@ -387,6 +436,7 @@ impl CompiledIndexWriter {
             batch.slice_mut(s![offset..offset + n, ..]).assign(doc);
             offset += n;
         }
+        WriterProfile::add(&self.prof.concat, t);
         (batch, doclens)
     }
 
@@ -425,6 +475,7 @@ impl CompiledIndexWriter {
         // mirroring `compress_and_residuals_cpu`'s own `codes.as_slice().unwrap()`.
         let centroids = codec.centroids_view();
         let mut residuals = batch;
+        let t_res = Instant::now();
         residuals
             .axis_iter_mut(Axis(0))
             .into_par_iter()
@@ -435,11 +486,15 @@ impl CompiledIndexWriter {
                     .zip(centroid.iter())
                     .for_each(|(r, c)| *r -= c);
             });
+        WriterProfile::add(&self.prof.residual, t_res);
 
         // Quantize/pack via the SHARED tail so this layout cannot drift from
         // encode_index_chunk. (`quantize_residuals` inside it is already
         // rayon-parallel over rows.)
-        pack_encoded_chunk(codec, &batch_codes, &residuals, doclens)
+        let t_pack = Instant::now();
+        let out = pack_encoded_chunk(codec, &batch_codes, &residuals, doclens);
+        WriterProfile::add(&self.prof.pack, t_pack);
+        out
     }
 
     /// Encode the buffered documents into a chunk using a CALLER-SUPPLIED code
@@ -482,7 +537,9 @@ impl CompiledIndexWriter {
             self.id_buffer.len(),
             batch.nrows(),
         );
+        let t_assign = Instant::now();
         let batch_codes = assigner(&batch, &self.id_buffer);
+        WriterProfile::add(&self.prof.assign, t_assign);
         self.finish_encoded_chunk(batch, batch_codes, doclens)
     }
 
@@ -542,8 +599,11 @@ impl CompiledIndexWriter {
         // (centroid, doc_id) then deduping yields, per centroid in ascending
         // order, the sorted unique doc ids — identical to create_index_files's
         // BTreeMap-then-per-centroid sort_unstable + dedup.
+        let t_sort = Instant::now();
         self.ivf_pairs.sort_unstable();
         self.ivf_pairs.dedup();
+        WriterProfile::add(&self.prof.finalize_sort, t_sort);
+        let t_fwrite = Instant::now();
         let mut ivf_data: Vec<i64> = Vec::with_capacity(self.ivf_pairs.len());
         let mut ivf_lengths: Vec<i32> = vec![0; num_centroids];
         for &(centroid, doc_id) in &self.ivf_pairs {
@@ -577,6 +637,29 @@ impl CompiledIndexWriter {
             writer.flush()?;
             Ok(())
         })?;
+        WriterProfile::add(&self.prof.finalize_write, t_fwrite);
+
+        // Dump the per-stage breakdown ONLY when explicitly requested, so the
+        // default build path emits nothing. next-plaid has no `tracing`, so this
+        // matches the crate's existing `eprintln!` diagnostics.
+        if std::env::var_os("SEMANTEX_CINDER_PROFILE").is_some() {
+            let p = &self.prof;
+            let s = |c: &Cell<Duration>| c.get().as_secs_f64();
+            eprintln!(
+                "[cinder-writer-profile] flush_chunk: concat={:.2}s assign={:.2}s \
+                 residual={:.2}s pack(quantize)={:.2}s write_files={:.2}s ivf_accum={:.2}s | \
+                 finalize: sort+dedup={:.2}s ivf/meta_write={:.2}s | ivf_pairs={}",
+                s(&p.concat),
+                s(&p.assign),
+                s(&p.residual),
+                s(&p.pack),
+                s(&p.write_files),
+                s(&p.ivf_accum),
+                s(&p.finalize_sort),
+                s(&p.finalize_write),
+                self.ivf_pairs.len(),
+            );
+        }
 
         Ok(metadata)
     }
