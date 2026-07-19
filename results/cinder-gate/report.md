@@ -132,6 +132,11 @@ pre-existing PDF-parse failures on demo assets).
 described in the headline finding — this is a real, reproducible ~7–8× slowdown across three repos of
 very different sizes (gin 7.0×, CopilotKit 7.7×, platform 7.9×), not noise.
 
+Raw `/usr/bin/time -l` timing+RSS logs for the platform and gin shortlist/exact A/B pairs (re-run
+independently, corroborating the table above within run-to-run variance: platform 44.63s/5.54s, gin
+8.69s/1.23s) are now persisted on disk at
+`benchmarks/relevance/results/cinder-gate-8resume-evidence/`.
+
 ## V.4 C3 — build memory (peak RSS)
 
 Peak RSS from `/usr/bin/time -l` (`maximum resident set size`), converted bytes/1,048,576. Gate:
