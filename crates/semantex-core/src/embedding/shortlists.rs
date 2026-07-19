@@ -668,6 +668,54 @@ mod tests {
             let want = sorted_reference_argmax(&e, &[0, 0, 0], &tie_short, &tcv);
             assert_eq!(got, want, "exact-tie case e={e:?} must match reference");
         }
+
+        // Decisive lowest-id tie-break case. The `tie_centroids` fixture
+        // above happens to derive an ASCENDING shortlist ([1, 2, ...]), so
+        // the running-best candidate already holds the lower id by the time
+        // the "equal" candidate is scanned — `dot == best && cid < best_id`
+        // is reached but its condition never flips the outcome versus a
+        // naive bare `dot > best_dot` (first-scanned-wins). It would NOT
+        // catch a regression that dropped the `cid < best_id` clause.
+        //
+        // Production shortlists are stored in DESCENDING-dot order (top-m by
+        // dot product, per `derive`'s doc comment), so a real exact tie
+        // routinely scans a HIGHER-id centroid before a lower-id one. This
+        // fixture reproduces that: the shortlist for token 0 is derived as
+        // `[1, 0]` (id 1 first), then queried with an embedding that ties
+        // exactly against both centroids — making the `cid < best_id` clause
+        // the ONLY thing that makes the lowest id win.
+        let decisive_centroids = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+        let dcv = decisive_centroids.view();
+        let mut decisive_table = StaticTokenTable::new(1, 2, [0.2; 5]);
+        // dot(row, c0) = 0.3, dot(row, c1) = 0.9: c1 strictly outscores c0,
+        // so derive's descending sort places id 1 before id 0 for real (not
+        // via the ascending tie-break rule) — a genuine "higher id scanned
+        // first" shortlist.
+        decisive_table.set_row(0, &[0.3, 0.9]);
+        let decisive_short = CentroidShortlists::derive(&decisive_table, &dcv, 2).unwrap();
+        assert_eq!(
+            decisive_short.for_token(0),
+            &[1, 0],
+            "fixture must present the higher id (1) before the lower id (0)"
+        );
+
+        // e ties exactly against both centroids: dot(e, c0) = dot(e, c1) =
+        // 0.5 (exact in f32 — 0.5/1.0/0.0 are all exactly representable). A
+        // regression that dropped `cid < best_id` (falling back to bare
+        // `dot > best_dot`, i.e. first-scanned-wins) would return 1 here,
+        // since id 1 is scanned first and the bare `>` never fires on a tie.
+        let e = vec![0.5f32, 0.5];
+        let got = shortlist_argmax(&e, &[0], &decisive_short, &dcv, &mut scratch);
+        let want = sorted_reference_argmax(&e, &[0], &decisive_short, &dcv);
+        assert_eq!(
+            got, 0,
+            "lowest id must win despite the higher id being scanned first"
+        );
+        assert_eq!(
+            want, 0,
+            "reference implementation must also pick the lowest id"
+        );
+        assert_eq!(got, want, "marker and reference implementations must agree");
     }
 
     #[test]
