@@ -396,9 +396,10 @@ impl CompiledIndexWriter {
     /// the SHARED [`crate::index::pack_encoded_chunk`] — the exact tail
     /// [`crate::index::encode_index_chunk`] uses — so the on-disk residual pack
     /// layout cannot drift from the default path. The residual subtraction here
-    /// is the same elementwise math `compress_and_residuals_cpu` runs (serial vs
-    /// its parallel form is numerically identical, since each row is
-    /// independent). The ONLY thing that varies between the plain and id-aware
+    /// is the same elementwise math — and the same rayon row-parallel form —
+    /// `compress_and_residuals_cpu` runs (each row is independent, so the
+    /// parallel pass is bit-identical to a serial one). The ONLY thing that
+    /// varies between the plain and id-aware
     /// assigner paths is how `batch_codes` was produced; everything from
     /// residuals onward lives here (and in the shared tail) so it cannot drift
     /// between the two. The subtract's own agreement with `encode_index_chunk` is
@@ -409,23 +410,35 @@ impl CompiledIndexWriter {
         batch_codes: Array1<usize>,
         doclens: Vec<i64>,
     ) -> Result<EncodedIndexChunk> {
+        use rayon::prelude::*;
+
         let codec = &self.artifacts.codec;
 
-        // residuals = embedding − centroid[code], the same elementwise
-        // subtraction compress_and_residuals_cpu performs (it runs the pass in
-        // parallel; running it serially here is numerically identical because
-        // each row is independent).
+        // residuals = embedding − centroid[code]. This is the SAME elementwise
+        // subtraction — and now the SAME rayon row-parallel form — that
+        // `compress_and_residuals_cpu` (index.rs) runs on the default exhaustive
+        // path. Each row depends only on its own embedding and its own assigned
+        // centroid, so parallelizing over rows is BIT-identical to the serial
+        // pass (no cross-row interaction, no reduction, no reordering within a
+        // row) — only wall-clock changes. `batch_codes` comes from an assigner's
+        // `Array1::from_vec`, so it is contiguous and `as_slice` cannot fail,
+        // mirroring `compress_and_residuals_cpu`'s own `codes.as_slice().unwrap()`.
         let centroids = codec.centroids_view();
         let mut residuals = batch;
-        for (mut row, &code) in residuals.axis_iter_mut(Axis(0)).zip(batch_codes.iter()) {
-            let centroid = centroids.row(code);
-            row.iter_mut()
-                .zip(centroid.iter())
-                .for_each(|(r, c)| *r -= c);
-        }
+        residuals
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(batch_codes.as_slice().unwrap().par_iter())
+            .for_each(|(mut row, &code)| {
+                let centroid = centroids.row(code);
+                row.iter_mut()
+                    .zip(centroid.iter())
+                    .for_each(|(r, c)| *r -= c);
+            });
 
         // Quantize/pack via the SHARED tail so this layout cannot drift from
-        // encode_index_chunk.
+        // encode_index_chunk. (`quantize_residuals` inside it is already
+        // rayon-parallel over rows.)
         pack_encoded_chunk(codec, &batch_codes, &residuals, doclens)
     }
 
