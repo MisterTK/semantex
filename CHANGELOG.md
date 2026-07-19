@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.1.0 — 2026-07-19
+
+Cinder — compiled encoder-free indexing — becomes the default dense-indexing
+path. This is a real behavior change, not a drop-in upgrade: dense builds are
+dramatically faster and more reliable, at the cost of a small, disclosed
+retrieval-quality regression on Go (below). Opt out with `SEMANTEX_CINDER=0` or
+`SEMANTEX_CINDER=false` to restore the previous contextual-encoder build path.
+
+### Changed
+
+- **Cinder is now the default dense-indexing path** (`SEMANTEX_CINDER` is
+  default-on; it was opt-in before). Cinder embeds each token from a static
+  table plus a distilled micro-mixer instead of running a full contextual
+  encoder at build time, so a dense index builds in seconds to tens of seconds
+  with no model inference. The previous default — the full contextual encoder —
+  **cannot complete an index at all on very large repos** (it OOMs); Cinder
+  finishes the same build. That changed the real-world baseline and is what
+  motivated flipping the default.
+- **Opt-out values.** Set `SEMANTEX_CINDER=0` or `SEMANTEX_CINDER=false`
+  (case-insensitive) to disable Cinder and fall back to the previous build path.
+  Only those two tokens are recognized — `off`/`no`/`disabled` do **not** turn
+  it off (absent, or any other value, means on).
+
+### Known tradeoffs
+
+- **Retrieval quality on Go regresses slightly.** The encoder-free approach
+  costs ~2.8% relative nDCG@10 on Go specifically versus the full contextual
+  encoder (CodeSearchNet hybrid). Python and JavaScript are at or above the
+  previous default's quality bar; Go is the only language that regresses. This
+  is an inherent property of encoder-free indexing, not a bug — a
+  quality-improvement fast-follow is planned (see `results/cinder-gate/report.md`).
+- **Aggressive build targets not fully met at extreme scale.** At ~150k+ chunks
+  Cinder's own internal build-speed / peak-memory targets aren't fully reached,
+  though the build still completes successfully — and still far faster than the
+  previous default, which cannot complete builds at that scale at all.
+
+### Added
+
+- **Ember/Cinder artifact distribution via GitHub release assets** — the static
+  table, micro-mixer, and shortlist artifacts Cinder needs at build time are now
+  published as release assets and fetched on demand, so a fresh install gets a
+  working default indexing path instead of Cinder only working on a machine that
+  trained the artifacts locally.
+
 ## v1.0.3 — 2026-07-12
 
 `semantex_history` gains upstream-staleness and cross-branch visibility.
