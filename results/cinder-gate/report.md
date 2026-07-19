@@ -1,27 +1,44 @@
 # Cinder — Gate Evaluation Report (compiled encoder-free indexing)
 
-**Date:** 2026-07-18 (updated post-Task-6b)
-**Branch:** `feat/cinder-instant-indexing` @ `0e258b3`
+**Date:** 2026-07-18 (updated post-Task-9)
+**Branch:** `feat/cinder-instant-indexing` @ `fe39706`+Task-9
 **History:** Tasks 0–7 merged. Task 8's first pass measured the four gates against **v1**, which
-silently shipped **exhaustive** centroid assignment (that record is preserved verbatim in
-**Appendix A** below). **Task 6b** (`ba378b2`) then wired the real shortlist-union assigner into
-`build_cinder`; **this task** re-validated all four gates against that real production path and
-added the `SEMANTEX_CINDER_EXACT_ASSIGN` diagnostic (`0e258b3`). Everything above Appendix A is the
-current/primary record.
+silently shipped **exhaustive** centroid assignment (preserved verbatim in **Appendix A**).
+**Task 6b** (`ba378b2`) wired the real shortlist-union assigner into `build_cinder`; Task 8's second
+pass re-validated the gates and added `SEMANTEX_CINDER_EXACT_ASSIGN` (`0e258b3`, preserved in the
+**Post-Task-6b** section). **Task 9 (this task)** found the shortlist assigner was a single-threaded
+scalar loop (the entire ~8× C2 regression vs the rayon-parallel exhaustive path) and **parallelized
+it** — see the **Post-Task-9** section, which is now the current/primary record for C2. Post-Task-6b
+and Appendix A are retained as the honest before/after ledger.
 **Spec:** `docs/superpowers/specs/2026-07-18-cinder-*` (design `9aeb82f`, plan `5857973`)
 **Scope:** Cinder validation gates **C1 (quality), C2 (build speed), C3 (build memory),
 C4 (shortlist agreement)**. Cinder is off-by-default; `SEMANTEX_CINDER=1` activates it.
 
-## TL;DR — final (post-Task-6b) per-gate verdicts
+## TL;DR — final (post-Task-9) per-gate verdicts
 
-| Gate | What it checks | Verdict (real shortlist assignment) |
+| Gate | What it checks | Verdict (post-Task-9 parallel shortlist assignment) |
 |---|---|---|
-| **C4** shortlist agreement | shortlist-union argmax ≥99% agreement w/ exhaustive argmax | **PASS** at m=128 (0.99547) |
-| **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) |
-| **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — and ~8× WORSE than v1** (CopilotKit 787.8s, platform 44.6s) |
-| **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL — but BETTER than v1** (CopilotKit 1966MB, platform 672MB peak) |
+| **C4** shortlist agreement | shortlist-union argmax ≥99% agreement w/ exhaustive argmax | **PASS** at m=128 (0.99547) — unchanged |
+| **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) — unchanged (byte-identical codes) |
+| **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — but the ~8× Task-6b regression is FIXED** (CopilotKit 787.8s→**106.8s**, platform 44.6s→**6.0s**; now on par w/ exhaustive; floored by non-assignment dense work) |
+| **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL** (CopilotKit 1965MB, platform 670MB) — not regressed by Task 9; still < exhaustive |
 
-### ⚠️ Headline finding — wiring the real shortlist assigner INVERTS the v1 hypothesis
+**Task-9 headline:** the shortlist assigner Task 6b wired was single-threaded; the exhaustive path is
+rayon-parallel + batched matmul — the whole ~8× C2 pessimization. Parallelizing the per-token
+assignment loop (rayon `into_par_iter().map_init`, byte-identical output) removes the regression
+(7.4× faster on CopilotKit + platform, on par with exhaustive, equal memory). **But C2's absolute
+<5s/<1s targets remain unmet: after the fix, assignment is only ~4% of the CopilotKit build.** The
+floor is non-assignment dense work — serial static+mixer encode (~35%) + the vendored next-plaid
+residual/quantize/IVF writer path (~53%) — which no assignment optimization can touch. See
+**Post-Task-9** below. Recommendation: keep Cinder default-OFF; the assigner is no longer a
+pessimization, but hitting C2 needs a broader dense-pipeline parallelization (escalated).
+
+### ⚠️ Headline finding (Task 6b) — wiring the real shortlist assigner INVERTS the v1 hypothesis
+
+> **RESOLVED by Task 9 (see Post-Task-9 below):** the inversion was caused by the assigner being a
+> *single-threaded scalar loop* while the exhaustive path is *rayon-parallel + batched matmul*. Task 9
+> parallelized the assigner; the ~8× slowdown is gone and the shortlist path is now on par with
+> exhaustive. The analysis below is the Task-6b state, retained for the ledger.
 
 The v1 report (Appendix A) hypothesized that C2 failed *only* because v1 shipped **exhaustive**
 assignment, and that wiring the C4-certified shortlist-union assigner would make Cinder "instant."
@@ -54,7 +71,96 @@ recommendation and the out-of-scope follow-up (a vectorized/batched shortlist).
 
 ---
 
-# Post-Task-6b (v2) — corrected measurements (PRIMARY / CURRENT)
+# Post-Task-9 (v3) — parallelized shortlist assigner (PRIMARY / CURRENT for C2)
+
+Task 9 targeted the C2 regression the Post-Task-6b section documented (real shortlist assignment ran
+~8× SLOWER than exhaustive). **Root cause confirmed by profiling:** the `build_cinder`
+`IdAwareCodeAssigner` closure ran a *single-threaded scalar* `for` loop over every token row, calling
+`shortlist_argmax` serially — while the exhaustive fallback (`Codec::compress_into_codes_cpu`) is
+*rayon-parallel over row batches + a batched `batch.dot(&centroids.t())` matmul*. That asymmetry
+(serial+scalar-random-gather vs parallel+matmul) is the entire slowdown, despite the shortlist
+touching ~1072 candidates/token vs exhaustive's 8192.
+
+**Profiling (serial, 8192 centroids, dim 48, m=128, 9-tap window):** FULL `shortlist_argmax`
+38.1 µs/token, of which dot-product+gather **66%**, union-build (sort+dedup) 19%. Dominant cost is the
+per-candidate dot+gather, and the whole loop was single-threaded.
+
+## IX.1 The fix
+
+`crates/semantex-core/src/search/colbert_plaid_backend.rs::build_cinder` — the assigner closure now
+parallelizes across the chunk's token rows:
+`(0..batch.nrows()).into_par_iter().map_init(Vec::<u16>::new, |scratch, r| shortlist_argmax(…))
+.collect()`. Same `shortlist_argmax`, same union/argmax/tie-break; rayon's indexed `collect` restores
+row order so `out[r]` is byte-identical to the serial value **regardless of thread count**. `map_init`
+reuses one tiny scratch buffer per worker (no per-token alloc, no RSS growth). No new dependency
+(`rayon` already used throughout). No change to `shortlists.rs` semantics.
+
+## IX.2 C2 — build speed (dense-stage increment), same protocol as §V.3
+
+| repo (chunks) | Post-Task-6b serial shortlist | **Task-9 parallel shortlist** | exhaustive ref | target | verdict |
+|---|---:|---:|---:|---:|---|
+| gin (2,233) | 8.72s | **1.31s** (6.7×) | 1.25s | (not a gate) | on par |
+| platform (7,831) | 44.62s | **6.00s** (7.4×) | 5.41s (same-binary EXACT) | <1s | **FAIL** (6.0×) |
+| CopilotKit (159,013) | 787.81s | **106.76s** (7.4×) | 102.42s (ref) | <5s | **FAIL** (21×) |
+
+**The ~8× Task-6b regression is fully eliminated** — parallel shortlist is now within a few % of
+exhaustive on all three repos. **But C2's absolute targets are still unmet**, because exhaustive
+*itself* is ~102s/5.4s (20×/5× over target). After the fix the assignment is only ~4s of CopilotKit's
+107s (106.8 − 102.4). Raw logs + the bench harness: `results/cinder-gate/task9-evidence/` +
+`bench_cinder.sh`.
+
+**Floor breakdown (temporary stage timers, since reverted):**
+
+| repo | dense total | encode (serial mixer) | writer (assign+residual+quantize+IO) | finalize |
+|---|---:|---:|---:|---:|
+| gin | 1.31s | 0.40s (30%) | 0.64s (49%) | 0.16s (12%) |
+| platform | 6.00s | 2.13s (35%) | 3.16s (53%) | 0.60s (10%) |
+
+The dense stage is dominated by the **serial `CinderEncoder::encode_documents_with_window_ids`
+static+mixer encode (~35%)** and the **vendored next-plaid residual/quantize/IVF writer path (~53%)**
+— both independent of the assignment method. **No assignment optimization can pass C2**; a second
+lever (bitset/vectorized union) was evaluated and rejected as verdict-irrelevant (it would shave
+<1% of the total). Hitting <5s/<1s requires parallelizing that broader pipeline (encode in-crate +
+the vendored residual/quantize path) — escalated as a separate, larger effort.
+
+## IX.3 C1 / C3 / C4 sanity (post-fix)
+
+- **C1 (quality): UNCHANGED — provably.** The parallel assigner emits **byte-identical codes** to the
+  serial path (new test `parallel_map_init_matches_serial_argmax` + the model-gated end-to-end test +
+  `out[r]` being a pure function of row `r`). Byte-identical codes → identical index → identical nDCG,
+  so the §V.2 verdict stands verbatim: **py 0.9066 PASS / js 0.5354 PASS / go 0.7382 FAIL**. A CSN
+  re-run would deterministically reproduce those numbers; it is redundant, not skipped.
+- **C3 (memory): NOT regressed.** Peak RSS is within noise of the Post-Task-6b serial numbers
+  (gin 651.8 MB, platform 670.2 MB, CopilotKit 1965.5 MB); per-thread scratch is ~2 KB. C3 stays
+  **FAIL** vs the 300 MB gate (the ~1 GB next-plaid construction floor, §V.4/§8), still below
+  exhaustive's peak. Task 9 neither helped nor hurt C3.
+- **C4 (agreement): UNCHANGED.** `shortlist_argmax` / `shortlist_agreement` are byte-for-byte
+  untouched. **PASS at m=128 (0.99547)**.
+
+## IX.4 Tests & restoration
+
+`cargo test --workspace` = **1501 passed, 0 failed** (all Post-Task-6b tests unchanged + the new
+determinism test). Model-gated `cinder_build_produces_searchable_index` **PASS (3.30s)** with
+`ORT_DYLIB_PATH` set (bare `cargo test` fails it on an ORT `dlopen` *before* indexing — a pre-existing
+harness gap, not this change). All three benchmark repos restored to original chunk counts
+(gin 2,233 / platform 7,831 / CopilotKit 159,013); no `.semantex.pre-cinder` backups remain.
+
+## IX.5 Recommendation (updated)
+
+**Keep Cinder default-OFF.** Task 9 removes the reason the shortlist assigner looked like a
+pessimization — it is now on par with exhaustive at lower memory and byte-identical quality — so the
+shortlist path is a legitimate default *for the assignment step*. But C2's absolute <5s/<1s targets
+are **not** met and cannot be met by assignment work alone: the binding constraint is the serial
+encode + vendored residual/quantize/IVF construction. Recommended next effort (escalated, not done
+here): (1) parallelize `encode_documents_with_window_ids` (in-crate, safe, ~35% of floor);
+(2) parallelize next-plaid's `finish_encoded_chunk` residual subtraction + confirm `quantize_residuals`
+parallelism (~53%, vendored → workspace-member dance); (3) the ~1 GB construction floor still gates
+C3. Even (1)+(2) is estimated to land platform ~2s / CopilotKit ~30–40s — a big win but still short of
+target on CPU, so genuinely hitting the spec likely needs a lighter codec or GPU assist.
+
+---
+
+# Post-Task-6b (v2) — corrected measurements (superseded for C2 by Post-Task-9; retained as ledger)
 
 All measurements below were taken from release HEAD `0e258b3` (Task 6b real shortlist assigner +
 this task's diagnostic), one process at a time, using the same protocols as the v1 record. Each
