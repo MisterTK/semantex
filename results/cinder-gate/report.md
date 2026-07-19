@@ -1,31 +1,241 @@
 # Cinder — Gate Evaluation Report (compiled encoder-free indexing)
 
-**Date:** 2026-07-18
-**Branch:** `feat/cinder-instant-indexing` @ `23a6bf1` (Tasks 0–7 merged; this task adds two
-commits: the code additions below + this report)
+**Date:** 2026-07-18 (updated post-Task-6b)
+**Branch:** `feat/cinder-instant-indexing` @ `0e258b3`
+**History:** Tasks 0–7 merged. Task 8's first pass measured the four gates against **v1**, which
+silently shipped **exhaustive** centroid assignment (that record is preserved verbatim in
+**Appendix A** below). **Task 6b** (`ba378b2`) then wired the real shortlist-union assigner into
+`build_cinder`; **this task** re-validated all four gates against that real production path and
+added the `SEMANTEX_CINDER_EXACT_ASSIGN` diagnostic (`0e258b3`). Everything above Appendix A is the
+current/primary record.
 **Spec:** `docs/superpowers/specs/2026-07-18-cinder-*` (design `9aeb82f`, plan `5857973`)
 **Scope:** Cinder validation gates **C1 (quality), C2 (build speed), C3 (build memory),
-C4 (shortlist agreement)** — the whole-feature acceptance gate. Cinder is off-by-default;
-`SEMANTEX_CINDER=1` is required to activate it.
+C4 (shortlist agreement)**. Cinder is off-by-default; `SEMANTEX_CINDER=1` activates it.
 
-## TL;DR — per-gate verdicts
+## TL;DR — final (post-Task-6b) per-gate verdicts
 
-| Gate | What it checks | Verdict |
+| Gate | What it checks | Verdict (real shortlist assignment) |
 |---|---|---|
-| **C4** shortlist agreement | shortlist-union argmax ≥99% agreement with exhaustive argmax | **PASS** at m=128 (0.99547); m=32→0.9571, m=64→0.9874 |
-| **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7377, −0.0080) |
-| **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL** (CopilotKit 102.4s, platform 5.42s) |
-| **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL** (platform ≈1.08GB, CopilotKit ≈2.58GB increment) |
+| **C4** shortlist agreement | shortlist-union argmax ≥99% agreement w/ exhaustive argmax | **PASS** at m=128 (0.99547) |
+| **C1** quality (CSN hybrid nDCG@10) | py ≥0.8970, js ≥0.5329, go ≥0.7457 | **py PASS / js PASS / go FAIL** (go 0.7382, −0.0075) |
+| **C2** build speed (dense increment) | <5s CopilotKit, <1s platform | **FAIL — and ~8× WORSE than v1** (CopilotKit 787.8s, platform 44.6s) |
+| **C3** build memory (peak-RSS increment) | <300MB over sparse baseline | **FAIL — but BETTER than v1** (CopilotKit 1966MB, platform 672MB peak) |
 
-**Overall recommendation: keep Cinder default-OFF as shipped; iterate before promoting.**
-The feature is *correct* (byte-compatible index, activation confirmed on real repos, fallback
-chain solid) but does **not** deliver its two headline promises in v1: it is **not "instant"**
-(C2) and **not low-memory** (C3), and it carries a **narrow quality regression on Go** (C1).
-Crucially, the reason C2/C3 fail is that v1 ships **exhaustive** centroid assignment — the
-shortlist-union assignment that would make it instant is *deferred*, and this report's C4 result
-is exactly the validation that turning it on is safe (99.5% agreement at m=128). The clear next
-step to realize Cinder's value is to wire the shortlist assigner into `build_cinder`. Do not
-promote to default until C2 (and ideally C3) are addressed.
+### ⚠️ Headline finding — wiring the real shortlist assigner INVERTS the v1 hypothesis
+
+The v1 report (Appendix A) hypothesized that C2 failed *only* because v1 shipped **exhaustive**
+assignment, and that wiring the C4-certified shortlist-union assigner would make Cinder "instant."
+**Task 6b wired it — and it made C2 ~7–8× SLOWER, not faster.** The shortlist path is a per-token
+scalar closure (build the shortlist union → `sort_unstable` → dedup → scalar dot products over
+~m·|window| candidates, m=128); the exhaustive path is a single batched-BLAS
+`compress_into_codes_cpu` that vectorizes the 8,192-centroid argmax "for free." On CPU the batched
+matmul wins decisively despite doing more nominal FLOPs. Measured dense-stage build time, same
+repos, same preserve/restore + `/usr/bin/time -l` protocol:
+
+| repo | v1 exhaustive (Appendix A §6) | EXACT re-measure (this run) | **real shortlist (Task 6b)** | shortlist slowdown |
+|---|---:|---:|---:|---:|
+| platform (7,831 chunks) | 5.42s | 5.68s | **44.62s** | 7.9× |
+| CopilotKit (159,013) | 102.42s | 102.42s (reused ref) | **787.81s** | 7.7× |
+| gin (2,233) | — | 1.25s | **8.72s** | 7.0× |
+
+My EXACT (`SEMANTEX_CINDER_EXACT_ASSIGN=1`) platform re-measure (5.68s) reproduces v1's exhaustive
+5.42s, cross-validating that the v1 "Cinder" arm was exhaustive and that reusing v1's CopilotKit
+exhaustive number as the EXACT reference is legitimate. Quality is unaffected (C1 shortlist ≈ exact
+within ≤0.002 nDCG, exactly as C4's 99.5% agreement predicts) and peak memory actually **drops**
+(per-token processing avoids the batched score matrix) — but the speed regression means **C2 is now
+failed harder, not fixed.**
+
+**Overall recommendation (unchanged in direction): keep Cinder default-OFF; do NOT promote.** The
+feature is correct (byte-compatible index, confirmed activation, clean fallback chain), C4-safe, and
+quality-neutral, but meets none of C1(go)/C2/C3. The shortlist-assignment optimization the v1 report
+named as "the fix" is, as currently implemented, a *pessimization* on CPU. See §V.5 for the practical
+implication (exhaustive is both faster **and** marginally higher-quality here) and §V.8 for the
+recommendation and the out-of-scope follow-up (a vectorized/batched shortlist).
+
+---
+
+# Post-Task-6b (v2) — corrected measurements (PRIMARY / CURRENT)
+
+All measurements below were taken from release HEAD `0e258b3` (Task 6b real shortlist assigner +
+this task's diagnostic), one process at a time, using the same protocols as the v1 record. Each
+benchmark repo's `.semantex` was preserved (`mv .semantex .semantex.pre-cinder`) and restored; all
+touched repos verified back to their exact original chunk counts (§V.6).
+
+## V.1 What changed since v1 (Appendix A)
+
+- **Task 6b (`ba378b2`, opus-reviewed & approved):** `build_cinder` now installs a real
+  `IdAwareCodeAssigner` closure that wraps `shortlists::shortlist_argmax` via
+  `CompiledIndexWriter::with_id_aware_assigner` / `add_document_with_ids`, threading per-token window
+  ids through the writer. So `SEMANTEX_CINDER=1` now genuinely uses the shortlist-union assignment,
+  not the writer's default exhaustive scan. (Appendix A §4 documents the v1 state where these were
+  identical — that section is now historical.)
+- **This task (`0e258b3`):** added `SEMANTEX_CINDER_EXACT_ASSIGN=1`, which (with `SEMANTEX_CINDER=1`)
+  forces the writer's default exhaustive assignment by *not* installing the id-aware assigner — the
+  clean toggle that makes the C1 ablation's arm (1) "Cinder full" and arm (2) "mixer+exact" genuinely
+  differ, and isolates the assignment-approximation effect from the mixer's contribution. Off by
+  default → shortlist is the production path. Covered by an end-to-end test asserting that with the
+  flag set, on-disk codes equal the exhaustive full-scan argmax.
+
+Query-path invariance for arm-3/4 reuse re-verified: `git diff --name-only 23a6bf1..0e258b3` touches
+only build-path files (`colbert_plaid_backend.rs::build_cinder`, `cinder.rs`, `model_manager.rs`,
+the two CLI commands, `main.rs`) — **no** `encode_query`/`dense_backend`/`fusion`/`query_expander`/
+searcher changes — so the reused tier0+frozen (`fd136f7`) and full-hybrid (`4c8572d`) recordings stay
+comparable.
+
+## V.2 C1 — quality (real shortlist vs forced-exact), git `0e258b3`
+
+CSN hybrid harness, seed 20260531, 200 queries × 1000-doc corpus per language (`config/csn_subset.yaml`).
+Arms 1 & 2 re-run fresh at this HEAD (run-ids `cinder-gate-8resume-cinder-shortlist` /
+`cinder-gate-8resume-mixer-exact`); arms 3 & 4 reused (query path unchanged, §V.1).
+
+| Language | **Arm 1 Cinder** (real shortlist) | Arm 2 mixer+exact (exhaustive) | Arm 3 tier0+frozen | Arm 4 full-hybrid | C1 target | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| python | **0.9066** | 0.9085 | 0.917455 | 0.896963 | ≥0.8970 | **PASS** (+0.0096) |
+| javascript | **0.5354** | 0.5356 | 0.513874 | 0.556572 | ≥0.5329 | **PASS** (+0.0025) |
+| go | **0.7382** | 0.7394 | 0.726119 | 0.759336 | ≥0.7457 | **FAIL** (−0.0075) |
+
+**Assignment-approximation effect (arm 1 shortlist − arm 2 exact):** python −0.0019, javascript
+−0.0002, go −0.0012 — all within ±0.002, i.e. quality-neutral, exactly as C4's 99.5% agreement
+predicts. (Exhaustive is marginally *higher* on all three — see §V.5.) **The real shortlist
+assignment does not move quality.**
+
+**Mixer effect (arm 1 − arm 3 tier0+frozen):** python −0.0109, javascript +0.0215, go +0.0121 — the
+distilled micro-mixer beats the linear 5-tap mix on js/go, slightly negative on python (BM25
+dominates there). Same story as v1. **Residual encoder-free gap (arm 4 − arm 1):** go 0.0211, i.e.
+Cinder retains 97.2% of full-contextual on go (below the 98.2% target) — the inherent
+encoder-free-vs-contextual-teacher gap the mixer only partially closes.
+
+**C1 verdict: python PASS, javascript PASS (narrow), go FAIL (−0.0075).** Essentially identical to v1
+— confirming the assignment method (shortlist vs exhaustive) is not what drives C1.
+
+**C1 go contingency — NOT applied.** Shortfall 0.0075 (≤2pt), but (i) not mixer-attributable (the
+mixer *improves* go by +0.0121) and (ii) not assignment-attributable (arm 2 exact also fails go at
+0.7394, −0.0063). The shortfall is the fundamental encoder-free gap, so per the plan's bound
+("mixer-attributable AND ≤2pts") the hashed bigram/trigram contingency does not apply; the honest go
+FAIL is reported.
+
+## V.3 C2 — build speed (dense-stage increment)
+
+Method identical to Appendix A §6 (no dense-disable switch exists; dense-stage Δt =
+`PLAID index built via cinder` log timestamp − `using cinder compiled indexing` timestamp under
+`RUST_LOG=semantex_core=info`). Both Cinder runs logged the `using cinder compiled indexing`
+confirmation and **zero** Cinder fallback warnings (CopilotKit's only WARNs were 11 benign
+pre-existing PDF-parse failures on demo assets).
+
+| Repo (chunks) | **real shortlist (Task 6b)** | EXACT re-measure | v1 exhaustive (App. A) | target | verdict |
+|---|---:|---:|---:|---:|---|
+| platform (7,831) | **44.62s** | 5.68s | 5.42s | <1s | **FAIL** (44.6×) |
+| CopilotKit (159,013) | **787.81s** | 102.42s (ref) | 102.42s | <5s | **FAIL** (157×) |
+
+**C2 verdict: FAIL, and materially worse than v1.** Wiring the shortlist assigner took platform
+5.42s → 44.6s and CopilotKit 102s → 788s. Root cause is the scalar-closure vs batched-BLAS gap
+described in the headline finding — this is a real, reproducible ~7–8× slowdown across three repos of
+very different sizes (gin 7.0×, CopilotKit 7.7×, platform 7.9×), not noise.
+
+## V.4 C3 — build memory (peak RSS)
+
+Peak RSS from `/usr/bin/time -l` (`maximum resident set size`), converted bytes/1,048,576. Gate:
+peak-RSS increment <300 MB over the sparse baseline (~68–80 MB, Task 7).
+
+| Repo | **real shortlist (Task 6b)** | EXACT re-measure | v1 exhaustive (App. A) | increment vs sparse | verdict |
+|---|---:|---:|---:|---:|---|
+| platform (7,831) | **671.9 MB** | 1089.0 MB | 1158.8 MB | ≈592 MB | **FAIL** |
+| CopilotKit (159,013) | **1965.9 MB** | 2664.4 MB (ref) | 2664.4 MB | ≈1886 MB | **FAIL** |
+| gin (2,233) | 650.0 MB | 1058.5 MB | — | — | (not a gate repo) |
+
+**C3 verdict: FAIL, but the shortlist path uses LESS memory than exhaustive** (platform −417 MB,
+CopilotKit −698 MB, gin −408 MB). The exhaustive `compress_into_codes_cpu` materializes a large
+batched centroid-score matrix; the shortlist closure processes one token at a time and never does.
+So Task 6b trades **speed for memory**: ~8× slower but ~0.4–0.7 GB lower peak. Both still exceed the
+300 MB increment gate (the ~1 GB next-plaid construction floor — Appendix A §8 — dominates either
+way), so C3 stays FAIL, but the direction of the tradeoff is worth stating plainly rather than as a
+strict win/loss.
+
+## V.5 C4 (unchanged) + the practical assignment-choice data point
+
+C4 is an offline mechanism gate (shortlist-union argmax vs exhaustive argmax agreement over 100k
+sampled `(mixed-embedding, window)` pairs); it did not change with Task 6b and remains **PASS at
+m=128 (0.99547)** — see Appendix A §3 for the derivation. C4 certifies that the shortlist assignment
+is *quality-safe* (it agrees with exhaustive on 99.5% of tokens), and V.2 confirms that safety in
+end-to-end nDCG.
+
+**Practical implication (a data point for the ship/iterate decision, not resolved here):** on this
+CPU host the exhaustive assignment is **both faster (§V.3, ~8×) and marginally higher-quality**
+(§V.2, +0.0002…+0.0019 nDCG across all three languages). There is therefore a straightforward
+argument for keeping **exhaustive** as Cinder's practical default going forward rather than the
+shortlist path — i.e. Cinder's value (encoder-free static+mixer indexing) is realized on the
+exhaustive assignment, and the shortlist assigner, though correct and C4-certified, is currently all
+cost (speed) and no benefit on CPU. This is a call for the final whole-branch review / the user, not
+this report.
+
+## V.6 Fallback checks (re-verified at `0e258b3`) + repo restoration
+
+On gin (`.semantex` preserved/restored; mixer artifact moved aside and restored):
+
+- **Mixer moved aside + `SEMANTEX_CINDER=1`:** logged `WARN … SEMANTEX_CINDER is set but the Cinder
+  artifacts failed to load … (failed to load Cinder mixer …cinder_mixer.bin: No such file or
+  directory); falling back to the existing PLAID build path`, then completed the tier-chain build
+  (`PLAID index built (2233 chunks)`, **not** "via cinder"), exit 0. **PASS.**
+- **All artifacts present + flag OFF:** **zero** cinder log lines; normal build
+  (`PLAID index built (2233 chunks)`), exit 0. Byte-identical-to-today behavior. **PASS.**
+
+**Repo restoration — all verified:** CopilotKit 159,013 chunks, platform 7,831, gin 2,233 (+ mixer
+restored). No `.semantex.pre-cinder`/`.pre-fb`/`.aside` backups remain anywhere. During cleanup a
+pre-existing `.semantex/` auto-append to `.gitignore` (a semantex-index-build side effect, predating
+this session) was found in **gin** (unstaged) and **CopilotKit** (staged) and reverted to committed
+state; platform's `.gitignore` was clean. Untracked cross-tool artifacts (`.semantexignore`,
+`graphify-out/`, platform `docs/plans/*`) were left as-is — pre-existing, not this session's.
+
+An interrupted-session leftover was also cleaned before measuring: CopilotKit's live `.semantex` was
+an incomplete cinder build (lock file, no `meta.json`, 453 MB stray WAL) with the true 159,013-chunk
+original preserved in `.semantex.pre-cinder`; the incomplete build was discarded and the original
+restored.
+
+## V.7 Code changes (this task)
+
+- **`SEMANTEX_CINDER_EXACT_ASSIGN` diagnostic** (`0e258b3`) in
+  `crates/semantex-core/src/search/colbert_plaid_backend.rs::build_cinder`: env-gated branch that
+  installs the shortlist assigner (default) or leaves the writer on its exhaustive default (flag set).
+  Plus a `(v)` block in the ignored end-to-end `cinder_build_produces_searchable_index` test asserting
+  on-disk codes equal the exhaustive full-scan argmax when the flag is set (ran with `--ignored` →
+  PASS). `cargo test -p semantex-core` = 1244 lib tests pass, 0 fail.
+- **Task 6b wiring fix** (`ba378b2`, landed before this task): real shortlist-union assigner in
+  `build_cinder` (the code this report re-validates). Not authored here, listed for the ledger.
+
+## V.8 Recommendation (updated for the corrected numbers)
+
+**Keep Cinder default-OFF (opt-in behind `SEMANTEX_CINDER=1`); do NOT promote to default.** It is
+correct, C4-safe, and quality-neutral, but fails C1(go), C2, and C3, and — the key change from v1 —
+the shortlist-union assigner that v1 named as the fix for C2 is, as implemented, a CPU pessimization
+that makes C2 ~8× worse.
+
+- **C2 is not solved by Task 6b; the natural follow-up is a *vectorized/batched* shortlist
+  implementation** (build a per-flush candidate-union matrix and do one batched matmul + argmax over
+  the union, so the theoretical O(~128) vs O(8192) advantage is realized instead of being eaten by
+  per-token scalar work + `sort_unstable`). That is a real engineering task and is **explicitly out of
+  scope for this validation** — not attempted here.
+- **Assignment-default question (for the whole-branch review / user):** since exhaustive is faster and
+  marginally higher-quality on CPU (§V.5), consider making exhaustive Cinder's practical default and
+  treating the shortlist assigner as experimental until it is vectorized. The
+  `SEMANTEX_CINDER_EXACT_ASSIGN` knob added here makes this a one-line env toggle to A/B.
+- **C3** additionally needs the ~1 GB next-plaid construction floor (Appendix A §8) and (for the
+  exhaustive path) the batched score-matrix addressed for large repos.
+- **C1 go** is a narrow (0.75pt) regression with the mixer net-positive — acceptable to carry while
+  off-by-default.
+
+Do not promote Cinder to default.
+
+---
+
+# Appendix A — v1 (pre-Task-6b) record (SUPERSEDED; retained for history)
+
+> **The sections below are the original Task-8 first-pass report, measured against v1 which silently
+> shipped EXHAUSTIVE centroid assignment (before Task 6b wired the real shortlist assigner). They are
+> retained verbatim as research signal per this branch's ledger. Where they conflict with the
+> Post-Task-6b sections above, the above is authoritative. Specifically: §4's "arm 2 ≡ arm 1" and §9's
+> "Not added: SEMANTEX_CINDER_EXACT_ASSIGN" describe the v1 state only — the diagnostic and the real
+> shortlist arm both exist as of `0e258b3` (see §V.1/§V.7), and §12's recommendation is superseded by
+> §V.8.**
 
 ---
 
