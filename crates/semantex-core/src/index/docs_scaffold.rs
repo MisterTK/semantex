@@ -550,7 +550,7 @@ pub fn apply_module_budget(scaffold: &mut ModuleScaffold, budget_tokens: usize) 
     }
     let approx_bytes = budget_tokens.saturating_mul(4);
     loop {
-        let size = serde_json::to_vec(&*scaffold).map(|v| v.len()).unwrap_or(0);
+        let size = serde_json::to_vec(&*scaffold).map_or(0, |v| v.len());
         if size <= approx_bytes {
             return;
         }
@@ -594,7 +594,7 @@ pub fn apply_overview_budget(scaffold: &mut OverviewScaffold, budget_tokens: usi
     }
     let approx_bytes = budget_tokens.saturating_mul(4);
     loop {
-        let size = serde_json::to_vec(&*scaffold).map(|v| v.len()).unwrap_or(0);
+        let size = serde_json::to_vec(&*scaffold).map_or(0, |v| v.len());
         if size <= approx_bytes {
             return;
         }

@@ -117,9 +117,7 @@ pub fn history_commit_limit() -> usize {
 /// `SEMANTEX_HISTORY_BLAME=1` opts into the expensive per-chunk blame pass.
 /// Off by default.
 pub fn blame_enabled() -> bool {
-    std::env::var("SEMANTEX_HISTORY_BLAME")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var("SEMANTEX_HISTORY_BLAME").is_ok_and(|v| v == "1")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -799,8 +797,7 @@ fn commit_exists(project_root: &Path, sha: &str) -> bool {
         project_root,
         &["cat-file", "-e", &format!("{sha}^{{commit}}")],
     )
-    .map(|o| o.status.success())
-    .unwrap_or(false)
+    .is_ok_and(|o| o.status.success())
 }
 
 fn rev_list_count(project_root: &Path, range: &str) -> Option<usize> {

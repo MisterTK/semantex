@@ -220,39 +220,55 @@ pub(crate) fn download_file(url: &str, dest: &Path) -> Result<()> {
         .unwrap_or_default();
     pb.set_message(file_name);
 
-    // Write to a temp file first, then rename for atomicity
+    // Write to a temp file first, then rename for atomicity. The temp name is
+    // PID-suffixed and opened with `create_new` so two concurrent downloads of
+    // the same file can never interleave writes into one temp and rename a
+    // corrupted result; error paths remove the temp so a failed download stays
+    // retryable.
     let parent = dest.parent().context("dest has no parent directory")?;
     let tmp_path = parent.join(format!(
-        ".tmp_{}",
+        ".tmp_{}.{}",
         dest.file_name()
-            .map_or_else(|| "download".into(), |n| n.to_string_lossy().to_string())
+            .map_or_else(|| "download".into(), |n| n.to_string_lossy().to_string()),
+        std::process::id()
     ));
 
-    let mut tmp_file = fs::File::create(&tmp_path)
-        .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
+    let mut tmp_file = fs::File::create_new(&tmp_path).with_context(|| {
+        format!(
+            "Failed to create {} (leftover from a crashed download? remove it and retry)",
+            tmp_path.display()
+        )
+    })?;
 
     let mut reader = resp.into_body().into_reader();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .context("Failed to read response body")?;
-        if n == 0 {
-            break;
+    let copy_result = (|| -> Result<()> {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .context("Failed to read response body")?;
+            if n == 0 {
+                break;
+            }
+            tmp_file.write_all(&buf[..n])?;
+            pb.inc(n as u64);
         }
-        tmp_file.write_all(&buf[..n])?;
-        pb.inc(n as u64);
+        tmp_file.flush()?;
+        Ok(())
+    })();
+    drop(tmp_file);
+    if let Err(e) = copy_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
 
-    tmp_file.flush()?;
-    drop(tmp_file);
-
-    fs::rename(&tmp_path, dest).with_context(|| {
-        format!(
+    fs::rename(&tmp_path, dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        anyhow::Error::new(e).context(format!(
             "Failed to rename {} -> {}",
             tmp_path.display(),
             dest.display()
-        )
+        ))
     })?;
 
     pb.finish_with_message("done");

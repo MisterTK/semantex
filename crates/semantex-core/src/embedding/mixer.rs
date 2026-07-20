@@ -86,13 +86,28 @@ impl MicroMixer {
         buf.extend_from_slice(&(self.dims as u32).to_le_bytes());
         buf.extend_from_slice(&(MIXER_WINDOW as u32).to_le_bytes());
         for arr in [&self.dw, &self.b1, &self.wp, &self.b2] {
-            for v in arr.iter() {
+            for v in arr {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("saving mixer to {}", path.display()))?;
+        let mut file = std::fs::File::create_new(&tmp).with_context(|| {
+            format!(
+                "failed to create temp file {} (leftover from a crashed run? remove it and retry)",
+                tmp.display()
+            )
+        })?;
+        if let Err(e) = std::io::Write::write_all(&mut file, &buf) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(
+                anyhow::Error::new(e).context(format!("writing mixer temp file {}", tmp.display()))
+            );
+        }
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(e).context(format!("saving mixer to {}", path.display()))
+        })?;
         Ok(())
     }
 

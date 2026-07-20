@@ -6,7 +6,7 @@ resolver = "3"
 version = "1.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.91"
+rust-version = "1.97"
 repository = "https://github.com/MisterTK/semantex"
 homepage = "https://semantex.dev"
 description = "Semantex — semantic code search — hybrid dense + BM25 retrieval engine"
@@ -28,7 +28,7 @@ regex = "1"
 # These are listed as non-optional in the workspace so downstream crates can
 # reference them; the `optional = true` that gates compilation lives in
 # semantex-core/Cargo.toml (the only crate that uses them).
-genai = "0.5"
+genai = "0.6.5"
 async-trait = "0.1"
 which = "8"
 # next-plaid 1.6: vendored PLAID engine (Apache-2.0, pure-Rust over ndarray, mmap,
