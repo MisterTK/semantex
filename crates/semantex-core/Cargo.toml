@@ -62,7 +62,7 @@ ort = { version = "2.0.0-rc.11", default-features = false, features = ["ndarray"
 instant-distance = "0.6"
 
 # Full-text search (BM25)
-tantivy = { version = "0.26", features = ["stemmer"] }
+tantivy = { version = "0.26.1", features = ["stemmer"] }
 
 # AST parsing
 tree-sitter = "0.26.9"
