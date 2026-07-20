@@ -269,7 +269,7 @@ fn print_branches_section(project_path: &Path) {
 
     let current_key = layout::current_branch_key(project_path);
     let mut branches = entry.branches;
-    branches.sort_by(|a, b| b.last_indexed_ts.cmp(&a.last_indexed_ts));
+    branches.sort_by_key(|b| std::cmp::Reverse(b.last_indexed_ts));
 
     println!();
     println!("{}", "Branches:".bold());
@@ -300,8 +300,7 @@ fn format_unix_ts_age(unix_ts: i64) -> String {
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     let secs = (now - unix_ts).max(0);
     if secs < 60 {
         format!("{secs}s")

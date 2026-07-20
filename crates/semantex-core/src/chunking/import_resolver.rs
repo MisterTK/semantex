@@ -448,15 +448,14 @@ fn resolve_c_include(
 
     // Only resolve quoted includes: #include "foo.h"
     // Skip angle-bracket includes: #include <stdio.h>
-    let path_str = if let Some(rest) = trimmed.strip_prefix("#include") {
+    let path_str = {
+        let rest = trimmed.strip_prefix("#include")?;
         let rest = rest.trim();
         if rest.starts_with('"') {
             rest.trim_matches('"')
         } else {
             return None; // angle-bracket or malformed
         }
-    } else {
-        return None;
     };
 
     // Try relative to current file's directory first

@@ -2674,12 +2674,11 @@ impl McpServer {
 
         let current_key = semantex_core::index::layout::current_branch_key(canonical);
         let mut branches = entry.branches;
-        branches.sort_by(|a, b| b.last_indexed_ts.cmp(&a.last_indexed_ts));
+        branches.sort_by_key(|b| std::cmp::Reverse(b.last_indexed_ts));
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs() as i64);
 
         let mut out = String::from("\n  Branches:");
         for b in &branches {
@@ -2917,7 +2916,7 @@ impl McpServer {
             m.chunks_read,
             coverage,
             result.confidence,
-            &result.metrics.confidence_zone
+            result.metrics.confidence_zone
         );
 
         // Build structured output (machine-readable)

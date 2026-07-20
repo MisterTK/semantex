@@ -254,7 +254,7 @@ pub fn enforce_retention_with_cap(
 
     // Newest first, so the first `cap` distinct keys (current always
     // included) are the ones we keep.
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     keep.insert(current_branch_key.to_string());
@@ -294,8 +294,7 @@ fn root_embedder_fingerprint(project_root: &Path) -> String {
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Record (upsert into the global registry) that `project_root`'s current

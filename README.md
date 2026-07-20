@@ -196,7 +196,7 @@ curl -fsSL https://raw.githubusercontent.com/MisterTK/semantex/main/install.sh |
 
 **Windows** — download from [GitHub Releases](https://github.com/MisterTK/semantex/releases/latest).
 
-**Build from source** (Rust 1.91+):
+**Build from source** (Rust 1.97+):
 
 ```bash
 git clone https://github.com/MisterTK/semantex.git
@@ -401,7 +401,7 @@ semantex/
 - **Platform**: macOS (ARM/Intel), Linux, Windows
 - **Memory**: 2GB+ RAM recommended
 - **Disk**: ~100MB for models + index storage
-- **Build**: Rust 1.91+ (if building from source)
+- **Build**: Rust 1.97+ (if building from source)
 
 ### First Index
 

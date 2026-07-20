@@ -86,7 +86,7 @@ impl MicroMixer {
         buf.extend_from_slice(&(self.dims as u32).to_le_bytes());
         buf.extend_from_slice(&(MIXER_WINDOW as u32).to_le_bytes());
         for arr in [&self.dw, &self.b1, &self.wp, &self.b2] {
-            for v in arr.iter() {
+            for v in arr {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }

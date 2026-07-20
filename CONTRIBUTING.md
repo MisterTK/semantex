@@ -13,7 +13,7 @@ cargo test --all
 
 ### Requirements
 
-- Rust 1.91+ (edition 2024)
+- Rust 1.97+ (edition 2024)
 - ~17MB for ColBERT model (auto-downloaded on first `semantex index`)
 
 ## Development Workflow

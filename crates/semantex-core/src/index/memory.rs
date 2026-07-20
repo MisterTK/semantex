@@ -147,8 +147,7 @@ fn format_tags(tags: &[String]) -> String {
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Per-process counter mixed into [`generate_key`] so two saves in the same
@@ -163,8 +162,7 @@ static KEY_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn generate_key() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let counter = KEY_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}-{counter:x}-{:x}", std::process::id())
 }
