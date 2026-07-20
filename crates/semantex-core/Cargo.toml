@@ -128,6 +128,9 @@ sha2 = "0.10"
 
 # Parallelism
 rayon = "1"
+# ndarray 0.17 / ndarray-npy 0.10 are blocked by third-party pins (checked
+# 2026-07-19): next-plaid-onnx and fastkmeans-rs (latest releases) both require
+# ndarray ^0.16, and Array types flow across those crate boundaries.
 ndarray = "0.16"
 # .npy read/write for the frozen-centroid training artifact (embedding/centroid_train.rs).
 # Version pinned to match the vendored next-plaid's own ndarray-npy dependency.

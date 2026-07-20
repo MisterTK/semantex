@@ -215,13 +215,23 @@ pub fn save_centroids_npy(path: &Path, centroids: &Array2<f32>) -> Result<()> {
             .unwrap_or("centroids"),
         std::process::id()
     ));
-    let file = std::fs::File::create(&tmp)
-        .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
-    centroids
-        .write_npy(file)
-        .context("failed to write centroids npy")?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to move centroids into place at {}", path.display()))?;
+    let file = std::fs::File::create_new(&tmp).with_context(|| {
+        format!(
+            "failed to create temp file {} (leftover from a crashed run? remove it and retry)",
+            tmp.display()
+        )
+    })?;
+    if let Err(e) = centroids.write_npy(file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context("failed to write centroids npy"));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::Error::new(e).context(format!(
+            "failed to move centroids into place at {}",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
