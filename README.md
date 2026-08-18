@@ -4,10 +4,11 @@
 
 semantex is a fully local semantic code search MCP server that replaces the Grep→Read→Grep→Read loop AI agents fall into when exploring a codebase — the industry-default retrieval pattern, whose cognitive cost compounds quadratically with every extra tool call (see below). It combines ColBERT dense embeddings with BM25 sparse search to find code by meaning, then delivers pre-digested answers so your agent can act on the first call instead of the tenth.
 
-As of the **v1.0.0** release, four things separate semantex from the rest of the semantic code search field:
+As of the **v1.0.0** release, five things separate semantex from the rest of the semantic code search field:
 
 - **The only active tool doing local ColBERT late-interaction retrieval.** Most semantic code search tools use single-vector embeddings; semantex uses per-token MaxSim scoring (ColBERT/PLAID) — the retrieval method the field has converged on for precision — and runs it entirely on-device.
 - **The most self-contained implementation of that convergent architecture.** Single binary, no vector database, no embedding API, no API keys to provision or rotate. Your code and your queries never leave the machine.
+- **A novel fix for late-interaction's indexing bottleneck.** Real per-token ColBERT indexing means running a transformer forward pass over every token of every chunk, which chokes on large repos. semantex's **Cinder** encoder-free indexer replaces that pass with a distilled compiled operator, cutting a build that previously couldn't complete on a ~159k-chunk repo down to about a minute — see [Cinder](#cinder-solving-late-interactions-indexing-bottleneck) below.
 - **Adoption machinery, not just an engine.** In-place, idempotent installers — MCP registration plus hooks/rules/skill files, written directly to each platform's real config path, no copy-paste — for **9 agent platforms** (Claude Code, Cursor, Codex, Aider, Gemini CLI, GitHub Copilot, OpenCode, Devin Desktop/Windsurf, Trae) route agents to semantex automatically instead of relying on the agent to remember it exists.
 - **A codebase-understanding platform, not just a search box.** Multi-branch indexing, cross-repo federated search, searchable git history, durable project memory, and deterministic doc scaffolding all ship in v1.0 — see [What's New](#whats-new-in-v10).
 
@@ -178,6 +179,25 @@ Query → Exact string match ─────────────────
 2. **Sparse search** — BM25 via Tantivy with Snowball stemming and code-aware tokenization
 3. **Fusion** — query-adaptive convex combination of dense, sparse, and exact match scores
 4. **Deep pipeline** — search → triage → call graph expansion → content read → extractive summary
+
+### The Dense Channel: LateOn, and What We Built On Top Of It
+
+semantex's dense channel is [LightOn's LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge) — a ~17MB int8 ColBERT-style late-interaction model — served through a vendored, patched fork of LightOn's own [next-plaid](https://github.com/lightonai/next-plaid) PLAID index (we fixed a k-means step that was allocating 26GB down to 9GB). Every token of every chunk gets its own embedding, and matches are scored with true per-token MaxSim rather than a single pooled vector per document — the retrieval method the field has converged on for code-search precision, and semantex is one of the few local, single-binary implementations of it.
+
+We didn't stop at wiring the model in. On top of the stock LateOn/PLAID pipeline we shipped a query-adaptive fusion layer (dense + BM25 + exact-match, above), incremental crash-safe index updates (insert/delete without a full rebuild), multi-branch snapshotting, and — the most recent and most structural addition — a fix for late-interaction's biggest practical weakness: indexing cost.
+
+### Cinder: Solving Late Interaction's Indexing Bottleneck
+
+Late-interaction retrieval is precise, but it's expensive to build: PLAID needs a real embedding for **every token of every chunk**, which means running the full transformer forward pass over the entire corpus at index time. That's fine on a small repo. On a large one — we hit this concretely on a ~159k-chunk monorepo — the encoder pass alone could OOM or simply never finish, no matter how the batching was tuned.
+
+**Cinder** is our fix, and it doesn't touch PLAID or how search is scored — it only changes how index-time embeddings get produced:
+
+- We distilled the real encoder offline into a **static per-token embedding table** plus a tiny **micro-mixer**: a compiled operator that approximates the transformer's contextualization for a token using only a fixed 9-token window around it.
+- We paired that with **frozen, universal cluster centroids** and per-vocabulary **centroid shortlists**, trained once and shipped as ~19MB of artifacts, so PLAID's clustering/assignment step also skips the encoder.
+- At index time, every token becomes an embedding via table lookup + micro-mixer — never a transformer forward pass. That took the CopilotKit-scale build from "doesn't complete" to **~55 seconds**, with measured **99.5% cluster-assignment agreement** against the real encoder and retrieval quality within **1-4% of full-encoder nDCG@10** (Python actually improves slightly; JavaScript and Go see a small dip).
+- Cinder is **on by default** (`SEMANTEX_CINDER`, opt out with `=0` or `=false`) and fails safe: if its artifacts aren't available, indexing transparently falls back to running the real encoder, exactly as before Cinder existed.
+
+The net effect: the thing that makes late-interaction retrieval good — real per-token embeddings — no longer has to be the thing that makes indexing a large repo impractical.
 
 ### Fully Local & Private
 
@@ -475,4 +495,4 @@ Apache-2.0
 
 ## Credits
 
-Built with [next-plaid](https://github.com/lightonai/next-plaid) (ColBERT/PLAID), [Tantivy](https://github.com/quickwit-oss/tantivy) (BM25), [fastembed-rs](https://github.com/Anush008/fastembed-rs) (reranking), [tree-sitter](https://tree-sitter.github.io/) (AST parsing), [ONNX Runtime](https://onnxruntime.ai/) (inference).
+Built with [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge) (LightOn's late-interaction ColBERT model) and [next-plaid](https://github.com/lightonai/next-plaid) (LightOn's PLAID index, vendored and patched), [Tantivy](https://github.com/quickwit-oss/tantivy) (BM25), [fastembed-rs](https://github.com/Anush008/fastembed-rs) (reranking), [tree-sitter](https://tree-sitter.github.io/) (AST parsing), [ONNX Runtime](https://onnxruntime.ai/) (inference).
